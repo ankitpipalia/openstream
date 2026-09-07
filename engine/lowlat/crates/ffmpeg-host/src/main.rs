@@ -506,8 +506,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!(
                         "OpenStream restarting FFmpeg encoder at {target:.2} Mbps ({reason})",
                     );
-                    ffmpeg.terminate().await;
-                    let (child, next) = spawn_ffmpeg(SpawnRequest {
+                    match spawn_ffmpeg(SpawnRequest {
                         codec: negotiated.video,
                         width: negotiated.width,
                         height: negotiated.height,
@@ -516,13 +515,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         four_four_four: negotiated.video_444,
                         bitrate_override_mbps: Some(target),
                         capture_input: display_capture_input(&host_displays, display_index),
-                    })?;
-                    ffmpeg = ChildGuard::new(child);
-                    profile = next;
-                    stdout = ffmpeg.take_stdout().ok_or("FFmpeg stdout was not piped")?;
-                    access_units = AccessUnitizer::for_codec(negotiated.video);
-                    last_restart = Some(Instant::now());
-                    keyframe_requested = false;
+                    }) {
+                        Ok((child, next)) => {
+                            let mut replacement = ChildGuard::new(child);
+                            let Some(replacement_stdout) = replacement.take_stdout() else {
+                                replacement.terminate().await;
+                                eprintln!(
+                                    "OpenStream FFmpeg restart produced no stdout; keeping the current capture"
+                                );
+                                last_restart = Some(now);
+                                continue;
+                            };
+                            // Start and validate the replacement before
+                            // terminating the current encoder. A transient
+                            // device/driver failure therefore causes a retry,
+                            // not an avoidable black stream.
+                            ffmpeg.terminate().await;
+                            ffmpeg = replacement;
+                            profile = next;
+                            stdout = replacement_stdout;
+                            access_units = AccessUnitizer::for_codec(negotiated.video);
+                            last_restart = Some(now);
+                            keyframe_requested = false;
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "OpenStream could not restart FFmpeg; keeping the current capture: {error}"
+                            );
+                            // Rate-limit failed attempts just like successful
+                            // ones. Otherwise a missing encoder/device turns
+                            // the 100 ms control tick into a process-spawn
+                            // loop.
+                            last_restart = Some(now);
+                        }
+                    }
                 }
                 }
             }

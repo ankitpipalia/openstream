@@ -54,6 +54,14 @@ const UI_QUEUE_CAPACITY: usize = 8;
 /// worker is stalled. The queue is intentionally larger than the UI queue so
 /// short scheduling pauses do not drop normal keyboard transitions.
 const INPUT_QUEUE_CAPACITY: usize = 1024;
+/// Lifecycle and state transitions need a separate bounded lane so a burst of
+/// normal input cannot prevent a release or stop command from reaching the
+/// worker. The lane is still bounded: repeated lifecycle notifications must
+/// not become an unbounded memory escape hatch.
+const CRITICAL_INPUT_QUEUE_CAPACITY: usize = 16;
+/// Status/topology messages are small and infrequent, but must not disappear
+/// behind a burst of decoded frames.
+const CRITICAL_UI_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug)]
 enum UiMessage {
@@ -83,13 +91,44 @@ enum UiMessage {
 
 /// Non-blocking bounded sender used by the network worker. Blocking the
 /// transport on a stalled desktop window would turn a rendering problem into
-/// a connection-wide deadlock; dropping a stale UI update is safer.
-#[derive(Clone)]
-struct UiSender(SyncSender<UiMessage>);
+/// a connection-wide deadlock; stale frames/metrics may be dropped, while
+/// lifecycle and topology messages use the separate priority lane.
+#[derive(Clone, Debug)]
+struct UiSender {
+    normal: SyncSender<UiMessage>,
+    critical: SyncSender<UiMessage>,
+}
 
 impl UiSender {
     fn send(&self, message: UiMessage) -> Result<(), ()> {
-        self.0.try_send(message).map_err(|_| ())
+        let critical = matches!(
+            &message,
+            UiMessage::Ready { .. } | UiMessage::Error(_) | UiMessage::Displays(_) | UiMessage::End
+        );
+        let sender = if critical {
+            &self.critical
+        } else {
+            &self.normal
+        };
+        sender.try_send(message).map_err(|_| ())
+    }
+}
+
+/// The UI side of the two bounded lanes. Critical messages are checked first
+/// so a terminal error/end notification is visible even when several stale
+/// frames were already queued.
+#[derive(Debug)]
+struct UiReceiver {
+    normal: Receiver<UiMessage>,
+    critical: Receiver<UiMessage>,
+}
+
+impl UiReceiver {
+    fn try_recv(&self) -> Result<UiMessage, TryRecvError> {
+        match self.critical.try_recv() {
+            Ok(message) => Ok(message),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.normal.try_recv(),
+        }
     }
 }
 
@@ -101,10 +140,68 @@ enum UiInput {
     Stop,
 }
 
+/// Two bounded input lanes. Normal events preserve FIFO order; release/stop
+/// and monitor-selection commands have a small priority lane so cleanup and
+/// explicit state changes are not lost when normal input is backpressured.
+#[derive(Clone, Debug)]
+struct InputSender {
+    normal: SyncSender<UiInput>,
+    critical: SyncSender<UiInput>,
+}
+
+impl InputSender {
+    fn try_send(&self, input: UiInput) -> Result<(), ()> {
+        let critical = matches!(
+            &input,
+            UiInput::Release | UiInput::SelectDisplay(_) | UiInput::Stop
+        );
+        let sender = if critical {
+            &self.critical
+        } else {
+            &self.normal
+        };
+        sender.try_send(input).map_err(|_| ())
+    }
+}
+
+#[derive(Debug)]
+struct InputReceiver {
+    normal: Receiver<UiInput>,
+    critical: Receiver<UiInput>,
+}
+
+impl InputReceiver {
+    /// Normal events are drained before the critical lane so an explicit
+    /// release cannot be reordered ahead of already-queued button presses.
+    fn try_recv(&self) -> Result<UiInput, TryRecvError> {
+        match self.normal.try_recv() {
+            Ok(input) => Ok(input),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.critical.try_recv(),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (ui_raw_tx, ui_rx) = mpsc::sync_channel(UI_QUEUE_CAPACITY);
-    let ui_tx = UiSender(ui_raw_tx);
-    let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
+    let (ui_normal_tx, ui_normal_rx) = mpsc::sync_channel(UI_QUEUE_CAPACITY);
+    let (ui_critical_tx, ui_critical_rx) = mpsc::sync_channel(CRITICAL_UI_QUEUE_CAPACITY);
+    let ui_tx = UiSender {
+        normal: ui_normal_tx,
+        critical: ui_critical_tx,
+    };
+    let ui_rx = UiReceiver {
+        normal: ui_normal_rx,
+        critical: ui_critical_rx,
+    };
+    let (input_normal_tx, input_normal_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
+    let (input_critical_tx, input_critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
+    let input_tx = InputSender {
+        normal: input_normal_tx,
+        critical: input_critical_tx,
+    };
+    let input_rx = InputReceiver {
+        normal: input_normal_rx,
+        critical: input_critical_rx,
+    };
     let worker = thread::Builder::new()
         .name("openstream-network".to_string())
         .spawn(move || run_worker(ui_tx, input_rx))?;
@@ -307,7 +404,7 @@ fn selected_display_index(displays: &[RemoteDisplay]) -> Option<usize> {
 #[allow(clippy::cast_possible_truncation)]
 fn forward_input(
     window: &Window,
-    input_tx: &SyncSender<UiInput>,
+    input_tx: &InputSender,
     last_mouse: &mut Option<(i32, i32)>,
     button_state: &mut [bool; 3],
     gamepads: &mut Option<Gilrs>,
@@ -372,7 +469,7 @@ fn forward_input(
 
 fn poll_gamepads(
     gamepads: &mut Option<Gilrs>,
-    input_tx: &SyncSender<UiInput>,
+    input_tx: &InputSender,
     timestamp: u64,
     gamepad_ids: &mut HashMap<u32, GamepadId>,
     rumble_effects: &mut HashMap<u32, Effect>,
@@ -664,7 +761,7 @@ fn keyboard_usages() -> &'static [(Key, u32)] {
     ]
 }
 
-fn run_worker(ui_tx: UiSender, input_rx: Receiver<UiInput>) {
+fn run_worker(ui_tx: UiSender, input_rx: InputReceiver) {
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -680,7 +777,7 @@ fn run_worker(ui_tx: UiSender, input_rx: Receiver<UiInput>) {
 
 async fn network_loop(
     ui_tx: UiSender,
-    input_rx: Receiver<UiInput>,
+    input_rx: InputReceiver,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
@@ -1179,12 +1276,14 @@ impl From<io::Error> for UiMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        axis_value, cycled_display, gamepad_axis_index, gamepad_button_index, keyboard_usages,
-        selected_display_index,
+        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, InputReceiver, InputSender,
+        UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display, gamepad_axis_index,
+        gamepad_button_index, keyboard_usages, selected_display_index,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
     use openstream_media::displays::{Display, PRIMARY_FLAG, SELECTED_FLAG};
+    use std::sync::mpsc;
 
     #[test]
     fn gamepad_layout_is_stable_across_platform_backends() {
@@ -1240,5 +1339,56 @@ mod tests {
         assert_eq!(cycled_display(&displays, Some(1), true), Some((0, 10)));
         assert_eq!(cycled_display(&displays, Some(0), false), Some((1, 20)));
         assert_eq!(cycled_display(&[], None, true), None);
+    }
+
+    #[test]
+    fn critical_input_survives_a_full_normal_queue() {
+        let (normal_tx, normal_rx) = mpsc::sync_channel(1);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
+        let sender = InputSender {
+            normal: normal_tx,
+            critical: critical_tx,
+        };
+        let receiver = InputReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+        };
+        let event = UiInput::Event(openstream_media::input::InputEvent::release(1));
+        assert!(sender.try_send(event).is_ok());
+        assert!(
+            sender
+                .try_send(UiInput::Event(
+                    openstream_media::input::InputEvent::release(2)
+                ))
+                .is_err()
+        );
+        assert!(sender.try_send(UiInput::Release).is_ok());
+        assert!(matches!(receiver.try_recv(), Ok(UiInput::Event(_))));
+        assert!(matches!(receiver.try_recv(), Ok(UiInput::Release)));
+    }
+
+    #[test]
+    fn critical_ui_state_survives_a_full_frame_queue() {
+        let (normal_tx, normal_rx) = mpsc::sync_channel(1);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_UI_QUEUE_CAPACITY);
+        let sender = UiSender {
+            normal: normal_tx,
+            critical: critical_tx,
+        };
+        let receiver = UiReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+        };
+        assert!(
+            sender
+                .send(UiMessage::Frame {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0],
+                })
+                .is_ok()
+        );
+        assert!(sender.send(UiMessage::End).is_ok());
+        assert!(matches!(receiver.try_recv(), Ok(UiMessage::End)));
     }
 }
