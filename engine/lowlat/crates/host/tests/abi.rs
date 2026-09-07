@@ -45,6 +45,15 @@ fn shared_object() -> PathBuf {
     let profile = artifacts();
     let mut build = Command::new(env!("CARGO"));
     build.args(["build", "--quiet", "-p", "lowlat-host"]);
+    // This test may itself be running under `-Z sanitizer=address`. The
+    // shared object is a separately loaded production artifact, and inheriting
+    // sanitizer flags into this nested Cargo invocation breaks proc-macro
+    // resolution (and tests the toolchain rather than the ABI boundary).
+    build
+        .env_remove("RUSTFLAGS")
+        .env_remove("RUSTDOCFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTDOCFLAGS");
     // The test profile decides which directory this is running from, and the
     // build has to land in the same one.
     if profile.file_name().is_some_and(|name| name == "release") {

@@ -251,7 +251,7 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
     let mut left_arena = Arena::new();
     let mut right_arena = Arena::new();
     let mut left = shell(&mut left_arena, LEFT, RIGHT, 0xA1);
-    let mut right = shell(&mut right_arena, RIGHT, LEFT, 0xB2);
+    let mut right = shell_guest(&mut right_arena, RIGHT, LEFT, 0xB2);
 
     let left_addr = loopback_of(&left);
     let right_addr = loopback_of(&right);
