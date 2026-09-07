@@ -45,6 +45,14 @@ fn shared_object() -> PathBuf {
     let profile = artifacts();
     let mut build = Command::new(env!("CARGO"));
     build.args(["build", "--quiet", "-p", "lowlat-host"]);
+    // The test may have been invoked with an explicit target, which makes
+    // Cargo place the executable in `<target>/<triple>/<profile>`. Point the
+    // nested build at the directory immediately above that profile so its
+    // default-host artifact lands beside the test executable as well.
+    let target_dir = profile
+        .parent()
+        .expect("the profile directory has a target directory");
+    build.arg("--target-dir").arg(target_dir);
     // This test may itself be running under `-Z sanitizer=address`. The
     // shared object is a separately loaded production artifact, and inheriting
     // sanitizer flags into this nested Cargo invocation breaks proc-macro
