@@ -202,10 +202,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         normal: input_normal_rx,
         critical: input_critical_rx,
     };
-    let worker = thread::Builder::new()
-        .name("openstream-network".to_string())
-        .spawn(move || run_worker(ui_tx, input_rx))?;
-
     let mut window = Window::new(
         "OpenStream",
         DEFAULT_WIDTH,
@@ -226,6 +222,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // This opt-in path exercises native adapter creation, texture upload, and
+    // one present without requiring a signaling service or pairing secret.
+    // It is intentionally not part of normal startup or the production
+    // session state machine.
+    if env::var("OPENSTREAM_RENDERER_SMOKE").as_deref() == Ok("1") {
+        let pixels = [0xff00_00ff, 0xff00_ff00, 0xffff_0000, 0xffff_ffff];
+        if let Some(presenter) = native_presenter.as_mut() {
+            presenter
+                .present(&window, 2, 2, &pixels)
+                .map_err(|error| format!("native renderer smoke failed: {error}"))?;
+        } else {
+            window.update_with_buffer(&pixels, 2, 2)?;
+        }
+        window.update();
+        return Ok(());
+    }
+    let worker = thread::Builder::new()
+        .name("openstream-network".to_string())
+        .spawn(move || run_worker(ui_tx, input_rx))?;
     window.set_target_fps(120);
     let hotkeys = display::Hotkey::from_env();
     let mut last_hotkey: Option<display::HotkeyAction> = None;

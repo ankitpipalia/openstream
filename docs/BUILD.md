@@ -157,6 +157,13 @@ reason and keeps the session alive with the software presenter. Set
 `OPENSTREAM_AUDIO_PLAYER=ffplay` for the optional external PCM audio sink;
 native audio sinks remain platform work.
 
+For a credential-free native presentation smoke, build the desktop client and
+run `OPENSTREAM_RENDERER=metal OPENSTREAM_RENDERER_SMOKE=1
+./target/debug/openstream-desktop-client` on macOS, or select `vulkan`,
+`opengl`, or `d3d12` on a host with that backend. The smoke creates a bounded
+test frame, uploads it, presents once, pumps the window, and exits; unsupported
+backends must report a software fallback rather than failing the process.
+
 Clients acknowledge only fully assembled video frames with the versioned `FA`
 control envelope. The native Linux host uses those ACKs for bounded bitrate
 feedback (`OPENSTREAM_VIDEO_MBPS`, `OPENSTREAM_VIDEO_MIN_MBPS`, and
