@@ -14,24 +14,24 @@ use std::time::Duration;
 const X_TCP_BASE_PORT: u16 = 6000;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maximum single framebuffer read (64 megapixels of 32-bit pixels).
-pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 /// One X11 screen reported by the server setup.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Screen {
-    pub index: usize,
-    pub root: u32,
-    pub width_px: u16,
-    pub height_px: u16,
-    pub width_mm: u16,
-    pub height_mm: u16,
-    pub root_depth: u8,
-    pub root_visual: u32,
+pub(crate) struct Screen {
+    pub(crate) index: usize,
+    pub(crate) root: u32,
+    pub(crate) width_px: u16,
+    pub(crate) height_px: u16,
+    pub(crate) width_mm: u16,
+    pub(crate) height_mm: u16,
+    pub(crate) root_depth: u8,
+    pub(crate) root_visual: u32,
 }
 
 /// Typed X11 failures; every variant maps to a host fallback, never a panic.
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     NoDisplay,
     BadDisplay(String),
     Io(std::io::Error),
@@ -55,7 +55,7 @@ impl std::error::Error for Error {}
 
 /// Parsed DISPLAY: unix socket path or TCP endpoint plus screen number.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DisplayAddr {
+pub(crate) enum DisplayAddr {
     Unix {
         path: String,
         screen: u32,
@@ -69,7 +69,7 @@ pub enum DisplayAddr {
 
 /// Parse `$DISPLAY` without shelling out. Accepts `:0`, `:0.1`,
 /// `/tmp/launch-.../:0`, `host:10`, and `host:10.0`.
-pub fn parse_display(spec: &str) -> Result<DisplayAddr, Error> {
+pub(crate) fn parse_display(spec: &str) -> Result<DisplayAddr, Error> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Err(Error::NoDisplay);
@@ -141,16 +141,14 @@ impl Write for Stream {
 }
 
 /// An authenticated X11 connection with the parsed server setup.
-pub struct Connection {
+pub(crate) struct Connection {
     stream: Stream,
-    pub screens: Vec<Screen>,
-    pub image_byte_order: u8,
-    pub bitmap_bit_order: u8,
+    pub(crate) screens: Vec<Screen>,
 }
 
 impl Connection {
     /// Open `$DISPLAY` (or `spec` when given) and run the setup handshake.
-    pub fn open(spec: Option<&str>) -> Result<Self, Error> {
+    pub(crate) fn open(spec: Option<&str>) -> Result<Self, Error> {
         let text = match spec {
             Some(display) => display.to_string(),
             None => std::env::var("DISPLAY").map_err(|_| Error::NoDisplay)?,
@@ -179,8 +177,6 @@ impl Connection {
         let mut connection = Self {
             stream,
             screens: Vec::new(),
-            image_byte_order: 0,
-            bitmap_bit_order: 0,
         };
         connection.handshake()?;
         Ok(connection)
@@ -197,9 +193,7 @@ impl Connection {
 
     fn handshake(&mut self) -> Result<(), Error> {
         // Setup request: little-endian order, X11.0, no authentication.
-        let mut request = [0_u8; 12];
-        request[0] = b'l';
-        request[2] = 11;
+        let request = setup_request_bytes();
         self.stream.write_all(&request).map_err(Error::Io)?;
         self.stream.flush().map_err(Error::Io)?;
 
@@ -218,40 +212,9 @@ impl Connection {
         }
         let length = u16::from_le_bytes([header[6], header[7]]) as usize * 4;
         let body = self.read_exact_vec(length)?;
-        let (screens, image_order, bitmap_order) = parse_setup(&body)?;
+        let (screens, _, _) = parse_setup(&body)?;
         self.screens = screens;
-        self.image_byte_order = image_order;
-        self.bitmap_bit_order = bitmap_order;
         Ok(())
-    }
-
-    /// Grab one raw ZPixmap framebuffer for `screen` (native byte order).
-    ///
-    /// Returns `(width, height, depth, bytes)` with 32-bit pixels when the
-    /// root depth is 24/32. Callers convert to the encoder's planar format.
-    pub fn get_image(&mut self, screen: usize) -> Result<(u16, u16, u8, Vec<u8>), Error> {
-        let info = self.screens.get(screen).ok_or(Error::Truncated)?.clone();
-        // GetImage: opcode 73, format ZPixmap(2).
-        let mut request = [0_u8; 20];
-        request[0] = 73;
-        request[1] = 2;
-        request[2..4].copy_from_slice(&5_u16.to_le_bytes());
-        request[4..8].copy_from_slice(&info.root.to_le_bytes());
-        request[12..14].copy_from_slice(&info.width_px.to_le_bytes());
-        request[14..16].copy_from_slice(&info.height_px.to_le_bytes());
-        request[16..20].copy_from_slice(&0xFFFF_FFFF_u32.to_le_bytes());
-        self.stream.write_all(&request).map_err(Error::Io)?;
-        self.stream.flush().map_err(Error::Io)?;
-
-        let header = self.read_exact_vec(32)?;
-        if header[0] != 1 {
-            return Err(Error::Refused(format!("GetImage error {}", header[0])));
-        }
-        let depth = header[1];
-        let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize * 4;
-        let _visual = u32::from_le_bytes(header[8..12].try_into().map_err(|_| Error::Truncated)?);
-        let bytes = self.read_exact_vec(length)?;
-        Ok((info.width_px, info.height_px, depth, bytes))
     }
 }
 
@@ -260,7 +223,7 @@ fn take(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], Error> {
 }
 
 /// Parse the setup success body into screens. Pure and fully unit-tested.
-pub fn parse_setup(body: &[u8]) -> Result<(Vec<Screen>, u8, u8), Error> {
+pub(crate) fn parse_setup(body: &[u8]) -> Result<(Vec<Screen>, u8, u8), Error> {
     if body.len() < 32 {
         return Err(Error::Truncated);
     }
@@ -308,7 +271,7 @@ pub fn parse_setup(body: &[u8]) -> Result<(Vec<Screen>, u8, u8), Error> {
 }
 
 /// Build the 12-byte setup request (handshake preamble), for tests.
-pub fn setup_request_bytes() -> [u8; 12] {
+fn setup_request_bytes() -> [u8; 12] {
     let mut request = [0_u8; 12];
     request[0] = b'l';
     request[2] = 11;

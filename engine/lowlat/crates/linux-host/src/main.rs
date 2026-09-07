@@ -351,9 +351,13 @@ fn list_displays() -> Result<(), Box<dyn std::error::Error>> {
             .map(|screen| {
                 serde_json::json!({
                     "index": screen.index,
+                    "root": screen.root,
                     "width_px": screen.width_px,
                     "height_px": screen.height_px,
+                    "width_mm": screen.width_mm,
+                    "height_mm": screen.height_mm,
                     "root_depth": screen.root_depth,
+                    "root_visual": screen.root_visual,
                 })
             })
             .collect::<Vec<_>>(),
@@ -370,6 +374,7 @@ fn list_displays() -> Result<(), Box<dyn std::error::Error>> {
                     "id": node.id,
                     "name": node.name,
                     "media_class": node.media_class,
+                    "object_serial": node.object_serial,
                 })
             })
             .collect::<Vec<_>>(),

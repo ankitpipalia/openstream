@@ -17,15 +17,15 @@ use std::time::Duration;
 
 /// One PipeWire source node that can feed screen capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceNode {
-    pub id: u32,
-    pub name: String,
-    pub media_class: String,
-    pub object_serial: Option<u32>,
+pub(crate) struct SourceNode {
+    pub(crate) id: u32,
+    pub(crate) name: String,
+    pub(crate) media_class: String,
+    pub(crate) object_serial: Option<u32>,
 }
 
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     Unavailable(String),
     Spawn(std::io::Error),
     InvalidJson(String),
@@ -44,7 +44,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// List candidate screen-source nodes via `pw-dump`.
-pub fn list_source_nodes() -> Result<Vec<SourceNode>, Error> {
+pub(crate) fn list_source_nodes() -> Result<Vec<SourceNode>, Error> {
     let output = run_pw_dump().map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => Error::Unavailable("pw-dump is not installed".into()),
         _ => Error::Spawn(error),
@@ -53,7 +53,7 @@ pub fn list_source_nodes() -> Result<Vec<SourceNode>, Error> {
 }
 
 /// Parse `pw-dump` JSON into source nodes. Pure and unit-tested.
-pub fn parse_nodes(json: &str) -> Result<Vec<SourceNode>, Error> {
+pub(crate) fn parse_nodes(json: &str) -> Result<Vec<SourceNode>, Error> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|error| Error::InvalidJson(error.to_string()))?;
     let entries = value
@@ -100,26 +100,6 @@ pub fn parse_nodes(json: &str) -> Result<Vec<SourceNode>, Error> {
         }
     }
     Ok(nodes)
-}
-
-/// FFmpeg `pipewire` input arguments for `node`, or the default screen
-/// source when `node` is `None`. Returned as an argv slice for the
-/// shell-free FFmpeg spawner.
-pub fn ffmpeg_input_args(node: Option<&SourceNode>) -> Vec<String> {
-    match node {
-        Some(node) => vec![
-            "-f".into(),
-            "pipewire".into(),
-            "-i".into(),
-            node.id.to_string(),
-        ],
-        None => vec![
-            "-f".into(),
-            "pipewire".into(),
-            "-i".into(),
-            "default".into(),
-        ],
-    }
 }
 
 fn run_pw_dump() -> std::io::Result<String> {
@@ -241,18 +221,5 @@ mod tests {
     fn rejects_non_json_and_non_array() {
         assert!(matches!(parse_nodes("nope"), Err(Error::InvalidJson(_))));
         assert!(matches!(parse_nodes("{}"), Err(Error::InvalidJson(_))));
-    }
-
-    #[test]
-    fn ffmpeg_args_name_the_node_id() {
-        let nodes = parse_nodes(FIXTURE).expect("parse fixture");
-        assert_eq!(
-            ffmpeg_input_args(Some(&nodes[0])),
-            vec!["-f", "pipewire", "-i", "28"]
-        );
-        assert_eq!(
-            ffmpeg_input_args(None),
-            vec!["-f", "pipewire", "-i", "default"]
-        );
     }
 }
