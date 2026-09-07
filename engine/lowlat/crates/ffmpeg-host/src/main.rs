@@ -46,6 +46,11 @@ const MAX_FFMPEG_ARGS_BYTES: usize = 16 * 1024;
 /// enough to absorb normal pipe chunking while still failing closed on a
 /// broken encoder or an unexpected elementary stream.
 const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
+/// A client may request a different monitor, but the host must not respawn an
+/// external capture process for every packet a peer sends. This cooldown is
+/// independent of adaptive bitrate restarts because monitor selection is a
+/// user-visible control action.
+const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,6 +86,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         session.connection_path()
     );
     let (requested_width, requested_height, requested_fps) = configured_limits();
+    let host_displays = enumerate_host_displays(requested_width, requested_height);
+    let mut display_index = selected_display(&host_displays)?;
+    let capture_backend = env::var("OPENSTREAM_CAPTURE_BACKEND").unwrap_or_else(|_| {
+        match env::consts::OS {
+            "linux" => "x11grab",
+            "macos" => "avfoundation",
+            "windows" => "gdigrab",
+            _ => "unsupported",
+        }
+        .to_string()
+    });
+    // Runtime monitor switching is only honest when this adapter controls the
+    // X11 origin. A custom input or custom argument list may describe a
+    // PipeWire/window/device source that cannot be selected by an xrandr id.
+    let display_selection_enabled = cfg!(target_os = "linux")
+        && capture_backend == "x11grab"
+        && env::var_os("OPENSTREAM_FFMPEG_INPUT").is_none()
+        && env::var_os("OPENSTREAM_FFMPEG_ARGS").is_none()
+        && host_displays.len() > 1;
     let host_policy = openstream_platform::policy::HostPolicy::from_env();
     eprintln!("{}", host_policy.log_line());
     let clipboard_policy = ClipboardPolicy::from_env();
@@ -94,6 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     host_capabilities.rumble = host_policy.gamepad && cfg!(target_os = "linux");
     host_capabilities.clipboard = clipboard_requested && platform_clipboard::available();
     host_capabilities.microphone = host_policy.microphone;
+    host_capabilities.multi_monitor = display_selection_enabled;
     // 10-bit and 4:4:4 are opt-in host profiles: the encoder emits them only
     // when both the host allows them here and the client negotiates them.
     host_capabilities.video_10_bit = env::var("OPENSTREAM_ALLOW_10BIT").as_deref() == Ok("1");
@@ -122,11 +147,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("OpenStream guest microphone intake enabled");
     }
 
-    // Multi-monitor: enumerate outputs, select one for x11grab capture,
-    // and advertise the topology when negotiated. Selection is startup-only;
-    // a different display needs a host restart with OPENSTREAM_DISPLAY.
-    let host_displays = enumerate_host_displays(requested_width, requested_height);
-    let display_index = selected_display().min(host_displays.len().saturating_sub(1));
+    // Multi-monitor: enumerate outputs, select one for x11grab capture, and
+    // advertise the topology when both peers support the live control.
     if let Some(selected) = host_displays.get(display_index) {
         eprintln!(
             "OpenStream capturing display {} ({}x{}+{}+{}{})",
@@ -139,7 +161,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if negotiated.multi_monitor {
-        match openstream_media::displays::encode_list(&host_displays) {
+        match openstream_media::displays::encode_list(&topology_with_selected(
+            &host_displays,
+            display_index,
+        )) {
             Ok(topology) => {
                 if reliable_control
                     .send(&mut session, &topology)
@@ -217,6 +242,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut keyframe_requested = false;
+    let mut pending_display = None;
+    let mut last_display_switch = None;
     let mut control_tick = tokio::time::interval(Duration::from_millis(100));
     let mut clipboard_tick = tokio::time::interval(Duration::from_millis(500));
 
@@ -279,6 +306,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             } else if mic_sink.accept(&payload) {
                                 // Guest microphone audio: validated, decoded,
                                 // and counted above. Never input.
+                            } else if queue_display_selection(
+                                &payload,
+                                &host_displays,
+                                display_index,
+                                &mut pending_display,
+                                display_selection_enabled,
+                            ) {
+                                // A monitor change is applied by the bounded
+                                // restart in the control tick below.
                             } else if let Err(error) = host_input.apply(&payload) {
                                 eprintln!("OpenStream host input event rejected: {error}");
                             }
@@ -315,14 +351,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     } else if mic_sink.accept(&packet.payload) {
                         // Guest microphone audio: validated, decoded, and
                         // counted above. Never input.
-                    } else if let Ok(selected) =
-                        openstream_media::displays::decode_select(&packet.payload)
-                    {
-                        // Runtime display switching needs a capture restart;
-                        // acknowledge by logging and keep streaming.
-                        eprintln!(
-                            "OpenStream client requested display {selected}; restart the host with OPENSTREAM_DISPLAY={selected} to switch"
-                        );
+                    } else if queue_display_selection(
+                        &packet.payload,
+                        &host_displays,
+                        display_index,
+                        &mut pending_display,
+                        display_selection_enabled,
+                    ) {
+                        // A monitor change is applied by the bounded restart
+                        // in the control tick below.
                     } else if packet.payload != b"openstream/frame-ack"
                         && packet.payload != b"openstream/end"
                         && let Err(error) = host_input.apply(&packet.payload)
@@ -385,6 +422,61 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reliable_control.retry(&mut session).await?;
                 session.maintain_liveness().await?;
                 let now = Instant::now();
+                let display_target = pending_display.filter(|_| {
+                    last_display_switch
+                        .is_none_or(|previous| now.duration_since(previous) >= DISPLAY_SWITCH_MIN_INTERVAL)
+                });
+                if let Some(target) = display_target {
+                    eprintln!(
+                        "OpenStream switching FFmpeg capture from display {} to {}",
+                        display_index, target
+                    );
+                    match spawn_ffmpeg(SpawnRequest {
+                        codec: negotiated.video,
+                        width: negotiated.width,
+                        height: negotiated.height,
+                        fps: negotiated.fps,
+                        ten_bit: negotiated.video_10_bit,
+                        four_four_four: negotiated.video_444,
+                        bitrate_override_mbps: Some(profile.bitrate_mbps),
+                        capture_input: display_capture_input(&host_displays, target),
+                    }) {
+                        Ok((child, next_profile)) => {
+                            let mut replacement = ChildGuard::new(child);
+                            let Some(replacement_stdout) = replacement.take_stdout() else {
+                                replacement.terminate().await;
+                                eprintln!("OpenStream display switch produced no FFmpeg stdout; keeping the current capture");
+                                pending_display = None;
+                                continue;
+                            };
+                            // Spawn the replacement before terminating the old
+                            // process. A failed display/device open therefore
+                            // leaves the existing stream alive.
+                            ffmpeg.terminate().await;
+                            ffmpeg = replacement;
+                            profile = next_profile;
+                            stdout = replacement_stdout;
+                            access_units = AccessUnitizer::for_codec(negotiated.video);
+                            display_index = target;
+                            pending_display = None;
+                            last_display_switch = Some(now);
+                            last_restart = Some(now);
+                            keyframe_requested = false;
+                            if negotiated.multi_monitor {
+                                let topology = openstream_media::displays::encode_list(
+                                    &topology_with_selected(&host_displays, display_index),
+                                )?;
+                                reliable_control.send(&mut session, &topology).await?;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("OpenStream could not switch to display {target}: {error}");
+                            // The old capture remains active; require a fresh
+                            // client request after the display topology changes.
+                            pending_display = None;
+                        }
+                    }
+                } else {
                 let force_keyframe_restart = keyframe_requested
                     && last_restart
                         .is_none_or(|previous| now.duration_since(previous) >= restart_policy.min_interval);
@@ -430,6 +522,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     access_units = AccessUnitizer::for_codec(negotiated.video);
                     last_restart = Some(Instant::now());
                     keyframe_requested = false;
+                }
                 }
             }
             _ = clipboard_tick.tick(), if clipboard_policy.may_send(negotiated.clipboard) => {
@@ -826,11 +919,85 @@ fn enumerate_host_displays(
 }
 
 /// Resolve the selected display index from `OPENSTREAM_DISPLAY` (default 0).
-fn selected_display() -> usize {
-    std::env::var("OPENSTREAM_DISPLAY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
+/// A configured but malformed/out-of-range value is an error: silently
+/// clamping it to another monitor is an especially confusing hosting failure.
+fn selected_display(displays: &[openstream_media::displays::Display]) -> Result<usize, String> {
+    let requested = std::env::var("OPENSTREAM_DISPLAY").ok();
+    resolve_display_index(requested.as_deref(), displays.len())
+}
+
+fn resolve_display_index(requested: Option<&str>, count: usize) -> Result<usize, String> {
+    let index = match requested {
+        None => 0,
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| "OPENSTREAM_DISPLAY must be a non-negative display index".to_string())?,
+    };
+    if index >= count {
+        return Err(format!(
+            "OPENSTREAM_DISPLAY={index} is unavailable; the host reported {count} display(s)"
+        ));
+    }
+    Ok(index)
+}
+
+/// Copy a topology while marking exactly one display as the active capture.
+/// The primary bit belongs to the desktop layout; the selected bit belongs to
+/// the current stream and lets a client preserve an explicitly configured
+/// non-primary monitor instead of immediately forcing the primary one.
+fn topology_with_selected(
+    displays: &[openstream_media::displays::Display],
+    selected: usize,
+) -> Vec<openstream_media::displays::Display> {
+    use openstream_media::displays::{PRIMARY_FLAG, SELECTED_FLAG};
+    displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| {
+            let mut display = *display;
+            display.flags &= PRIMARY_FLAG;
+            if index == selected {
+                display.flags |= SELECTED_FLAG;
+            }
+            display
+        })
+        .collect()
+}
+
+/// Consume an authenticated monitor-selection request and queue a validated
+/// index for the control tick. `MS`-prefixed malformed messages are consumed
+/// too, so they cannot fall through into the input parser.
+fn queue_display_selection(
+    payload: &[u8],
+    displays: &[openstream_media::displays::Display],
+    current: usize,
+    pending: &mut Option<usize>,
+    enabled: bool,
+) -> bool {
+    if !payload.starts_with(b"MS") {
+        return false;
+    }
+    let selected = match openstream_media::displays::decode_select(payload) {
+        Ok(selected) => selected,
+        Err(error) => {
+            eprintln!("OpenStream dropped malformed display selection: {error}");
+            return true;
+        }
+    };
+    if !enabled {
+        eprintln!(
+            "OpenStream ignored display selection because the capture backend is not switchable"
+        );
+        return true;
+    }
+    let Some(index) = displays.iter().position(|display| display.id == selected) else {
+        eprintln!("OpenStream rejected unavailable display id {selected}");
+        return true;
+    };
+    if index != current {
+        *pending = Some(index);
+    }
+    true
 }
 
 /// x11grab input for the selected display (`:0.0+X+Y`), or `None` to keep
@@ -1197,7 +1364,8 @@ mod tests {
     use super::{
         AccessUnitizer, MAX_FFMPEG_ARGS, MAX_VIDEO_FILTER_BYTES, capture_arguments,
         configured_video_filter, contains_idr, display_capture_input, enumerate_host_displays,
-        resolve_encode_profile, split_command_line, validate_custom_ffmpeg_args,
+        queue_display_selection, resolve_display_index, resolve_encode_profile, split_command_line,
+        topology_with_selected, validate_custom_ffmpeg_args,
     };
 
     #[test]
@@ -1470,5 +1638,64 @@ mod tests {
         let displays = enumerate_host_displays(1920, 1080);
         assert!(!displays.is_empty());
         assert!(displays.iter().any(|display| display.primary()));
+    }
+
+    #[test]
+    fn display_selection_is_fail_closed_instead_of_clamped() {
+        assert_eq!(resolve_display_index(None, 2), Ok(0));
+        assert_eq!(resolve_display_index(Some("1"), 2), Ok(1));
+        assert!(resolve_display_index(Some("bogus"), 2).is_err());
+        assert!(resolve_display_index(Some("2"), 2).is_err());
+        assert!(resolve_display_index(Some("0"), 0).is_err());
+    }
+
+    #[test]
+    fn display_selection_queues_only_a_known_id() {
+        use openstream_media::displays::{Display, SELECTED_FLAG};
+        let displays = vec![
+            Display {
+                id: 10,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                flags: 1,
+            },
+            Display {
+                id: 20,
+                x: 1920,
+                y: 0,
+                width: 1280,
+                height: 1024,
+                flags: 0,
+            },
+        ];
+        let mut pending = None;
+        assert!(queue_display_selection(
+            &openstream_media::displays::encode_select(20),
+            &displays,
+            0,
+            &mut pending,
+            true,
+        ));
+        assert_eq!(pending, Some(1));
+        assert!(queue_display_selection(
+            &openstream_media::displays::encode_select(99),
+            &displays,
+            0,
+            &mut pending,
+            true,
+        ));
+        assert_eq!(pending, Some(1));
+        assert!(!queue_display_selection(
+            b"input",
+            &displays,
+            0,
+            &mut pending,
+            true
+        ));
+        let topology = topology_with_selected(&displays, 1);
+        assert!(!topology[0].selected());
+        assert_eq!(topology[1].flags, SELECTED_FLAG);
     }
 }

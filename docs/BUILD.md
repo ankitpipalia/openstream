@@ -311,7 +311,10 @@ needs `OPENSTREAM_MIC_INPUT` naming the FFmpeg device. Hardware encoding is
 selected with `OPENSTREAM_VIDEO_ENCODER` (`auto` detects NVENC then VAAPI
 with a software fallback), and 10-bit/4:4:4 need `OPENSTREAM_ALLOW_10BIT` /
 `OPENSTREAM_ALLOW_444` on both ends. Multi-monitor selection uses
-`OPENSTREAM_DISPLAY` with topology advertised on negotiation; headless
+`OPENSTREAM_DISPLAY` with topology advertised on negotiation; while connected,
+the desktop client uses Ctrl+Alt+PageUp/PageDown to request the previous/next
+announced output. The Linux X11/FFmpeg and native DRM/KMS hosts apply that
+request live; custom FFmpeg inputs do not advertise switching. Headless
 machines can add an Xvfb virtual display via
 [`scripts/virtual-display.sh`](../scripts/virtual-display.sh).
 

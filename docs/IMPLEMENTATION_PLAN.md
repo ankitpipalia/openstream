@@ -209,8 +209,9 @@ with bounded latency, audio, pointer, and keyboard input.
 - [x] Desktop gamepad button/axis/unplug events through `gilrs` and `OI`.
 - [x] Host rumble handling through the bounded project-owned `OR` envelope;
   desktop clients consume it through Gilrs.
-- [x] Hotkey policy (`OPENSTREAM_HOTKEYS`, default Ctrl+Alt+End disconnect and
-  Ctrl+Alt+Home release; fullscreen stays startup-only).
+- [x] Hotkey policy (`OPENSTREAM_HOTKEYS`, default Ctrl+Alt+End disconnect,
+  Ctrl+Alt+Home release, and Ctrl+Alt+PageUp/PageDown monitor selection;
+  fullscreen stays startup-only).
 
 Gate: Windows, macOS, and Linux clients connect to the Linux host and to their
 own desktop hosts using the same test service.
@@ -255,10 +256,12 @@ and send pointer/gamepad input without host capability exposure.
 - [x] H.265 capability negotiation and external-FFmpeg host path; hardware
   decoder acceptance rides the FFmpeg BGRA path on desktop clients.
 - [x] Multi-monitor topology wire format (`MD` list / `MS` select, bounded),
-  RandR enumeration, `OPENSTREAM_DISPLAY` startup selection with x11grab
-  offsets, advertised on negotiation, plus an Xvfb virtual-display helper
-  (`scripts/virtual-display.sh`); live virtual-display drivers and runtime
-  switching remain open.
+  RandR enumeration, fail-closed `OPENSTREAM_DISPLAY` startup selection with
+  x11grab offsets, selected-output metadata, client PageUp/PageDown selection,
+  and bounded runtime capture switching for the Linux X11/FFmpeg and native
+  DRM/KMS hosts; an Xvfb virtual-display helper remains available
+  (`scripts/virtual-display.sh`). Live virtual-display drivers and OS-level
+  monitor creation remain open.
 - [x] 10-bit and 4:4:4 end-to-end through the FFmpeg host/decoder path behind
   `OPENSTREAM_ALLOW_10BIT/444` on both ends with negotiation gating; native
   GPU renderer acceptance remains open.

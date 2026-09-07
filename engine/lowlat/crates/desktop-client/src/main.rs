@@ -27,6 +27,7 @@ use openstream_client_core::{
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
 };
+use openstream_media::displays::Display as RemoteDisplay;
 use openstream_media::input::{InputEvent, RumbleEvent};
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
@@ -76,6 +77,7 @@ enum UiMessage {
         strong: u8,
         weak: u8,
     },
+    Displays(Vec<RemoteDisplay>),
     End,
 }
 
@@ -95,6 +97,7 @@ impl UiSender {
 enum UiInput {
     Event(InputEvent),
     Release,
+    SelectDisplay(u32),
     Stop,
 }
 
@@ -124,6 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rumble_effects = HashMap::new();
     let mut connected = false;
     let mut base_title = String::from("OpenStream");
+    let mut displays = Vec::<RemoteDisplay>::new();
+    let mut selected_display = None;
     let mut pacer = render::FramePacer::new(60);
     let mut gamepads = match Gilrs::new() {
         Ok(gamepads) => Some(gamepads),
@@ -185,6 +190,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         weak,
                     );
                 }
+                Ok(UiMessage::Displays(topology)) => {
+                    selected_display = selected_display_index(&topology);
+                    displays = topology;
+                    let monitor = selected_display
+                        .and_then(|index| displays.get(index))
+                        .map_or_else(
+                            || "monitor=?".to_string(),
+                            |display| format!("monitor={}", display.id),
+                        );
+                    window.set_title(&format!("OpenStream -- {base_title} -- {monitor}"));
+                }
                 Ok(UiMessage::End) => {
                     connected = false;
                     window.set_title("OpenStream -- disconnected");
@@ -223,12 +239,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         // Window hotkeys (default Ctrl+Alt+End to disconnect, Ctrl+Alt+Home
-        // to release input) fire once per press; fullscreen itself is a
-        // startup-only mode via OPENSTREAM_DISPLAY_MODE.
+        // to release input, and Ctrl+Alt+PageUp/PageDown to select a monitor)
+        // fire once per press; fullscreen itself is a startup-only mode via
+        // OPENSTREAM_DISPLAY_MODE.
         match display::poll_hotkey(&window, &hotkeys, &mut last_hotkey) {
             Some(display::HotkeyAction::Disconnect) => break,
             Some(display::HotkeyAction::ReleaseInput) => {
                 let _ = input_tx.try_send(UiInput::Release);
+            }
+            Some(
+                action @ (display::HotkeyAction::NextDisplay
+                | display::HotkeyAction::PreviousDisplay),
+            ) => {
+                let forward = matches!(action, display::HotkeyAction::NextDisplay);
+                if let Some((index, id)) = cycled_display(&displays, selected_display, forward)
+                    && input_tx.try_send(UiInput::SelectDisplay(id)).is_ok()
+                {
+                    selected_display = Some(index);
+                    window.set_title(&format!(
+                        "OpenStream -- {base_title} -- monitor={id} (pending)"
+                    ));
+                }
             }
             None => {}
         }
@@ -241,6 +272,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = worker.join();
     Ok(())
+}
+
+/// Pick the next or previous announced output with wrap-around. Selection is
+/// deliberately computed from the topology received from the host; no local
+/// numeric assumption can target an output the host did not publish.
+fn cycled_display(
+    displays: &[RemoteDisplay],
+    selected: Option<usize>,
+    forward: bool,
+) -> Option<(usize, u32)> {
+    if displays.is_empty() {
+        return None;
+    }
+    let current = selected.unwrap_or(0).min(displays.len() - 1);
+    let index = if forward {
+        (current + 1) % displays.len()
+    } else if current == 0 {
+        displays.len() - 1
+    } else {
+        current - 1
+    };
+    Some((index, displays[index].id))
+}
+
+fn selected_display_index(displays: &[RemoteDisplay]) -> Option<usize> {
+    displays
+        .iter()
+        .position(|display| display.selected())
+        .or_else(|| displays.iter().position(|display| display.primary()))
+        .or_else(|| (!displays.is_empty()).then_some(0))
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -648,6 +709,9 @@ async fn network_loop(
     // only when the operator opts in so default sessions stay 8-bit 4:2:0.
     client_capabilities.video_10_bit = env::var("OPENSTREAM_ALLOW_10BIT").as_deref() == Ok("1");
     client_capabilities.video_444 = env::var("OPENSTREAM_ALLOW_444").as_deref() == Ok("1");
+    // The window exposes a bounded monitor picker (Ctrl+Alt+PageUp/PageDown)
+    // once the host publishes its topology.
+    client_capabilities.multi_monitor = true;
     // Microphone passthrough needs a configured capture device; the host
     // still applies its own take-microphone policy before unmuting.
     client_capabilities.microphone = mic::mic_configured();
@@ -802,6 +866,11 @@ async fn network_loop(
                         .send(&mut session, &InputEvent::release(monotonic_us()).encode())
                         .await?;
                 }
+                UiInput::SelectDisplay(id) => {
+                    reliable_control
+                        .send(&mut session, &openstream_media::displays::encode_select(id))
+                        .await?;
+                }
                 UiInput::Stop => {
                     let _ = reliable_control.send(&mut session, b"openstream/end").await;
                     let _ = decoder.kill().await;
@@ -820,6 +889,17 @@ async fn network_loop(
                         for payload in deliveries {
                             if payload == b"openstream/end" {
                                 return Ok(());
+                            }
+                            if payload.starts_with(b"MD") {
+                                match openstream_media::displays::decode_list(&payload) {
+                                    Ok(topology) => {
+                                        let _ = ui_tx.send(UiMessage::Displays(topology));
+                                    }
+                                    Err(error) => eprintln!(
+                                        "OpenStream dropped malformed display topology: {error}"
+                                    ),
+                                }
+                                continue;
                             }
                             if let Ok(rumble) = RumbleEvent::decode(&payload) {
                                 let _ = ui_tx.send(UiMessage::Rumble {
@@ -841,6 +921,17 @@ async fn network_loop(
                     }
                     if packet.payload == b"openstream/end" {
                         return Ok(());
+                    }
+                    if packet.payload.starts_with(b"MD") {
+                        match openstream_media::displays::decode_list(&packet.payload) {
+                            Ok(topology) => {
+                                let _ = ui_tx.send(UiMessage::Displays(topology));
+                            }
+                            Err(error) => eprintln!(
+                                "OpenStream dropped malformed display topology: {error}"
+                            ),
+                        }
+                        continue;
                     }
                     if let Ok(rumble) = RumbleEvent::decode(&packet.payload) {
                         let _ = ui_tx.send(UiMessage::Rumble {
@@ -1087,9 +1178,13 @@ impl From<io::Error> for UiMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{axis_value, gamepad_axis_index, gamepad_button_index, keyboard_usages};
+    use super::{
+        axis_value, cycled_display, gamepad_axis_index, gamepad_button_index, keyboard_usages,
+        selected_display_index,
+    };
     use gilrs::{Axis, Button};
     use minifb::Key;
+    use openstream_media::displays::{Display, PRIMARY_FLAG, SELECTED_FLAG};
 
     #[test]
     fn gamepad_layout_is_stable_across_platform_backends() {
@@ -1119,5 +1214,31 @@ mod tests {
         assert!(keyboard_usages().contains(&(Key::Enter, 0x28)));
         assert!(keyboard_usages().contains(&(Key::LeftCtrl, 0xe0)));
         assert!(!keyboard_usages().iter().any(|(_, usage)| *usage == 0));
+    }
+
+    #[test]
+    fn monitor_selection_prefers_the_host_selected_output() {
+        let displays = vec![
+            Display {
+                id: 10,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                flags: PRIMARY_FLAG,
+            },
+            Display {
+                id: 20,
+                x: 1920,
+                y: 0,
+                width: 1280,
+                height: 1024,
+                flags: SELECTED_FLAG,
+            },
+        ];
+        assert_eq!(selected_display_index(&displays), Some(1));
+        assert_eq!(cycled_display(&displays, Some(1), true), Some((0, 10)));
+        assert_eq!(cycled_display(&displays, Some(0), false), Some((1, 20)));
+        assert_eq!(cycled_display(&[], None, true), None);
     }
 }

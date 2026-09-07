@@ -10,6 +10,11 @@ mod pipewire;
 #[cfg(target_os = "linux")]
 mod x11;
 
+#[cfg(target_os = "linux")]
+use std::env;
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("openstream-linux-host requires a Linux target");
@@ -18,10 +23,9 @@ fn main() {
 #[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::env;
     use std::net::SocketAddr;
-    use std::time::{Duration, Instant};
 
+    use lowlat::display::Display as NativeDisplay;
     use lowlat::stream::{Backend, Codec, Config, Quality, Stream};
     use lowlat_inject::event::{Extents, Injector};
     use lowlat_inject::uinput::Devices;
@@ -75,12 +79,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input_enabled = host_policy.input;
     let audio_requested = env::var("OPENSTREAM_AUDIO").as_deref() == Ok("1");
     let clipboard_requested = host_policy.clipboard;
+    let native_outputs = NativeDisplay::outputs();
+    let output = env::var("LOWLAT_OUTPUT").ok();
+    if let Some(requested) = output.as_deref()
+        && !native_outputs
+            .iter()
+            .any(|available| available.id == requested)
+    {
+        return Err(
+            format!("LOWLAT_OUTPUT={requested} is not one of the currently lit outputs").into(),
+        );
+    }
+    let mut selected_output = output.clone().or_else(NativeDisplay::preferred);
     let mut host_capabilities = Capabilities::host_with_limits(1920, 1080, 60);
     host_capabilities.video_codecs = vec![VideoCodec::H264];
     host_capabilities.input = input_enabled;
     host_capabilities.rumble = host_policy.gamepad;
     host_capabilities.clipboard = clipboard_requested && platform_clipboard::available();
     host_capabilities.microphone = host_policy.microphone;
+    host_capabilities.multi_monitor = native_outputs.len() > 1;
     if !audio_requested {
         host_capabilities.audio_codecs.clear();
     }
@@ -91,13 +108,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("the Linux lowlat adapter currently emits H.264 only".into());
     }
     let mut reliable_control = ReliableControl::new(openstream_client_core::MAX_CONTROL_PENDING);
+    if negotiated.multi_monitor {
+        let topology = openstream_media::displays::encode_list(&native_topology(
+            &native_outputs,
+            selected_output.as_deref(),
+        ))?;
+        reliable_control.send(&mut session, &topology).await?;
+    }
     let seconds = env::var("OPENSTREAM_HOST_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(15)
         .min(24 * 60 * 60);
-    let output = env::var("LOWLAT_OUTPUT").ok();
     let backend = match env::var("LOWLAT_BACKEND").as_deref() {
         Ok("vendor") => Some(Backend::Vendor),
         Ok("open") => Some(Backend::Open),
@@ -215,6 +238,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )? {
                                 // Clipboard data is handled only after both
                                 // peers explicitly negotiated the feature.
+                            } else if let Some(selection) =
+                                decode_output_selection(&payload, &native_outputs)
+                            {
+                                match selection {
+                                    Ok(output_id) => {
+                                        stream.select_output(Some(output_id.clone()));
+                                        selected_output = Some(output_id);
+                                        if negotiated.multi_monitor {
+                                            let topology =
+                                                openstream_media::displays::encode_list(&native_topology(
+                                                    &native_outputs,
+                                                    selected_output.as_deref(),
+                                                ))?;
+                                            reliable_control
+                                                .send(&mut session, &topology)
+                                                .await?;
+                                        }
+                                    }
+                                    Err(error) => eprintln!(
+                                        "OpenStream rejected display selection: {error}"
+                                    ),
+                                }
                             } else if payload != b"openstream/frame-ack"
                                 && payload != b"openstream/end"
                                 && let Some((injector, devices)) = input.as_mut()
@@ -247,6 +292,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut clipboard_assembler,
                         &mut clipboard_value,
                     )? {
+                        continue;
+                    }
+                    if let Some(selection) =
+                        decode_output_selection(&packet.payload, &native_outputs)
+                    {
+                        match selection {
+                            Ok(output_id) => {
+                                stream.select_output(Some(output_id.clone()));
+                                selected_output = Some(output_id);
+                                if negotiated.multi_monitor {
+                                    let topology =
+                                        openstream_media::displays::encode_list(&native_topology(
+                                            &native_outputs,
+                                            selected_output.as_deref(),
+                                        ))?;
+                                    reliable_control.send(&mut session, &topology).await?;
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("OpenStream rejected display selection: {error}")
+                            }
+                        }
                         continue;
                     }
                 }
@@ -346,6 +413,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("OpenStream Linux host sent {frames} encoded frames");
     eprintln!("OpenStream transport stats: {:?}", session.stats());
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Convert the native host's stable connector names into the compact topology
+/// message shared with desktop clients. The wire id is a CRC32 of the full
+/// `cardN:CONNECTOR` identity; the native stream still receives the original
+/// string when a selection is applied.
+fn native_topology(
+    outputs: &[lowlat::display::Selectable],
+    selected: Option<&str>,
+) -> Vec<openstream_media::displays::Display> {
+    use openstream_media::displays::{Display, PRIMARY_FLAG, SELECTED_FLAG};
+
+    let mut topology = outputs
+        .iter()
+        .filter_map(|output| {
+            if output.width == 0 || output.height == 0 {
+                return None;
+            }
+            let width = u16::try_from(output.width).ok()?;
+            let height = u16::try_from(output.height).ok()?;
+            let (x, y, primary) = output.place.map_or((0, 0, false), |place| {
+                (
+                    i32::try_from(place.x).unwrap_or(i32::MAX),
+                    i32::try_from(place.y).unwrap_or(i32::MAX),
+                    place.x == 0 && place.y == 0,
+                )
+            });
+            let mut flags = u16::from(primary) * PRIMARY_FLAG;
+            if selected == Some(output.id.as_str()) {
+                flags |= SELECTED_FLAG;
+            }
+            Some(Display {
+                id: lowlat_core::crc32::of(output.id.as_bytes()),
+                x,
+                y,
+                width,
+                height,
+                flags,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !topology.iter().any(|display| display.primary())
+        && let Some(first) = topology.first_mut()
+    {
+        first.flags |= PRIMARY_FLAG;
+    }
+    topology
+}
+
+#[cfg(target_os = "linux")]
+/// Decode a selection only when the payload is an `MS` message. Returning an
+/// error rather than `None` for malformed or unknown ids prevents it from
+/// falling through into the native input parser.
+fn decode_output_selection(
+    payload: &[u8],
+    outputs: &[lowlat::display::Selectable],
+) -> Option<Result<String, String>> {
+    if !payload.starts_with(b"MS") {
+        return None;
+    }
+    let selected = match openstream_media::displays::decode_select(payload) {
+        Ok(selected) => selected,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    Some(
+        outputs
+            .iter()
+            .find(|output| lowlat_core::crc32::of(output.id.as_bytes()) == selected)
+            .map(|output| output.id.clone())
+            .ok_or_else(|| format!("display id {selected} is not currently available")),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -576,7 +715,8 @@ fn command_probe(program: &str, args: &[&str]) -> serde_json::Value {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::command_probe;
+    use super::{command_probe, decode_output_selection, native_topology};
+    use lowlat::display::Selectable;
 
     #[test]
     fn command_probe_reports_a_fixed_successful_command() {
@@ -604,6 +744,39 @@ mod tests {
                 .and_then(|value| value.as_str())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn native_topology_round_trips_stable_connector_selection() {
+        let outputs = vec![
+            Selectable {
+                id: "card0:DP-1".to_string(),
+                connector: "DP-1".to_string(),
+                width: 1920,
+                height: 1080,
+                place: None,
+            },
+            Selectable {
+                id: "card0:HDMI-A-1".to_string(),
+                connector: "HDMI-A-1".to_string(),
+                width: 1280,
+                height: 1024,
+                place: None,
+            },
+        ];
+        let topology = native_topology(&outputs, Some("card0:HDMI-A-1"));
+        assert_eq!(topology.len(), 2);
+        assert!(topology[0].primary());
+        assert!(topology[1].selected());
+        let selected = openstream_media::displays::encode_select(topology[1].id);
+        assert_eq!(
+            decode_output_selection(&selected, &outputs),
+            Some(Ok("card0:HDMI-A-1".to_string()))
+        );
+        let unknown = openstream_media::displays::encode_select(0xdead_beef);
+        assert!(decode_output_selection(&unknown, &outputs)
+            .expect("MS is consumed")
+            .is_err());
     }
 }
 

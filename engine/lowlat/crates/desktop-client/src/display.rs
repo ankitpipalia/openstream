@@ -68,6 +68,10 @@ pub(crate) enum HotkeyAction {
     Disconnect,
     /// Release all held input without disconnecting.
     ReleaseInput,
+    /// Ask the host to capture the next announced display.
+    NextDisplay,
+    /// Ask the host to capture the previous announced display.
+    PreviousDisplay,
 }
 
 /// One parsed hotkey: modifiers plus a final key name.
@@ -81,7 +85,8 @@ pub(crate) struct Hotkey {
 }
 
 impl Hotkey {
-    /// Default safety set: Ctrl+Alt+End disconnects, Ctrl+Alt+Home releases.
+    /// Default safety/navigation set: Ctrl+Alt+End disconnects,
+    /// Ctrl+Alt+Home releases input, and PageUp/PageDown select monitors.
     pub(crate) fn defaults() -> Vec<Self> {
         vec![
             Self {
@@ -97,6 +102,20 @@ impl Hotkey {
                 alt: true,
                 shift: false,
                 key: "home".into(),
+            },
+            Self {
+                action: HotkeyAction::PreviousDisplay,
+                ctrl: true,
+                alt: true,
+                shift: false,
+                key: "pageup".into(),
+            },
+            Self {
+                action: HotkeyAction::NextDisplay,
+                ctrl: true,
+                alt: true,
+                shift: false,
+                key: "pagedown".into(),
             },
         ]
     }
@@ -127,6 +146,10 @@ impl Hotkey {
             let action = match action_name.trim().to_ascii_lowercase().as_str() {
                 "disconnect" | "quit" | "exit" => HotkeyAction::Disconnect,
                 "release" | "release-input" | "ungrab" => HotkeyAction::ReleaseInput,
+                "next-display" | "next-monitor" | "next" => HotkeyAction::NextDisplay,
+                "previous-display" | "previous-monitor" | "previous" | "prev" => {
+                    HotkeyAction::PreviousDisplay
+                }
                 _ => continue,
             };
             let mut ctrl = false;
@@ -283,13 +306,16 @@ mod tests {
 
     #[test]
     fn hotkey_spec_parses_actions_and_modifiers() {
-        let hotkeys = Hotkey::parse_spec("disconnect=ctrl+alt+end,release=shift+f1");
-        assert_eq!(hotkeys.len(), 2);
+        let hotkeys = Hotkey::parse_spec(
+            "disconnect=ctrl+alt+end,release=shift+f1,next-display=ctrl+alt+pagedown",
+        );
+        assert_eq!(hotkeys.len(), 3);
         assert_eq!(hotkeys[0].action, HotkeyAction::Disconnect);
         assert!(hotkeys[0].ctrl && hotkeys[0].alt && !hotkeys[0].shift);
         assert_eq!(hotkeys[0].key, "end");
         assert_eq!(hotkeys[1].action, HotkeyAction::ReleaseInput);
         assert!(hotkeys[1].shift);
+        assert_eq!(hotkeys[2].action, HotkeyAction::NextDisplay);
     }
 
     #[test]
@@ -298,7 +324,7 @@ mod tests {
         assert!(Hotkey::parse_spec("bogus").is_empty());
         // Modifiers without a final key are unusable and skipped.
         assert!(Hotkey::parse_spec("disconnect=ctrl+alt").is_empty());
-        assert_eq!(Hotkey::defaults().len(), 2);
+        assert_eq!(Hotkey::defaults().len(), 4);
     }
 
     #[test]

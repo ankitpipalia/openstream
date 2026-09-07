@@ -3,14 +3,21 @@
 //! Display topology rides the reliable control channel as small framed
 //! messages. The host enumerates its outputs (X11 RandR on Linux, one
 //! synthetic display elsewhere until native enumeration lands per OS) and
-//! the client selects which display to stream with `OPENSTREAM_DISPLAY`.
-//! All parsing is total: malformed topology never panics, it is rejected.
+//! the client selects which display to stream with an authenticated `MS`
+//! message. `OPENSTREAM_DISPLAY` is a host-side startup index; clients do not
+//! guess host monitor numbering. All parsing is total: malformed topology
+//! never panics, it is rejected.
 
 /// Maximum displays carried in one topology message.
 pub const MAX_DISPLAYS: usize = 16;
 const MAGIC: [u8; 2] = *b"MD";
 const VERSION: u8 = 1;
 const SELECT_MAGIC: [u8; 2] = *b"MS";
+/// Bit in [`Display::flags`] marking the primary desktop output.
+pub const PRIMARY_FLAG: u16 = 1 << 0;
+/// Bit in [`Display::flags`] marking the output currently being captured.
+pub const SELECTED_FLAG: u16 = 1 << 1;
+const KNOWN_FLAGS: u16 = PRIMARY_FLAG | SELECTED_FLAG;
 /// Fixed bytes per display record: id + x + y + w + h + flags.
 pub const DISPLAY_RECORD_LEN: usize = 22;
 
@@ -29,7 +36,12 @@ pub struct Display {
 impl Display {
     /// Whether this output is the primary display.
     pub fn primary(self) -> bool {
-        self.flags & 1 != 0
+        self.flags & PRIMARY_FLAG != 0
+    }
+
+    /// Whether this output is the one the host is currently capturing.
+    pub fn selected(self) -> bool {
+        self.flags & SELECTED_FLAG != 0
     }
 }
 
@@ -69,6 +81,9 @@ pub fn encode_list(displays: &[Display]) -> Result<Vec<u8>, Error> {
     out.push(VERSION);
     out.push(u8::try_from(displays.len()).map_err(|_| Error::TooMany)?);
     for display in displays {
+        if display.flags & !KNOWN_FLAGS != 0 {
+            return Err(Error::ReservedBits);
+        }
         out.extend_from_slice(&display.id.to_be_bytes());
         out.extend_from_slice(&display.x.to_be_bytes());
         out.extend_from_slice(&display.y.to_be_bytes());
@@ -106,6 +121,12 @@ pub fn decode_list(bytes: &[u8]) -> Result<Vec<Display>, Error> {
             height: u16::from_be_bytes(chunk[14..16].try_into().expect("record checked")),
             flags: u16::from_be_bytes(chunk[16..18].try_into().expect("record checked")),
         });
+        if displays
+            .last()
+            .is_some_and(|display| display.flags & !KNOWN_FLAGS != 0)
+        {
+            return Err(Error::ReservedBits);
+        }
         // Last 4 bytes of each record are reserved for layout generation.
         if chunk[18..22] != [0, 0, 0, 0] {
             return Err(Error::ReservedBits);
@@ -233,7 +254,7 @@ mod tests {
                 y: 0,
                 width: 1920,
                 height: 1080,
-                flags: 1,
+                flags: PRIMARY_FLAG | SELECTED_FLAG,
             },
             Display {
                 id: 1,
@@ -248,7 +269,9 @@ mod tests {
         let decoded = decode_list(&encoded).expect("decode topology");
         assert_eq!(decoded, displays);
         assert!(decoded[0].primary());
+        assert!(decoded[0].selected());
         assert!(!decoded[1].primary());
+        assert!(!decoded[1].selected());
     }
 
     #[test]
@@ -271,6 +294,9 @@ mod tests {
         assert_eq!(decode_list(&bad), Err(Error::BadMagic));
         bad = encode_list(&too_many[..1]).expect("one display");
         bad[22] = 1;
+        assert_eq!(decode_list(&bad), Err(Error::ReservedBits));
+        bad = encode_list(&too_many[..1]).expect("one display");
+        bad[20] = 0x80;
         assert_eq!(decode_list(&bad), Err(Error::ReservedBits));
     }
 

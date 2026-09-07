@@ -169,11 +169,16 @@ directly, while the FFmpeg host decodes into a verification sink
 ### Multi-monitor topology
 
 Topology rides the reliable control channel as `MD` list messages (up to 16
-displays: id, x/y offsets, dimensions, primary flag) with `MS` 8-byte
-selection messages back. Hosts enumerate via RandR on Linux (single-display
-fallback elsewhere) and advertise when `multi_monitor` negotiated; clients
-select at startup with `OPENSTREAM_DISPLAY`. Runtime switching needs a host
-restart and is acknowledged as such.
+displays: id, x/y offsets, dimensions, primary flag, and current-selection
+flag) with `MS` 8-byte selection messages back. Hosts enumerate via RandR on
+Linux for the FFmpeg X11 path, or stable `cardN:connector` identities for the
+native DRM/KMS path; unsupported/custom capture inputs do not advertise live
+selection. `OPENSTREAM_DISPLAY` is validated at startup rather than clamped,
+and desktop clients can send a bounded next/previous request with
+Ctrl+Alt+PageUp/PageDown. Linux X11/FFmpeg and native DRM/KMS hosts apply a
+valid request with a rate-limited capture restart/rebuild and publish the new
+selected flag; virtual display drivers and other OS-native monitor creation
+remain outside v1.
 
 ### Guest sessions and TURN credentials
 
