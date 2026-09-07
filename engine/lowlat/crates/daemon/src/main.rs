@@ -98,7 +98,7 @@ mod linux {
     const UNREAD_MARKER_ADDRESS: SocketAddr =
         SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
 
-    async fn run_service() {
+    pub(super) async fn run_service() {
         if let Err(error) = run().await {
             lowlat_common::log_error!("lowlatd: {error}");
             std::process::exit(1);
@@ -361,12 +361,12 @@ mod linux {
         // reassembly path a peer runs and the part a small synthetic picture never
         // reaches.
         let width: u32 = flag("--width")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .map(|value| value.min(MAX_VIDEO_WIDTH))
             .unwrap_or(WIDTH);
         let height: u32 = flag("--height")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .map(|value| value.min(MAX_VIDEO_HEIGHT))
             .unwrap_or(HEIGHT);
@@ -374,7 +374,7 @@ mod linux {
         // promise: the loop follows the display's own present, so asking for more
         // than the captured output refreshes at produces what it refreshes at.
         let fps: u32 = flag("--fps")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .map(|value| value.min(MAX_VIDEO_FPS))
             .unwrap_or(FPS);
@@ -382,7 +382,7 @@ mod linux {
         // picture; a band makes frames large enough to need more than one
         // fragment, which is the only way a peer's reassembly is exercised.
         let detail_rows: u32 = flag("--detail")
-            .and_then(|v| v.parse().ok())
+            .and_then(|v| v.parse::<u32>().ok())
             .map(|value| value.min(MAX_DETAIL_ROWS))
             .unwrap_or(0);
         // Advertised capacity, and the number of seats the stream offers. Read

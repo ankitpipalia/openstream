@@ -2613,7 +2613,9 @@ mod tests {
     fn candidate_trickle_is_deduplicated_and_bounded() {
         let mut seam = admission(1);
         seam.new_attempt("bounded", peer()).expect("register");
-        for port in 40_000..40_000 + (MAX_PENDING_CANDIDATES as u16 + 8) {
+        let candidate_count =
+            u16::try_from(MAX_PENDING_CANDIDATES).expect("test candidate bound fits in a port");
+        for port in 40_000..40_000 + candidate_count + 8 {
             seam.add_candidate(
                 "bounded",
                 SocketAddr::new("203.0.113.9".parse().unwrap(), port),
