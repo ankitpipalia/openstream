@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     use openstream_media::clipboard::{Assembler as ClipboardAssembler, fragment_text};
     use openstream_media::input::RumbleEvent;
+    use openstream_media::microphone::GuestMicSink;
     use openstream_media::{
         AdaptiveBitrate, AudioFrame, FrameAck, KEYFRAME_REQUEST, fragment_frame,
     };
@@ -108,6 +109,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("the Linux lowlat adapter currently emits H.264 only".into());
     }
     let mut reliable_control = ReliableControl::new(openstream_client_core::MAX_CONTROL_PENDING);
+    // The native Linux adapter must consume the same guest-microphone controls
+    // as the external FFmpeg adapter. With no sink path this still validates
+    // and counts decoded frames, which makes the negotiated capability honest
+    // without silently injecting audio into an OS device.
+    let mut mic_sink = GuestMicSink::from_env(negotiated.microphone && host_policy.microphone);
+    if mic_sink.accepting() {
+        eprintln!("OpenStream native guest microphone intake enabled");
+    }
     if negotiated.multi_monitor {
         let topology = openstream_media::displays::encode_list(&native_topology(
             &native_outputs,
@@ -238,6 +247,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )? {
                                 // Clipboard data is handled only after both
                                 // peers explicitly negotiated the feature.
+                            } else if mic_sink.accept(&payload) {
+                                // Guest microphone audio is decoded and
+                                // optionally written to OPENSTREAM_MIC_SINK;
+                                // it must never fall through to input.
                             } else if let Some(selection) =
                                 decode_output_selection(&payload, &native_outputs)
                             {
@@ -292,6 +305,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut clipboard_assembler,
                         &mut clipboard_value,
                     )? {
+                        continue;
+                    }
+                    if mic_sink.accept(&packet.payload) {
                         continue;
                     }
                     if let Some(selection) =
@@ -774,9 +790,11 @@ mod tests {
             Some(Ok("card0:HDMI-A-1".to_string()))
         );
         let unknown = openstream_media::displays::encode_select(0xdead_beef);
-        assert!(decode_output_selection(&unknown, &outputs)
-            .expect("MS is consumed")
-            .is_err());
+        assert!(
+            decode_output_selection(&unknown, &outputs)
+                .expect("MS is consumed")
+                .is_err()
+        );
     }
 }
 

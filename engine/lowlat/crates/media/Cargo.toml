@@ -8,6 +8,8 @@ license.workspace = true
 authors = ["OpenStream contributors"]
 
 [dependencies]
+lowlat-audio.workspace = true
+lowlat-core.workspace = true
 openstream-protocol = { path = "../protocol" }
 
 [lints]

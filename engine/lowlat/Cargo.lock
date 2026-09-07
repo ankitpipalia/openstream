@@ -1465,6 +1465,8 @@ dependencies = [
 name = "openstream-media"
 version = "0.1.0"
 dependencies = [
+ "lowlat-audio",
+ "lowlat-core",
  "openstream-protocol",
 ]
 

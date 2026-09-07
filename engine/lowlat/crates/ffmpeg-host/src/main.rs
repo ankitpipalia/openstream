@@ -28,7 +28,6 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
 
 mod input;
-mod mic_sink;
 mod reconfigure;
 
 const DEFAULT_SIGNAL_ORIGIN: &str = "http://127.0.0.1:8080";
@@ -142,7 +141,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut reliable_control = ReliableControl::new(openstream_client_core::MAX_CONTROL_PENDING);
     // Guest-microphone intake: negotiated capability plus explicit policy.
     // Accepted frames decode into the verification sink when configured.
-    let mut mic_sink = mic_sink::MicSink::from_env(negotiated.microphone && host_policy.microphone);
+    let mut mic_sink = openstream_media::microphone::GuestMicSink::from_env(
+        negotiated.microphone && host_policy.microphone,
+    );
     if mic_sink.accepting() {
         eprintln!("OpenStream guest microphone intake enabled");
     }

@@ -12,6 +12,7 @@ pub mod clipboard;
 pub mod displays;
 pub mod input;
 pub mod metrics;
+pub mod microphone;
 
 use openstream_protocol::MAX_PLAINTEXT;
 
