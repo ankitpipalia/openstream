@@ -3093,6 +3093,29 @@ mod geometry {
             ));
             session
         }
+
+        /// A host-side session with only the control rings attached.
+        ///
+        /// The control-path tests send from a guest session into this one.
+        /// Keeping the directions explicit matters because `Session` rejects
+        /// a datagram sealed by the same side before it reaches a ring.
+        fn host_session(&mut self) -> Session<'_> {
+            let envelope = Envelope::from_key(&KEY).expect("envelope");
+            let mut session = Session::new(envelope, 1, 0.0);
+            assert!(attach_recv(
+                &mut session,
+                CONTROL_CHANNEL,
+                &mut self.control_recv_bodies,
+                &mut self.control_recv_meta,
+            ));
+            assert!(attach_send(
+                &mut session,
+                CONTROL_CHANNEL,
+                &mut self.control_send_bodies,
+                &mut self.control_send_meta,
+            ));
+            session
+        }
     }
 
     /// The video receive ring a peer has and a host does not.
@@ -3241,7 +3264,7 @@ mod geometry {
         messages: &[Control<'_>],
     ) -> Negotiation {
         let mut ours = Arena::new();
-        let mut ours = ours.session();
+        let mut ours = ours.host_session();
         let mut theirs = Arena::new();
         let mut theirs = theirs.session();
         for message in messages {
@@ -3343,7 +3366,7 @@ mod geometry {
 
     fn drain_one(input: &mut Input<Recorder>, pointer: Pointer<'_>, message: &Control<'_>) {
         let mut ours = Arena::new();
-        let mut ours = ours.session();
+        let mut ours = ours.host_session();
         let mut theirs = Arena::new();
         let mut theirs = theirs.session();
         theirs
@@ -3619,7 +3642,7 @@ mod geometry {
     #[test]
     fn a_peers_declaration_reaches_the_negotiation_through_the_real_rings() {
         let mut ours = Arena::new();
-        let mut ours = ours.session();
+        let mut ours = ours.host_session();
         let mut theirs = Arena::new();
         let mut theirs = theirs.session();
 
@@ -3761,7 +3784,7 @@ mod geometry {
     #[test]
     fn a_message_too_long_to_take_ends_the_attempt_rather_than_spinning() {
         let mut ours = Arena::new();
-        let mut ours = ours.session();
+        let mut ours = ours.host_session();
         let mut theirs = Arena::new();
         let mut theirs = theirs.session();
 
