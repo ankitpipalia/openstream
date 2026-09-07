@@ -67,7 +67,8 @@ pub(crate) fn parse_nodes(json: &str) -> Result<Vec<SourceNode>, Error> {
         let id = entry
             .get("id")
             .and_then(|id| id.as_u64())
-            .unwrap_or(u32::MAX as u64) as u32;
+            .and_then(|id| u32::try_from(id).ok())
+            .unwrap_or(u32::MAX);
         let props = entry.get("info").and_then(|info| info.get("props"));
         let name = props
             .and_then(|props| props.get("node.name"))
@@ -88,7 +89,7 @@ pub(crate) fn parse_nodes(json: &str) -> Result<Vec<SourceNode>, Error> {
         let object_serial = props
             .and_then(|props| props.get("object.serial"))
             .and_then(|serial| serial.as_u64())
-            .map(|serial| serial as u32);
+            .and_then(|serial| u32::try_from(serial).ok());
         nodes.push(SourceNode {
             id,
             name: name.to_string(),

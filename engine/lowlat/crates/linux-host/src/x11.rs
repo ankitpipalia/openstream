@@ -229,6 +229,9 @@ pub(crate) fn parse_setup(body: &[u8]) -> Result<(Vec<Screen>, u8, u8), Error> {
     }
     let vendor_len = u16::from_le_bytes([body[16], body[17]]) as usize;
     let num_screens = body[20] as usize;
+    if num_screens == 0 {
+        return Err(Error::Truncated);
+    }
     let num_formats = body[21] as usize;
     let image_order = body[22];
     let bitmap_order = body[23];

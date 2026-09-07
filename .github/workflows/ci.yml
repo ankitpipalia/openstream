@@ -258,13 +258,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Linux gamepad dependency
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libvulkan1 mesa-vulkan-drivers
       - name: Install nightly
         run: rustup toolchain install nightly --component rust-src
       - name: Address sanitizer
         run: |
           cargo +nightly test --workspace --all-features \
-            -Z build-std --target x86_64-unknown-linux-gnu
+            -Z build-std --target x86_64-unknown-linux-gnu \
+            -- --test-threads=1
         env:
           RUSTFLAGS: -Z sanitizer=address
           RUSTDOCFLAGS: -Z sanitizer=address

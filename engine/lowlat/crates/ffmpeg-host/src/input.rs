@@ -17,7 +17,7 @@ use openstream_media::input::{FLAG_RELATIVE, InputKind};
 pub(crate) enum HostInput {
     Disabled,
     #[cfg(target_os = "linux")]
-    Linux(LinuxInput),
+    Linux(Box<LinuxInput>),
     #[cfg(target_os = "windows")]
     Windows(WindowsInput),
     #[cfg(target_os = "macos")]
@@ -39,7 +39,7 @@ impl HostInput {
             let injector = lowlat_inject::event::Injector::new(extents);
             let devices = lowlat_inject::uinput::Devices::create("openstream")
                 .map_err(|error| error.to_string())?;
-            return Ok(Self::Linux(LinuxInput { injector, devices }));
+            return Ok(Self::Linux(Box::new(LinuxInput { injector, devices })));
         }
 
         #[cfg(target_os = "windows")]
