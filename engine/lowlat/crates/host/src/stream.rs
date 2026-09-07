@@ -6152,15 +6152,11 @@ mod tests {
         // The control first. Frames are taken as fast as they are made, so
         // nothing is ever behind and nothing asks for a recovery.
         let calm = {
-            let stream = report_stream();
-            let wake = lowlat_net::Wake::new().expect("wake");
-            let seat = stream
-                .seats()
-                .take(
-                    wake.handle().expect("handle"),
-                    wake.handle().expect("a second handle"),
-                )
-                .expect("a free seat");
+            // Keep this test independent of a physical VAAPI render node. The
+            // behavior under test is the host loop's accounting, and
+            // `Harness` drives that same loop with an in-process encoder.
+            let harness = Harness::start();
+            let seat = harness.seat();
             let mut received = 0usize;
             let mut keyframes = 0usize;
             until_within(30_000.0, "the calm window to report", || {
@@ -6172,7 +6168,7 @@ mod tests {
                 }
                 received >= REPORT_FRAMES as usize + 60
             });
-            let counted = stream.shared.refreshes.read();
+            let counted = harness.stream.shared.refreshes.read();
             println!("calm: {received} frames, {keyframes} keyframes on the wire, {counted:?}");
             // **The wire is the independent witness.** The count is taken
             // inside the loop and the keyframes are what left it, so a counter
@@ -6197,17 +6193,11 @@ mod tests {
         // ring fills, refuses, and every frame after that is one its guest
         // missed.
         let squeezed = {
-            let stream = report_stream();
-            let wake = lowlat_net::Wake::new().expect("wake");
-            let _seat = stream
-                .seats()
-                .take(
-                    wake.handle().expect("handle"),
-                    wake.handle().expect("a second handle"),
-                )
-                .expect("a free seat");
+            let harness = Harness::start();
+            let _seat = harness.seat();
             until_within(30_000.0, "the squeezed window to report", || {
-                stream
+                harness
+                    .stream
                     .shared
                     .refreshes
                     .read()
@@ -6215,7 +6205,7 @@ mod tests {
                     .iter()
                     .any(|n| *n > 0)
             });
-            let counted = stream.shared.refreshes.read();
+            let counted = harness.stream.shared.refreshes.read();
             println!("squeezed: {counted:?}");
             counted
         };
@@ -6237,34 +6227,6 @@ mod tests {
             "back pressure asked for no more refreshes than an idle stream: {squeezed:?} against \
              {calm:?}"
         );
-    }
-
-    /// A stream shaped for the refresh test: real pipeline, no display, and a
-    /// rate low enough that a guest which never drains runs out of room.
-    fn report_stream() -> Stream {
-        Stream::start(Config {
-            audio: None,
-            convert: None,
-            prefer_vulkan: false,
-            audio_on: false,
-            accept_microphone: false,
-            audio_kbps: 128,
-            allow_raw_audio: false,
-            output: None,
-            display: false,
-            width: 1920,
-            height: 1080,
-            fps: 60,
-            codec: Codec::H264,
-            quality: lowlat_encode::Quality::default(),
-            backend: Some(Backend::Open),
-            configured_mbps: 10.0,
-            min_mbps: 1.0,
-            rotation: lowlat_core::video::Rotation::None,
-            detail_rows: 0,
-            full_fps: false,
-            cg_level: 1,
-        })
     }
 
     /// Run the real pipeline at `fps` until it has reported, and print the
