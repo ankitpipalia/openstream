@@ -23,14 +23,22 @@ fn root() -> PathBuf {
         .expect("the workspace root is two levels above this crate")
 }
 
-/// The directory cargo put this test's own executable in, which is also where
-/// it put the shared object.
+/// The Cargo profile directory for this test and the shared object.
+///
+/// Integration tests normally run from `<profile>/deps`, but sanitizer and
+/// build-script-driven invocations can place the executable below another
+/// directory first. Walk upward until the actual `debug` or `release` profile
+/// is found instead of relying on a fixed number of parent directories.
 fn artifacts() -> PathBuf {
     let exe = std::env::current_exe().expect("a running test has a path");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("a test executable lives in <profile>/deps")
-        .to_path_buf()
+    exe.ancestors()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| matches!(name, "debug" | "release"))
+        })
+        .map(Path::to_path_buf)
+        .expect("a test executable lives below a Cargo debug or release profile")
 }
 
 /// The shared object, which is what every check here is really about.
