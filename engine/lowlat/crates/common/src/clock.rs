@@ -70,11 +70,10 @@ pub fn precise_sleep(duration: Duration) {
     }
 }
 
-// `clock_nanosleep` is available on Linux and the other Unix targets used by
-// the daemon, but Apple libc does not expose it. Keep the precise monotonic
-// implementation where the API exists and use the standard-library fallback
-// on Apple; the final spin still preserves the short-deadline behavior.
-#[cfg(all(unix, not(target_os = "macos")))]
+// `clock_nanosleep` is available on Linux. Apple libc and the mobile targets
+// do not expose this Linux API, so use the standard-library fallback there;
+// the final spin still preserves the short-deadline behavior.
+#[cfg(target_os = "linux")]
 fn sleep_until(target: Instant) {
     let remaining = target.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -124,7 +123,7 @@ fn sleep_until(target: Instant) {
     }
 }
 
-#[cfg(any(not(unix), target_os = "macos"))]
+#[cfg(not(target_os = "linux"))]
 fn sleep_until(target: Instant) {
     let remaining = target.saturating_duration_since(Instant::now());
     if !remaining.is_zero() {

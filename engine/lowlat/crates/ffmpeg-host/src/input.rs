@@ -9,7 +9,10 @@
 
 use std::env;
 
-use openstream_media::input::{FLAG_RELATIVE, InputEvent, InputKind, RumbleEvent};
+use openstream_media::input::{InputEvent, RumbleEvent};
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use openstream_media::input::{FLAG_RELATIVE, InputKind};
 
 pub(crate) enum HostInput {
     Disabled,
@@ -34,7 +37,8 @@ impl HostInput {
         {
             let extents = lowlat_inject::event::Extents::alone(u32::from(width), u32::from(height));
             let injector = lowlat_inject::event::Injector::new(extents);
-            let devices = lowlat_inject::uinput::Devices::create("openstream")?;
+            let devices = lowlat_inject::uinput::Devices::create("openstream")
+                .map_err(|error| error.to_string())?;
             return Ok(Self::Linux(LinuxInput { injector, devices }));
         }
 
@@ -90,7 +94,7 @@ impl HostInput {
 
 impl Drop for HostInput {
     fn drop(&mut self) {
-        let result = match self {
+        let result: Result<(), String> = match self {
             Self::Disabled => Ok(()),
             #[cfg(target_os = "linux")]
             Self::Linux(input) => {
@@ -198,7 +202,7 @@ mod windows {
         fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
     }
 
-    pub(super) struct WindowsInput {
+    pub(crate) struct WindowsInput {
         width: u32,
         height: u32,
         active_keys: Vec<u16>,

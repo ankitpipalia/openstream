@@ -204,6 +204,8 @@ impl core::fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }

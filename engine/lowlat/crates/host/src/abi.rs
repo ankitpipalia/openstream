@@ -1215,6 +1215,7 @@ fn refused(error: crate::admission::Error) -> lowlat_status {
         Error::UnknownAttempt => LOWLAT_ERR_UNKNOWN_ATTEMPT,
         Error::AtCapacity => LOWLAT_ERR_AT_CAPACITY,
         Error::AlreadyBegun => LOWLAT_ERR_ALREADY_BEGUN,
+        Error::DuplicateAttempt => LOWLAT_ERR_INVALID_ARGUMENT,
         Error::Withdrawn => LOWLAT_ERR_WITHDRAWN,
         Error::Io => LOWLAT_ERR_IO,
         Error::Crypto => LOWLAT_ERR_CRYPTO,
