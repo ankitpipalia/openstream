@@ -147,10 +147,15 @@ rate is not used as a timing assertion.
 `openstream-desktop-client` is the first windowed desktop adapter. It accepts
 the same pairing variables as `openstream-client`, starts an external FFmpeg
 decoder for the negotiated codec, presents BGRA frames in a native window, and
-forwards HID keyboard, three-button pointer, wheel, and gamepad events. It is a software
-presentation path. Set `OPENSTREAM_AUDIO_PLAYER=ffplay` for the optional
-external PCM audio sink; GPU renderers and native audio sinks remain platform
-work.
+forwards HID keyboard, three-button pointer, wheel, and gamepad events. The
+default `OPENSTREAM_RENDERER=software` path is portable; `metal`, `vulkan`,
+`opengl`/`gles`, and `d3d12` select the optional wgpu native texture-present
+path. The legacy `d3d11` spelling is accepted for compatibility but maps to
+wgpu's Direct3D12 backend because wgpu does not expose a D3D11 backend. If
+native initialization or a later surface operation fails, the client logs the
+reason and keeps the session alive with the software presenter. Set
+`OPENSTREAM_AUDIO_PLAYER=ffplay` for the optional external PCM audio sink;
+native audio sinks remain platform work.
 
 Clients acknowledge only fully assembled video frames with the versioned `FA`
 control envelope. The native Linux host uses those ACKs for bounded bitrate

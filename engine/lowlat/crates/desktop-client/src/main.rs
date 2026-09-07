@@ -1,11 +1,11 @@
 //! Small cross-platform desktop client.
 //!
 //! The network/media core is shared with mobile and the headless test client.
-//! This binary adds the first real desktop presentation path: FFmpeg decodes
-//! negotiated Annex-B H.264/H.265 access units to BGRA and minifb presents
-//! them in a native window. It is intentionally a thin UI adapter so native
-//! D3D11, Metal, and Vulkan/Wayland renderers can replace this path later
-//! without changing signaling or the OpenStream wire format.
+//! This binary adds the desktop presentation path: FFmpeg decodes negotiated
+//! Annex-B H.264/H.265 access units to BGRA and presents them in a native
+//! window. The default minifb software path and the optional wgpu
+//! Metal/Vulkan/OpenGL/Direct3D path share the same bounded UI and network
+//! queues without changing signaling or the OpenStream wire format.
 
 use std::collections::HashMap;
 use std::env;
@@ -212,6 +212,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_HEIGHT,
         display::DisplayMode::from_env().window_options(),
     )?;
+    let render_backend = render::RenderBackend::from_env();
+    let mut native_presenter = if render_backend.is_native() {
+        match render::GpuPresenter::new(&window, render_backend) {
+            Ok(presenter) => Some(presenter),
+            Err(error) => {
+                eprintln!(
+                    "OpenStream native renderer {render_backend:?} unavailable: {error}; using software present"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     window.set_target_fps(120);
     let hotkeys = display::Hotkey::from_env();
     let mut last_hotkey: Option<display::HotkeyAction> = None;
@@ -264,7 +278,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     buffer_width = width;
                     buffer_height = height;
                     buffer = pixels;
-                    if let Err(error) = window.update_with_buffer(&buffer, width, height) {
+                    if let Some(presenter) = native_presenter.as_mut() {
+                        if let Err(error) = presenter.present(&window, width, height, &buffer) {
+                            eprintln!(
+                                "OpenStream native renderer stopped: {error}; using software present"
+                            );
+                            native_presenter = None;
+                            if let Err(error) = window.update_with_buffer(&buffer, width, height) {
+                                let _ = input_tx.try_send(UiInput::Stop);
+                                return Err(error.into());
+                            }
+                        }
+                    } else if let Err(error) = window.update_with_buffer(&buffer, width, height) {
                         let _ = input_tx.try_send(UiInput::Stop);
                         return Err(error.into());
                     }
@@ -321,6 +346,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Re-presents are paced so an idle stream does not spin the GPU.
         if buffer.len() == buffer_width.saturating_mul(buffer_height)
             && pacer.should_present(std::time::Instant::now())
+            && native_presenter.is_none()
         {
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
         }
@@ -812,14 +838,6 @@ async fn network_loop(
     // Microphone passthrough needs a configured capture device; the host
     // still applies its own take-microphone policy before unmuting.
     client_capabilities.microphone = mic::mic_configured();
-    // Native GPU upload names are accepted for forward compatibility and
-    // resolve to the software present path with a one-time notice.
-    let (render_backend, render_fallback) = render::RenderBackend::from_env();
-    if render_fallback {
-        eprintln!(
-            "OpenStream renderer {render_backend:?} is not native yet; using software present"
-        );
-    }
     let negotiated = session
         .negotiate_client_with_capabilities(client_capabilities)
         .await?;

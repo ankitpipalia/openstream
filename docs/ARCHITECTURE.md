@@ -101,14 +101,15 @@ invokes FFmpeg as an external process, using the explicit `x11grab` or
 `pipewire` profile on Linux, `gdigrab` on Windows, and `avfoundation` on
 macOS, then feeds bounded H.264 chunks into the same encrypted packetizer.
 The headless client can optionally pipe those chunks to `ffplay`.
-`openstream-desktop-client` adds a software-rendered
-native window: FFmpeg decodes negotiated access units to BGRA while the
-window forwards keyboard, pointer, wheel, and gamepad events through the shared `OI`
-envelope. `openstream-ffmpeg-host` consumes those authenticated `OI` events
-through the reliable control channel and translates basic keyboard, pointer,
-and wheel input using Linux `uinput`, Windows `SendInput`, or macOS
-CoreGraphics HID events when `OPENSTREAM_ENABLE_INPUT=1`. Native capture,
-hardware encoding, GPU renderers, and platform audio sinks remain separate
+`openstream-desktop-client` adds a desktop window: FFmpeg decodes negotiated
+access units to BGRA while the default software presenter or optional wgpu
+Metal/Vulkan/OpenGL/Direct3D12 presenter displays them. The window forwards
+keyboard, pointer, wheel, and gamepad events through the shared `OI` envelope.
+`openstream-ffmpeg-host` consumes those authenticated `OI` events through the
+reliable control channel and translates basic keyboard, pointer, and wheel
+input using Linux `uinput`, Windows `SendInput`, or macOS CoreGraphics HID
+events when `OPENSTREAM_ENABLE_INPUT=1`. Native capture, hardware encoding,
+exact Direct3D11 semantics, and platform audio sinks remain separate open
 adapters; an optional `OPENSTREAM_AUDIO_PLAYER` process provides a portable
 desktop PCM sink during development.
 

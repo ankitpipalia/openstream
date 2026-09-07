@@ -23,9 +23,10 @@ deployed with infrastructure that you control.
 - Linux X11/DRM/PipeWire capture and uinput integration through the imported
   lowlat engine, plus an external FFmpeg host path for Linux, Windows, and
   macOS.
-- Software-rendered desktop client, desktop gamepad/input support, mobile FFI,
-  Android MediaCodec/AudioTrack sources, and iOS VideoToolbox/AudioEngine
-  integration sources.
+- Software-rendered desktop client with an optional native `wgpu` presentation
+  path (Metal, Vulkan/OpenGL, and Direct3D12), desktop gamepad/input support,
+  mobile FFI, Android MediaCodec/AudioTrack sources, and iOS
+  VideoToolbox/AudioEngine integration sources.
 - Bounded queues, fuzz targets, CI checks, deployment templates, and detailed
   architecture/protocol documentation.
 
@@ -146,9 +147,9 @@ commit it, put it in a public issue, or include it in logs.
 The local development path is functional and validated through direct UDP,
 forced relay, and authenticated loopback ICE. The implementation is not yet a
 finished product: public-NAT/coturn interoperability, long-run Linux hardware
-acceptance, native desktop GPU renderers, OS virtual microphone routing,
-Android/iOS device builds, USB passthrough, and multi-guest media fan-out
-remain tracked work.
+acceptance, exact Direct3D11/native GPU-driver acceptance, OS virtual
+microphone routing, Android/iOS device builds, USB passthrough, and multi-guest
+media fan-out remain tracked work.
 
 The legacy `lowlat-tray` binary is intentionally not load-bearing and remains
 an open compatibility-engine phase. It is separate from the OpenStream

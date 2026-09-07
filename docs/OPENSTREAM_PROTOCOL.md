@@ -337,14 +337,15 @@ the encrypted transport; it does not expose peer addresses or credentials.
 
 This is a working development streaming stack, not yet a finished product:
 
-- native GPU capture/encode/render adapters remain open on all three desktop
+- native host GPU capture/encode adapters remain open on all three desktop
   OSes; the FFmpeg external path (x11grab/PipeWire/GDI/AVFoundation,
   libx264/x265 plus NVENC/VAAPI profiles, 8-bit 4:2:0 with opt-in 10-bit and
   4:4:4) is implemented and tested, with native X11/PipeWire discovery wired
   into the Linux host;
-- desktop presentation is software (validated BGRA, paced re-presents,
-  windowed/borderless/fullscreen modes, hotkeys); D3D11/Metal/Vulkan upload
-  paths remain open;
+- desktop presentation has a validated software path plus an optional wgpu
+  texture-present path for Metal, Vulkan/OpenGL, and Direct3D12
+  (`OPENSTREAM_RENDERER`); exact D3D11 semantics, native driver acceptance,
+  and native audio remain open;
 - mobile shells need on-device acceptance and signed packaging; lifecycle,
   thermal shedding, and the host-checkable harness are implemented;
 - multi-guest media fan-out to N simultaneous guests remains open; admission,

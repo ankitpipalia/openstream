@@ -181,8 +181,8 @@ path to the OpenStream packetizer. `openstream-linux-host --preflight` reports
 the native capture gate, outputs, X11/PipeWire availability, input device, and
 hardware candidates without exposing credentials. The cross-platform external-FFmpeg adapter provides
 an initial real H.264 source and basic host keyboard/pointer/wheel injection,
-and the client can hand the stream to `ffplay`; native GPU renderers, live
-OS-level virtual-microphone routing, and decoder-level keyframe acceptance
+and the client can hand the stream to `ffplay`; native host GPU capture/encode,
+live OS-level virtual-microphone routing, and decoder-level keyframe acceptance
 remain open.
 
 Gate: Ubuntu 22.04+ host streams a real desktop at 1080p60 for ten minutes
@@ -191,14 +191,15 @@ with bounded latency, audio, pointer, and keyboard input.
 ## Phase 4 — desktop client
 
 - [x] Shared client core and reusable peer-session establishment.
-- [x] Cross-platform software desktop window using FFmpeg decode and shared
-  keyboard/pointer input (`openstream-desktop-client`), now with validated
-  BGRA presents, paced re-presents, and a renderer selector whose native
-  names (`d3d11`/`metal`/`vulkan`) resolve to software with notice.
+- [x] Cross-platform desktop window using FFmpeg decode and shared
+  keyboard/pointer input (`openstream-desktop-client`), with validated
+  software BGRA presents, paced re-presents, and an optional native `wgpu`
+  texture-present path for Metal, Vulkan/OpenGL, and Direct3D12.
 - [x] Optional external `ffplay` PCM sink for the desktop Opus path.
-- [ ] Windows Direct3D renderer.
-- [ ] macOS Metal renderer.
-- [ ] Linux OpenGL/Vulkan renderer.
+- [ ] Exact Direct3D11 backend (the `d3d11` selector currently uses wgpu's
+  Direct3D12 backend) and native driver/device acceptance.
+- [ ] Long-run native renderer acceptance across supported Windows, macOS, and
+  Linux GPU/driver combinations.
 - [x] Full-screen/windowed/scale modes (`OPENSTREAM_DISPLAY_MODE`:
   windowed/borderless/fullscreen via borderless + FitScreen; exclusive-mode
   switching stays with the future native renderers).
@@ -264,7 +265,7 @@ and send pointer/gamepad input without host capability exposure.
   monitor creation remain open.
 - [x] 10-bit and 4:4:4 end-to-end through the FFmpeg host/decoder path behind
   `OPENSTREAM_ALLOW_10BIT/444` on both ends with negotiation gating; native
-  GPU renderer acceptance remains open.
+  renderer acceptance remains open for the platform/driver matrix.
 - [x] Bounded host rumble envelope and desktop/mobile client haptic callbacks.
 - [x] Pen semantics: versioned `PenMotion`/`PenButton`/`PenProximity` OI
   events with pressure clamping, pointer-path host translation on Linux
