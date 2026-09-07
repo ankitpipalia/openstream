@@ -9,6 +9,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+defaults:
+  run:
+    working-directory: engine/lowlat
+
 jobs:
   check:
     name: format, lints, tests
@@ -19,12 +23,6 @@ jobs:
       - name: Install toolchain
         run: rustup component add rustfmt clippy
 
-      # The colour conversion is checked against a reference computed on the
-      # processor, and that check runs on the software driver rather than
-      # needing a graphics card. It is the only thing that catches a wrong
-      # colour matrix: comparing a converted desktop against its source is
-      # nearly blind to one, because a desktop is mostly grey and a grey pixel
-      # carries no colour for a matrix to act on.
       - name: Install a graphics driver for the conversion test
         run: sudo apt-get update && sudo apt-get install -y libvulkan1 mesa-vulkan-drivers
 
@@ -34,11 +32,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            engine/lowlat/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # AGENTS.md 1: ASCII only, section sign excepted. Runs first because it
-      # needs no toolchain and fails fast.
       - name: ASCII check
         run: python3 scripts/check-ascii.py
 
@@ -46,7 +42,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
@@ -72,7 +68,6 @@ jobs:
         run: cargo fmt --all --check
       - name: Test portable protocol/service/client crates
         run: cargo test --locked -p openstream-client-core -p openstream-protocol -p openstream-transport -p openstream-signal-server -p openstream-reference-peer -p openstream-media -p openstream-platform -p openstream-client -p openstream-desktop-client -p openstream-ffmpeg-host -p openstream-mobile-ffi -p openstream-bridge -- --test-threads=1
-
       - name: Test native Linux host adapters (X11/PipeWire/HWACCEL parsing)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --locked -p openstream-linux-host
@@ -159,15 +154,12 @@ jobs:
           -p openstream-platform
           -p openstream-client-core
           -p openstream-mobile-ffi
-
       - name: Check cross-platform FFmpeg host adapter
         if: matrix.host
         run: cargo check --locked --target ${{ matrix.target }} -p openstream-ffmpeg-host
-
       - name: Check native Linux host adapter
         if: matrix.linux_host
         run: cargo check --locked --target ${{ matrix.target }} -p openstream-linux-host
-
       - name: Build OpenStream desktop release artifacts
         if: matrix.host
         run: >-
@@ -175,11 +167,9 @@ jobs:
           -p openstream-ffmpeg-host
           -p openstream-client
           -p openstream-signal-server
-
       - name: Build OpenStream Linux host release artifact
         if: matrix.linux_host
         run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-linux-host
-
       - name: Build OpenStream mobile bridge release artifact
         if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android' || matrix.target == 'aarch64-apple-ios'
         run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-mobile-ffi
@@ -226,9 +216,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      # docs/08-testing.md 7: concurrency primitives are model checked, not
-      # soak tested. This job is not optional.
       - name: Loom
         run: cargo test -p lowlat-common --lib --release
         env:
@@ -240,10 +227,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      # Run on the runner with the repository's own toolchain rather than in a
-      # musl container: rust-toolchain.toml pins a target the container has no
-      # toolchain for, which degrades dependency resolution before any policy
-      # is even evaluated.
       - uses: taiki-e/install-action@cargo-deny
       - name: Deny
         run: cargo deny check
@@ -253,10 +236,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
       - name: Install nightly
         run: rustup toolchain install nightly --component rust-src
-
       - name: Address sanitizer
         run: |
           cargo +nightly test --workspace --all-features \
