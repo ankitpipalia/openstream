@@ -1,0 +1,9 @@
+# Copy to signing.properties (same directory as the root build.gradle.kts)
+# and fill in. Never commit the result: it points at a private keystore.
+# Generate a key with:
+#   keytool -genkeypair -v -keystore openstream-release.jks -alias openstream \
+#     -keyalg RSA -keysize 2048 -validity 10000
+storeFile=/absolute/path/to/openstream-release.jks
+storePassword=REPLACE_WITH_KEYSTORE_PASSWORD
+keyAlias=openstream
+keyPassword=REPLACE_WITH_KEY_PASSWORD

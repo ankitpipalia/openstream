@@ -1,0 +1,29 @@
+[Unit]
+Description=OpenStream self-hosted signaling service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openstream
+Group=openstream
+EnvironmentFile=/etc/openstream/signal.env
+# Optional built-in relay configuration lives in the EnvironmentFile. Example:
+# OPENSTREAM_RELAY_BIND=0.0.0.0:40000 and
+# OPENSTREAM_RELAY_ENDPOINT=203.0.113.10:40000.
+# OPENSTREAM_RELAY_SECRET=REPLACE_WITH_A_LONG_RANDOM_SECRET (>=16 bytes).
+ExecStart=/usr/local/bin/openstream-signal-server
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/openstream
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

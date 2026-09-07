@@ -1,0 +1,13 @@
+[package]
+name = "openstream-platform"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[dependencies]
+
+[lints]
+workspace = true

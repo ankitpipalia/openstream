@@ -1,0 +1,41 @@
+# How the C header is generated from the Rust definitions.
+#
+# The header is committed at include/lowlat.h and a test regenerates it and
+# compares, so a definition that changes without the header changing fails the
+# build (docs/06-api.md 12). Regenerate with:
+#
+#   LOWLAT_BLESS_HEADER=1 cargo test -p lowlat-host --test abi
+
+language = "C"
+# One line that every compiler in use understands, instead of a macro name an
+# application can collide with.
+pragma_once = true
+# One header that compiles as C and as C++, which is the gate. Without this the
+# C++ translation unit mangles every name and links against nothing.
+cpp_compat = true
+documentation_style = "c99"
+no_includes = true
+sys_includes = ["stdint.h", "stdbool.h"]
+line_length = 88
+tab_width = 4
+
+header = """
+/* lowlat - the public C ABI.
+ *
+ * Generated from the Rust definitions. Do not edit; see crates/host/cbindgen.toml.
+ */"""
+
+[parse]
+parse_deps = false
+
+[export]
+prefix = ""
+# **Named because nothing references them.** These enumerations exist to name
+# the values of configuration fields that are carried as plain integers, which
+# is deliberate -- the application writes those fields, so reading one back as a
+# variant would be reading whatever it wrote. Nothing being typed by them is the
+# point, and it is also why they have to be asked for here.
+include = ["lowlat_codec", "lowlat_encoder", "lowlat_rotation", "lowlat_cg_level", "lowlat_log_level", "lowlat_quality"]
+
+[enum]
+prefix_with_name = false

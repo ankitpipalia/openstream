@@ -1,0 +1,27 @@
+[package]
+name = "openstream-client-core"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[dependencies]
+futures-util.workspace = true
+getrandom.workspace = true
+hex = "0.4"
+if-addrs.workspace = true
+openstream-protocol = { path = "../protocol" }
+openstream-transport = { path = "../transport" }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
+webrtc-ice.workspace = true
+webrtc-util.workspace = true
+
+[lints]
+workspace = true

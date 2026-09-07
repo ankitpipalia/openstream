@@ -1,0 +1,30 @@
+[package]
+name = "openstream-linux-host"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[[bin]]
+name = "openstream-linux-host"
+path = "src/main.rs"
+
+[dependencies]
+lowlat-common.workspace = true
+lowlat-host.workspace = true
+lowlat-net.workspace = true
+openstream-client-core = { path = "../client-core" }
+openstream-media = { path = "../media" }
+openstream-platform = { path = "../platform" }
+openstream-protocol = { path = "../protocol" }
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+lowlat-core.workspace = true
+lowlat-inject.workspace = true
+
+[lints]
+workspace = true

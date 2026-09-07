@@ -1,0 +1,26 @@
+[package]
+name = "lowlat-core"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Primitives only. The state machines are ours; see AGENTS.md 11.
+# no_std, no alloc: default features pull in `alloc` and `getrandom`, and the
+# core needs neither. It derives nonces rather than generating them, which is
+# what keeps replay and simulation deterministic.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+# Connectivity check authentication. Same family and the same reason for
+# default-features = false: fixed-size state on the stack, no alloc, no RNG.
+hmac = { version = "0.12", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+lowlat-common = { workspace = true, features = ["alloc-counter"] }
+
+[lints]
+workspace = true

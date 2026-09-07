@@ -1,0 +1,167 @@
+# OpenStream
+
+OpenStream is an independent, self-hosted low-latency desktop and game
+streaming stack focused on Linux hosting. It includes a Rust signaling service,
+encrypted UDP transport, bounded video/audio framing, a Linux host adapter,
+cross-platform FFmpeg host/client adapters, desktop input, and client-only
+Android/iOS integration seams.
+
+This project is experimental. It is not a drop-in replacement for Parsec and
+does not claim compatibility with Parsec's proprietary BUD/Kessel protocols or
+services. The OpenStream runtime uses its own versioned protocol and can be
+deployed with infrastructure that you control.
+
+## What is included
+
+- Self-hosted REST pairing and role-scoped WebSocket signaling.
+- Authenticated X25519/AES-256-GCM UDP sessions with replay and size limits.
+- Direct UDP nomination, optional STUN and UPnP, an application-owned relay,
+  and an optional standards-based ICE/TURN path.
+- Bounded H.264/H.265 fragmentation, reassembly, frame acknowledgements,
+  audio framing, jitter buffering, packet-loss concealment, and clipboard/input
+  envelopes.
+- Linux X11/DRM/PipeWire capture and uinput integration through the imported
+  lowlat engine, plus an external FFmpeg host path for Linux, Windows, and
+  macOS.
+- Software-rendered desktop client, desktop gamepad/input support, mobile FFI,
+  Android MediaCodec/AudioTrack sources, and iOS VideoToolbox/AudioEngine
+  integration sources.
+- Bounded queues, fuzz targets, CI checks, deployment templates, and detailed
+  architecture/protocol documentation.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `engine/lowlat` | Rust workspace containing OpenStream crates and the isolated MIT-licensed lowlat engine |
+| `mobile/android` | Android client shell and JNI bridge |
+| `mobile/ios` | iOS client integration sources |
+| `include` | Public C header for the client-only mobile bridge |
+| `deploy` | systemd and coturn deployment templates |
+| `scripts` | Build, pairing, smoke-test, and mobile acceptance helpers |
+| `docs` | Architecture, protocol, deployment, testing, compatibility, and research notes |
+
+Vendor installers, extracted Parsec payloads, credentials, local packet/video
+captures, build directories, and reverse-engineering work files are deliberately
+excluded from this repository. The research documents describe how to perform
+authorized local analysis without redistributing vendor artifacts.
+
+## Quick start: local end-to-end demo
+
+### Requirements
+
+- Rust 1.85 or newer
+- `ffmpeg` on `PATH`
+- `curl`
+- macOS, Linux, or a compatible Unix shell for the default launcher
+
+Run the complete local signal-server, FFmpeg host, and headless-client demo:
+
+```sh
+./scripts/run-local-demo.sh
+```
+
+The demo uses loopback-only development authentication, creates temporary
+pairing data, and writes an H.264 access-unit file. Override the duration,
+ports, output path, or FFmpeg input with `OPENSTREAM_DEMO_SECONDS`,
+`OPENSTREAM_DEMO_PORT`, `OPENSTREAM_DEMO_OUTPUT`, and
+`OPENSTREAM_FFMPEG_ARGS`.
+
+Run the authenticated full-ICE loopback smoke separately:
+
+```sh
+./scripts/full-ice-smoke.sh
+```
+
+To exercise the built-in opaque relay, configure a reachable relay endpoint
+and set `OPENSTREAM_FORCE_RELAY=1`. For local testing:
+
+```sh
+OPENSTREAM_FORCE_RELAY=1 \
+OPENSTREAM_RELAY_BIND=127.0.0.1:18100 \
+OPENSTREAM_RELAY_ENDPOINT=127.0.0.1:18100 \
+OPENSTREAM_DEMO_PORT=18101 \
+./scripts/run-local-demo.sh
+```
+
+## Build and test
+
+```sh
+cd engine/lowlat
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+cargo test --workspace --all-features --locked -- --test-threads=1
+cargo check --manifest-path fuzz/Cargo.toml --locked
+cargo build --workspace --release --locked
+```
+
+The fuzz package is intentionally outside the normal Cargo workspace. With
+`cargo-fuzz` installed, run bounded campaigns before release, for example:
+
+```sh
+cargo fuzz run openstream-protocol -- -runs=10000
+cargo fuzz run openstream-media -- -runs=10000
+```
+
+Hardware-dependent capture, GPU encoder, sound-server, uinput, Android, and
+iOS tests require their native operating system, SDK, device, or driver and
+are explicitly marked in the test and feature matrix.
+
+## Self-hosting
+
+Build the release binaries from `engine/lowlat` and use the templates in
+[`deploy/`](deploy/). Put the signaling service behind HTTPS/WSS for any
+non-loopback deployment. Set a strong `OPENSTREAM_ADMIN_TOKEN`; without it,
+session-management endpoints refuse requests unless the server is explicitly
+run in loopback-only development mode with `OPENSTREAM_ALLOW_NO_AUTH=1`.
+
+For the application relay, configure:
+
+```text
+OPENSTREAM_RELAY_BIND=0.0.0.0:40000
+OPENSTREAM_RELAY_ENDPOINT=203.0.113.10:40000
+OPENSTREAM_RELAY_SECRET=REPLACE_WITH_A_LONG_RANDOM_SECRET
+```
+
+The relay secret must contain at least 16 bytes. Persist it securely if relay
+tickets should survive service restarts. TURN credentials are configured
+separately and are never placed in pairing JSON or URLs.
+
+Pairing JSON contains role bearer capabilities. Treat it as a secret and never
+commit it, put it in a public issue, or include it in logs.
+
+## Current status
+
+The local development path is functional and validated through direct UDP,
+forced relay, and authenticated loopback ICE. The implementation is not yet a
+finished product: public-NAT/coturn interoperability, long-run Linux hardware
+acceptance, native desktop GPU renderers, OS virtual microphone routing,
+Android/iOS device builds, USB passthrough, and multi-guest media fan-out
+remain tracked work.
+
+The legacy `lowlat-tray` binary is intentionally not load-bearing and remains
+an open compatibility-engine phase. It is separate from the OpenStream
+signal/host/client path.
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [OpenStream protocol](docs/OPENSTREAM_PROTOCOL.md)
+- [Build and validation matrix](docs/BUILD.md)
+- [Deployment templates](deploy/README.md)
+- [Feature matrix](docs/FEATURE_MATRIX.md)
+- [Implementation plan](docs/IMPLEMENTATION_PLAN.md)
+- [Open-source stack decision](docs/OPEN_SOURCE_STACK.md)
+- [Authorized reverse-engineering notes](docs/REVERSE_ENGINEERING.md)
+- [Analysis toolkit](docs/RE_TOOLKIT.md)
+- [Third-party inventory](THIRD_PARTY.md)
+- [License](LICENSE)
+
+## License
+
+OpenStream-owned code is released under the MIT License. The isolated lowlat
+engine and vendored third-party headers retain their own license and
+provenance notices. See [THIRD_PARTY.md](THIRD_PARTY.md) before distributing
+builds that include FFmpeg, PipeWire, libva, NVENC, coturn, or other external
+components.

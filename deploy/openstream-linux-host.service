@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenStream native Linux host adapter
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/openstream/linux-host.env
+ExecStart=%h/.local/bin/openstream-linux-host
+Restart=on-failure
+RestartSec=2s
+# The service needs the display/GPU and (when input is enabled) uinput
+# devices. Use a dedicated login user and grant only the required groups.
+SupplementaryGroups=video render input
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/openstream
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target

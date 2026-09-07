@@ -1,0 +1,25 @@
+[package]
+name = "lowlat-audio"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lowlat-common.workspace = true
+# The wire's own constants, so the sample rate is one value rather than two
+# that agree today.
+lowlat-core.workspace = true
+# The codec, as a pure-Rust port rather than as bindings: no runtime library to
+# find, nothing new that is `unsafe`, and a bitstream the reference decoder was
+# measured to read correctly. BSD-3-Clause, no transitive dependencies.
+opus-rs.workspace = true
+
+[dev-dependencies]
+lowlat-common = { workspace = true, features = ["alloc-counter"] }
+
+[lints]
+workspace = true

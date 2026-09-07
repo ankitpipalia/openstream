@@ -1,0 +1,4 @@
+module OpenStreamFFI {
+    header "../../include/openstream_client.h"
+    export *
+}

@@ -1,0 +1,28 @@
+[package]
+name = "lowlat-kessel"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+lowlat-common.workspace = true
+# Jitter on the reconnect schedule; the workspace has one entropy source.
+lowlat-crypto.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+
+[dev-dependencies]
+# The liveness test stands a server up locally rather than reaching the network.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+futures-util.workspace = true
+
+[lints]
+workspace = true

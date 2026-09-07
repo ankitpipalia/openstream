@@ -1,0 +1,31 @@
+[package]
+name = "lowlatd"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "lowlatd"
+path = "src/main.rs"
+
+[dependencies]
+# The logging macros, so the daemon's own lines carry the same level, the same
+# timestamp and the same stream as the library's rather than being a second
+# account of one run on a different file descriptor.
+lowlat-common.workspace = true
+lowlat-host.workspace = true
+# The sound configuration its flags fill in.
+lowlat-audio.workspace = true
+lowlat-kessel.workspace = true
+sha2.workspace = true
+# The translation between signaling and the seam is JSON on one side and an
+# async client on the other; both stop at this boundary.
+tokio.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+# Example coturn configuration for the optional OpenStream full-ICE/TURN path.
+# The OpenStream signal service mints session-scoped TURN REST credentials
+# (HMAC-SHA1 over `expiry:session:role`) when it is started with
+# OPENSTREAM_TURN_SECRET and OPENSTREAM_TURN_URLS. Point this file at the
+# same secret so coturn accepts exactly those credentials:
+#
+#   OPENSTREAM_TURN_SECRET=<the static-auth-secret below>
+#   OPENSTREAM_TURN_URLS=turn:turn.example.invalid:3478
+#   OPENSTREAM_TURN_REALM=openstream
+#
+# Hosts and clients fetch their role credential with the session bearer
+# token: GET /v1/session/{id}/turn. The provisioning helpers
+# (scripts/create-session.sh|.ps1) embed the host credential in the pairing
+# JSON automatically; explicit OPENSTREAM_TURN_USERNAME/PASSWORD still win
+# when both are present. Do not expose this file with a real secret.
+listening-port=3478
+fingerprint
+use-auth-secret
+static-auth-secret=REPLACE_WITH_A_LONG_RANDOM_SECRET
+realm=openstream
+# Keep the default allocation lifetime aligned with the service TTL clamp
+# (OPENSTREAM_TURN_TTL, 60s..24h, default 1h).
+stale-nonce=3600
+no-cli
+# Terminate TLS at a reverse proxy in production; this example keeps the
+# relay on plain UDP as negotiated by the ICE agent.
+no-tls
+no-dtls
+# Restrict relay allocation to the public interface/range in production.
+# relay-ip=203.0.113.10
+# Allowed peer IPs may be restricted further with allowed-peer-ip rules.

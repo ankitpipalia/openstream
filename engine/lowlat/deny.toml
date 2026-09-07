@@ -1,0 +1,58 @@
+# Dependency policy. See AGENTS.md 12.
+#
+# The load-bearing rule here is the GPL denial. Codec libraries are loaded at
+# runtime and never linked; if one ever enters the link graph, the distributed
+# binary becomes GPL regardless of what LICENSE says. This file is what turns
+# that from a discipline into a build failure.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # **A data licence, not a code one.** It covers the Mozilla root
+    # certificate store that `webpki-roots` ships, which is what the signaling
+    # client verifies the service's certificate against. Permissive: version
+    # 2.0 drops the attribution requirement version 1.0 carried, imposes no
+    # condition on what is built from the data, and is not copyleft, so it does
+    # not touch the rule this file exists for.
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Our own crates are path dependencies carrying no version, which reads as a
+# wildcard. The rule exists to stop an unpinned *third-party* version reaching
+# the link graph, and this exemption covers path dependencies only, all of which
+# are publish = false here. Removing it does not tighten anything; it just
+# fails the build on our own workspace.
+allow-wildcard-paths = true
+# Nothing in the link graph may be copyleft. Runtime loading is the only
+# sanctioned way to reach a GPL codec.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

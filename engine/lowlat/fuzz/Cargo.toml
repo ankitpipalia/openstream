@@ -1,0 +1,82 @@
+# Excluded from the workspace: cargo-fuzz needs nightly and its own flags, and
+# leaving it a member drags those into every ordinary build.
+[package]
+name = "lowlat-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lowlat-core = { path = "../crates/core" }
+# The microphone target reaches past the wire parse into the codec, because
+# that is where the bytes a guest chose actually get interpreted.
+lowlat-audio = { path = "../crates/audio" }
+openstream-media = { path = "../crates/media" }
+openstream-protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "video"
+path = "fuzz_targets/video.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "check"
+path = "fuzz_targets/check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembly"
+path = "fuzz_targets/reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "microphone"
+path = "fuzz_targets/microphone.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openstream-protocol"
+path = "fuzz_targets/openstream-protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openstream-media"
+path = "fuzz_targets/openstream-media.rs"
+test = false
+doc = false
+bench = false

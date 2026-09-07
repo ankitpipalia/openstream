@@ -1,0 +1,17 @@
+[package]
+name = "openstream-transport"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[dependencies]
+getrandom.workspace = true
+openstream-protocol = { path = "../protocol" }
+tokio.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

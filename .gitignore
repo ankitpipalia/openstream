@@ -1,0 +1,53 @@
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+.commandcode/
+
+# Rust/Cargo build output
+**/target/
+**/*.rs.bk
+
+# Android/Gradle build output
+mobile/**/build/
+mobile/**/.gradle/
+mobile/**/local.properties
+
+# Local secrets and pairing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+pairing.json
+openstream-*.env
+
+# Generated media and diagnostics
+*.h264
+*.h265
+*.ivf
+*.pcm
+*.wav
+*.pcap
+*.pcapng
+*.log
+
+# Authorized local reverse-engineering evidence. These files are not part of
+# the public source tree and must never be committed or redistributed.
+analysis/
+extracted_pkg/
+Parsec.app/
+Parsec_*.xapk
+parsec-*.pkg
+parsec-*.exe
+
+# Optional local reference checkout; OpenStream does not build from it.
+libmatoya/
+
+# The nested lowlat checkout used to have its own submodule metadata. The
+# public repository includes the source snapshot, not nested Git metadata.
+engine/lowlat/.gitmodules

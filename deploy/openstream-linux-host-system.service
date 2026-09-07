@@ -1,0 +1,25 @@
+[Unit]
+Description=OpenStream native Linux host adapter (system service)
+After=graphical-session.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openstream-host
+Group=openstream-host
+EnvironmentFile=/etc/openstream/linux-host.env
+ExecStart=/usr/local/bin/openstream-linux-host
+Restart=on-failure
+RestartSec=2s
+# System service: runs outside any login session for unattended hosting.
+# Grant only the device groups the capture/encode/input paths need.
+SupplementaryGroups=video render input
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/cache/openstream
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
