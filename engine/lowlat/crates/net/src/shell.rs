@@ -349,15 +349,6 @@ mod tests {
         }
     }
 
-    fn endpoint<'a>(
-        arena: &'a mut Arena,
-        ours: (&'a str, &'a str),
-        theirs: (&'a str, &'a str),
-        seed: u8,
-    ) -> Endpoint<'a> {
-        endpoint_directed(arena, ours, theirs, seed, Direction::Host)
-    }
-
     fn endpoint_directed<'a>(
         arena: &'a mut Arena,
         ours: (&'a str, &'a str),

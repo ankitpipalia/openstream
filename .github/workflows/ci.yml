@@ -179,12 +179,21 @@ jobs:
           -p openstream-mobile-ffi
       - name: Check cross-platform FFmpeg host adapter
         if: matrix.host
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo check --locked --target ${{ matrix.target }} -p openstream-ffmpeg-host
       - name: Check native Linux host adapter
         if: matrix.linux_host
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo check --locked --target ${{ matrix.target }} -p openstream-linux-host
       - name: Build OpenStream desktop release artifacts
         if: matrix.host
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: >-
           cargo build --locked --release --target ${{ matrix.target }}
           -p openstream-ffmpeg-host
@@ -192,6 +201,9 @@ jobs:
           -p openstream-signal-server
       - name: Build OpenStream Linux host release artifact
         if: matrix.linux_host
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-linux-host
       - name: Build OpenStream mobile bridge release artifact
         if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android' || matrix.target == 'aarch64-apple-ios'
