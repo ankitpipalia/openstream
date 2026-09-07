@@ -218,6 +218,36 @@ extern "C" void on_rumble(void *opaque, uint32_t device_id, uint8_t strong, uint
     finish_callback(context, detach, env);
 }
 
+extern "C" void on_displays(void *opaque, const uint8_t *bytes, size_t length) {
+    auto *context = static_cast<BridgeContext *>(opaque);
+    if (context == nullptr || !begin_callback(context)) {
+        return;
+    }
+    bool detach = false;
+    JNIEnv *env = environment(context, &detach);
+    if (env == nullptr || (bytes == nullptr && length != 0) ||
+        length > static_cast<size_t>(INT32_MAX)) {
+        finish_callback(context, detach, env);
+        return;
+    }
+    jbyteArray array = env->NewByteArray(static_cast<jsize>(length));
+    if (array != nullptr) {
+        env->SetByteArrayRegion(array, 0, static_cast<jsize>(length),
+                                reinterpret_cast<const jbyte *>(bytes));
+        jclass klass = env->GetObjectClass(context->callbacks);
+        if (klass != nullptr) {
+            jmethodID method = env->GetMethodID(klass, "onDisplays", "([B)V");
+            if (method != nullptr) {
+                env->CallVoidMethod(context->callbacks, method, array);
+            }
+            env->DeleteLocalRef(klass);
+        }
+        env->DeleteLocalRef(array);
+    }
+    clear_exception(env);
+    finish_callback(context, detach, env);
+}
+
 extern "C" void on_error(void *opaque, int32_t code) {
     auto *context = static_cast<BridgeContext *>(opaque);
     if (context == nullptr || !begin_callback(context)) {
@@ -292,6 +322,7 @@ jlong start_client(JNIEnv *env, jstring origin, jstring pairing_json, jstring ic
     table.on_video = on_video;
     table.on_audio = on_audio;
     table.on_rumble = on_rumble;
+    table.on_displays = on_displays;
     table.on_error = on_error;
 
     OpenStreamClient *client = nullptr;
@@ -382,6 +413,17 @@ Java_app_openstream_OpenStreamNative_nativeSendInput(JNIEnv *env, jclass, jlong 
     env->ReleaseByteArrayElements(payload, bytes, JNI_ABORT);
     clear_exception(env);
     return static_cast<jint>(result);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_openstream_OpenStreamNative_nativeSelectDisplay(JNIEnv *, jclass, jlong value,
+                                                          jint display_id) {
+    auto *handle = reinterpret_cast<BridgeHandle *>(value);
+    if (handle == nullptr || display_id < 0) {
+        return -1;
+    }
+    return static_cast<jint>(openstream_client_select_display(
+        handle->client, static_cast<uint32_t>(display_id)));
 }
 
 extern "C" JNIEXPORT jint JNICALL

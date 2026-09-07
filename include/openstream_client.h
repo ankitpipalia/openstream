@@ -17,6 +17,8 @@ typedef void (*openstream_on_audio)(void *context, const int16_t *pcm,
                                     uint64_t presentation_time_us);
 typedef void (*openstream_on_rumble)(void *context, uint32_t device_id,
                                      uint8_t strong, uint8_t weak);
+typedef void (*openstream_on_displays)(void *context, const uint8_t *bytes,
+                                       size_t length);
 typedef void (*openstream_on_error)(void *context, int32_t code);
 
 typedef struct OpenStreamCallbacks {
@@ -25,6 +27,7 @@ typedef struct OpenStreamCallbacks {
     openstream_on_video on_video;
     openstream_on_audio on_audio;
     openstream_on_rumble on_rumble;
+    openstream_on_displays on_displays;
     openstream_on_error on_error;
 } OpenStreamCallbacks;
 
@@ -50,6 +53,10 @@ OpenStreamClient *openstream_client_start_with_ice(
 int32_t openstream_client_send_input(OpenStreamClient *client,
                                      const uint8_t *payload,
                                      size_t payload_len);
+/* Request one display id previously delivered in an authenticated `MD`
+ * topology callback. The host validates that it is still available. */
+int32_t openstream_client_select_display(OpenStreamClient *client,
+                                          uint32_t display_id);
 /*
  * Suspend (nonzero) or resume (zero) media callbacks without tearing down
  * the session. While suspended the bridge keeps assembly ACKs flowing so the

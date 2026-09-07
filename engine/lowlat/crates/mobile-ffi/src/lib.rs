@@ -44,6 +44,9 @@ pub struct OpenStreamCallbacks {
     pub on_video: Option<extern "C" fn(*mut c_void, *const u8, usize, bool, u64)>,
     pub on_audio: Option<extern "C" fn(*mut c_void, *const i16, usize, u64)>,
     pub on_rumble: Option<extern "C" fn(*mut c_void, u32, u8, u8)>,
+    /// Encoded, validated `MD` topology bytes. The pointer is valid only for
+    /// the callback; a platform must copy them before returning.
+    pub on_displays: Option<extern "C" fn(*mut c_void, *const u8, usize)>,
     pub on_error: Option<extern "C" fn(*mut c_void, i32)>,
 }
 
@@ -246,6 +249,30 @@ pub unsafe extern "C" fn openstream_client_send_input(
     }
 }
 
+/// Request one display from the host's validated `MD` topology.
+///
+/// The request is sent through the same bounded ordered control channel as
+/// input and lifecycle messages. The host still validates that the id is
+/// currently advertised; this call does not grant access to arbitrary host
+/// outputs.
+///
+/// # Safety
+///
+/// `client` must be a live handle returned by `openstream_client_start`, and
+/// it must not be stopped concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openstream_client_select_display(
+    client: *mut OpenStreamClient,
+    display_id: u32,
+) -> i32 {
+    if client.is_null() {
+        return -1;
+    }
+    let client = unsafe { &*client };
+    let payload = openstream_media::displays::encode_select(display_id).to_vec();
+    client.input_tx.try_send(payload).map_or(-2, |_| 0)
+}
+
 /// Suspend or resume media callbacks without tearing down the session.
 ///
 /// While suspended the worker keeps assembly ACKs and keyframe requests
@@ -374,6 +401,7 @@ async fn run_client(
     // decode, so mobile advertises only the codec it actually consumes.
     let mut client_capabilities = openstream_client_core::Capabilities::client_default();
     client_capabilities.video_codecs = vec![VideoCodec::H264];
+    client_capabilities.multi_monitor = true;
     let negotiated = session
         .negotiate_client_with_capabilities(client_capabilities)
         .await?;
@@ -448,6 +476,9 @@ async fn run_client(
                             if payload == b"openstream/end" {
                                 return Ok(());
                             }
+                            if report_display_topology(callbacks, &payload) {
+                                continue;
+                            }
                             if let Ok(rumble) = RumbleEvent::decode(&payload)
                                 && let Some(on_rumble) = callbacks.on_rumble
                             {
@@ -463,6 +494,9 @@ async fn run_client(
                     }
                     if packet.payload == b"openstream/end" {
                         return Ok(());
+                    }
+                    if report_display_topology(callbacks, &packet.payload) {
+                        continue;
                     }
                     if let Ok(rumble) = RumbleEvent::decode(&packet.payload)
                         && let Some(on_rumble) = callbacks.on_rumble
@@ -588,6 +622,23 @@ async fn run_client(
     }
 }
 
+/// Validate and forward an `MD` topology without making foreign code parse an
+/// untrusted byte slice. A malformed topology is consumed and ignored; it is
+/// a peer media/control error, not a reason to invoke a platform callback with
+/// data it cannot trust.
+fn report_display_topology(callbacks: OpenStreamCallbacks, payload: &[u8]) -> bool {
+    if !payload.starts_with(b"MD") {
+        return false;
+    }
+    if openstream_media::displays::decode_list(payload).is_err() {
+        return true;
+    }
+    if let Some(on_displays) = callbacks.on_displays {
+        on_displays(callbacks.context, payload.as_ptr(), payload.len());
+    }
+    true
+}
+
 fn report_error(callbacks: OpenStreamCallbacks, code: i32) {
     if let Some(on_error) = callbacks.on_error {
         on_error(callbacks.context, code);
@@ -597,6 +648,18 @@ fn report_error(callbacks: OpenStreamCallbacks, code: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    extern "C" fn count_display_callbacks(context: *mut c_void, bytes: *const u8, length: usize) {
+        if context.is_null() || (bytes.is_null() && length != 0) {
+            return;
+        }
+        // The production callback contract requires the foreign side to copy
+        // only during the call. This test records that a validated payload
+        // crossed the boundary without retaining the borrowed pointer.
+        unsafe {
+            *context.cast::<usize>() += 1;
+        }
+    }
 
     #[test]
     fn lifecycle_and_thermal_setters_reject_null_handles() {
@@ -612,7 +675,36 @@ mod tests {
             unsafe { openstream_client_send_input(std::ptr::null_mut(), std::ptr::null(), 0) },
             -1
         );
+        assert_eq!(
+            unsafe { openstream_client_select_display(std::ptr::null_mut(), 1) },
+            -1
+        );
         // Stopping a null handle is a no-op, never a crash.
         unsafe { openstream_client_stop(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn display_topology_is_validated_before_the_foreign_callback() {
+        let mut callbacks_seen = 0_usize;
+        let callbacks = OpenStreamCallbacks {
+            context: (&mut callbacks_seen as *mut usize).cast(),
+            on_displays: Some(count_display_callbacks),
+            ..OpenStreamCallbacks::default()
+        };
+        let topology =
+            openstream_media::displays::encode_list(&[openstream_media::displays::Display {
+                id: 7,
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                flags: openstream_media::displays::PRIMARY_FLAG,
+            }])
+            .expect("topology");
+        assert!(report_display_topology(callbacks, &topology));
+        assert_eq!(callbacks_seen, 1);
+        assert!(report_display_topology(callbacks, b"MD\x01"));
+        assert_eq!(callbacks_seen, 1, "malformed topology reached the callback");
+        assert!(!report_display_topology(callbacks, b"other"));
     }
 }

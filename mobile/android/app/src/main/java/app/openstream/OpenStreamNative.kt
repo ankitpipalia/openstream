@@ -17,6 +17,7 @@ object OpenStreamNative {
         open fun onVideo(bytes: ByteArray, keyframe: Boolean, presentationTimeUs: Long) {}
         open fun onAudio(pcm: ShortArray, presentationTimeUs: Long) {}
         open fun onRumble(deviceId: Int, strong: Byte, weak: Byte) {}
+        open fun onDisplays(bytes: ByteArray) {}
         open fun onError(code: Int) {}
     }
 
@@ -40,6 +41,10 @@ object OpenStreamNative {
 
     @JvmStatic
     external fun nativeSendInput(handle: Long, payload: ByteArray): Int
+
+    /** Request a display id previously announced by the host. */
+    @JvmStatic
+    external fun nativeSelectDisplay(handle: Long, displayId: Int): Int
 
     /** Suspend (`paused = true`) or resume backgrounded media callbacks. */
     @JvmStatic

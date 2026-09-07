@@ -23,16 +23,22 @@ check() {
 check "mobile-ffi unit tests (policy + null-handle FFI)" \
     "cargo test --locked --manifest-path '$lowlat/Cargo.toml' -p openstream-mobile-ffi -- --test-threads=1 >/dev/null 2>&1"
 
-check "C header declares pause/thermal APIs" \
+check "C header declares lifecycle and display APIs" \
     "grep -q openstream_client_set_paused '$root/include/openstream_client.h' &&
-     grep -q openstream_client_set_thermal '$root/include/openstream_client.h'"
+     grep -q openstream_client_set_thermal '$root/include/openstream_client.h' &&
+     grep -q openstream_client_select_display '$root/include/openstream_client.h' &&
+     grep -q openstream_on_displays '$root/include/openstream_client.h'"
 
-check "JNI bridges pause/thermal" \
+check "JNI bridges lifecycle and display controls" \
     "grep -q nativeSetPaused '$root/mobile/android/app/src/main/cpp/openstream_jni.cpp' &&
-     grep -q nativeSetThermal '$root/mobile/android/app/src/main/cpp/openstream_jni.cpp'"
+     grep -q nativeSetThermal '$root/mobile/android/app/src/main/cpp/openstream_jni.cpp' &&
+     grep -q nativeSelectDisplay '$root/mobile/android/app/src/main/cpp/openstream_jni.cpp' &&
+     grep -q onDisplays '$root/mobile/android/app/src/main/cpp/openstream_jni.cpp'"
 
 check "Kotlin declares pause/thermal/lifecycle hooks" \
     "grep -q nativeSetPaused '$root/mobile/android/app/src/main/java/app/openstream/OpenStreamNative.kt' &&
+     grep -q nativeSelectDisplay '$root/mobile/android/app/src/main/java/app/openstream/OpenStreamNative.kt' &&
+     grep -q onDisplays '$root/mobile/android/app/src/main/java/app/openstream/OpenStreamNative.kt' &&
      grep -q onPause '$root/mobile/android/app/src/main/java/app/openstream/MainActivity.kt' &&
      grep -q onResume '$root/mobile/android/app/src/main/java/app/openstream/MainActivity.kt' &&
      grep -q ThermalStatus '$root/mobile/android/app/src/main/java/app/openstream/MainActivity.kt'"
@@ -40,6 +46,8 @@ check "Kotlin declares pause/thermal/lifecycle hooks" \
 check "Swift declares pause/thermal/lifecycle hooks" \
     "grep -q setPaused '$root/mobile/ios/OpenStreamSession.swift' &&
      grep -q setThermalLevel '$root/mobile/ios/OpenStreamSession.swift' &&
+     grep -q selectDisplay '$root/mobile/ios/OpenStreamSession.swift' &&
+     grep -q displays '$root/mobile/ios/OpenStreamSession.swift' &&
      grep -q viewDidDisappear '$root/mobile/ios/OpenStreamViewController.swift' &&
      grep -q thermalStateDidChangeNotification '$root/mobile/ios/OpenStreamViewController.swift'"
 
@@ -47,13 +55,14 @@ check "release signing template exists and keystore is untracked" \
     "test -f '$root/mobile/android/signing.properties.example' &&
      ! test -f '$root/mobile/android/signing.properties'"
 
-# Symbol check on a host-built bridge: the lifecycle APIs must be exported.
+# Symbol check on a host-built bridge: the lifecycle/display APIs must be exported.
 if cargo build --locked --manifest-path "$lowlat/Cargo.toml" -p openstream-mobile-ffi >/dev/null 2>&1; then
     lib=$(find "$lowlat/target/debug" -maxdepth 1 \( -name 'libopenstream_mobile_ffi.dylib' -o -name 'libopenstream_mobile_ffi.so' -o -name 'libopenstream_mobile_ffi.a' \) | head -n 1)
     if [ -n "${lib:-}" ] && command -v nm >/dev/null 2>&1; then
-        check "bridge exports pause/thermal symbols" \
+        check "bridge exports lifecycle/display symbols" \
             "nm -g '$lib' 2>/dev/null | grep -q openstream_client_set_paused &&
-             nm -g '$lib' 2>/dev/null | grep -q openstream_client_set_thermal"
+             nm -g '$lib' 2>/dev/null | grep -q openstream_client_set_thermal &&
+             nm -g '$lib' 2>/dev/null | grep -q openstream_client_select_display"
     else
         printf 'skip bridge symbol check (no nm or no host cdylib)\n'
     fi

@@ -10,6 +10,7 @@ public final class OpenStreamSession {
         public var video: (Data, Bool, UInt64) -> Void
         public var audio: ([Int16], UInt64) -> Void
         public var rumble: (UInt32, UInt8, UInt8) -> Void
+        public var displays: (Data) -> Void
         public var error: (Int32) -> Void
 
         public init(
@@ -17,12 +18,14 @@ public final class OpenStreamSession {
             video: @escaping (Data, Bool, UInt64) -> Void,
             audio: @escaping ([Int16], UInt64) -> Void,
             rumble: @escaping (UInt32, UInt8, UInt8) -> Void = { _, _, _ in },
+            displays: @escaping (Data) -> Void = { _ in },
             error: @escaping (Int32) -> Void
         ) {
             self.ready = ready
             self.video = video
             self.audio = audio
             self.rumble = rumble
+            self.displays = displays
             self.error = error
         }
     }
@@ -94,6 +97,7 @@ public final class OpenStreamSession {
             on_video: Self.video,
             on_audio: Self.audio,
             on_rumble: Self.rumble,
+            on_displays: Self.displays,
             on_error: Self.error
         )
         var originBytes = Array(origin.utf8)
@@ -162,6 +166,16 @@ public final class OpenStreamSession {
                 buffer.count
             )
         }
+    }
+
+    /// Request one display from the last authenticated `MD` topology.
+    /// Returns the bridge status code, or -1 without a live handle.
+    @discardableResult
+    public func selectDisplay(_ displayID: UInt32) -> Int32 {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard let handle else { return -1 }
+        return openstream_client_select_display(handle, displayID)
     }
 
     public func stop() {
@@ -241,5 +255,13 @@ public final class OpenStreamSession {
         guard let opaque else { return }
         let context = Unmanaged<Context>.fromOpaque(opaque).takeUnretainedValue()
         context.callbacks.rumble(deviceID, strong, weak)
+    }
+
+    private static let displays: @convention(c) (
+        UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int
+    ) -> Void = { opaque, bytes, length in
+        guard let opaque, let bytes, length >= 0 else { return }
+        let context = Unmanaged<Context>.fromOpaque(opaque).takeUnretainedValue()
+        context.callbacks.displays(Data(bytes: bytes, count: length))
     }
 }
