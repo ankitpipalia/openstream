@@ -236,6 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.update_with_buffer(&pixels, 2, 2)?;
         }
         window.update();
+        eprintln!("OpenStream renderer smoke passed");
         return Ok(());
     }
     let worker = thread::Builder::new()
