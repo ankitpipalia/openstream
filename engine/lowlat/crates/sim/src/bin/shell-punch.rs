@@ -21,6 +21,11 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+fn main() {
+    linux::run();
+}
+
+#[cfg(target_os = "linux")]
 mod linux {
 
     use std::env;
@@ -56,7 +61,7 @@ mod linux {
     const CHANNEL: u8 = 1;
     const KEY: [u8; 32] = [0x77u8; 32];
 
-    fn main() {
+    pub(super) fn run() {
         let args: Vec<String> = env::args().collect();
         if let Err(error) = peer(&args) {
             eprintln!("error: {error}");
