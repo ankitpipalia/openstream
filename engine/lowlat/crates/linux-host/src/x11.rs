@@ -255,11 +255,12 @@ impl Connection {
     }
 }
 
+fn take(bytes: &[u8], offset: usize, length: usize) -> Result<&[u8], Error> {
+    bytes.get(offset..offset + length).ok_or(Error::Truncated)
+}
+
 /// Parse the setup success body into screens. Pure and fully unit-tested.
 pub fn parse_setup(body: &[u8]) -> Result<(Vec<Screen>, u8, u8), Error> {
-    let take = |bytes: &[u8], offset: usize, length: usize| -> Result<&[u8], Error> {
-        bytes.get(offset..offset + length).ok_or(Error::Truncated)
-    };
     if body.len() < 32 {
         return Err(Error::Truncated);
     }

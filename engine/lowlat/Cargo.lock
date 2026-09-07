@@ -1447,6 +1447,7 @@ dependencies = [
 name = "openstream-linux-host"
 version = "0.1.0"
 dependencies = [
+ "lowlat-audio",
  "lowlat-common",
  "lowlat-core",
  "lowlat-host",

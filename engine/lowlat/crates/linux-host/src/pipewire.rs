@@ -129,7 +129,7 @@ fn run_pw_dump() -> std::io::Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    let stdout = match child.stdout.take() {
+    let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
             let _ = child.kill();
