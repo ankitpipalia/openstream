@@ -1,20 +1,12 @@
-//! Frame sources. Synthetic now; real backends at Gate B.
+//! Capture and conversion interfaces.
 //!
-//! See docs/05-host.md section 2.
-//!
-//! **A frame here is planar 4:2:0 in system memory, and that is a deliberate
-//! narrowing of what section 2 describes.** The rule there is that a captured
-//! frame moves as a device handle and is never copied to system memory,
-//! because a real capture backend receives one from the compositor and a
-//! readback would be pure loss. Nothing is captured yet. What exists is a
-//! generator, and the frames it makes have to reach **both** encode backends,
-//! which on a machine with two vendors' hardware are two different devices
-//! with no shared allocation between them. A device handle cannot satisfy
-//! that; system memory can, and each backend uploads into its own surfaces.
-//!
-//! So the copy is not a readback that crept in. It is a generator writing its
-//! output where every consumer can read it, and it disappears when real
-//! capture arrives with a handle of its own.
+//! The native Linux host now has a real DRM/KMS scanout source in
+//! [`scanout`], and `lowlat-host::display` imports those device buffers into a
+//! device-side conversion pipeline. The system-memory generator in
+//! [`synthetic`] remains an intentional test source for codec and transport
+//! tests; it is not the production Linux capture path. X11 setup diagnostics
+//! and the external FFmpeg X11/PipeWire profiles live in the Linux host and
+//! FFmpeg adapter crates rather than in this low-level interface.
 
 pub mod convert;
 pub mod cursor;

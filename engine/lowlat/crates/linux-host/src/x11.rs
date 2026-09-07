@@ -1,10 +1,10 @@
-//! Minimal pure-std X11 display client for enumeration and raw capture.
+//! Minimal pure-std X11 display client for setup and screen enumeration.
 //!
 //! This module speaks just enough of the X11 wire protocol to list screens
-//! and grab ZPixmap frames without linking Xlib or adding a dependency. It
-//! is used for display enumeration (`OPENSTREAM_LIST_DISPLAYS=1`) and as the
-//! fallback raw-capture source on X11 sessions. Failures are typed so the
-//! host can fall back to the lowlat display pipeline or the FFmpeg adapter.
+//! without linking Xlib or adding a dependency. It is used for display
+//! diagnostics (`OPENSTREAM_LIST_DISPLAYS=1` and `--preflight`). The actual
+//! external X11 frame source is FFmpeg's `x11grab` profile; the native host
+//! capture path is DRM/KMS scanout in `lowlat-host`.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -160,6 +160,12 @@ impl Connection {
         let stream = match addr {
             DisplayAddr::Unix { path, .. } => {
                 let stream = UnixStream::connect(path).map_err(Error::Io)?;
+                stream
+                    .set_read_timeout(Some(IO_TIMEOUT))
+                    .map_err(Error::Io)?;
+                stream
+                    .set_write_timeout(Some(IO_TIMEOUT))
+                    .map_err(Error::Io)?;
                 Stream::Unix(stream)
             }
             DisplayAddr::Tcp { host, port, .. } => {

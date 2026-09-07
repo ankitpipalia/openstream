@@ -45,6 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::var("OPENSTREAM_LIST_DISPLAYS").as_deref() == Ok("1") {
         return list_displays();
     }
+    if env::args().any(|argument| argument == "--preflight")
+        || env::var("OPENSTREAM_LINUX_HOST_PREFLIGHT").as_deref() == Ok("1")
+    {
+        return preflight();
+    }
     let pairing: Pairing = serde_json::from_str(
         &env::var("OPENSTREAM_PAIRING_JSON")
             .map_err(|_| "OPENSTREAM_PAIRING_JSON must contain the create-session response")?,
@@ -392,6 +397,214 @@ fn list_displays() -> Result<(), Box<dyn std::error::Error>> {
         })
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+/// Emit a bounded, secret-free Linux host readiness report and exit.
+///
+/// This deliberately reports facts instead of returning a single boolean:
+/// no display, an inaccessible framebuffer, a missing render node, a missing
+/// FFmpeg executable, and a missing PipeWire session require different fixes.
+/// A successful preflight is not a substitute for a real ten-minute stream
+/// acceptance run because encoder/driver compatibility is only fully proven
+/// when a frame is submitted.
+fn preflight() -> Result<(), Box<dyn std::error::Error>> {
+    use lowlat::display::{Capturable, Display};
+    use openstream_platform::hwaccel::{EncoderCodec, HwReport};
+
+    let outputs = Display::outputs();
+    let capture = Display::capturable();
+    let capture_name = match capture {
+        Capturable::Yes => "yes",
+        Capturable::NothingLit => "nothing_lit",
+        Capturable::NotReachable => "not_reachable",
+    };
+    let output_json = outputs
+        .iter()
+        .map(|output| {
+            let placement = output.place.map(|place| {
+                serde_json::json!({
+                    "x": place.x,
+                    "y": place.y,
+                    "width": place.width,
+                    "height": place.height,
+                    "desktop_width": place.desktop_width,
+                    "desktop_height": place.desktop_height,
+                })
+            });
+            serde_json::json!({
+                "id": output.id,
+                "connector": output.connector,
+                "width": output.width,
+                "height": output.height,
+                "driver": Display::driver(Some(&output.id)),
+                "placement": placement,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let x11 = match x11::Connection::open(None) {
+        Ok(connection) => serde_json::json!({
+            "available": true,
+            "screens": connection.screens.iter().map(|screen| serde_json::json!({
+                "index": screen.index,
+                "width_px": screen.width_px,
+                "height_px": screen.height_px,
+                "root_depth": screen.root_depth,
+            })).collect::<Vec<_>>(),
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "error": error.to_string(),
+        }),
+    };
+    let pipewire = match pipewire::list_source_nodes() {
+        Ok(nodes) => serde_json::json!({
+            "available": true,
+            "sources": nodes.iter().map(|node| serde_json::json!({
+                "id": node.id,
+                "name": node.name,
+                "media_class": node.media_class,
+                "object_serial": node.object_serial,
+            })).collect::<Vec<_>>(),
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "error": error.to_string(),
+        }),
+    };
+
+    let hardware = HwReport::probe();
+    let ffmpeg = command_probe(
+        &env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string()),
+        &["-hide_banner", "-loglevel", "error", "-version"],
+    );
+    let report = serde_json::json!({
+        "schema": 1,
+        "platform": {
+            "os": env::consts::OS,
+            "arch": env::consts::ARCH,
+            "display_env_set": env::var_os("DISPLAY").is_some(),
+            "wayland_display_env_set": env::var_os("WAYLAND_DISPLAY").is_some(),
+        },
+        "native_drm": {
+            "capturable": capture_name,
+            "outputs": output_json,
+            "host_capture_gate": capture == Capturable::Yes,
+        },
+        "x11": x11,
+        "pipewire": pipewire,
+        "ffmpeg": ffmpeg,
+        "hardware": {
+            "vaapi_render_node": hardware.vaapi_render_node(),
+            "nvenc_library": hardware.nvenc_library,
+            "nvenc_library_location": hardware.nvenc_library_location(),
+            "nvidia_smi": hardware.nvidia_smi,
+            "preferred_h264_encoder": hardware.preferred_encoder(EncoderCodec::H264),
+            "preferred_h265_encoder": hardware.preferred_encoder(EncoderCodec::H265),
+        },
+        "input": {
+            "uinput_present": std::fs::metadata("/dev/uinput").is_ok(),
+            "enabled_by_policy": env::var("OPENSTREAM_ENABLE_INPUT").as_deref() == Ok("1"),
+        },
+        "audio": {
+            "requested": env::var("OPENSTREAM_AUDIO").as_deref() == Ok("1"),
+            "server_configured": env::var_os("OPENSTREAM_AUDIO_SERVER").is_some(),
+            "device_configured": env::var_os("OPENSTREAM_AUDIO_DEVICE").is_some(),
+        },
+        "acceptance": {
+            "preflight_is_not_live_stream_test": true,
+            "encoder_submission": "not tested; run the native host with a real pairing",
+            "recommended_command": "openstream-linux-host --preflight",
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn command_probe(program: &str, args: &[&str]) -> serde_json::Value {
+    use std::process::{Command, Stdio};
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return serde_json::json!({
+                "program": program,
+                "available": false,
+                "error": error.to_string(),
+            });
+        }
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return serde_json::json!({
+                    "program": program,
+                    "available": status.success(),
+                    "exit_code": status.code(),
+                });
+            }
+            Ok(None) if started.elapsed() > Duration::from_secs(3) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return serde_json::json!({
+                    "program": program,
+                    "available": false,
+                    "timed_out": true,
+                });
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return serde_json::json!({
+                    "program": program,
+                    "available": false,
+                    "error": error.to_string(),
+                });
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::command_probe;
+
+    #[test]
+    fn command_probe_reports_a_fixed_successful_command() {
+        let report = command_probe("true", &[]);
+        assert_eq!(
+            report.get("available").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            report.get("exit_code").and_then(|value| value.as_i64()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn command_probe_reports_missing_program_without_panicking() {
+        let report = command_probe("openstream-command-that-does-not-exist", &[]);
+        assert_eq!(
+            report.get("available").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(
+            report
+                .get("error")
+                .and_then(|value| value.as_str())
+                .is_some()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

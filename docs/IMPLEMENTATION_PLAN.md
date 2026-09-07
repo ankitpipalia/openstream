@@ -125,11 +125,13 @@ those figures as acceptance guidance rather than a protocol requirement.
 
 ## Phase 3 — Linux host
 
-- [x] Native X11 display adapter: pure-std setup/screens enumeration plus
-  raw ZPixmap capture with typed fallbacks (`OPENSTREAM_LIST_DISPLAYS=1`);
-  the streaming path continues through the lowlat display pipeline.
+- [x] Native Linux DRM/KMS scanout capture: output/framebuffer discovery,
+  device-buffer export, pointer-plane support, device-side conversion, and
+  bounded encoder integration through the lowlat display pipeline.
+- [x] X11 setup/screens enumeration for diagnostics; actual X11 frame capture
+  is the external FFmpeg `x11grab` profile, not a hidden raw-ZPixmap fallback.
 - [x] Native PipeWire source discovery (`pw-dump` node list, shell-free) plus
-  the FFmpeg `pipewire` capture profile and node selection.
+  the external FFmpeg `pipewire` capture profile and node selection.
 - [x] Native H.264/HEVC encoder profiles through FFmpeg/libavcodec
   (`libx264`/`libx265` defaults, `h264_nvenc`/`hevc_nvenc`,
   `h264_vaapi`/`hevc_vaapi`, `auto` NVENC-first detection with software
@@ -138,9 +140,10 @@ those figures as acceptance guidance rather than a protocol requirement.
   `ffplay` presentation smoke path.
 - [x] Optional external FFmpeg PCM audio source, Opus packetization, and
   headless PCM output smoke path.
-- [x] VAAPI and NVENC adapters: filesystem/driver detection, capability
-  report, low-latency profile flags, and negotiated 10-bit/4:4:4 pixel-format
-  gating (`OPENSTREAM_VIDEO_ENCODER`, `OPENSTREAM_PIX_FMT`,
+- [x] VAAPI and NVENC adapters: bounded filesystem/driver detection, common
+  distribution library paths, explicit render-node override, low-latency
+  profile flags, and negotiated 10-bit/4:4:4 pixel-format gating
+  (`OPENSTREAM_VIDEO_ENCODER`, `OPENSTREAM_PIX_FMT`,
   `OPENSTREAM_ALLOW_10BIT/444`).
 - [x] Linux lowlat Opus system-audio capture with configurable device,
   bitrate, and local-mute policy; external FFmpeg remains the portable fallback.
@@ -171,8 +174,10 @@ those figures as acceptance guidance rather than a protocol requirement.
   (`deploy/openstream-linux-host-system.service` runs unattended as a
   dedicated system user; compositor-mediated capture stays session-bound).
 
-The Linux-only headless adapter now wires the imported display/encoder path to
-the OpenStream packetizer. The cross-platform external-FFmpeg adapter provides
+The Linux-only headless adapter now wires the imported DRM/KMS display/encoder
+path to the OpenStream packetizer. `openstream-linux-host --preflight` reports
+the native capture gate, outputs, X11/PipeWire availability, input device, and
+hardware candidates without exposing credentials. The cross-platform external-FFmpeg adapter provides
 an initial real H.264 source and basic host keyboard/pointer/wheel injection,
 and the client can hand the stream to `ffplay`; native GPU renderers, live
 OS-level virtual-microphone routing, and decoder-level keyframe acceptance

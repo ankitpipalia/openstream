@@ -22,9 +22,23 @@ impl HwReport {
     pub fn probe() -> Self {
         Self {
             vaapi_node: vaapi_node_present(),
-            nvenc_library: NVENC_CANDIDATES.iter().any(|path| path_exists(path)),
+            nvenc_library: nvenc_library_location().is_some(),
             nvidia_smi: command_exists("nvidia-smi"),
         }
+    }
+
+    /// Return the render node selected for VAAPI, if this report found one.
+    ///
+    /// The node is resolved again rather than stored in the compact boolean
+    /// report so callers can construct synthetic reports in tests and so the
+    /// public report remains cheap to copy.
+    pub fn vaapi_render_node(&self) -> Option<String> {
+        self.vaapi_node.then(vaapi_render_node).flatten()
+    }
+
+    /// Return the discovered NVIDIA encode library path, if any.
+    pub fn nvenc_library_location(&self) -> Option<String> {
+        self.nvenc_library.then(nvenc_library_location).flatten()
     }
 
     /// Best FFmpeg encoder this report supports for `codec`, or `None` when
@@ -78,9 +92,15 @@ impl EncoderCodec {
 
 const NVENC_CANDIDATES: &[&str] = &[
     "/usr/lib/x86_64-linux-gnu/libnvidia-encode.so.1",
+    "/usr/lib/x86_64-linux-gnu/nvidia/current/libnvidia-encode.so.1",
+    "/usr/lib/x86_64-linux-gnu/nvidia/libnvidia-encode.so.1",
     "/usr/lib/aarch64-linux-gnu/libnvidia-encode.so.1",
+    "/usr/lib/aarch64-linux-gnu/nvidia/current/libnvidia-encode.so.1",
+    "/usr/lib/aarch64-linux-gnu/nvidia/libnvidia-encode.so.1",
     "/usr/lib64/libnvidia-encode.so.1",
     "/usr/lib/libnvidia-encode.so.1",
+    "/usr/lib/wsl/lib/libnvidia-encode.so.1",
+    "/run/opengl-driver/lib/libnvidia-encode.so.1",
 ];
 
 fn path_exists(path: &str) -> bool {
@@ -91,10 +111,31 @@ fn vaapi_node_present() -> bool {
     vaapi_render_node().is_some()
 }
 
+fn nvenc_library_location() -> Option<String> {
+    if let Ok(path) = std::env::var("OPENSTREAM_NVENC_LIBRARY")
+        && !path.trim().is_empty()
+        && path_exists(&path)
+    {
+        return Some(path);
+    }
+    NVENC_CANDIDATES
+        .iter()
+        .find(|path| path_exists(path))
+        .map(|path| (*path).to_string())
+}
+
 /// Return a real render node instead of assuming the first GPU is always
 /// `renderD128`. Multi-GPU hosts commonly expose renderD129+ and selecting the
 /// wrong node makes FFmpeg fail after negotiation.
 fn vaapi_render_node() -> Option<String> {
+    if let Ok(path) = std::env::var("OPENSTREAM_VAAPI_RENDER_NODE") {
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        return (path.starts_with("/dev/dri/renderD") && path_exists(path))
+            .then(|| path.to_string());
+    }
     let mut nodes = std::fs::read_dir("/dev/dri")
         .ok()?
         .flatten()
@@ -115,13 +156,32 @@ fn vaapi_render_node() -> Option<String> {
 }
 
 fn command_exists(program: &str) -> bool {
-    std::process::Command::new(program)
+    let Ok(mut child) = std::process::Command::new(program)
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+        .spawn()
+    else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(2) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// FFmpeg output arguments for one hardware encoder profile.
@@ -185,7 +245,8 @@ pub fn ffmpeg_profile_args(
             );
         }
         "h264_vaapi" | "hevc_vaapi" => {
-            let render_node = vaapi_render_node().unwrap_or_else(|| "/dev/dri/renderD128".into());
+            let render_node = vaapi_render_node()
+                .ok_or_else(|| "no usable VAAPI render node was found".to_string())?;
             args.extend(
                 [
                     "-va_device",
@@ -311,12 +372,16 @@ mod tests {
 
     #[test]
     fn vaapi_profile_names_the_render_node() {
-        let args = ffmpeg_profile_args("h264_vaapi", 1280, 720, 30, 4.0, "yuv420p")
-            .expect("vaapi profile");
-        assert!(
-            args.iter()
-                .any(|argument| argument.starts_with("/dev/dri/renderD"))
-        );
+        match vaapi_render_node() {
+            Some(node) => {
+                let args = ffmpeg_profile_args("h264_vaapi", 1280, 720, 30, 4.0, "yuv420p")
+                    .expect("vaapi profile");
+                assert!(args.iter().any(|argument| argument == &node));
+            }
+            None => {
+                assert!(ffmpeg_profile_args("h264_vaapi", 1280, 720, 30, 4.0, "yuv420p").is_err())
+            }
+        }
     }
 
     #[test]

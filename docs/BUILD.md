@@ -256,6 +256,18 @@ The native Linux adapter uses the lowlat sound-server capture path when
 `OPENSTREAM_AUDIO_MUTE_LOCAL` as needed. The same client audio framing and
 Opus decoder consume either host implementation.
 
+Before starting a native Linux host, run
+[`scripts/linux-host-preflight.sh`](../scripts/linux-host-preflight.sh), or
+invoke `openstream-linux-host --preflight` directly.
+It emits bounded JSON describing DRM/KMS outputs and framebuffer reachability,
+X11 setup availability, PipeWire source discovery, FFmpeg presence, VAAPI/
+NVENC candidates, `/dev/uinput` presence, and audio configuration. It never
+prints pairing JSON, bearer tokens, addresses, or clipboard contents. A
+successful preflight is necessary but not sufficient: the native encoder and
+conversion driver still require a live paired stream. Set
+`OPENSTREAM_VAAPI_RENDER_NODE=/dev/dri/renderDNNN` when the automatically
+selected VAAPI node is not the device associated with the intended deployment.
+
 `openstream-mobile-ffi` builds the SDK-independent native bridge as a
 `cdylib`/`staticlib`; link it from the Android/iOS application and implement
 the decoder/presentation callbacks in the platform layer. Cross-compilation

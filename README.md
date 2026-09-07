@@ -73,6 +73,16 @@ Run the authenticated full-ICE loopback smoke separately:
 ./scripts/full-ice-smoke.sh
 ```
 
+On a Linux host, inspect native capture and device readiness before pairing:
+
+```sh
+./scripts/linux-host-preflight.sh
+```
+
+The report distinguishes DRM/KMS framebuffer reachability, X11/PipeWire
+availability, FFmpeg and hardware candidates, and `/dev/uinput` presence. It
+is diagnostic output, not proof of a live encoder/driver stream.
+
 To exercise the built-in opaque relay, configure a reachable relay endpoint
 and set `OPENSTREAM_FORCE_RELAY=1`. For local testing:
 
