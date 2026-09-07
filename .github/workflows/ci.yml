@@ -314,3 +314,37 @@ jobs:
         env:
           RUSTFLAGS: -Z sanitizer=address
           RUSTDOCFLAGS: -Z sanitizer=address
+
+  ci-gate:
+    name: CI gate
+    if: ${{ always() }}
+    needs:
+      - check
+      - openstream-portable
+      - openstream-target-matrix
+      - openstream-desktop-target-matrix
+      - loom
+      - deny
+      - smoke
+      - sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job to pass
+        env:
+          CHECK: ${{ needs.check.result }}
+          PORTABLE: ${{ needs.openstream-portable.result }}
+          TARGETS: ${{ needs.openstream-target-matrix.result }}
+          DESKTOP_TARGETS: ${{ needs.openstream-desktop-target-matrix.result }}
+          LOOM: ${{ needs.loom.result }}
+          DENY: ${{ needs.deny.result }}
+          SMOKE: ${{ needs.smoke.result }}
+          SANITIZERS: ${{ needs.sanitizers.result }}
+        run: |
+          for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
+              "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS"; do
+            if [ "$result" != success ]; then
+              echo "CI job result was $result" >&2
+              exit 1
+            fi
+          done
+          echo "all CI jobs passed"
