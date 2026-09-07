@@ -20,6 +20,11 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+fn main() {
+    linux::run();
+}
+
+#[cfg(target_os = "linux")]
 mod linux {
 
     use std::io::Write;
@@ -27,7 +32,7 @@ mod linux {
     use lowlat::display::{Display, Register, Registration};
     use lowlat_encode::{Poll, vaapi};
 
-    fn main() {
+    pub(super) fn run() {
         let mut args = std::env::args().skip(1);
         let wanted = args.next().filter(|arg| !arg.is_empty());
         let out = args

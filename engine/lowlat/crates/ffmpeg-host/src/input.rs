@@ -113,7 +113,7 @@ impl Drop for HostInput {
 }
 
 #[cfg(target_os = "linux")]
-struct LinuxInput {
+pub(crate) struct LinuxInput {
     injector: lowlat_inject::event::Injector,
     devices: lowlat_inject::uinput::Devices,
 }

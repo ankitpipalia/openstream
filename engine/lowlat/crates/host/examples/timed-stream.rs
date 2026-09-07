@@ -14,12 +14,17 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+fn main() {
+    linux::run();
+}
+
+#[cfg(target_os = "linux")]
 mod linux {
 
     use lowlat::stream::{Backend, Codec, Config, Stream};
     use lowlat::timing::Report;
 
-    fn main() {
+    pub(super) fn run() {
         let seconds: u64 = std::env::args()
             .nth(1)
             .and_then(|value| value.parse().ok())

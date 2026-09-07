@@ -42,7 +42,6 @@ lowlat-common = { path = "crates/common" }
 lowlat-core = { path = "crates/core" }
 lowlat-crypto = { path = "crates/crypto" }
 lowlat-net = { path = "crates/net" }
-lowlat-sim = { path = "crates/sim" }
 lowlat-capture = { path = "crates/capture" }
 lowlat-audio = { path = "crates/audio" }
 lowlat-encode = { path = "crates/encode" }
