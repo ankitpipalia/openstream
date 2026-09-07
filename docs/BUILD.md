@@ -8,6 +8,7 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
 ```
 
 The parser fuzz package is intentionally excluded from the normal workspace
@@ -27,8 +28,11 @@ These checks cover the protocol, signaling, simulator, codec framing, and
 platform-independent client logic. Hardware-dependent capture, encoder, audio,
 and `/dev/uinput` tests are ignored or skipped when the device is unavailable.
 
-The 2026-09-07 verification run passed all four commands above. The C ABI
-header also passes `clang -fsyntax-only -x c`.
+The 2026-09-07 verification run passed all five commands above. The dependency
+audit permits only a crate-scoped `CC0-1.0` exception for `hexf-parse`, the
+transitive shader-literal parser used by `wgpu`/`naga`; all other non-approved
+licenses remain rejected. The C ABI header also passes
+`clang -fsyntax-only -x c`.
 
 The latest local application smoke also completed over the current encrypted
 path: a 5-second FFmpeg test source delivered 164 H.264 access units, the
@@ -123,6 +127,11 @@ credentials and marshalled candidate strings through the WebSocket, completed
 ICE negotiation, and carried the same X25519/AES-GCM fragmented-video exchange;
 the client reassembled the 2,319-byte payload and the host received its ACK.
 This proves the local agent path, not an external coturn allocation.
+
+The GitHub Actions smoke job repeats the full-ICE loopback, runs a three-second
+encrypted FFmpeg test-pattern loopback, and executes the host-checkable mobile
+acceptance harness. These checks are deliberately separate from physical GPU,
+capture-device, TURN/public-NAT, and mobile-device acceptance.
 
 The application-owned relay was then exercised with
 `OPENSTREAM_FORCE_RELAY=1`. The pairing response advertised the relay,

@@ -38,6 +38,11 @@ allow = [
     # not touch the rule this file exists for.
     "CDLA-Permissive-2.0",
 ]
+# wgpu -> naga uses hexf-parse for hexadecimal shader literals. This is a
+# crate-scoped exception: CC0 is not accepted for any other dependency.
+exceptions = [
+    { allow = ["CC0-1.0"], name = "hexf-parse" },
+]
 
 [bans]
 multiple-versions = "warn"

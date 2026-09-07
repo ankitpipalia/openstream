@@ -22,6 +22,7 @@ implementation.
 | serde, serde_json, hex | Control-plane and key-message serialization | MIT/Apache-2.0 ecosystem crates |
 | minifb | Initial software-rendered desktop client window | MIT; native GPU renderers may replace it per platform |
 | wgpu | Optional native desktop texture presentation through Metal, Vulkan/OpenGL, and Direct3D12 backends | MIT/Apache-2.0 ecosystem crate; exact version is locked in `engine/lowlat/Cargo.lock` |
+| hexf-parse | Transitive `wgpu`/`naga` parser for hexadecimal shader literals | CC0-1.0; allowed only as a crate-scoped `cargo-deny` exception |
 | bytemuck, pollster | Pixel-slice casting and synchronous native-GPU initialization bridge | MIT/Apache-2.0 ecosystem crates; exact versions are locked in `engine/lowlat/Cargo.lock` |
 | gilrs | Cross-platform desktop gamepad event collection | Apache-2.0/MIT; exact version is locked in `engine/lowlat/Cargo.lock` |
 | webrtc-ice | Optional standards-based ICE/TURN agent in `openstream-client-core` | MIT/Apache-2.0; exact version is locked in `engine/lowlat/Cargo.lock` |

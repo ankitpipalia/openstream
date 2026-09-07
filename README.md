@@ -104,6 +104,7 @@ cargo check --workspace --locked
 cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 cargo test --workspace --all-features --locked -- --test-threads=1
 cargo check --manifest-path fuzz/Cargo.toml --locked
+cargo deny check
 cargo build --workspace --release --locked
 ```
 
@@ -145,11 +146,15 @@ commit it, put it in a public issue, or include it in logs.
 ## Current status
 
 The local development path is functional and validated through direct UDP,
-forced relay, and authenticated loopback ICE. The implementation is not yet a
-finished product: public-NAT/coturn interoperability, long-run Linux hardware
-acceptance, exact Direct3D11/native GPU-driver acceptance, OS virtual
-microphone routing, Android/iOS device builds, USB passthrough, and multi-guest
-media fan-out remain tracked work.
+forced relay, and authenticated loopback ICE. The GitHub workflow also runs
+the full-ICE loopback, a short encrypted FFmpeg media loopback, and the
+host-checkable mobile acceptance harness on Ubuntu. The implementation is not
+yet a finished product: public-NAT/coturn interoperability, long-run Linux
+hardware acceptance, exact Direct3D11/native GPU-driver acceptance, durable
+signaling/account state, native Windows/macOS hosting, native desktop audio,
+OS virtual microphone routing, virtual displays, Windows/macOS virtual
+gamepads, Android/iOS device builds, USB passthrough, and multi-guest media
+fan-out remain tracked work.
 
 The legacy `lowlat-tray` binary is intentionally not load-bearing and remains
 an open compatibility-engine phase. It is separate from the OpenStream

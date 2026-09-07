@@ -9,6 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: engine/lowlat
@@ -263,6 +266,36 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: Deny
         run: cargo deny check
+
+  smoke:
+    name: protocol and media smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl ffmpeg
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/lowlat/target
+          key: ${{ runner.os }}-cargo-smoke-${{ hashFiles('**/Cargo.lock') }}
+      - name: Full ICE authenticated loopback
+        run: timeout 180s ./scripts/full-ice-smoke.sh
+        working-directory: .
+      - name: FFmpeg encrypted media loopback
+        run: >-
+          OPENSTREAM_DEMO_SECONDS=3
+          OPENSTREAM_DEMO_OUTPUT="$RUNNER_TEMP/openstream-demo.h264"
+          timeout 180s ./scripts/run-local-demo.sh
+        working-directory: .
+      - name: Host-checkable mobile acceptance
+        run: ./scripts/mobile-acceptance.sh
+        working-directory: .
 
   sanitizers:
     name: sanitizers
