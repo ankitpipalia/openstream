@@ -128,7 +128,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Install Android SDK tooling
         if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4.0.1
       - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android'
         run: sdkmanager "ndk;26.3.11579264"
@@ -348,3 +348,4 @@ jobs:
             fi
           done
           echo "all CI jobs passed"
+        working-directory: .
