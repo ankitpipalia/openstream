@@ -270,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 reliable_control.retry(&mut session).await?;
+                session.maintain_liveness().await?;
                 if let Some(adaptive) = adaptive.as_mut()
                     && let Some(decision) = adaptive.tick(
                         started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),

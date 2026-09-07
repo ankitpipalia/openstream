@@ -330,6 +330,9 @@ struct CreateGuest {
 
 #[derive(Debug, Serialize)]
 struct GuestCreated {
+    /// Stable non-secret identifier used by management endpoints. The bearer
+    /// token is returned separately and must never be placed in a URL.
+    guest_id: String,
     guest_token: String,
     input: bool,
 }
@@ -360,8 +363,9 @@ async fn create_guest(
         return (StatusCode::CONFLICT, "guest cap reached\n").into_response();
     }
     let token = Uuid::new_v4().simple().to_string();
+    let guest_id = Uuid::new_v4().simple().to_string();
     session.guests.push_back(Guest {
-        id: Uuid::new_v4().simple().to_string(),
+        id: guest_id.clone(),
         token: token.clone(),
         input: request.input,
         sender: None,
@@ -371,6 +375,7 @@ async fn create_guest(
         generation: 0,
     });
     Json(GuestCreated {
+        guest_id,
         guest_token: token,
         input: request.input,
     })
@@ -401,12 +406,12 @@ async fn list_guests(
     Json(guests).into_response()
 }
 
-/// Kick one admitted guest by full token. Authenticated by the host role
-/// token or the admin token; the guest WebSocket is closed promptly.
+/// Kick one admitted guest by its stable non-secret id. Authenticated by the
+/// host role token or the admin token; the guest WebSocket is closed promptly.
 async fn kick_guest(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path((session_id, guest_token)): Path<(String, String)>,
+    Path((session_id, guest_id)): Path<(String, String)>,
 ) -> Response {
     let (sender, promotion) = {
         let mut sessions = state.sessions.lock().await;
@@ -422,11 +427,7 @@ async fn kick_guest(
         if !(host || admin) {
             return (StatusCode::UNAUTHORIZED, "host authorization required\n").into_response();
         }
-        let Some(position) = session
-            .guests
-            .iter()
-            .position(|guest| ct_eq(&guest.token, &guest_token))
-        else {
+        let Some(position) = session.guests.iter().position(|guest| guest.id == guest_id) else {
             return (StatusCode::NOT_FOUND, "unknown guest\n").into_response();
         };
         let kicked = session
@@ -593,7 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             post(create_guest).get(list_guests),
         )
         .route(
-            "/v1/session/{session_id}/guests/{guest_token}",
+            "/v1/session/{session_id}/guests/{guest_id}",
             axum::routing::delete(kick_guest),
         )
         .route("/v1/signal/{session_id}/{role}", get(signal_socket))
@@ -774,12 +775,18 @@ async fn session_turn(
     let remaining = session
         .expires_at
         .saturating_duration_since(Instant::now())
-        .as_secs()
-        .max(1);
-    let mut issued = turn.issue(&session_id, role, turn::now_unix());
-    if issued.ttl_seconds > remaining {
-        issued = turn.issue_with_ttl(&session_id, role, turn::now_unix(), remaining);
-    }
+        .as_secs();
+    let Some(issued) = turn.issue_for_session(&session_id, role, turn::now_unix(), remaining)
+    else {
+        // The TURN REST API has a minimum useful credential lifetime. Refuse
+        // a nearly expired session instead of minting a credential that would
+        // remain valid after the OpenStream session is gone.
+        return (
+            StatusCode::CONFLICT,
+            "session expires too soon for a TURN credential\n",
+        )
+            .into_response();
+    };
     Json(TurnIssued {
         username: issued.username,
         password: issued.password,
@@ -1125,12 +1132,9 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                     }
                     continue;
                 }
-                let valid_object = serde_json::from_str::<serde_json::Value>(&text)
-                    .map(|value| value.is_object())
-                    .unwrap_or(false);
-                if !valid_object {
+                if let Err(reason) = validate_signal_message(&text) {
                     if out_tx.try_send(Message::Text(
-                        "{\"type\":\"error\",\"reason\":\"invalid_json\"}".into(),
+                        format!("{{\"type\":\"error\",\"reason\":\"{reason}\"}}").into(),
                     )).is_err() {
                         break;
                     }
@@ -1310,6 +1314,105 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
     if let Some(promotion) = promotion {
         let _ = promotion.try_send(Message::Text("{\"type\":\"promoted\"}".into()));
     }
+}
+
+/// Validate every signaling envelope before it is forwarded to another
+/// authenticated role. Forwarding opaque JSON is convenient during early
+/// development, but accepting arbitrary object types allows malformed or
+/// unexpected messages to reach every peer and makes protocol evolution
+/// ambiguous. The exact field semantics are validated again by
+/// `openstream-client-core`; this layer establishes a small, bounded message
+/// vocabulary and protects the signaling service itself.
+fn validate_signal_message(text: &str) -> Result<(), &'static str> {
+    let value = serde_json::from_str::<serde_json::Value>(text).map_err(|_| "invalid_json")?;
+    let object = value.as_object().ok_or("message_must_be_object")?;
+    let message_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("message_type_missing")?;
+
+    match message_type {
+        "candidate" => {
+            let kind = object
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("candidate_kind_missing")?;
+            if !matches!(kind, "host" | "mapped" | "server_reflexive" | "relay") {
+                return Err("candidate_kind_invalid");
+            }
+            let ip = object
+                .get("ip")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("candidate_ip_missing")?;
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                return Err("candidate_ip_invalid");
+            }
+            let port = object
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("candidate_port_missing")?;
+            if !(1..=u64::from(u16::MAX)).contains(&port) {
+                return Err("candidate_port_invalid");
+            }
+        }
+        "candidate_done" => {
+            let count = object
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("candidate_count_missing")?;
+            if !(1..=32).contains(&count) {
+                return Err("candidate_count_invalid");
+            }
+        }
+        "key" => {
+            if !valid_hex_field(object, "public_key", 32)
+                || !valid_hex_field(object, "identity_public_key", 32)
+                || !valid_hex_field(object, "signature", 64)
+            {
+                return Err("key_encoding_invalid");
+            }
+        }
+        "ice_credentials" => {
+            if !bounded_string_field(object, "ufrag", 1, 32)
+                || !bounded_string_field(object, "pwd", 1, 256)
+            {
+                return Err("ice_credentials_invalid");
+            }
+        }
+        "ice_candidate" => {
+            if !bounded_string_field(object, "candidate", 1, 4096) {
+                return Err("ice_candidate_invalid");
+            }
+        }
+        "ice_candidate_done" => {}
+        _ => return Err("unsupported_message_type"),
+    }
+    Ok(())
+}
+
+fn bounded_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    minimum: usize,
+    maximum: usize,
+) -> bool {
+    object
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.len() >= minimum && value.len() <= maximum)
+}
+
+fn valid_hex_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    bytes: usize,
+) -> bool {
+    object
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| {
+            value.len() == bytes * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// Clear the relay slot owned by `owner` ("host", "client", or a guest id),
@@ -1562,6 +1665,7 @@ mod tests {
         CreationLimiter, Guest, MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE,
         RELAY_BYTES_PER_SECOND, RELAY_PACKETS_PER_SECOND, RelaySlot, SESSION_CREATE_WINDOW,
         authorized, bearer_token, max_guests_for_new_session, relay_ticket,
+        validate_signal_message,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use std::time::{Duration, Instant};
@@ -1704,5 +1808,53 @@ mod tests {
         assert!(limiter.allow(start + SESSION_CREATE_WINDOW));
         assert_eq!(limiter.events.len(), 1);
         assert!(limiter.allow(start + SESSION_CREATE_WINDOW + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn signaling_validator_accepts_current_establishment_messages() {
+        assert!(
+            validate_signal_message(
+                r#"{"type":"candidate","kind":"host","ip":"127.0.0.1","port":4000}"#
+            )
+            .is_ok()
+        );
+        assert!(validate_signal_message(r#"{"type":"candidate_done","count":1}"#).is_ok());
+        assert!(
+            validate_signal_message(&format!(
+                r#"{{"type":"key","public_key":"{}","identity_public_key":"{}","signature":"{}"}}"#,
+                "aa".repeat(32),
+                "bb".repeat(32),
+                "cc".repeat(64),
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_signal_message(
+                r#"{"type":"ice_credentials","ufrag":"short","pwd":"long-password"}"#
+            )
+            .is_ok()
+        );
+        assert!(validate_signal_message(
+            r#"{"type":"ice_candidate","candidate":"candidate:1 1 udp 1 127.0.0.1 4000 typ host"}"#
+        )
+        .is_ok());
+        assert!(validate_signal_message(r#"{"type":"ice_candidate_done"}"#).is_ok());
+    }
+
+    #[test]
+    fn signaling_validator_rejects_unknown_and_malformed_messages() {
+        for message in [
+            r#"[]"#,
+            r#"{"type":"unknown"}"#,
+            r#"{"type":"candidate","kind":"host","ip":"not-an-ip","port":4000}"#,
+            r#"{"type":"candidate","kind":"host","ip":"127.0.0.1","port":0}"#,
+            r#"{"type":"key","public_key":"00"}"#,
+            r#"{"type":"ice_candidate","candidate":""}"#,
+        ] {
+            assert!(
+                validate_signal_message(message).is_err(),
+                "accepted {message}"
+            );
+        }
     }
 }

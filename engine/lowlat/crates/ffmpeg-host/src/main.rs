@@ -383,6 +383,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     reliable_control.send(&mut session, &rumble.encode()).await?;
                 }
                 reliable_control.retry(&mut session).await?;
+                session.maintain_liveness().await?;
                 let now = Instant::now();
                 let force_keyframe_restart = keyframe_requested
                     && last_restart

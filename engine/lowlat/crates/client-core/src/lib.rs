@@ -60,6 +60,16 @@ pub const MAX_CONTROL_PENDING: usize = 64;
 /// the server's WebSocket ceiling and prevents a client from retaining a
 /// large attacker-controlled value while it waits for a later phase.
 pub const MAX_SIGNAL_MESSAGE_BYTES: usize = 64 * 1024;
+/// Retransmit an unacknowledged capability/control frame at a bounded cadence.
+/// Establishment needs this before the normal application event loops exist.
+const CAPABILITY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// Direct UDP has no ICE consent agent. Send an authenticated application
+/// keepalive when an otherwise quiet stream reaches this interval.
+const DIRECT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// A direct path that produces no authenticated packet for this long is
+/// considered dead. Full ICE retains its own consent freshness and is not
+/// subject to this application-data timeout.
+const DIRECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Video codecs understood by the initial OpenStream clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -951,6 +961,8 @@ pub struct PeerSession {
     /// before the other side has left the probe loop. Preserve that
     /// authenticated packet instead of dropping it at the phase boundary.
     prefetched: Option<Packet>,
+    /// Last direct-path keepalive sent by the owning event loop.
+    last_keepalive: std::time::Instant,
 }
 
 /// Bounded ordered control helper layered over a [`PeerSession`].
@@ -1321,6 +1333,7 @@ impl PeerSession {
             cipher: CipherSession::new(keys.tx, keys.rx),
             stats: SessionStats::default(),
             prefetched: None,
+            last_keepalive: std::time::Instant::now(),
         })
     }
 
@@ -1533,6 +1546,7 @@ impl PeerSession {
                     cipher,
                     stats: SessionStats::default(),
                     prefetched,
+                    last_keepalive: std::time::Instant::now(),
                 });
             }
         }
@@ -1572,6 +1586,20 @@ impl PeerSession {
             DataPath::Direct { transport, .. } => transport.release_upnp().await?,
             DataPath::Ice(_) => {}
         }
+        Ok(())
+    }
+
+    /// Send an authenticated liveness packet for a direct UDP path when the
+    /// caller's event loop reaches the keepalive interval. Full ICE already
+    /// owns consent freshness, so this is intentionally a no-op there.
+    pub async fn maintain_liveness(&mut self) -> Result<(), Error> {
+        if !matches!(&self.transport, DataPath::Direct { .. })
+            || self.last_keepalive.elapsed() < DIRECT_KEEPALIVE_INTERVAL
+        {
+            return Ok(());
+        }
+        self.send(Kind::Control, 0, 0, PATH_KEEPALIVE).await?;
+        self.last_keepalive = std::time::Instant::now();
         Ok(())
     }
 
@@ -1615,10 +1643,12 @@ impl PeerSession {
                 packet
             } else {
                 match &self.transport {
-                    DataPath::Direct { transport, .. } => transport
-                        .recv(&mut self.cipher)
-                        .await
-                        .map_err(Error::from)?,
+                    DataPath::Direct { transport, .. } => {
+                        tokio::time::timeout(DIRECT_IDLE_TIMEOUT, transport.recv(&mut self.cipher))
+                            .await
+                            .map_err(|_| Error::Timeout("direct data path liveness"))?
+                            .map_err(Error::from)?
+                    }
                     DataPath::Ice(path) => {
                         let mut datagram = [0_u8; MAX_DATAGRAM];
                         let length = path
@@ -1637,6 +1667,13 @@ impl PeerSession {
             // handshake traffic, not application control messages; consume
             // them here so they cannot be parsed as capabilities.
             if is_path_probe_packet(&packet) {
+                continue;
+            }
+            if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE {
+                self.send(Kind::Control, 0, 0, PATH_KEEPALIVE_ACK).await?;
+                continue;
+            }
+            if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE_ACK {
                 continue;
             }
             self.stats.received_packets = self.stats.received_packets.saturating_add(1);
@@ -1661,23 +1698,32 @@ impl PeerSession {
     ) -> Result<NegotiatedCapabilities, Error> {
         let hello =
             encode_hello(host.clone()).map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        self.send(Kind::Control, 0, 0, &hello).await?;
-        let packet = tokio::time::timeout(PHASE_TIMEOUT, self.recv())
-            .await
-            .map_err(|_| Error::Timeout("host capability acknowledgement"))??;
-        if packet.kind != Kind::Control {
-            return Err(Error::InvalidMessage(
-                "capability acknowledgement is not control data".into(),
-            ));
+        let mut reliable = ReliableControl::new(MAX_CONTROL_PENDING);
+        reliable.send(self, &hello).await?;
+        let deadline = TokioInstant::now() + PHASE_TIMEOUT;
+        let mut next_retry = TokioInstant::now() + CAPABILITY_RETRY_INTERVAL;
+        loop {
+            let deliveries = self
+                .receive_reliable_packet(
+                    &mut reliable,
+                    deadline,
+                    &mut next_retry,
+                    "host capability acknowledgement",
+                )
+                .await?;
+            let Some(payload) = deliveries.into_iter().next() else {
+                continue;
+            };
+            let message = decode_capability_message(&payload)
+                .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+            let CapabilityMessage::HelloAck { capabilities } = message else {
+                return Err(Error::InvalidMessage(
+                    "host expected a capability acknowledgement".into(),
+                ));
+            };
+            return negotiate(&host, &capabilities)
+                .map_err(|error| Error::InvalidMessage(error.to_string()));
         }
-        let message = decode_capability_message(&packet.payload)
-            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        let CapabilityMessage::HelloAck { capabilities } = message else {
-            return Err(Error::InvalidMessage(
-                "host expected a capability acknowledgement".into(),
-            ));
-        };
-        negotiate(&host, &capabilities).map_err(|error| Error::InvalidMessage(error.to_string()))
     }
 
     /// Run the encrypted client-side capability exchange.
@@ -1691,34 +1737,96 @@ impl PeerSession {
         &mut self,
         client: Capabilities,
     ) -> Result<NegotiatedCapabilities, Error> {
-        let packet = tokio::time::timeout(PHASE_TIMEOUT, self.recv())
-            .await
-            .map_err(|_| Error::Timeout("client capability hello"))??;
-        if packet.kind != Kind::Control {
-            return Err(Error::InvalidMessage(
-                "capability hello is not control data".into(),
-            ));
-        }
-        let message = decode_capability_message(&packet.payload)
-            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        let CapabilityMessage::Hello {
-            role: CapabilityRole::Host,
-            capabilities: host,
-        } = message
-        else {
-            return Err(Error::InvalidMessage(
-                "client expected a host capability hello".into(),
-            ));
+        let mut reliable = ReliableControl::new(MAX_CONTROL_PENDING);
+        let deadline = TokioInstant::now() + PHASE_TIMEOUT;
+        let mut next_retry = TokioInstant::now() + CAPABILITY_RETRY_INTERVAL;
+        let host = loop {
+            let deliveries = self
+                .receive_reliable_packet(
+                    &mut reliable,
+                    deadline,
+                    &mut next_retry,
+                    "client capability hello",
+                )
+                .await?;
+            let mut host = None;
+            for payload in deliveries {
+                let message = decode_capability_message(&payload)
+                    .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+                let CapabilityMessage::Hello {
+                    role: CapabilityRole::Host,
+                    capabilities,
+                } = message
+                else {
+                    return Err(Error::InvalidMessage(
+                        "client expected a host capability hello".into(),
+                    ));
+                };
+                host = Some(capabilities);
+            }
+            if let Some(host) = host {
+                break host;
+            }
         };
         let ack = encode_hello_ack(client.clone())
             .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        self.send(Kind::Control, 0, 0, &ack).await?;
+        reliable.send(self, &ack).await?;
+        // The host acknowledges the client's HelloAck. Waiting for that
+        // acknowledgement prevents the client from returning to its media
+        // loop after a one-way packet loss and gives the host a chance to
+        // finish the same ordered handshake.
+        while reliable.outstanding() != 0 {
+            let _ = self
+                .receive_reliable_packet(
+                    &mut reliable,
+                    deadline,
+                    &mut next_retry,
+                    "client capability acknowledgement",
+                )
+                .await?;
+        }
         negotiate(&host, &client).map_err(|error| Error::InvalidMessage(error.to_string()))
+    }
+
+    /// Receive one valid reliable-control frame during establishment. Raw
+    /// control packets are ignored so path probes or legacy close markers do
+    /// not get mistaken for capability messages. A retry is driven whenever
+    /// the bounded interval elapses, and the overall phase remains finite.
+    async fn receive_reliable_packet(
+        &mut self,
+        reliable: &mut ReliableControl,
+        deadline: TokioInstant,
+        next_retry: &mut TokioInstant,
+        phase: &'static str,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        loop {
+            let now = TokioInstant::now();
+            if now >= deadline {
+                return Err(Error::Timeout(phase));
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let until_retry = next_retry.saturating_duration_since(now);
+            let wait = remaining.min(until_retry.max(Duration::from_millis(1)));
+            match tokio::time::timeout(wait, self.recv()).await {
+                Ok(Ok(packet)) => {
+                    if let Some(deliveries) = reliable.receive(self, &packet).await? {
+                        return Ok(deliveries);
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    reliable.retry(self).await?;
+                    *next_retry = TokioInstant::now() + CAPABILITY_RETRY_INTERVAL;
+                }
+            }
+        }
     }
 }
 
 const PATH_PROBE: &[u8] = b"openstream/path-probe/v1";
 const PATH_PROBE_ACK: &[u8] = b"openstream/path-probe-ack/v1";
+const PATH_KEEPALIVE: &[u8] = b"openstream/path-keepalive/v1";
+const PATH_KEEPALIVE_ACK: &[u8] = b"openstream/path-keepalive-ack/v1";
 
 #[derive(Debug, Clone, Copy)]
 struct PeerKey {

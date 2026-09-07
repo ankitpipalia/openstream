@@ -179,8 +179,10 @@ restart and is acknowledged as such.
 
 The signaling service admits guests beyond the legacy client token:
 host-minted guest bearer tokens with input tiers
-(`POST /v1/session/{id}/guests`), redacted listing, and kick with prompt
-close. Media stays 1:1 — the first connected guest with no legacy client
+(`POST /v1/session/{id}/guests`), redacted listing, and kick by the returned
+non-secret `guest_id` (`DELETE /v1/session/{id}/guests/{guest_id}`) with prompt
+close. The guest bearer token is returned only in the create response and is
+sent in the WebSocket `Authorization` header, never in a management URL. Media stays 1:1 — the first connected guest with no legacy client
 attached goes active while the rest park with promotion on disconnect; the
 active guest may use the relay under the client role. Session-scoped TURN
 credentials come from `GET /v1/session/{id}/turn` (TURN REST HMAC-SHA1 over

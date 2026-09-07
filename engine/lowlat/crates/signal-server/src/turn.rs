@@ -97,14 +97,10 @@ impl TurnConfig {
         })
     }
 
-    /// Mint credentials for one session role at `now_unix`.
-    pub(crate) fn issue(&self, session_id: &str, role: &str, now_unix: u64) -> TurnCredentials {
-        self.issue_with_ttl(session_id, role, now_unix, self.ttl_seconds)
-    }
-
-    /// Mint credentials with an explicit TTL (already clamped to the session
-    /// lifetime by the caller). TTLs below the minimum are raised to it so a
-    /// nearly-expired session still yields a usable coturn credential.
+    /// Mint credentials with an explicit TTL. This low-level helper keeps its
+    /// historical minimum clamp; callers that bind credentials to a session
+    /// lifetime must use [`TurnConfig::issue_for_session`] so a nearly expired
+    /// session is rejected rather than extended past its own expiry.
     pub(crate) fn issue_with_ttl(
         &self,
         session_id: &str,
@@ -117,6 +113,28 @@ impl TurnConfig {
         issued.urls = self.urls.clone();
         issued.realm = self.realm.clone();
         issued
+    }
+
+    /// Mint a credential that cannot outlive the OpenStream session. TURN's
+    /// classic REST format has a practical minimum lifetime in this service;
+    /// returning `None` is safer than issuing a credential that survives a
+    /// session which is about to expire.
+    pub(crate) fn issue_for_session(
+        &self,
+        session_id: &str,
+        role: &str,
+        now_unix: u64,
+        remaining_seconds: u64,
+    ) -> Option<TurnCredentials> {
+        if remaining_seconds < MIN_TURN_TTL_SECONDS {
+            return None;
+        }
+        Some(self.issue_with_ttl(
+            session_id,
+            role,
+            now_unix,
+            self.ttl_seconds.min(remaining_seconds),
+        ))
     }
 }
 
@@ -271,5 +289,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn session_scoped_credentials_never_outlive_the_session() {
+        let config = TurnConfig {
+            secret: b"test-secret-0123456789".to_vec(),
+            realm: "openstream".into(),
+            urls: vec!["turn:turn.example:3478".into()],
+            ttl_seconds: 3600,
+        };
+        assert!(
+            config
+                .issue_for_session("session", "host", 1_700_000_000, 59)
+                .is_none()
+        );
+        assert_eq!(
+            config
+                .issue_for_session("session", "host", 1_700_000_000, 60)
+                .expect("minimum lifetime is usable")
+                .ttl_seconds,
+            60
+        );
+        assert_eq!(
+            config
+                .issue_for_session("session", "host", 1_700_000_000, 120)
+                .expect("session lifetime caps the credential")
+                .ttl_seconds,
+            120
+        );
     }
 }

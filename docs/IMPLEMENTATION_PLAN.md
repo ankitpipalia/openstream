@@ -3,6 +3,28 @@
 This is the execution plan, not a claim that every phase is complete. Each
 phase has a concrete gate and must remain honest about what it verifies.
 
+## Engineering hardening P0 — correctness, security, and liveness
+
+- [x] Replace guest bearer-token management URLs with stable non-secret guest
+  identifiers; retain the bearer only in the create response and WebSocket
+  `Authorization` header.
+- [x] Prevent session-scoped TURN credentials from surviving the session's
+  remaining lifetime; reject issuance when the remaining lifetime is below the
+  configured minimum.
+- [x] Validate the current signaling message vocabulary and bounded fields
+  before forwarding messages between roles.
+- [x] Make capability negotiation use the bounded reliable-control channel with
+  retransmission and an acknowledgement barrier on both sides.
+- [x] Add authenticated direct-UDP keepalives and a finite direct-path idle
+  timeout; wire liveness maintenance into every OpenStream host/client loop.
+- [x] Bound desktop UI and input queues so a stalled renderer or network worker
+  cannot grow memory without limit.
+
+Gate: focused service/client/desktop tests, the complete locked workspace test
+suite, clippy with warnings denied, and both local FFmpeg and full-ICE smoke
+paths pass. External coturn, physical NAT, hardware, and stock Parsec
+interoperability remain separate acceptance gates.
+
 ## Phase 0 — workspace and evidence
 
 - [x] Preserve the supplied Parsec artifacts as analysis inputs.

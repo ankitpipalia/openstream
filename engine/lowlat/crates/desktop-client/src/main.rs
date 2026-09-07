@@ -13,7 +13,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -45,6 +45,14 @@ mod render;
 
 const DEFAULT_WIDTH: usize = 1280;
 const DEFAULT_HEIGHT: usize = 720;
+/// A slow window must not let decoded frames or status messages accumulate
+/// without bound. New frames are dropped when the UI is behind; the next
+/// frame is still a complete decoded image.
+const UI_QUEUE_CAPACITY: usize = 8;
+/// Input is sampled at the UI rate and must remain bounded if the network
+/// worker is stalled. The queue is intentionally larger than the UI queue so
+/// short scheduling pauses do not drop normal keyboard transitions.
+const INPUT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
 enum UiMessage {
@@ -71,6 +79,18 @@ enum UiMessage {
     End,
 }
 
+/// Non-blocking bounded sender used by the network worker. Blocking the
+/// transport on a stalled desktop window would turn a rendering problem into
+/// a connection-wide deadlock; dropping a stale UI update is safer.
+#[derive(Clone)]
+struct UiSender(SyncSender<UiMessage>);
+
+impl UiSender {
+    fn send(&self, message: UiMessage) -> Result<(), ()> {
+        self.0.try_send(message).map_err(|_| ())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum UiInput {
     Event(InputEvent),
@@ -79,8 +99,9 @@ enum UiInput {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (ui_tx, ui_rx) = mpsc::channel();
-    let (input_tx, input_rx) = mpsc::channel();
+    let (ui_raw_tx, ui_rx) = mpsc::sync_channel(UI_QUEUE_CAPACITY);
+    let ui_tx = UiSender(ui_raw_tx);
+    let (input_tx, input_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
     let worker = thread::Builder::new()
         .name("openstream-network".to_string())
         .spawn(move || run_worker(ui_tx, input_rx))?;
@@ -142,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     buffer_height = height;
                     buffer = pixels;
                     if let Err(error) = window.update_with_buffer(&buffer, width, height) {
-                        let _ = input_tx.send(UiInput::Stop);
+                        let _ = input_tx.try_send(UiInput::Stop);
                         return Err(error.into());
                     }
                 }
@@ -207,14 +228,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match display::poll_hotkey(&window, &hotkeys, &mut last_hotkey) {
             Some(display::HotkeyAction::Disconnect) => break,
             Some(display::HotkeyAction::ReleaseInput) => {
-                let _ = input_tx.send(UiInput::Release);
+                let _ = input_tx.try_send(UiInput::Release);
             }
             None => {}
         }
         window.update();
     }
-    let _ = input_tx.send(UiInput::Release);
-    let _ = input_tx.send(UiInput::Stop);
+    let _ = input_tx.try_send(UiInput::Release);
+    let _ = input_tx.try_send(UiInput::Stop);
     for effect in rumble_effects.values() {
         let _ = effect.stop();
     }
@@ -225,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[allow(clippy::cast_possible_truncation)]
 fn forward_input(
     window: &Window,
-    input_tx: &Sender<UiInput>,
+    input_tx: &SyncSender<UiInput>,
     last_mouse: &mut Option<(i32, i32)>,
     button_state: &mut [bool; 3],
     gamepads: &mut Option<Gilrs>,
@@ -235,12 +256,12 @@ fn forward_input(
     let timestamp = monotonic_us();
     for &(key, usage) in keyboard_usages() {
         if window.is_key_pressed(key, KeyRepeat::No) {
-            let _ = input_tx.send(UiInput::Event(InputEvent::keyboard(
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
                 usage, 0, true, timestamp,
             )));
         }
         if window.is_key_released(key) {
-            let _ = input_tx.send(UiInput::Event(InputEvent::keyboard(
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
                 usage, 0, false, timestamp,
             )));
         }
@@ -252,7 +273,7 @@ fn forward_input(
             let dx = current.0.saturating_sub(previous.0);
             let dy = current.1.saturating_sub(previous.1);
             if dx != 0 || dy != 0 {
-                let _ = input_tx.send(UiInput::Event(InputEvent::pointer_motion(
+                let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
                     true, dx, dy, timestamp,
                 )));
             }
@@ -266,7 +287,7 @@ fn forward_input(
     {
         let pressed = window.get_mouse_down(button);
         if pressed != button_state[index] {
-            let _ = input_tx.send(UiInput::Event(InputEvent::pointer_button(
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_button(
                 u32::try_from(index + 1).unwrap_or(1),
                 pressed,
                 timestamp,
@@ -281,7 +302,7 @@ fn forward_input(
         #[allow(clippy::cast_possible_truncation)]
         let y = y.round() as i32;
         if x != 0 || y != 0 {
-            let _ = input_tx.send(UiInput::Event(InputEvent::wheel(x, y, timestamp)));
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::wheel(x, y, timestamp)));
         }
     }
 
@@ -290,7 +311,7 @@ fn forward_input(
 
 fn poll_gamepads(
     gamepads: &mut Option<Gilrs>,
-    input_tx: &Sender<UiInput>,
+    input_tx: &SyncSender<UiInput>,
     timestamp: u64,
     gamepad_ids: &mut HashMap<u32, GamepadId>,
     rumble_effects: &mut HashMap<u32, Effect>,
@@ -306,14 +327,14 @@ fn poll_gamepads(
         match event.event {
             EventType::ButtonPressed(button, _) => {
                 if let Some(index) = gamepad_button_index(button) {
-                    let _ = input_tx.send(UiInput::Event(InputEvent::gamepad_button(
+                    let _ = input_tx.try_send(UiInput::Event(InputEvent::gamepad_button(
                         device_id, index, true, timestamp,
                     )));
                 }
             }
             EventType::ButtonReleased(button, _) => {
                 if let Some(index) = gamepad_button_index(button) {
-                    let _ = input_tx.send(UiInput::Event(InputEvent::gamepad_button(
+                    let _ = input_tx.try_send(UiInput::Event(InputEvent::gamepad_button(
                         device_id, index, false, timestamp,
                     )));
                 }
@@ -325,7 +346,7 @@ fn poll_gamepads(
                     _ => None,
                 };
                 if let Some(axis) = axis {
-                    let _ = input_tx.send(UiInput::Event(InputEvent::gamepad_axis(
+                    let _ = input_tx.try_send(UiInput::Event(InputEvent::gamepad_axis(
                         device_id,
                         axis,
                         axis_value(value),
@@ -335,7 +356,7 @@ fn poll_gamepads(
             }
             EventType::AxisChanged(axis, value, _) => {
                 if let Some(axis) = gamepad_axis_index(axis) {
-                    let _ = input_tx.send(UiInput::Event(InputEvent::gamepad_axis(
+                    let _ = input_tx.try_send(UiInput::Event(InputEvent::gamepad_axis(
                         device_id,
                         axis,
                         axis_value(value),
@@ -348,7 +369,7 @@ fn poll_gamepads(
                     let _ = effect.stop();
                 }
                 gamepad_ids.remove(&device_id);
-                let _ = input_tx.send(UiInput::Event(InputEvent::gamepad_unplug(
+                let _ = input_tx.try_send(UiInput::Event(InputEvent::gamepad_unplug(
                     device_id, timestamp,
                 )));
             }
@@ -582,7 +603,7 @@ fn keyboard_usages() -> &'static [(Key, u32)] {
     ]
 }
 
-fn run_worker(ui_tx: Sender<UiMessage>, input_rx: Receiver<UiInput>) {
+fn run_worker(ui_tx: UiSender, input_rx: Receiver<UiInput>) {
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -597,7 +618,7 @@ fn run_worker(ui_tx: Sender<UiMessage>, input_rx: Receiver<UiInput>) {
 }
 
 async fn network_loop(
-    ui_tx: Sender<UiMessage>,
+    ui_tx: UiSender,
     input_rx: Receiver<UiInput>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
@@ -944,6 +965,7 @@ async fn network_loop(
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
+                session.maintain_liveness().await?;
             }
             _ = metrics_tick.tick() => {
                 let _ = ui_tx.send(UiMessage::Metrics(metrics.snapshot().overlay_line()));

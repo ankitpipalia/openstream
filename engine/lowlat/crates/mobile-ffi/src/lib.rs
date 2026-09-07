@@ -435,6 +435,7 @@ async fn run_client(
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
+                session.maintain_liveness().await?;
             }
             packet = session.recv() => {
                 let packet = packet?;

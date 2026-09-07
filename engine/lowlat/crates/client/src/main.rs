@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
+                session.maintain_liveness().await?;
                 continue;
             }
         };
