@@ -110,6 +110,8 @@ and no unbounded memory growth.
   account policy and user-facing approval UI remain planned.
 - [x] Cross-platform shell/PowerShell pairing-provisioning helpers with
   protected admin-token support.
+- [x] Independent expired-session reaper, WebSocket close notification, and
+  graceful HTTP/relay shutdown on SIGTERM or Ctrl-C.
 
 Gate: two local processes connect through loopback, LAN, the application relay,
 and configured full ICE; tokens are never accepted after expiry or revocation.

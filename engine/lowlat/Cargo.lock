@@ -1522,6 +1522,7 @@ dependencies = [
  "sha2",
  "tokio",
  "uuid",
+ "webrtc-ice",
 ]
 
 [[package]]

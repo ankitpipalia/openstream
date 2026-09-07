@@ -32,6 +32,9 @@ that is reachable beyond a trusted local development machine. Send
 variable is unset, management requests are refused by default. For an
 explicit loopback-only development server, set `OPENSTREAM_ALLOW_NO_AUTH=1`;
 the service rejects that mode on a non-loopback bind and prints a warning.
+The administrator token must be at least 16 bytes; use a randomly generated
+value and keep it in the protected environment file rather than in a unit
+file or command-line argument.
 
 For the built-in relay, bind one UDP socket privately and advertise its
 reachable numeric endpoint:
@@ -129,3 +132,6 @@ tracing around this command because the environment contains credentials.
 The signal service applies a fixed global limit of 60 new sessions per minute.
 This bounds accidental or compromised-admin-token churn; deployments needing
 tenant-specific quotas still need an identity-aware admission layer.
+Expired sessions are reaped independently of new requests and optional relay
+traffic. HTTP and relay tasks also stop on SIGTERM/CTRL-C so systemd shutdown
+does not leave a relay or stale WebSocket state running in the process.

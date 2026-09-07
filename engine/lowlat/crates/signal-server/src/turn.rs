@@ -23,6 +23,10 @@ pub(crate) const MIN_TURN_TTL_SECONDS: u64 = 60;
 pub(crate) const MAX_TURN_TTL_SECONDS: u64 = 24 * 60 * 60;
 /// Default TURN credential lifetime when the deployment does not set one.
 pub(crate) const DEFAULT_TURN_TTL_SECONDS: u64 = 60 * 60;
+const MAX_TURN_URLS: usize = 16;
+const MAX_TURN_URL_BYTES: usize = 512;
+const MAX_TURN_REALM_BYTES: usize = 128;
+const MAX_TURN_SECRET_BYTES: usize = 4096;
 
 /// Configuration read once at startup from the process environment.
 #[derive(Clone)]
@@ -51,10 +55,10 @@ impl TurnConfig {
     /// instead of minting credentials.
     pub(crate) fn from_env() -> Option<Self> {
         let secret = match std::env::var("OPENSTREAM_TURN_SECRET") {
-            Ok(secret) if secret.len() >= 16 => secret,
+            Ok(secret) if (16..=MAX_TURN_SECRET_BYTES).contains(&secret.len()) => secret,
             Ok(_) => {
                 eprintln!(
-                    "OPENSTREAM_TURN_SECRET is shorter than 16 characters; TURN issuance disabled"
+                    "OPENSTREAM_TURN_SECRET length is outside 16..={MAX_TURN_SECRET_BYTES} bytes; TURN issuance disabled"
                 );
                 return None;
             }
@@ -73,6 +77,12 @@ impl TurnConfig {
             eprintln!("OPENSTREAM_TURN_URLS has no URLs; TURN issuance disabled");
             return None;
         }
+        if urls.len() > MAX_TURN_URLS || urls.iter().any(|url| !valid_url(url)) {
+            eprintln!(
+                "OPENSTREAM_TURN_URLS contains an invalid URL or exceeds {MAX_TURN_URLS} entries; TURN issuance disabled"
+            );
+            return None;
+        }
         let ttl_seconds = std::env::var("OPENSTREAM_TURN_TTL")
             .ok()
             .and_then(|value| {
@@ -89,6 +99,12 @@ impl TurnConfig {
             .ok()
             .filter(|realm| !realm.trim().is_empty())
             .unwrap_or_else(|| "openstream".to_string());
+        if realm.len() > MAX_TURN_REALM_BYTES {
+            eprintln!(
+                "OPENSTREAM_TURN_REALM exceeds {MAX_TURN_REALM_BYTES} bytes; TURN issuance disabled"
+            );
+            return None;
+        }
         Some(Self {
             secret: secret.into_bytes(),
             realm,
@@ -136,6 +152,18 @@ impl TurnConfig {
             self.ttl_seconds.min(remaining_seconds),
         ))
     }
+}
+
+/// Accept only the RFC 7064/7065 URL forms understood by the ICE client.
+///
+/// Credentials are deliberately rejected here: this service supplies the
+/// short-lived REST username/password separately, and accepting userinfo in a
+/// configured URL would put a long-lived secret into every pairing response.
+fn valid_url(raw: &str) -> bool {
+    raw.len() <= MAX_TURN_URL_BYTES
+        && !raw.contains('@')
+        && !raw.contains(['\r', '\n'])
+        && webrtc_ice::url::Url::parse_url(raw).is_ok()
 }
 
 /// Short-lived TURN credentials handed to one session role.
@@ -261,6 +289,7 @@ mod tests {
             "OPENSTREAM_TURN_SECRET",
             "OPENSTREAM_TURN_URLS",
             "OPENSTREAM_TURN_TTL",
+            "OPENSTREAM_TURN_REALM",
         ]
         .iter()
         .map(|key| (*key, std::env::var(key).ok()))
@@ -281,6 +310,17 @@ mod tests {
         let config = TurnConfig::from_env().expect("configured");
         assert_eq!(config.urls, vec!["turn:turn.example:3478".to_string()]);
         assert_eq!(config.realm, "openstream");
+        unsafe {
+            std::env::set_var(
+                "OPENSTREAM_TURN_URLS",
+                "turn:user:password@turn.example:3478",
+            );
+        }
+        assert!(TurnConfig::from_env().is_none());
+        unsafe {
+            std::env::set_var("OPENSTREAM_TURN_URLS", "https://turn.example:3478");
+        }
+        assert!(TurnConfig::from_env().is_none());
         for (key, value) in saved {
             unsafe {
                 match value {

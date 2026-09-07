@@ -21,7 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use openstream_protocol::relay;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use uuid::Uuid;
 
 mod turn;
@@ -124,6 +124,12 @@ const RELAY_SLOT_IDLE: Duration = Duration::from_secs(60);
 /// for a session TTL.
 const SIGNAL_PING_INTERVAL: Duration = Duration::from_secs(15);
 const SIGNAL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Expired sessions are reaped even when no client sends another request and
+/// the optional relay is disabled.
+const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
+/// An administrator token is a network capability, so a one-character token
+/// is almost certainly an accidental insecure deployment.
+const MIN_ADMIN_TOKEN_BYTES: usize = 16;
 /// A valid relay ticket is still only a capability for one bounded data path.
 /// These budgets stop it becoming an unlimited bandwidth amplification tool.
 const RELAY_BYTES_PER_SECOND: usize = 8 * 1024 * 1024;
@@ -544,12 +550,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => return Err(format!("failed to read OPENSTREAM_RELAY_SECRET: {error}").into()),
     };
+    let admin_token = match std::env::var("OPENSTREAM_ADMIN_TOKEN") {
+        Ok(token) if token.len() >= MIN_ADMIN_TOKEN_BYTES => Some(token),
+        Ok(_) => {
+            return Err(format!(
+                "OPENSTREAM_ADMIN_TOKEN must be at least {MIN_ADMIN_TOKEN_BYTES} bytes"
+            )
+            .into());
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("failed to read OPENSTREAM_ADMIN_TOKEN: {error}").into()),
+    };
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
-        admin_token: std::env::var("OPENSTREAM_ADMIN_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty()),
+        admin_token,
         allow_no_auth: std::env::var("OPENSTREAM_ALLOW_NO_AUTH").as_deref() == Ok("1"),
         relay_address,
         turn: turn::TurnConfig::from_env(),
@@ -574,12 +589,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if let Some(relay_bind) = relay_bind {
-        let socket = UdpSocket::bind(relay_bind).await?;
-        println!("openstream UDP relay listening on {relay_bind}");
-        tokio::spawn(run_relay(socket, state.clone()));
-    }
-
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/session", post(create_session))
@@ -598,7 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::delete(kick_guest),
         )
         .route("/v1/signal/{session_id}/{role}", get(signal_socket))
-        .with_state(state);
+        .with_state(state.clone());
 
     println!("openstream-signal-server listening on http://{address}");
     if !admin_enabled {
@@ -607,12 +616,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let relay_task = if let Some(relay_bind) = relay_bind {
+        let socket = UdpSocket::bind(relay_bind).await?;
+        println!("openstream UDP relay listening on {relay_bind}");
+        Some(tokio::spawn(run_relay(
+            socket,
+            state.clone(),
+            shutdown_rx.clone(),
+        )))
+    } else {
+        None
+    };
+    let reaper_task = tokio::spawn(reap_sessions(state.clone(), shutdown_rx.clone()));
+    let signal_tx = shutdown_tx.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = signal_tx.send(true);
+    });
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+        .await;
+    let _ = shutdown_tx.send(true);
+    if let Some(task) = relay_task {
+        let _ = task.await;
+    }
+    let _ = reaper_task.await;
+    signal_task.abort();
+    result?;
     Ok(())
+}
+
+/// Wait for the shared shutdown flag used by HTTP, relay, and reaper tasks.
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    let _ = shutdown.changed().await;
+}
+
+/// Handle both Ctrl-C in a terminal and SIGTERM from systemd on Unix.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+/// Remove expired sessions independently of request and relay traffic.
+///
+/// Without this task, an otherwise idle service can retain expired sessions
+/// and their role senders indefinitely when the built-in relay is disabled.
+/// The map is bounded, but retaining stale capabilities makes memory usage and
+/// operational state depend on future session creation instead of TTL.
+async fn reap_sessions(state: AppState, shutdown: watch::Receiver<bool>) {
+    let mut interval = tokio::time::interval(SESSION_REAP_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let senders = reap_expired_sessions(&state).await;
+                for sender in senders {
+                    let _ = sender.try_send(Message::Close(None));
+                }
+            }
+            _ = wait_for_shutdown(shutdown.clone()) => break,
+        }
+    }
+}
+
+/// Remove expired sessions and return their live WebSocket senders for a
+/// close notice after the map lock is released.
+async fn reap_expired_sessions(state: &AppState) -> Vec<mpsc::Sender<Message>> {
+    let mut sessions = state.sessions.lock().await;
+    let now = Instant::now();
+    let expired = sessions
+        .iter()
+        .filter(|(_, session)| session.expires_at <= now)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let mut senders = Vec::new();
+    for id in expired {
+        let Some(mut session) = sessions.remove(&id) else {
+            continue;
+        };
+        senders.extend(session.host.take());
+        senders.extend(session.client.take());
+        senders.extend(
+            session
+                .guests
+                .iter_mut()
+                .filter_map(|guest| guest.sender.take()),
+        );
+    }
+    senders
 }
 
 async fn create_session(
@@ -1487,7 +1600,7 @@ fn queue_pending(queue: &mut VecDeque<Message>, queued_bytes: &mut usize, messag
 /// `MAX_DATAGRAM`; larger ones are dropped rather than relayed. Session
 /// expiry is reaped on a timer, not per datagram, so a UDP flood cannot turn
 /// the map cleanup into a control-plane stall.
-async fn run_relay(socket: UdpSocket, state: AppState) {
+async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver<bool>) {
     use openstream_protocol::MAX_DATAGRAM;
     // Keep one sentinel byte so UDP truncation is observable. A buffer sized
     // exactly to MAX_DATAGRAM would silently turn an oversized datagram into
@@ -1640,9 +1753,12 @@ async fn run_relay(socket: UdpSocket, state: AppState) {
                 }
             }
             _ = reap.tick() => {
+                let senders = reap_expired_sessions(&state).await;
+                for sender in senders {
+                    let _ = sender.try_send(Message::Close(None));
+                }
                 let mut sessions = state.sessions.lock().await;
                 let now = Instant::now();
-                sessions.retain(|_, session| session.expires_at > now);
                 // Drop idle relay slots so mappings never live the full
                 // session TTL without traffic.
                 for session in sessions.values_mut() {
@@ -1655,6 +1771,7 @@ async fn run_relay(socket: UdpSocket, state: AppState) {
                     }
                 }
             }
+            _ = wait_for_shutdown(shutdown.clone()) => break,
         }
     }
 }
@@ -1662,13 +1779,17 @@ async fn run_relay(socket: UdpSocket, state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreationLimiter, Guest, MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE,
+        AppState, CreationLimiter, Guest, MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE,
         RELAY_BYTES_PER_SECOND, RELAY_PACKETS_PER_SECOND, RelaySlot, SESSION_CREATE_WINDOW,
-        authorized, bearer_token, max_guests_for_new_session, relay_ticket,
-        validate_signal_message,
+        Session, authorized, bearer_token, max_guests_for_new_session, reap_expired_sessions,
+        relay_ticket, validate_signal_message,
     };
+    use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue};
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tokio::sync::{Mutex, mpsc};
 
     #[test]
     fn no_admin_token_refuses_everything_without_explicit_dev_opt_in() {
@@ -1808,6 +1929,48 @@ mod tests {
         assert!(limiter.allow(start + SESSION_CREATE_WINDOW));
         assert_eq!(limiter.events.len(), 1);
         assert!(limiter.allow(start + SESSION_CREATE_WINDOW + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_are_removed_and_their_sockets_are_closed() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            admin_token: None,
+            allow_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"test-relay-secret".to_vec(),
+        };
+        state.sessions.lock().await.insert(
+            "expired".into(),
+            Session {
+                expires_at: Instant::now() - Duration::from_secs(1),
+                host_token: "host-token".into(),
+                client_token: "client-token".into(),
+                host: Some(sender),
+                client: None,
+                host_generation: 1,
+                client_generation: 0,
+                pending_host: std::collections::VecDeque::new(),
+                pending_client: std::collections::VecDeque::new(),
+                pending_host_bytes: 0,
+                pending_client_bytes: 0,
+                relay_host: None,
+                relay_client: None,
+                guests: std::collections::VecDeque::new(),
+                max_guests: 1,
+            },
+        );
+
+        let senders = reap_expired_sessions(&state).await;
+        assert_eq!(senders.len(), 1);
+        assert!(state.sessions.lock().await.is_empty());
+        senders[0]
+            .try_send(Message::Close(None))
+            .expect("close fits in the bounded queue");
+        assert!(matches!(receiver.recv().await, Some(Message::Close(None))));
     }
 
     #[test]
