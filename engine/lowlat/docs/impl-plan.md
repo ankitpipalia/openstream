@@ -95,8 +95,11 @@ connectivity.
 - [x] Acknowledgement emission, negative acknowledgement, retransmission timeout, stall
   escape jumping to the furthest occupied slot.
 - [x] Send window bounded by the peer ring depth ([01 §7](01-protocol.md)).
-- [x] Path probe state machine ([01 §8](01-protocol.md)), including the compile-time assertion
-  that no emitted datagram can exceed the absolute ceiling.
+- [x] Path-aware DPLPMTUD state machine ([01 §8](01-protocol.md)), including
+  exact authenticated probe acknowledgements, three-attempt loss tolerance,
+  path-derived IPv4/IPv6/relay ceilings, maintenance reprobes, black-hole
+  recovery, and the compile-time assertion that no emitted datagram can exceed
+  the absolute ceiling.
 - [x] Control message framing and the opcode table ([01 §11](01-protocol.md)).
 - [x] Fuzz targets: envelope, cleartext packet, control message, video header, reassembler.
 

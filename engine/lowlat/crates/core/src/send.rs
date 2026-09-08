@@ -73,7 +73,11 @@ impl Default for SendSlot {
 pub struct SendRing<'a> {
     bodies: &'a mut [u8],
     meta: &'a mut [SendSlot],
+    /// Bytes reserved for each slot in caller-owned storage.
     slot_len: usize,
+    /// Bytes used to fragment newly enqueued messages. It may be smaller than
+    /// `slot_len` so a path can probe upward without reallocating the ring.
+    fragment_capacity: usize,
     channel: u8,
     /// The peer's cumulative acknowledgement: everything below is delivered.
     base: u32,
@@ -107,16 +111,46 @@ impl<'a> SendRing<'a> {
         slot_len: usize,
         channel: u8,
     ) -> Result<Self> {
-        if slot_len == 0 || meta.is_empty() || channel as usize >= packet::CHANNEL_COUNT {
+        Self::new_with_capacity(bodies, meta, slot_len, slot_len, channel)
+    }
+
+    /// Build a ring with separate storage and active-fragment capacities.
+    ///
+    /// `storage_len` should normally be the protocol ceiling's body capacity,
+    /// while `fragment_capacity` starts at the safe floor. This is the seam
+    /// that lets DPLPMTUD change packetization without moving or reallocating
+    /// the caller-owned ring. The ordinary [`Self::new`] constructor retains
+    /// its historical same-size behavior for small fixtures and callers that
+    /// do not opt into path probing.
+    pub fn new_with_capacity(
+        bodies: &'a mut [u8],
+        meta: &'a mut [SendSlot],
+        storage_len: usize,
+        fragment_capacity: usize,
+        channel: u8,
+    ) -> Result<Self> {
+        if storage_len == 0
+            || fragment_capacity == 0
+            || fragment_capacity > storage_len
+            || fragment_capacity > u16::MAX as usize
+            || meta.is_empty()
+            || channel as usize >= packet::CHANNEL_COUNT
+        {
             return Err(Error::BadLength);
         }
-        if bodies.len() != meta.len().checked_mul(slot_len).ok_or(Error::BadLength)? {
+        if bodies.len()
+            != meta
+                .len()
+                .checked_mul(storage_len)
+                .ok_or(Error::BadLength)?
+        {
             return Err(Error::BadLength);
         }
         Ok(Self {
             bodies,
             meta,
-            slot_len,
+            slot_len: storage_len,
+            fragment_capacity,
             channel,
             base: 0,
             next: 0,
@@ -129,6 +163,41 @@ impl<'a> SendRing<'a> {
             bytes_acked: 0,
             retransmitted: 0,
         })
+    }
+
+    /// Active body capacity used for future message fragmentation.
+    pub fn fragment_capacity(&self) -> usize {
+        self.fragment_capacity
+    }
+
+    /// Maximum body capacity the ring can hold in one slot.
+    pub fn storage_capacity(&self) -> usize {
+        self.slot_len
+    }
+
+    /// Whether changing the active capacity would leave every queued fragment
+    /// representable. Existing fragments are never silently split or merged;
+    /// a caller must wait for them to drain before shrinking the path.
+    pub fn can_set_fragment_capacity(&self, capacity: usize) -> bool {
+        capacity > 0
+            && capacity <= self.slot_len
+            && capacity <= u16::MAX as usize
+            && self
+                .meta
+                .iter()
+                .all(|slot| !slot.occupied || usize::from(slot.len) <= capacity)
+    }
+
+    /// Change the capacity used by newly queued messages.
+    ///
+    /// This is intentionally transactional with respect to the ring: an
+    /// invalid or unsafe shrink leaves the current packetization untouched.
+    pub fn set_fragment_capacity(&mut self, capacity: usize) -> bool {
+        if !self.can_set_fragment_capacity(capacity) {
+            return false;
+        }
+        self.fragment_capacity = capacity;
+        true
     }
 
     /// Fragments the peer has not acknowledged.
@@ -246,7 +315,7 @@ impl<'a> SendRing<'a> {
     /// Nothing is emitted here. The fragments become pending, and the scan
     /// releases them subject to the outstanding cap.
     pub fn enqueue(&mut self, message: &Message<'_>) -> Result<u32> {
-        let capacity = self.slot_len;
+        let capacity = self.fragment_capacity;
         let fragments = message.fragment_count(capacity);
         if fragments > self.window_free() {
             return Err(Error::BufferTooSmall);
@@ -609,6 +678,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn storage_capacity_can_exceed_active_fragment_capacity() {
+        const STORAGE: usize = 64;
+        const ACTIVE: usize = 32;
+        let mut bodies = std::vec![0u8; STORAGE * 4];
+        let mut meta = std::vec![SendSlot::default(); 4];
+        let mut ring =
+            SendRing::new_with_capacity(&mut bodies, &mut meta, STORAGE, ACTIVE, CHANNEL).unwrap();
+        assert_eq!(ring.storage_capacity(), STORAGE);
+        assert_eq!(ring.fragment_capacity(), ACTIVE);
+
+        let floor_message = Message::new(&[], &[0xA5; 40]).unwrap();
+        assert_eq!(
+            ring.enqueue(&floor_message).unwrap(),
+            2,
+            "the floor capacity applies"
+        );
+        assert!(ring.set_fragment_capacity(48));
+        let larger_message = Message::new(&[], &[0x5A; 40]).unwrap();
+        assert_eq!(ring.enqueue(&larger_message).unwrap(), 1);
+        assert!(!ring.can_set_fragment_capacity(ACTIVE));
+        assert!(!ring.set_fragment_capacity(ACTIVE));
+        assert_eq!(ring.fragment_capacity(), 48);
+    }
+
+    #[test]
+    fn an_empty_ceiling_sized_ring_can_adopt_a_larger_path() {
+        const STORAGE: usize = 64;
+        const ACTIVE: usize = 32;
+        let mut bodies = std::vec![0u8; STORAGE * 4];
+        let mut meta = std::vec![SendSlot::default(); 4];
+        let mut ring =
+            SendRing::new_with_capacity(&mut bodies, &mut meta, STORAGE, ACTIVE, CHANNEL).unwrap();
+        assert!(ring.set_fragment_capacity(48));
+        assert_eq!(ring.fragment_capacity(), 48);
+        let message = Message::new(&[], &[0x5A; 40]).unwrap();
+        assert_eq!(
+            ring.enqueue(&message).unwrap(),
+            1,
+            "the larger capacity applies"
+        );
+    }
+
     /// Drain one scan pass, returning the sequences emitted.
     fn drain(ring: &mut SendRing<'_>, now: f64, srtt: f64) -> Vec<u32> {
         let mut out = [0u8; 128];
@@ -620,6 +732,9 @@ mod tests {
             match parsed {
                 packet::Packet::Data(data) => seen.push(data.seq),
                 packet::Packet::Ack(_) => panic!("send ring emitted an ack"),
+                packet::Packet::Probe(_) | packet::Packet::ProbeAck(_) => {
+                    panic!("send ring emitted a path probe")
+                }
             }
         }
         seen

@@ -27,5 +27,15 @@ fuzz_target!(|data: &[u8]| {
                 );
             }
         }
+        Packet::Probe(ref inner) => {
+            if let Ok(written) = packet::encode_probe(&mut out, inner) {
+                assert_eq!(&out[..written], data, "probe did not round trip");
+            }
+        }
+        Packet::ProbeAck(ref inner) => {
+            if let Ok(written) = packet::encode_probe_ack(&mut out, inner) {
+                assert_eq!(&out[..written], data, "probe acknowledgement did not round trip");
+            }
+        }
     }
 });

@@ -60,17 +60,17 @@ const MAX_APPLICATION_MESSAGES: usize = 64;
 /// exactly what saying why was meant to avoid.
 const KICK_GRACE_MS: f64 = 250.0;
 
-/// What one fragment carries, and therefore what one ring slot holds.
+/// What one fragment carries before a path probe has justified more headroom.
 ///
 /// **Derived from the datagram floor, not from the path.** The size a peer
 /// accepts is not negotiated and cannot be, so the floor is the only size
 /// entitled to be emitted before a probe has justified anything larger. A
-/// slot wide enough for a bigger datagram is not free headroom: the slot
-/// width *is* the fragment width, so widening it puts oversized datagrams on
-/// a path nothing has measured, and a peer that cannot take one discards the
-/// whole thing silently.
+/// Ceiling-sized storage is not free headroom: the active fragment width
+/// remains this value until the path controller confirms a larger datagram.
 const BODY: usize = lowlat_core::DEFAULT_DATAGRAM - ENVELOPE_LEN - HEADER_LEN;
-const SLOT: usize = BODY;
+/// Storage width for a ring that can adopt any legal probed packet size. It is
+/// deliberately distinct from [`BODY`], the current safe packetization.
+const SLOT: usize = lowlat_core::MAX_DATAGRAM - ENVELOPE_LEN - HEADER_LEN;
 
 /// Ring depths, per channel and direction.
 ///
@@ -1276,7 +1276,7 @@ fn attach_send<'a>(
     bodies: &'a mut [u8],
     meta: &'a mut [SendSlot],
 ) -> bool {
-    match SendRing::new(bodies, meta, SLOT, channel) {
+    match SendRing::new_with_capacity(bodies, meta, SLOT, BODY, channel) {
         Ok(ring) => session.attach_send(channel, ring).is_ok(),
         Err(_) => false,
     }
@@ -3256,11 +3256,10 @@ mod geometry {
         largest
     }
 
-    /// **The slot width is the fragment width, so it is also the datagram
-    /// width.** A ring sized for headroom does not gain headroom; it emits
-    /// datagrams no probe has justified, and a peer that cannot take one
-    /// discards the whole datagram rather than truncating it. Widening `SLOT`
-    /// past the floor fails this. *Named regression test.*
+    /// **The active fragment width is the datagram width.** The ring reserves
+    /// ceiling-sized storage for a later PMTU transition, but the send helper
+    /// starts its active capacity at `BODY`, so it emits no datagram larger
+    /// than the floor before a probe justifies one. *Named regression test.*
     #[test]
     fn no_emitted_datagram_exceeds_the_floor_the_peer_is_known_to_accept() {
         let mut arena = Arena::new();
@@ -3270,7 +3269,7 @@ mod geometry {
 
         // Big enough to fragment many times over, so the full-size fragment is
         // the common case here rather than the exception.
-        let unit = vec![0xA5u8; 200 * SLOT];
+        let unit = vec![0xA5u8; 200 * BODY];
         ours.send_message(VIDEO_CHANNEL, &[], &unit).expect("queue");
 
         let largest = pump(&mut ours, &mut theirs, 1.0);
@@ -3301,7 +3300,7 @@ mod geometry {
         // Exactly the ceiling's worth of fragments. **The length prefix rides
         // in the first fragment**, so the largest frame that fits is four
         // bytes short of the arithmetic anyone would write down.
-        let frame = vec![0u8; ceiling * SLOT - lowlat_core::message::LENGTH_PREFIX_LEN];
+        let frame = vec![0u8; ceiling * BODY - lowlat_core::message::LENGTH_PREFIX_LEN];
         let queued = session
             .send_message(VIDEO_CHANNEL, &[], &frame)
             .expect("a frame at the ceiling was refused");

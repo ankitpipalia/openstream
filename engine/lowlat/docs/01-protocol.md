@@ -15,6 +15,8 @@ UDP datagram
        +- cleartext packet
             +- data packet    7-byte header + payload  (§5.1)
             +- group ack      7 + 4n bytes             (§5.2)
+            +- path probe     7-byte header + size + padding (§5.3)
+            +- probe ack      7-byte header + size       (§5.3)
                  +- channel stream, reassembled per §7
                       +- control message  13-byte header + body (§11)
 ```
@@ -106,13 +108,18 @@ Flag bits:
 |---|---|---|
 | 0 | `0x01` | data |
 | 1 | `0x02` | acknowledgement |
+| 2 | `0x04` | path-MTU probe; valid only as the standalone `PROBE` vocabulary (§5.3) |
 | 3 | `0x08` | keepalive |
 | 4 | `0x10` | negative acknowledgement, valid only with `0x02` |
 | 5 | `0x20` | last fragment of a message, valid only with `0x01` and not with `0x10` |
+| 6 | `0x40` | path-MTU probe acknowledgement; valid only as the standalone `PROBE_ACK` vocabulary (§5.3) |
+| 7 | `0x80` | reserved |
 
 Validation, in order, all mandatory:
 
-1. `flags & 0xC4` must be zero. Bits 2, 6, and 7 are reserved.
+1. If bit 2 or bit 6 is set, parse the standalone path-probe vocabulary in §5.3. A probe flag
+   cannot be combined with any other flag. For an ordinary packet, `flags & 0xC4` must be zero;
+   bit 7 is reserved and bits 2 and 6 are not ordinary packet modifiers.
 2. `flags & 0x0B` must equal exactly `0x01`, `0x02`, or `0x08`. Any other combination is
    malformed.
 3. `0x10` requires `flags & 0x0B == 0x02`.
@@ -150,7 +157,39 @@ Each entry is the next sequence number the sender expects on that channel, so it
 everything below it. Acknowledgements are **fire and forget**. They are never placed in a
 reliable ring and never retransmitted; doing so deadlocks the ring.
 
-### §5.3 Message framing and fragmentation
+### §5.3 Path-MTU probe and acknowledgement
+
+Path probes are authenticated control packets outside the reliable channel rings. They use the
+same seven-byte prefix as other cleartext packets, but their sequence field is an independent
+probe ID rather than a channel sequence number:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | marker `0x01` |
+| 1 | 1 | flags `0x04` for `PROBE`, `0x40` for `PROBE_ACK` |
+| 2 | 1 | channel `0` |
+| 3 | 4 | independent probe ID, big endian, not `0xFFFFFFFF` |
+| 7 | 2 | declared encrypted UDP payload size, big endian |
+| 9 | n | zero padding for `PROBE` only |
+
+The declared size includes the 29-byte encrypted record envelope. A `PROBE` is padded so the
+complete encrypted UDP payload is exactly that size; the padding is authenticated and carries
+no application data. A `PROBE_ACK` is exactly the nine-byte cleartext prefix above and echoes
+both the ID and the size. The two probe flags are standalone vocabularies and MUST NOT be
+combined with data, acknowledgement, NACK, keepalive, or last-fragment flags.
+
+After decrypting a `PROBE`, the receiver MUST also require that the actual received datagram
+length equals the authenticated declared size before sending the acknowledgement. It MUST NOT
+confirm a probe from a cumulative data acknowledgement: a large data fragment could have been
+repaired later at the base packet size. An acknowledgement for an old ID, a different size, or
+an earlier timed-out attempt proves nothing and is ignored.
+
+The sans-IO state machine and its path-specific ceiling are normative in §8. A socket shell
+reserves one probe at a time, retries a rung up to three times, and reports a local write error
+separately from a network timeout. Probes do not consume a data-channel sequence number or a
+reliable send-ring slot.
+
+### §5.4 Message framing and fragmentation
 
 A channel carries **messages**, not packets. A message is laid out across one or more
 consecutive sequence numbers:
@@ -251,8 +290,10 @@ because that is what the path constrains.
 On IPv4 the on-wire IP packet is `M + 28`, so the default occupies 1257 bytes and a 1500-byte
 path allows `M` up to 1472.
 
-**Default and floor: a 1229-byte datagram.** Every peer accepts this and it survives PPPoE,
-tunnels, and relay framing.
+**Default and floor: a 1229-byte datagram.** This fits within the IPv6 minimum MTU without
+additional encapsulation and provides substantial headroom on normal Ethernet/PPPoE paths.
+Additional tunnels or encapsulation can reduce the effective PMTU and are handled by path
+validation/failure policy; the floor is not a promise that every arbitrary tunnel can carry it.
 
 **Absolute ceiling: a 2000-byte datagram.** Implementations MUST NOT emit more under any
 circumstance, including after a successful probe. Peers are not required to accept more, and a
@@ -263,20 +304,40 @@ total and silent.
 An endpoint's configured MTU bounds only what that endpoint emits. This means peer capacity is
 unknowable a priori, and the only sound way to use headroom is to probe for it.
 
-Probing:
+The path ceiling is derived, not hard-coded. For an effective outer IP packet MTU `P`, the
+maximum OpenStream UDP payload is:
 
-1. Start at 1229. Stream at 1229 until a probe succeeds.
-2. Probe upward on the active path at 1280, 1350, then 1400, all datagram sizes.
-3. A probe is successful when it is cumulatively acknowledged. A probe that is not
-   acknowledged while smaller packets on the same channel are acknowledged is a failure at
-   that size, and probing stops there for the session.
-4. Clamp at 1472 on a direct path.
-5. When relayed, subtract the relay framing before clamping: 36 bytes for a data indication,
-   4 bytes for channel data.
-6. On any path change, reset to 1229 and probe again.
+```text
+P - IP header - UDP header - relay framing
+```
 
-A failed probe is indistinguishable from a peer with a smaller receive buffer, and the correct
-response is the same in both cases, which is why one mechanism covers both.
+The current constants are 28 bytes for IPv4, 48 bytes for IPv6, 36 bytes for a TURN data
+indication, and 4 bytes for TURN channel data. The result is still capped at 2000 bytes. For
+example, a 1500-byte route allows 1472 bytes on direct IPv4, 1452 on direct IPv6, 1436 through
+an IPv4 data indication, and 1448 through an IPv6 channel-data path.
+
+The core's DPLPMTUD state machine has four states: `BASE`, `SEARCHING`, `SEARCH_COMPLETE`, and
+`ERROR`. It starts at 1229 and probes upward on the active path at 1280, 1350, then 1400 when
+the derived ceiling allows them; if the path ceiling is larger, that exact derived ceiling is
+the final candidate. A `PROBE` is an encrypted, padding-only packet with a unique probe ID and
+an authenticated declared size; the peer returns a `PROBE_ACK` echoing both. The
+acknowledgement must match the exact in-flight ID and size. A cumulative data acknowledgement
+never confirms a path probe, because a large data fragment could have been repaired at a smaller
+size.
+
+An unanswered rung is retried up to three times. One lost probe is expected and does not end the
+search; three timed-out attempts finish the current search round at the last known-good size.
+After `SEARCH_COMPLETE`, the state machine tries the next legal search again after 600 seconds.
+The selected path and all outstanding probes are discarded on path migration or relay-family
+change. If the transport delivery watchdog reports a black hole, the current size falls back to
+1229 and searches again. A black hole at the base enters `ERROR`, because continuing to guess
+cannot restore a path that cannot carry the mandatory base packet.
+
+The session applies a confirmed size transactionally to both packetization and pacing. Send rings
+reserve storage for the 2000-byte ceiling but fragment new messages at the currently confirmed
+body capacity. A transition is refused while an attached ring contains a fragment too large for
+the new size; the caller must drain or reset that queue before lowering the path. This prevents
+the pacer and packetizer from disagreeing about what is allowed on the wire.
 
 A 1400-byte datagram carries 1364 bytes of payload against the default's 1193, about 14
 percent more per packet. A 100 KB keyframe drops from 86 packets to 76. The benefit is fewer
@@ -571,7 +632,7 @@ number, its permissions and whether it owns the machine.
 
 ### §11.3 Video framing
 
-Video is not a control message. It rides the ordinary message framing of §5.3 on its own
+Video is not a control message. It rides the ordinary message framing of §5.4 on its own
 channel, with a 10-byte header ahead of the bitstream:
 
 | Offset | Size | Field |
@@ -620,7 +681,7 @@ constant across a whole session's frames, incrementing only when the encoder is 
 It went from 1 to 2 across the same 112 second recording. Anything using it to order or
 deduplicate frames is broken.
 
-Within the first fragment's body, and remembering the four-byte length prefix from §5.3, the
+Within the first fragment's body, and remembering the four-byte length prefix from §5.4, the
 absolute offsets are: length at 0, frame identifier at 4, dimensions at 8 and 10, reserved at
 12, flags at 13, start code at 14, and the first unit's type byte at 18.
 
@@ -815,8 +876,8 @@ bit 3 is set on every offer, so `_flags` of 8 alone is the ordinary case: H.264,
 | envelope size | 29 | §3 |
 | data header size | 7 | §5.1 |
 | group ack size | 83 | §5.2 |
-| message length prefix | 4 | §5.3, big endian, first fragment only |
-| body capacity per fragment | 1229 - 36 = 1193 at the default | §5.3, tracks the datagram size |
+| message length prefix | 4 | §5.4, big endian, first fragment only |
+| body capacity per fragment | 1229 - 36 = 1193 at the default | §5.4, tracks the datagram size |
 | channel count | 19 | §6 |
 | outstanding fragment cap | 100 | §9, also the congestion window floor |
 | retransmission floor | 50 ms | §9 |
@@ -826,7 +887,8 @@ bit 3 is set on every offer, so `_flags` of 8 alone is the ordinary case: H.264,
 | peer slot payload capacity | 2000 | §7 |
 | datagram size, floor and default | 1229 | §8, yields 1193 payload |
 | datagram size, absolute ceiling | 2000 | §8, MUST NOT exceed |
-| direct path clamp | 1472 | §8 |
+| path-derived datagram ceiling | `P - IP - UDP - relay framing`, capped at 2000 | §8 |
+| fixed probe rungs | 1280, 1350, 1400 | §8; exact path ceiling is the final rung when larger |
 | ack cadence | 30 ms | §9 |
 | priority quantum | 4 default datagrams | §10, bounded control/audio burst when media is due |
 | video burst time cap | 5 ms | §10, with a one-datagram floor |

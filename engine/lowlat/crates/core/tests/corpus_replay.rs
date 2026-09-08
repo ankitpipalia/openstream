@@ -241,6 +241,9 @@ fn replays_a_recorded_session_byte_for_byte() {
                 let n = packet::encode_ack(&mut reencode, ack).expect("re-encode");
                 assert_eq!(&reencode[..n], &cleartext[..], "re-encoded ack differs");
             }
+            Packet::Probe(_) | Packet::ProbeAck(_) => {
+                panic!("the captured media corpus unexpectedly contains a PMTU packet")
+            }
         }
 
         // Assertion 4: message spans agree with the length prefix.

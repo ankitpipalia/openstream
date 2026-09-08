@@ -1,4 +1,4 @@
-//! Cleartext packets: the data packet and the group acknowledgement.
+//! Cleartext packets: data, acknowledgements, and authenticated PMTU probes.
 //!
 //! See docs/01-protocol.md 5. Validation is deliberately strict and total: a
 //! packet failing any check is discarded without touching session state, and
@@ -17,6 +17,9 @@ pub const CHANNEL_COUNT: usize = 19;
 
 pub const FLAG_DATA: u8 = 0x01;
 pub const FLAG_ACK: u8 = 0x02;
+/// An authenticated, padded path-MTU probe. Its `seq` field is a probe ID,
+/// not a data-channel sequence number.
+pub const FLAG_PROBE: u8 = 0x04;
 pub const FLAG_KEEPALIVE: u8 = 0x08;
 pub const FLAG_NACK: u8 = 0x10;
 /// Set on the **last** fragment of a message, clear on earlier ones.
@@ -24,9 +27,12 @@ pub const FLAG_NACK: u8 = 0x10;
 /// Emit it correctly for a peer's validation, but never key reassembly on it;
 /// reassembly is length-driven (docs/01-protocol.md 7).
 pub const FLAG_LAST: u8 = 0x20;
+/// Positive confirmation for an exact-size path-MTU probe.
+pub const FLAG_PROBE_ACK: u8 = 0x40;
 
-/// Bits 2, 6, and 7 are reserved and must be clear.
-const RESERVED_MASK: u8 = 0xC4;
+/// Bit 7 remains reserved. The other formerly reserved bits carry the
+/// authenticated PMTU probe vocabulary.
+const RESERVED_MASK: u8 = 0x80;
 /// The bits that select which kind of packet this is.
 const KIND_MASK: u8 = 0x0B;
 
@@ -38,6 +44,21 @@ pub struct Data<'a> {
     /// True if this is the final fragment of its message.
     pub last: bool,
     pub body: &'a [u8],
+}
+
+/// A padded path-MTU probe. `size` is the expected encrypted UDP payload
+/// length, including the envelope, and is echoed by the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probe {
+    pub id: u32,
+    pub size: usize,
+}
+
+/// A positive acknowledgement for one exact path-MTU probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeAck {
+    pub id: u32,
+    pub size: usize,
 }
 
 /// Acknowledgements and keepalives share a layout and differ only in kind.
@@ -75,6 +96,8 @@ pub struct Ack {
 pub enum Packet<'a> {
     Data(Data<'a>),
     Ack(Ack),
+    Probe(Probe),
+    ProbeAck(ProbeAck),
 }
 
 fn be32(src: &[u8], offset: usize) -> Result<u32> {
@@ -100,6 +123,52 @@ pub fn parse(cleartext: &[u8]) -> Result<Packet<'_>> {
     if flags & RESERVED_MASK != 0 {
         return Err(Error::Malformed);
     }
+    let probe_kind = flags & (FLAG_PROBE | FLAG_PROBE_ACK);
+    if probe_kind != 0 {
+        // Probes are deliberately a separate vocabulary. They have no data
+        // channel semantics, no NACK/last bit, and must carry an exact-size
+        // two-byte echo value after the common header.
+        if flags != FLAG_PROBE && flags != FLAG_PROBE_ACK {
+            return Err(Error::Malformed);
+        }
+        if channel != 0 {
+            return Err(Error::Malformed);
+        }
+        if marker != MARKER {
+            return Err(Error::Malformed);
+        }
+        let id = be32(cleartext, 3)?;
+        if id == u32::MAX {
+            return Err(Error::Malformed);
+        }
+        let size = cleartext
+            .get(HEADER_LEN..HEADER_LEN + 2)
+            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+            .map(u16::from_be_bytes)
+            .map(usize::from)
+            .ok_or(Error::ShortPacket)?;
+        if !(crate::DEFAULT_DATAGRAM..=crate::MAX_DATAGRAM).contains(&size) {
+            return Err(Error::Malformed);
+        }
+        if probe_kind == FLAG_PROBE {
+            let expected_cleartext_len = size
+                .checked_sub(crate::envelope::ENVELOPE_LEN)
+                .ok_or(Error::Malformed)?;
+            if cleartext.len() != expected_cleartext_len
+                || cleartext
+                    .get(HEADER_LEN + 2..)
+                    .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
+            {
+                return Err(Error::Malformed);
+            }
+            return Ok(Packet::Probe(Probe { id, size }));
+        }
+        if cleartext.len() != HEADER_LEN + 2 {
+            return Err(Error::Malformed);
+        }
+        return Ok(Packet::ProbeAck(ProbeAck { id, size }));
+    }
+
     let kind = flags & KIND_MASK;
     if kind != FLAG_DATA && kind != FLAG_ACK && kind != FLAG_KEEPALIVE {
         return Err(Error::Malformed);
@@ -188,6 +257,54 @@ pub fn encode_data(out: &mut [u8], data: &Data<'_>) -> Result<usize> {
     Ok(total)
 }
 
+/// Write a path-MTU probe and pad it to exactly `probe.size` encrypted wire
+/// bytes. The envelope is added by [`crate::session::Session`], so this
+/// function writes only the cleartext portion.
+pub fn encode_probe(out: &mut [u8], probe: &Probe) -> Result<usize> {
+    if probe.id == u32::MAX
+        || !(crate::DEFAULT_DATAGRAM..=crate::MAX_DATAGRAM).contains(&probe.size)
+    {
+        return Err(Error::Malformed);
+    }
+    let cleartext_len = probe
+        .size
+        .checked_sub(crate::envelope::ENVELOPE_LEN)
+        .ok_or(Error::BufferTooSmall)?;
+    if cleartext_len < HEADER_LEN + 2 {
+        return Err(Error::BufferTooSmall);
+    }
+    let out = out.get_mut(..cleartext_len).ok_or(Error::BufferTooSmall)?;
+    let [s0, s1, s2, s3] = probe.id.to_be_bytes();
+    let [m0, m1] = u16::try_from(probe.size)
+        .map_err(|_| Error::BadLength)?
+        .to_be_bytes();
+    let (head, tail) = out.split_at_mut(HEADER_LEN);
+    head.copy_from_slice(&[MARKER, FLAG_PROBE, 0, s0, s1, s2, s3]);
+    let size_bytes = tail.get_mut(..2).ok_or(Error::BufferTooSmall)?;
+    size_bytes.copy_from_slice(&[m0, m1]);
+    for byte in tail.get_mut(2..).unwrap_or(&mut []) {
+        *byte = 0;
+    }
+    Ok(cleartext_len)
+}
+
+/// Write a small positive acknowledgement for an exact path-MTU probe.
+pub fn encode_probe_ack(out: &mut [u8], ack: &ProbeAck) -> Result<usize> {
+    if ack.id == u32::MAX || !(crate::DEFAULT_DATAGRAM..=crate::MAX_DATAGRAM).contains(&ack.size) {
+        return Err(Error::Malformed);
+    }
+    let out = out.get_mut(..HEADER_LEN + 2).ok_or(Error::BufferTooSmall)?;
+    let [s0, s1, s2, s3] = ack.id.to_be_bytes();
+    let [m0, m1] = u16::try_from(ack.size)
+        .map_err(|_| Error::BadLength)?
+        .to_be_bytes();
+    let (head, tail) = out.split_at_mut(HEADER_LEN);
+    head.copy_from_slice(&[MARKER, FLAG_PROBE_ACK, 0, s0, s1, s2, s3]);
+    let size_bytes = tail.get_mut(..2).ok_or(Error::BufferTooSmall)?;
+    size_bytes.copy_from_slice(&[m0, m1]);
+    Ok(HEADER_LEN + 2)
+}
+
 /// Write a group acknowledgement or keepalive. Always [`ACK_LEN`] bytes.
 pub fn encode_ack(out: &mut [u8], ack: &Ack) -> Result<usize> {
     if ack.trigger_channel as usize >= CHANNEL_COUNT {
@@ -258,6 +375,96 @@ mod tests {
             panic!("expected data");
         };
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn a_path_probe_is_padded_to_its_declared_wire_size() {
+        let probe = Probe {
+            id: 0x1234_5678,
+            size: crate::DEFAULT_DATAGRAM,
+        };
+        let mut buf = [0xA5u8; crate::DEFAULT_DATAGRAM];
+        let cleartext_len = encode_probe(&mut buf, &probe).unwrap();
+        assert_eq!(cleartext_len + crate::envelope::ENVELOPE_LEN, probe.size);
+        assert_eq!(
+            &buf[..HEADER_LEN],
+            &[MARKER, FLAG_PROBE, 0, 0x12, 0x34, 0x56, 0x78]
+        );
+        assert_eq!(
+            &buf[HEADER_LEN..HEADER_LEN + 2],
+            &u16::try_from(probe.size).unwrap().to_be_bytes()
+        );
+        assert!(
+            buf[HEADER_LEN + 2..cleartext_len]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(parse(&buf[..cleartext_len]), Ok(Packet::Probe(probe)));
+    }
+
+    #[test]
+    fn a_probe_rejects_wrong_length_or_nonzero_padding() {
+        let probe = Probe {
+            id: 1,
+            size: crate::DEFAULT_DATAGRAM,
+        };
+        let mut buf = [0u8; crate::DEFAULT_DATAGRAM];
+        let cleartext_len = encode_probe(&mut buf, &probe).unwrap();
+        assert_eq!(
+            parse(&buf[..cleartext_len - 1]),
+            Err(Error::Malformed),
+            "declared size must describe the complete encrypted payload"
+        );
+        buf[cleartext_len - 1] = 1;
+        assert_eq!(parse(&buf[..cleartext_len]), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn a_probe_ack_round_trips_with_the_exact_size_echo() {
+        let ack = ProbeAck { id: 7, size: 1400 };
+        let mut buf = [0u8; 64];
+        let written = encode_probe_ack(&mut buf, &ack).unwrap();
+        assert_eq!(written, HEADER_LEN + 2);
+        assert_eq!(parse(&buf[..written]), Ok(Packet::ProbeAck(ack)));
+    }
+
+    #[test]
+    fn probe_flags_cannot_be_combined_or_moved_to_another_channel() {
+        let mut buf = [0u8; HEADER_LEN + 2];
+        buf[0] = MARKER;
+        buf[1] = FLAG_PROBE | FLAG_PROBE_ACK;
+        buf[2] = 0;
+        buf[3..7].copy_from_slice(&1u32.to_be_bytes());
+        buf[HEADER_LEN..].copy_from_slice(&1280u16.to_be_bytes());
+        assert_eq!(parse(&buf), Err(Error::Malformed));
+
+        buf[1] = FLAG_PROBE;
+        buf[2] = 1;
+        assert_eq!(parse(&buf), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn probes_require_the_canonical_marker_and_non_reserved_id() {
+        let mut buf = [0u8; HEADER_LEN + 2];
+        buf[0] = 0xFF;
+        buf[1] = FLAG_PROBE;
+        buf[2] = 0;
+        buf[3..7].copy_from_slice(&1u32.to_be_bytes());
+        buf[HEADER_LEN..].copy_from_slice(&1280u16.to_be_bytes());
+        assert_eq!(parse(&buf), Err(Error::Malformed));
+
+        buf[0] = MARKER;
+        buf[3..7].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(parse(&buf), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn probe_ack_does_not_accept_ambiguous_trailing_bytes() {
+        let ack = ProbeAck { id: 7, size: 1400 };
+        let mut buf = [0u8; HEADER_LEN + 3];
+        let written = encode_probe_ack(&mut buf, &ack).unwrap();
+        buf[written] = 1;
+        assert_eq!(parse(&buf), Err(Error::Malformed));
     }
 
     #[test]

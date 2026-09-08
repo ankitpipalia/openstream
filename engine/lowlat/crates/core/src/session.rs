@@ -86,6 +86,13 @@ pub enum Inbound {
     Ack,
     /// A keepalive.
     Keepalive,
+    /// An authenticated exact-size path-MTU probe. The caller should feed the
+    /// result into its [`crate::pmtu::PathMtu`] state machine and let the
+    /// automatically queued probe acknowledgement drain.
+    Probe { id: u32, size: usize },
+    /// An authenticated positive acknowledgement for an exact-size path-MTU
+    /// probe.
+    ProbeAck { id: u32, size: usize },
     /// Well formed but not for a channel we hold a ring for.
     Unhandled { channel: u8 },
 }
@@ -207,6 +214,14 @@ pub struct Session<'a> {
     /// Wire bytes emitted from each bounded priority class in the current
     /// drain pass. ACKs are not data and are intentionally not counted here.
     drain_bytes: [usize; CHANNEL_COUNT],
+    /// Datagram size currently used to fragment newly queued messages. Rings
+    /// are allocated for the protocol ceiling and this value starts at the
+    /// conservative floor until a path probe confirms more headroom.
+    path_datagram_size: usize,
+    /// At most one probe acknowledgement is retained. A peer may retransmit a
+    /// probe, and replacing an older identical response is safe while keeping
+    /// the no-allocator session bounded.
+    pending_probe_ack: Option<packet::ProbeAck>,
 }
 
 impl<'a> Session<'a> {
@@ -255,6 +270,8 @@ impl<'a> Session<'a> {
             drain_started: false,
             pacer: Pacer::new(now_ms),
             drain_bytes: [0; CHANNEL_COUNT],
+            path_datagram_size: crate::DEFAULT_DATAGRAM,
+            pending_probe_ack: None,
         }
     }
 
@@ -269,6 +286,17 @@ impl<'a> Session<'a> {
 
     /// Give the session a send ring for `channel`.
     pub fn attach_send(&mut self, channel: u8, ring: SendRing<'a>) -> Result<()> {
+        let mut ring = ring;
+        // A ceiling-sized ring may be attached after the path has already
+        // moved upward. Small fixtures and non-probing callers can retain a
+        // deliberately narrower ring as long as it never emits above the
+        // session's current path size.
+        let active_body = self
+            .path_datagram_size
+            .saturating_sub(ENVELOPE_LEN + packet::HEADER_LEN);
+        if ring.fragment_capacity() > active_body && !ring.set_fragment_capacity(active_body) {
+            return Err(Error::BufferTooSmall);
+        }
         *self
             .send
             .get_mut(channel as usize)
@@ -303,6 +331,70 @@ impl<'a> Session<'a> {
     /// send rings have been resized to emit the same packet size.
     pub fn set_pacing_datagram_size(&mut self, datagram_bytes: usize) -> bool {
         self.pacer.set_datagram_size(datagram_bytes)
+    }
+
+    /// Apply a path MTU transition to packetization and pacing as one
+    /// operation.
+    ///
+    /// Send rings must be allocated with enough storage for the protocol
+    /// ceiling (see [`SendRing::new_with_capacity`]). A transition is refused
+    /// if a ring is too small or contains already-fragmented data that cannot
+    /// be represented at the new size; this prevents a partial update where
+    /// pacing believes a larger/smaller datagram is active than packetization
+    /// can actually produce.
+    pub fn set_path_datagram_size(&mut self, datagram_bytes: usize) -> bool {
+        if !(crate::DEFAULT_DATAGRAM..=crate::MAX_DATAGRAM).contains(&datagram_bytes) {
+            return false;
+        }
+        let body = datagram_bytes.saturating_sub(ENVELOPE_LEN + packet::HEADER_LEN);
+        if self
+            .send
+            .iter()
+            .flatten()
+            .any(|ring| !ring.can_set_fragment_capacity(body))
+        {
+            return false;
+        }
+        if !self.pacer.set_datagram_size(datagram_bytes) {
+            return false;
+        }
+        for ring in self.send.iter_mut().flatten() {
+            // The immutable preflight above makes this infallible. Keep the
+            // boolean result out of the public contract so a future ring
+            // implementation cannot silently create a partial transition.
+            let _ = ring.set_fragment_capacity(body);
+        }
+        self.path_datagram_size = datagram_bytes;
+        true
+    }
+
+    /// Apply the currently confirmed size from a DPLPMTUD controller.
+    pub fn apply_path_mtu(&mut self, mtu: &crate::pmtu::PathMtu) -> bool {
+        if mtu.state() == crate::pmtu::PathMtuState::Error {
+            return false;
+        }
+        self.set_path_datagram_size(mtu.datagram_size())
+    }
+
+    /// Current datagram size used by packetization and pacing.
+    pub fn path_datagram_size(&self) -> usize {
+        self.path_datagram_size
+    }
+
+    /// Emit one exact-size authenticated path-MTU probe returned by
+    /// [`crate::pmtu::PathMtu::start_probe`]. A local output failure does not
+    /// mutate the PMTU controller; the caller should release its reservation
+    /// with `on_probe_send_failed` and retry.
+    pub fn emit_path_probe(&mut self, probe: crate::pmtu::Probe, out: &mut [u8]) -> Result<usize> {
+        let body = out.get_mut(ENVELOPE_LEN..).ok_or(Error::BufferTooSmall)?;
+        let cleartext_len = packet::encode_probe(
+            body,
+            &packet::Probe {
+                id: probe.id,
+                size: probe.size,
+            },
+        )?;
+        self.seal(cleartext_len, out)
     }
 
     /// The path-specific pacing target, or zero while pacing is disabled.
@@ -506,6 +598,28 @@ impl<'a> Session<'a> {
                     AckKind::Keepalive => Inbound::Keepalive,
                 })
             }
+            Packet::Probe(probe) => {
+                // The declared size is part of the authenticated probe
+                // metadata, but it is only meaningful when it also matches
+                // the actual encrypted UDP payload that arrived. Otherwise a
+                // peer could acknowledge a small packet while claiming a
+                // larger path size.
+                if datagram.len() != probe.size {
+                    return Err(Error::Malformed);
+                }
+                self.pending_probe_ack = Some(packet::ProbeAck {
+                    id: probe.id,
+                    size: probe.size,
+                });
+                Ok(Inbound::Probe {
+                    id: probe.id,
+                    size: probe.size,
+                })
+            }
+            Packet::ProbeAck(ack) => Ok(Inbound::ProbeAck {
+                id: ack.id,
+                size: ack.size,
+            }),
         }
     }
 
@@ -702,6 +816,9 @@ impl<'a> Session<'a> {
     /// polls on a timer instead of on this will either burn cycles or miss
     /// deadlines, and both have shipped before.
     pub fn next_timer_ms(&self, now_ms: f64) -> f64 {
+        if self.pending_probe_ack.is_some() {
+            return 0.0;
+        }
         let since_ack = now_ms - self.last_ack_sent_ms;
         let mut next = (ACK_CADENCE_MS - since_ack).max(0.0);
         if let Some(video) = self
@@ -755,6 +872,17 @@ impl<'a> Session<'a> {
             if result.is_ok() {
                 self.ack_due = false;
                 self.last_ack_sent_ms = now_ms;
+            }
+            return Some(result);
+        }
+
+        // A probe acknowledgement is control feedback, not bulk media. It
+        // remains ahead of all data, but unlike the group ACK it is retained
+        // until a sufficiently large output buffer lets it leave.
+        if let Some(probe_ack) = self.pending_probe_ack {
+            let result = self.emit_probe_ack(probe_ack, out);
+            if result.is_ok() {
+                self.pending_probe_ack = None;
             }
             return Some(result);
         }
@@ -874,6 +1002,14 @@ impl<'a> Session<'a> {
         };
         let body = out.get_mut(ENVELOPE_LEN..).ok_or(Error::BufferTooSmall)?;
         let written = packet::encode_ack(body, &ack)?;
+        self.seal(written, out)
+    }
+
+    /// Build and seal a positive acknowledgement for one exact-size path
+    /// probe.
+    fn emit_probe_ack(&mut self, ack: packet::ProbeAck, out: &mut [u8]) -> Result<usize> {
+        let body = out.get_mut(ENVELOPE_LEN..).ok_or(Error::BufferTooSmall)?;
+        let written = packet::encode_probe_ack(body, &ack)?;
         self.seal(written, out)
     }
 
@@ -1071,6 +1207,107 @@ mod tests {
         let mut out = [0u8; 1024];
         let len = right.take_message(VIDEO, &mut out).unwrap().unwrap();
         assert_eq!(&out[..len], &payload[..]);
+    }
+
+    #[test]
+    fn an_exact_size_probe_gets_an_authenticated_exact_ack() {
+        let mut left_arena = Arena::new();
+        let mut right_arena = Arena::new();
+        let mut left = endpoint(&mut left_arena, 0.0);
+        let mut right = endpoint_guest(&mut right_arena, 0.0);
+        let mut mtu = crate::pmtu::PathMtu::new(crate::pmtu::Path::Direct);
+        let probe = mtu.start_probe(0.0).unwrap();
+
+        let mut wire = [0u8; crate::MAX_DATAGRAM];
+        let mut scratch = [0u8; crate::MAX_DATAGRAM];
+        let written = left.emit_path_probe(probe, &mut wire).unwrap();
+        assert_eq!(written, probe.size);
+        assert_eq!(
+            right
+                .process_input(&wire[..written], 1.0, &mut scratch)
+                .unwrap(),
+            Inbound::Probe {
+                id: probe.id,
+                size: probe.size
+            }
+        );
+
+        let ack_len = right.get_output(1.0, &mut wire).unwrap().unwrap();
+        assert_eq!(
+            left.process_input(&wire[..ack_len], 2.0, &mut scratch)
+                .unwrap(),
+            Inbound::ProbeAck {
+                id: probe.id,
+                size: probe.size
+            }
+        );
+        assert!(mtu.on_probe_ack(probe.id, probe.size, 2.0));
+    }
+
+    #[test]
+    fn path_mtu_updates_packetization_and_pacing_atomically() {
+        const STORAGE_BODY: usize = crate::MAX_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        const ACTIVE_BODY: usize =
+            crate::DEFAULT_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        let mut bodies = std::vec![0u8; STORAGE_BODY * 8];
+        let mut meta = std::vec![SendSlot::default(); 8];
+        let envelope = Envelope::from_key(&KEY).unwrap();
+        let mut session = Session::with_direction(envelope, Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new_with_capacity(
+                    &mut bodies,
+                    &mut meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    VIDEO,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(session.path_datagram_size(), crate::DEFAULT_DATAGRAM);
+        let unusable =
+            crate::pmtu::PathMtu::new_with_config(crate::pmtu::PathConfig::direct_v6(1276), 0.0);
+        assert!(!session.apply_path_mtu(&unusable));
+        assert_eq!(session.path_datagram_size(), crate::DEFAULT_DATAGRAM);
+        assert!(session.set_path_datagram_size(1400));
+        assert_eq!(session.path_datagram_size(), 1400);
+        assert_eq!(session.pacing_burst_capacity_bytes(), 0);
+        session.send_message(VIDEO, &[], &[0xA5; 1300]).unwrap();
+        let mut wire = [0u8; crate::MAX_DATAGRAM];
+        let written = session.get_output(0.0, &mut wire).unwrap().unwrap();
+        assert!(written < 1400, "the 1304-byte body was not packetized once");
+        assert!(written > crate::DEFAULT_DATAGRAM - 1);
+    }
+
+    #[test]
+    fn a_path_mtu_shrink_is_refused_when_queued_fragments_are_too_large() {
+        const STORAGE_BODY: usize = crate::MAX_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        const ACTIVE_BODY: usize =
+            crate::DEFAULT_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        let mut bodies = std::vec![0u8; STORAGE_BODY * 8];
+        let mut meta = std::vec![SendSlot::default(); 8];
+        let envelope = Envelope::from_key(&KEY).unwrap();
+        let mut session = Session::with_direction(envelope, Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new_with_capacity(
+                    &mut bodies,
+                    &mut meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    VIDEO,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(session.set_path_datagram_size(1400));
+        session.send_message(VIDEO, &[], &[0x5A; 1300]).unwrap();
+        assert!(!session.set_path_datagram_size(crate::DEFAULT_DATAGRAM));
+        assert_eq!(session.path_datagram_size(), 1400);
     }
 
     /// The acknowledgement path closes the loop: the sender's window must free

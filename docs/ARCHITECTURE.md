@@ -155,7 +155,11 @@ lowlat host applies the stream target to a bounded, per-guest video pacer; ackno
 are unpaced, while control/input and audio get bounded priority quanta ahead of bulk video.
 The video burst is capped both by packet count and by approximately five milliseconds of
 wire time at the current target; a path-MTU update can change the packet-count conversion.
-Path-aware MTU probing and the portable `PeerSession` telemetry adapter remain open.
+The lowlat session now has a path-aware DPLPMTUD controller with exact authenticated padding
+probes, three-attempt loss tolerance, IPv4/IPv6/relay-derived ceilings, maintenance reprobes,
+and black-hole fallback. A confirmed size is applied atomically to ceiling-sized send-ring
+storage, active packetization, and pacing; lowering is refused while an attached ring still
+contains larger fragments. The portable `PeerSession` telemetry adapter remains open.
 The rate controller consumes measured delivery rate during clean-path ramp-up;
 these counters are local diagnostics and do not add a congestion-feedback wire
 message. The OpenStream `PeerSession`/FFmpeg path still uses its separate

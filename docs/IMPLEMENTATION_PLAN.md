@@ -308,8 +308,11 @@ without changing the default OpenStream wire format.
   priority quanta ahead of it, and a target can be applied independently to
   every network path. Burst credit is capped by both packet count and target
   wire time, with a path-datagram-size hook ready for MTU probing.
-- [ ] Add path-aware MTU probing; preserve the 1200-byte safe floor and never
-  raise the protocol ceiling.
+- [x] Add path-aware DPLPMTUD: exact authenticated padding probes and probe
+  acknowledgements, three-attempt loss tolerance, IPv4/IPv6/relay-derived
+  ceilings, SEARCH_COMPLETE maintenance reprobes, black-hole fallback, and a
+  transactional packetization/pacer update. The protocol floor remains 1229
+  bytes and the 2000-byte ceiling is never raised.
 - [ ] Add a common packet-telemetry adapter for the portable `PeerSession` /
   FFmpeg path so it uses the same delivery estimator as the native lowlat host.
 - [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →
