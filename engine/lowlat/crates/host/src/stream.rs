@@ -286,6 +286,11 @@ struct Seat {
     /// rather than a scaled integer, because the controller takes a float and
     /// a fixed-point round trip would quietly change what it is given.
     measured_bits: AtomicU32,
+    /// The current stream-wide video target to apply to this guest's
+    /// path-specific pacer, as `f32` bits. The encoded picture is shared, so
+    /// every guest receives the same target; each guest still has its own
+    /// bucket and therefore its own path pacing.
+    pacing_rate_bits: AtomicU32,
     /// A refresh this guest asked for outright.
     ///
     /// **A peer that cannot decode says so, and it is the only party that
@@ -349,6 +354,7 @@ impl Seat {
             window: AtomicU32::new(0),
             stale: AtomicU32::new(0),
             measured_bits: AtomicU32::new(0),
+            pacing_rate_bits: AtomicU32::new(0),
             missed: AtomicU32::new(0),
             refresh: AtomicU32::new(0),
             flags: AtomicU32::new(0),
@@ -359,6 +365,25 @@ impl Seat {
             wants_raw: AtomicU32::new(0),
             audio_wake: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Publish the stream-wide encoder target to this guest's path-specific
+    /// pacer. A zero or invalid value means that the guest has not received a
+    /// controller target yet, so its session keeps pacing disabled.
+    fn set_pacing_rate(&self, rate_mbps: f64) {
+        let rate = if rate_mbps.is_finite() && rate_mbps > 0.0 {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "the pacer reads an f32 diagnostic target"
+            )]
+            {
+                rate_mbps.min(f64::from(f32::MAX)) as f32
+            }
+        } else {
+            0.0
+        };
+        self.pacing_rate_bits
+            .store(rate.to_bits(), Ordering::Release);
     }
 }
 
@@ -1394,6 +1419,7 @@ impl Seats {
                 seat.window.store(0, Ordering::Relaxed);
                 seat.stale.store(0, Ordering::Relaxed);
                 seat.measured_bits.store(0, Ordering::Relaxed);
+                seat.pacing_rate_bits.store(0, Ordering::Relaxed);
                 seat.missed.store(0, Ordering::Relaxed);
                 seat.refresh.store(0, Ordering::Relaxed);
                 // **The declaration belongs to the guest, not to the seat.**
@@ -1502,6 +1528,16 @@ impl SeatHold {
         )]
         seat.measured_bits
             .store((measured_mbps as f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Read the current stream-wide video target for this guest's network
+    /// pacer. The encoder is shared across guests, but pacing state is not:
+    /// each network path receives the same encoded rate through its own
+    /// bounded bucket.
+    pub fn pacing_rate_mbps(&self) -> f32 {
+        self.shared.seats.get(self.index).map_or(0.0, |seat| {
+            f32::from_bits(seat.pacing_rate_bits.load(Ordering::Acquire))
+        })
     }
 
     /// What size the stream is really producing, once it is known.
@@ -3084,7 +3120,7 @@ fn encode_loop<E: Encoder + FromDevice>(
                 guest.set_rate(ceiling);
             }
             lowlat_common::log_info!(
-                "stream: sound costs {sound_mbps:.2} Mibit/s, the picture may use {:.2}",
+                "stream: sound costs {sound_mbps:.2} Mbps, the picture may use {:.2}",
                 budget.ceiling()
             );
         }
@@ -3712,6 +3748,16 @@ fn tick_rate<E: Encoder>(
         // A live change. It reinitialises nothing and forces no refresh, which
         // is what keeps the stream unbroken across a reconfigure.
         let _ = encoder.reconfigure(bps);
+    }
+    // The stream produces one encoded rate for everyone, but the network
+    // budget is per guest. Publish the same target to every seat; each guest's
+    // network thread applies it to its own token bucket and therefore paces
+    // independently on LAN, WAN, or relay paths.
+    let target = budget.applied_mbps();
+    for entry in active {
+        if let Some(seat) = shared.seats.get(entry.seat) {
+            seat.set_pacing_rate(target);
+        }
     }
 }
 
@@ -5377,6 +5423,31 @@ mod tests {
         );
         drop(first);
         drop(second);
+    }
+
+    #[test]
+    fn a_seat_publishes_a_safe_path_pacing_target() {
+        let seat = Seat::new();
+        assert_eq!(seat.pacing_rate_bits.load(Ordering::Acquire), 0);
+
+        seat.set_pacing_rate(12.5);
+        assert_eq!(
+            f32::from_bits(seat.pacing_rate_bits.load(Ordering::Acquire)),
+            12.5
+        );
+
+        // Invalid controller output must disable pacing rather than leave a
+        // previous target silently governing a session.
+        seat.set_pacing_rate(f64::NAN);
+        assert_eq!(
+            seat.pacing_rate_bits.load(Ordering::Acquire),
+            0.0f32.to_bits()
+        );
+        seat.set_pacing_rate(-1.0);
+        assert_eq!(
+            seat.pacing_rate_bits.load(Ordering::Acquire),
+            0.0f32.to_bits()
+        );
     }
 
     /// **The largest frame the session has produced is the session's, not the

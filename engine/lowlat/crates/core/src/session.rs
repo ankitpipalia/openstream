@@ -19,6 +19,7 @@ use crate::congestion::Controller;
 use crate::envelope::{Direction, ENVELOPE_LEN, Envelope};
 use crate::error::{Error, Result};
 use crate::message::Message;
+use crate::pacer::Pacer;
 use crate::packet::{self, Ack, AckKind, CHANNEL_COUNT, Packet};
 use crate::send::SendRing;
 
@@ -44,6 +45,21 @@ const SRTT_ALPHA: f64 = 0.1;
 /// Avoid turning a fast event-loop tick into a bursty one-millisecond rate
 /// sample. The controller retains the last sample until this interval elapses.
 const TRANSPORT_SAMPLE_MIN_MS: f64 = 100.0;
+
+/// The host-to-guest video channel. The session owns the transport mechanics,
+/// so keeping this semantic channel here lets its controller and pacer make
+/// the same choice without treating control/audio traffic as video capacity.
+pub const VIDEO_CHANNEL: u8 = 1;
+/// The host-to-guest audio channel, which is scheduled ahead of bulk video.
+pub const AUDIO_CHANNEL: u8 = 2;
+
+/// Output order after an acknowledgement has been emitted. Channel 0 carries
+/// control and input, so it is latency-sensitive; audio is small and should
+/// stay ahead of bulk video. The remaining channels retain their numeric
+/// order for forward compatibility.
+const DRAIN_ORDER: [usize; CHANNEL_COUNT] = [
+    0, 2, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+];
 
 /// What a datagram turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +98,7 @@ pub enum Health {
 /// minimum-sized sampling interval. `bytes_acked` is payload covered by the
 /// peer's cumulative acknowledgements, so `delivery_rate_mbps` describes what
 /// the path delivered rather than what the sender attempted to put on the
-/// socket. Rates use mebibits per second, matching
+/// socket. Rates use decimal megabits per second, matching
 /// [`crate::congestion::Controller`]. No peer clock or address is included.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TransportStats {
@@ -98,9 +114,11 @@ pub struct TransportStats {
     pub bytes_acked: u64,
     /// Retransmission transmissions since the session began.
     pub retransmitted_fragments: u64,
-    /// Attempted payload rate over the last sample interval, in mebibits/s.
+    /// Attempted payload rate over the last sample interval, in decimal
+    /// megabits/s.
     pub send_rate_mbps: f64,
-    /// Delivered payload rate over the last sample interval, in mebibits/s.
+    /// Delivered payload rate over the last sample interval, in decimal
+    /// megabits/s.
     pub delivery_rate_mbps: f64,
     /// Smoothed fragment round trip in fractional milliseconds.
     pub srtt_ms: f64,
@@ -149,8 +167,9 @@ pub struct Session<'a> {
     /// Latest packet-level telemetry snapshot.
     transport_stats: TransportStats,
     /// Latest packet-level snapshot for each attached send channel. The
-    /// aggregate above is kept for the session controller; media callers use
-    /// this array so control and audio traffic cannot inflate video delivery.
+    /// aggregate above is kept for diagnostics; the session controller and
+    /// media callers use the video entry so control and audio traffic cannot
+    /// inflate video delivery.
     channel_stats: [TransportStats; CHANNEL_COUNT],
     /// Cumulative counters at the start of the current rate sample.
     last_sample_ms: f64,
@@ -165,6 +184,10 @@ pub struct Session<'a> {
     /// Which channel the output drain is working through.
     drain_channel: usize,
     drain_started: bool,
+    /// Optional bulk-video pacing. It is disabled until the owning host gives
+    /// this session a path-specific target, preserving the old sans-IO API for
+    /// callers that have no congestion-control target yet.
+    pacer: Pacer,
 }
 
 impl<'a> Session<'a> {
@@ -211,6 +234,7 @@ impl<'a> Session<'a> {
             trigger: (0, 0),
             drain_channel: 0,
             drain_started: false,
+            pacer: Pacer::new(now_ms),
         }
     }
 
@@ -240,6 +264,21 @@ impl<'a> Session<'a> {
     /// Encoder rate the controller currently wants.
     pub fn rate_mbps(&self) -> f64 {
         self.controller.rate_mbps()
+    }
+
+    /// Set the target rate for bulk video pacing on this peer's path.
+    ///
+    /// The target is deliberately supplied by the owner of the session: one
+    /// host may have several guests with different paths, and a single global
+    /// pacer would let a fast LAN guest spend a relay guest's budget. A zero,
+    /// negative, or non-finite rate disables pacing. Rates are decimal Mbps.
+    pub fn set_pacing_rate_mbps(&mut self, now_ms: f64, rate_mbps: f64) {
+        self.pacer.set_rate(now_ms, rate_mbps);
+    }
+
+    /// The path-specific pacing target, or zero while pacing is disabled.
+    pub fn pacing_rate_mbps(&self) -> f64 {
+        self.pacer.rate_mbps()
     }
 
     /// Return the latest bounded packet-level transport snapshot.
@@ -455,6 +494,10 @@ impl<'a> Session<'a> {
 
     /// Housekeeping. Safe to call whenever the loop wakes.
     pub fn poll(&mut self, now_ms: f64) {
+        // A poll begins a fresh output pass. This also releases a pass that
+        // stopped at the pacer because the bucket was empty; the next drain
+        // must recalculate the send window rather than inherit the old cap.
+        self.drain_started = false;
         // Every acknowledgement resets the cadence, whatever prompted it, so
         // this fires only when nothing else has sent one. That is what makes it
         // a keepalive: the session is never silent for longer than the cadence,
@@ -512,8 +555,8 @@ impl<'a> Session<'a> {
                 )]
                 let acked_bits = acked_delta as f64 * 8.0;
                 let seconds = elapsed / 1000.0;
-                let send_rate_mbps = send_bits / seconds / 1_048_576.0;
-                let delivery_rate_mbps = acked_bits / seconds / 1_048_576.0;
+                let send_rate_mbps = send_bits / seconds / 1_000_000.0;
+                let delivery_rate_mbps = acked_bits / seconds / 1_000_000.0;
                 stats.interval_ms = elapsed;
                 stats.send_rate_mbps = if send_rate_mbps.is_finite() {
                     send_rate_mbps.max(0.0)
@@ -550,11 +593,20 @@ impl<'a> Session<'a> {
         }
         aggregate.srtt_ms = self.srtt_ms;
         self.transport_stats = aggregate;
-        self.controller.tick(
-            self.transport_stats.in_flight,
-            self.transport_stats.stale,
-            self.transport_stats.delivery_rate_mbps,
-        );
+        // This controller's public rate is a video rate. The aggregate
+        // snapshot remains useful for diagnostics, but feeding control or
+        // audio pressure into it makes a busy side channel look like video
+        // congestion and was the ambiguity the per-channel telemetry fixed.
+        if let Some(video) = self.channel_stats.get(VIDEO_CHANNEL as usize)
+            && self
+                .send
+                .get(VIDEO_CHANNEL as usize)
+                .and_then(Option::as_ref)
+                .is_some()
+        {
+            self.controller
+                .tick(video.in_flight, video.stale, video.delivery_rate_mbps);
+        }
     }
 
     /// Milliseconds until the session next needs attention.
@@ -564,13 +616,29 @@ impl<'a> Session<'a> {
     /// deadlines, and both have shipped before.
     pub fn next_timer_ms(&self, now_ms: f64) -> f64 {
         let since_ack = now_ms - self.last_ack_sent_ms;
-        (ACK_CADENCE_MS - since_ack).max(0.0)
+        let ack = (ACK_CADENCE_MS - since_ack).max(0.0);
+        let Some(video) = self
+            .send
+            .get(VIDEO_CHANNEL as usize)
+            .and_then(Option::as_ref)
+        else {
+            return ack;
+        };
+        if !self.pacer.enabled() {
+            return ack;
+        }
+        let Some(cleartext_len) = video.next_due_len(now_ms, self.srtt_ms, self.level) else {
+            return ack;
+        };
+        let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
+        ack.min(self.pacer.wait_ms(now_ms, wire_len))
     }
 
     /// Emit the next datagram, sealed and ready for the socket.
     ///
-    /// Drive until `None`. Data is drained before acknowledgements, so a burst
-    /// of media is not delayed behind bookkeeping.
+    /// Drive until `None`. Acknowledgements and latency-sensitive channels are
+    /// drained before bulk video, so a keyframe burst cannot delay feedback or
+    /// input.
     pub fn get_output(&mut self, now_ms: f64, out: &mut [u8]) -> Option<Result<usize>> {
         if !self.drain_started {
             for ring in self.send.iter_mut().flatten() {
@@ -580,31 +648,75 @@ impl<'a> Session<'a> {
             self.drain_started = true;
         }
 
+        // Acknowledgements are independent of the bulk send budget. Emit one
+        // first so a peer can release its window and so control feedback is
+        // never queued behind a keyframe burst.
+        if self.ack_due {
+            let result = self.emit_ack(out);
+            if result.is_ok() {
+                self.ack_due = false;
+                self.last_ack_sent_ms = now_ms;
+            }
+            return Some(result);
+        }
+
         // Cleartext is built directly at the ciphertext offset so sealing is a
         // header-and-tag write rather than a second pass over the payload.
         while self.drain_channel < CHANNEL_COUNT {
-            let index = self.drain_channel;
+            let Some(&index) = DRAIN_ORDER.get(self.drain_channel) else {
+                self.drain_channel = CHANNEL_COUNT;
+                continue;
+            };
             let srtt = self.srtt_ms;
             let level = self.level;
             let Some(ring) = self.send.get_mut(index).and_then(Option::as_mut) else {
                 self.drain_channel += 1;
                 continue;
             };
+            // Channel 0 carries input/control and channel 2 carries audio;
+            // both are small, latency-sensitive streams. Bulk video alone is
+            // paced against the target for this path, and the token check is
+            // performed before poll_send commits the slot as transmitted.
+            let paced = index == VIDEO_CHANNEL as usize && self.pacer.enabled();
+            if paced {
+                let Some(cleartext_len) = ring.next_due_len(now_ms, srtt, level) else {
+                    self.drain_channel += 1;
+                    continue;
+                };
+                let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
+                if !self.pacer.can_consume(now_ms, wire_len) {
+                    // Keep the pass open. The next timer includes exactly the
+                    // refill delay, and no ring cursor or send counter has
+                    // moved yet.
+                    return None;
+                }
+            }
             let Some(body) = out.get_mut(ENVELOPE_LEN..) else {
                 return Some(Err(Error::BufferTooSmall));
             };
             match ring.poll_send(now_ms, srtt, level, body) {
-                Some(Ok(written)) => return Some(self.seal(written, out)),
+                Some(Ok(written)) => {
+                    let result = self.seal(written, out);
+                    if let Ok(len) = result {
+                        if paced {
+                            // The read-only preflight above used the same
+                            // candidate and length. A failed consume here
+                            // would indicate arithmetic or state corruption;
+                            // retain the packet because the ring is already
+                            // committed and make the invariant visible in
+                            // debug builds.
+                            // Keep the call outside `debug_assert!`: the
+                            // token subtraction is the pacing side effect and
+                            // must also happen in release builds.
+                            let _consumed = self.pacer.try_consume(now_ms, len);
+                            debug_assert!(_consumed);
+                        }
+                    }
+                    return Some(result);
+                }
                 Some(Err(error)) => return Some(Err(error)),
                 None => self.drain_channel += 1,
             }
-        }
-
-        if self.ack_due {
-            self.ack_due = false;
-            self.last_ack_sent_ms = now_ms;
-            self.drain_started = false;
-            return Some(self.emit_ack(out));
         }
 
         self.drain_started = false;
@@ -911,7 +1023,7 @@ mod tests {
         assert_eq!(stats.retransmitted_fragments, 0);
         assert_eq!(stats.in_flight, 0);
         assert!((stats.interval_ms - 100.0).abs() < f64::EPSILON);
-        let expected_rate = 11.0 * 8.0 / 0.1 / 1_048_576.0;
+        let expected_rate = 11.0 * 8.0 / 0.1 / 1_000_000.0;
         assert!((stats.send_rate_mbps - expected_rate).abs() < 1e-12);
         assert!((stats.delivery_rate_mbps - expected_rate).abs() < 1e-12);
         assert!(stats.srtt_ms > 0.0);
@@ -935,6 +1047,140 @@ mod tests {
         session.poll(100.0);
         assert!((session.transport_stats().interval_ms - 100.0).abs() < f64::EPSILON);
         assert!(session.transport_stats().send_rate_mbps.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn acknowledgements_precede_queued_video() {
+        let mut left_arena = Arena::new();
+        let mut right_arena = Arena::new();
+        let mut left = endpoint_pair(&mut left_arena, 0.0, true);
+        let mut right = endpoint_pair_guest(&mut right_arena, 0.0, true);
+        let mut wire = [0u8; 512];
+        let mut scratch = [0u8; 512];
+
+        left.send_message(VIDEO, &[], b"video").unwrap();
+        let left_written = left.get_output(0.0, &mut wire).unwrap().unwrap();
+        right
+            .process_input(&wire[..left_written], 0.0, &mut scratch)
+            .expect("the queued video reaches the peer");
+        right.send_message(VIDEO, &[], b"reply-video").unwrap();
+
+        // The reply has both an acknowledgement owed to the received frame
+        // and its own video waiting. The acknowledgement must be first.
+        let written = right.get_output(1.0, &mut wire).unwrap().unwrap();
+        let opened = right.envelope.open(&wire[..written], &mut scratch).unwrap();
+        let Packet::Ack(_) = packet::parse(opened.cleartext).unwrap() else {
+            panic!("video was allowed to delay an acknowledgement");
+        };
+    }
+
+    #[test]
+    fn control_is_scheduled_before_paced_video() {
+        let mut arena = Arena::new();
+        let mut session = endpoint_pair(&mut arena, 0.0, true);
+        session.set_pacing_rate_mbps(0.0, 0.001);
+        session.send_message(VIDEO, &[], b"video").unwrap();
+        session.send_message(CONTROL, &[], b"input").unwrap();
+
+        let mut wire = [0u8; 512];
+        let mut scratch = [0u8; 512];
+        let written = session.get_output(0.0, &mut wire).unwrap().unwrap();
+        let opened = session
+            .envelope
+            .open(&wire[..written], &mut scratch)
+            .unwrap();
+        let Packet::Data(data) = packet::parse(opened.cleartext).unwrap() else {
+            panic!("expected the control data packet");
+        };
+        assert_eq!(data.channel, CONTROL);
+    }
+
+    #[test]
+    fn side_channel_pressure_does_not_drive_the_video_controller() {
+        const CONTROL_SLOTS: usize = 128;
+        let mut video_bodies = std::vec![0u8; SLOT * SLOTS];
+        let mut video_meta = std::vec![SendSlot::default(); SLOTS];
+        let mut control_bodies = std::vec![0u8; SLOT * CONTROL_SLOTS];
+        let mut control_meta = std::vec![SendSlot::default(); CONTROL_SLOTS];
+        let mut session =
+            Session::with_direction(Envelope::from_key(&KEY).unwrap(), Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new(&mut video_bodies, &mut video_meta, SLOT, VIDEO).unwrap(),
+            )
+            .unwrap();
+        session
+            .attach_send(
+                CONTROL,
+                SendRing::new(&mut control_bodies, &mut control_meta, SLOT, CONTROL).unwrap(),
+            )
+            .unwrap();
+
+        // Move the controller above its floor so an accidental
+        // aggregate-congestion tick is observable as a rate cut.
+        for _ in 0..60 {
+            session.controller.tick(0, 0, 10.0);
+        }
+        let before = session.rate_mbps();
+        for _ in 0..CONTROL_SLOTS {
+            session.send_message(CONTROL, &[], b"control").unwrap();
+        }
+
+        let mut wire = [0u8; 256];
+        while let Some(result) = session.get_output(0.0, &mut wire) {
+            result.unwrap();
+        }
+        session.poll(100.0);
+
+        assert_eq!(session.controller.total_decreases(), 0);
+        assert!((session.rate_mbps() - before).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn video_pacing_has_a_bounded_burst_and_refill_timer() {
+        const PACER_SLOT: usize = 128;
+        const PACER_SLOTS: usize = 64;
+        let mut bodies = std::vec![0u8; PACER_SLOT * PACER_SLOTS];
+        let mut meta = std::vec![SendSlot::default(); PACER_SLOTS];
+        let mut session =
+            Session::with_direction(Envelope::from_key(&KEY).unwrap(), Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new(&mut bodies, &mut meta, PACER_SLOT, VIDEO).unwrap(),
+            )
+            .unwrap();
+        session.set_pacing_rate_mbps(0.0, 1.0);
+
+        // Seven messages produce more than one bucketful while keeping every
+        // message within the ring's bounded capacity.
+        let payload = [0xA5u8; 900];
+        for _ in 0..7 {
+            session.send_message(VIDEO, &[], &payload).unwrap();
+        }
+
+        let mut wire = [0u8; 256];
+        let mut sent = 0usize;
+        while let Some(result) = session.get_output(0.0, &mut wire) {
+            let written = result.unwrap();
+            sent = sent.saturating_add(written);
+        }
+        assert!(sent > 0);
+        assert!(
+            sent <= crate::pacer::MAX_BURST_BYTES,
+            "the pacer emitted {sent} bytes in one burst"
+        );
+        let wait = session.next_timer_ms(0.0);
+        assert!(wait > 0.0 && wait < ACK_CADENCE_MS, "wait={wait}");
+
+        // A fresh poll starts another output pass after the bucket refills.
+        session.poll(wait + 0.1);
+        assert!(
+            session
+                .get_output(wait + 0.1, &mut wire)
+                .is_some_and(|result| result.is_ok())
+        );
     }
 
     #[test]

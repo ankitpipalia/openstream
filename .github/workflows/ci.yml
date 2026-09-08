@@ -50,6 +50,13 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 
+      - name: C ABI header syntax
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -I include \
+            -c crates/host/tests/c/alone.c -o /tmp/openstream-lowlat-abi-c.o
+          c++ -std=c++17 -Wall -Wextra -Werror -x c++ -I include \
+            -c crates/host/tests/c/alone.c -o /tmp/openstream-lowlat-abi-cpp.o
+
       - name: Compile fuzz harnesses
         run: cargo check --manifest-path fuzz/Cargo.toml --locked
 

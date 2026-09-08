@@ -189,6 +189,49 @@ impl<'a> SendRing<'a> {
         self.bytes_sent
     }
 
+    /// Wire length of the next fragment that would be emitted by the current
+    /// scan, without advancing the scan or changing any counters.
+    ///
+    /// A pacer must be able to ask this before calling [`Self::poll_send`]:
+    /// that method commits the send slot as it encodes, so checking the token
+    /// bucket afterward would allow a packet that had already become
+    /// impossible to take back. The calculation intentionally mirrors the
+    /// due/cap rules in `poll_send` and is read-only on purpose.
+    pub(crate) fn next_due_len(
+        &self,
+        now_ms: f64,
+        srtt_ms: f64,
+        _level_index: usize,
+    ) -> Option<usize> {
+        let mut cursor = self.cursor;
+        while cursor != self.next {
+            let sequence = cursor;
+            let index = self.index(sequence);
+            let Some(slot) = self.meta.get(index).copied() else {
+                cursor = cursor.wrapping_add(1);
+                continue;
+            };
+            if !slot.occupied {
+                cursor = cursor.wrapping_add(1);
+                continue;
+            }
+            if self.outstanding >= OUTSTANDING_CAP {
+                return None;
+            }
+
+            let age = now_ms - slot.last_sent_ms;
+            let nacked = self
+                .nack_below
+                .is_some_and(|below| seq::lt(sequence, below) && !slot.nack_resent);
+            let due = !slot.sent || nacked || age > Self::rto_ms(slot.retransmits, srtt_ms);
+            if due {
+                return packet::HEADER_LEN.checked_add(slot.len as usize);
+            }
+            cursor = cursor.wrapping_add(1);
+        }
+        None
+    }
+
     /// Next sequence that will be assigned.
     pub fn next_sequence(&self) -> u32 {
         self.next

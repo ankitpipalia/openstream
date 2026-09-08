@@ -379,9 +379,10 @@ the outstanding fragments, and writes it where the controller reads it. The two 
 split across two functions, not independent subsystems, and changing the scan changes the
 controller's input.
 
-The resulting rate actuates the **encoder bitrate** through a live reconfigure. It does not
-pace the socket. The reconfigure MUST NOT reinitialize the encoder and MUST NOT force a
-keyframe.
+The resulting rate actuates the **encoder bitrate** through a live reconfigure. It is also the
+target for the optional session-local bulk-video pacer, which meters wire bytes with a bounded
+token bucket. A pacer MUST NOT delay acknowledgements or latency-sensitive control/input, and
+the reconfigure MUST NOT reinitialize the encoder or force a keyframe.
 
 **A tick is a frame, not a timer.** The controller runs once per guest per encoded frame, from
 the pipeline that produced the frame. That fixes the periods above in wall-clock terms: at 60
@@ -393,9 +394,10 @@ depend on inbound traffic.
 Throughput is measured over the interval between ticks and requires **fractional millisecond**
 resolution. Quantizing the interval to whole milliseconds silently skips the peak update
 whenever it rounds to zero. The quantity measured is bytes sent on that channel since the
-previous increase tick, and the unit is **mebibits per second**: bytes times eight, divided by
-1048576, divided by the interval in seconds. Dividing by 1000000 instead reads about five
-percent high, which is a silent bias in the peak the controller creeps back toward.
+previous increase tick, and the unit is **decimal megabits per second**: bytes times eight,
+divided by 1000000, divided by the interval in seconds. This is the same unit used by encoder
+configuration and exported transport telemetry, so the controller does not carry a silent
+4.86% conversion bias.
 
 With more than one guest, the rate applied to the encoder is the **minimum** across guests, and
 it is applied only when it moves by more than 0.01 Mbps, so a rate that oscillates in the noise

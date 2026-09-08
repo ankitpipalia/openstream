@@ -136,7 +136,7 @@ milliseconds ago.**
 The original `bitrate_mbps` metric remains as a compatibility alias for the measured video
 delivery rate. The appended transport fields make the distinction explicit: attempted and
 delivered video rate, the bounded sample interval, cumulative video payload sent and
-acknowledged, and retransmission transmissions. Rates are mebibits per second. They are local
+acknowledged, and retransmission transmissions. Rates are decimal megabits per second. They are local
 diagnostics, not a new wire-level congestion message, and every field after `network_ms` is
 optional according to the caller's `size`.
 

@@ -183,7 +183,7 @@ mod tests {
             "no sound, no change"
         );
 
-        // Two guests on the uncompressed form, near 1.5 Mibit/s each.
+        // Two guests on the uncompressed form, near 1.5 Mbps each.
         budget.set_audio(3.0, &mut controllers);
         assert!(
             (budget.ceiling() - 13.5).abs() < 1e-9,

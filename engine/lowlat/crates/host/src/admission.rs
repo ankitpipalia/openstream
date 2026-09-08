@@ -431,10 +431,11 @@ pub(crate) struct Telemetry {
     /// The three rates, as `f32` bits: an atomic float is not portable and the
     /// bits are.
     bitrate_bits: AtomicU32,
-    /// The rate attempted on the video channel, in mebibits per second.
+    /// The rate attempted on the video channel, in decimal megabits per
+    /// second.
     send_rate_bits: AtomicU32,
-    /// The rate covered by cumulative acknowledgements, in mebibits per
-    /// second. `bitrate_bits` remains the legacy alias exposed by the original
+    /// The rate covered by cumulative acknowledgements, in decimal megabits
+    /// per second. `bitrate_bits` remains the legacy alias exposed by the original
     /// ABI field.
     delivery_rate_bits: AtomicU32,
     /// Length of the bounded rate sample, in milliseconds.
@@ -575,14 +576,14 @@ pub struct Metrics {
     pub window: u32,
     pub stale: u32,
     pub cg_events: u32,
-    /// Legacy alias for the measured video delivery rate, in mebibits/s.
+    /// Legacy alias for the measured video delivery rate, in decimal Mbps.
     pub bitrate_mbps: f32,
     pub encode_ms: f32,
     /// The smoothed round trip to this peer.
     pub network_ms: f32,
-    /// Payload rate attempted on the video channel, in mebibits/s.
+    /// Payload rate attempted on the video channel, in decimal Mbps.
     pub send_rate_mbps: f32,
-    /// Payload rate covered by cumulative acknowledgements, in mebibits/s.
+    /// Payload rate covered by cumulative acknowledgements, in decimal Mbps.
     pub delivery_rate_mbps: f32,
     /// Duration of the last packet-rate sample, in milliseconds.
     pub transport_interval_ms: f32,
@@ -1654,7 +1655,7 @@ fn send_control(session: &mut Session<'_>, message: &control::Control<'_>) {
 /// Throughput on a send channel for diagnostics that have not yet moved to
 /// the core's acknowledgement-based sampler.
 ///
-/// **Mebibits per second over a measured interval**, and the interval has to
+/// **Decimal megabits per second over a measured interval**, and the interval has to
 /// be long enough to mean something: sampled every pass, most intervals are a
 /// fraction of a millisecond and the figure is noise. Held between recomputes
 /// rather than reported as zero, because zero is a claim the path carried
@@ -1677,14 +1678,15 @@ impl Throughput {
             return self.mbps;
         }
         let moved = bytes.saturating_sub(self.last_bytes);
-        // Mebibits, not megabits. The controller's peak is compared against
-        // this, so the unit has to be the one it was tuned in.
+        // Decimal megabits. The controller's peak and encoder configuration
+        // use the same unit, so a diagnostic sample cannot carry a hidden
+        // 4.86% conversion bias.
         #[allow(
             clippy::cast_precision_loss,
             reason = "a byte count over half a second; f64 is exact far past it"
         )]
         let bits = (moved * 8) as f64;
-        self.mbps = bits / 1_048_576.0 / (elapsed / 1000.0);
+        self.mbps = bits / 1_000_000.0 / (elapsed / 1000.0);
         self.last_bytes = bytes;
         self.last_ms = now_ms;
         self.mbps
@@ -2483,6 +2485,17 @@ fn run_guest(args: Attached, wake: Wake, running: &lowlat_net::Running) {
                     mic.2
                 );
             }
+        }
+
+        // The encoder target is shared by the stream, but pacing is local to
+        // this guest's network path. Apply the latest target immediately
+        // before the shell drains output so a LAN guest and a relay guest do
+        // not borrow one another's bucket.
+        if let Some(seat) = seat.as_ref() {
+            shell
+                .endpoint()
+                .session()
+                .set_pacing_rate_mbps(now, f64::from(seat.pacing_rate_mbps()));
         }
 
         pass = pass.wrapping_add(1);

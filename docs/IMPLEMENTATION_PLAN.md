@@ -297,14 +297,19 @@ without changing the default OpenStream wire format.
   cumulatively acknowledged payload bytes, delivered/send rate over a bounded
   sampling interval, in-flight and stale pressure, SRTT, and retransmission
   count; the local congestion controller consumes measured delivery rate
-  instead of a constant zero. Rates are mebibits per second and snapshots are
+  instead of a constant zero. Rates are decimal megabits per second and snapshots are
   available per send channel as well as in aggregate.
 - [x] Propagate video-channel telemetry into the native Linux host's exported
   diagnostics and rate loop, keeping each guest's delivery measurement separate
   when guests share one encoder. Existing ABI consumers retain
   `bitrate_mbps` as a delivery-rate alias; the new counters are appended.
-- [ ] Add a paced sender with a bounded byte budget and path-aware MTU probing;
-  preserve the 1200-byte safe floor and never raise the protocol ceiling.
+- [x] Add a per-guest paced sender with a bounded byte budget for bulk video;
+  acknowledgements, control/input, and audio are scheduled ahead of it, and a
+  target can be applied independently to every network path.
+- [ ] Add path-aware MTU probing; preserve the 1200-byte safe floor and never
+  raise the protocol ceiling.
+- [ ] Add a common packet-telemetry adapter for the portable `PeerSession` /
+  FFmpeg path so it uses the same delivery estimator as the native lowlat host.
 - [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →
   VideoToolbox capture/encode, with live VideoToolbox bitrate updates.
 - [ ] Add native Windows capture/encode and decoder-surface presentation;

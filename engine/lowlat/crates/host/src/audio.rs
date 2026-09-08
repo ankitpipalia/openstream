@@ -225,7 +225,7 @@ pub(crate) fn guest_mbps(raw: bool, compressed_kbps: u32) -> f64 {
     } else {
         f64::from(compressed_kbps) * 1000.0 + framing
     };
-    bits / 1_048_576.0
+    bits / 1_000_000.0
 }
 
 /// Samples in one packet, as the divisor that turns a rate into a packet count.
@@ -293,22 +293,22 @@ mod tests {
     #[test]
     fn the_uncompressed_form_costs_what_the_wire_carries() {
         // 3840 bytes of samples plus nineteen of framing, fifty times a
-        // second, in mebibits.
-        let expected = ((FRAME_BYTES + AUDIO_HEADER_LEN + 4) * 8 * 50) as f64 / 1_048_576.0;
+        // second, in decimal megabits.
+        let expected = ((FRAME_BYTES + AUDIO_HEADER_LEN + 4) * 8 * 50) as f64 / 1_000_000.0;
         let measured = guest_mbps(true, 128);
         assert!(
             (measured - expected).abs() < 1e-9,
             "measured {measured}, expected {expected}"
         );
         // Which is about a megabit and a half.
-        assert!((1.4..1.6).contains(&measured), "{measured} Mibit/s");
+        assert!((1.4..1.6).contains(&measured), "{measured} Mbps");
     }
 
     /// The compressed form is the rate that was asked for, plus its framing.
     #[test]
     fn the_compressed_form_costs_the_rate_it_was_asked_for() {
         let measured = guest_mbps(false, 128);
-        let payload = 128_000.0 / 1_048_576.0;
+        let payload = 128_000.0 / 1_000_000.0;
         assert!(measured > payload, "framing was not counted");
         assert!(
             measured < payload * 1.1,

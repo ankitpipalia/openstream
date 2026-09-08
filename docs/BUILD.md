@@ -31,8 +31,9 @@ and `/dev/uinput` tests are ignored or skipped when the device is unavailable.
 The 2026-09-07 verification run passed all five commands above. The dependency
 audit permits only a crate-scoped `CC0-1.0` exception for `hexf-parse`, the
 transitive shader-literal parser used by `wgpu`/`naga`; all other non-approved
-licenses remain rejected. The C ABI header also passes
-`clang -fsyntax-only -x c`.
+licenses remain rejected. The C ABI header is generated from the Rust ABI
+definitions, and CI compiles its standalone translation unit as both C11 and
+C++17 with warnings treated as errors.
 
 The latest local application smoke also completed over the current encrypted
 path: a 5-second FFmpeg test source delivered 164 H.264 access units, the

@@ -1957,14 +1957,14 @@ pub struct lowlat_metrics {
     pub stale: u32,
     /// Times congestion cost this guest rate.
     pub cg_events: u32,
-    /// Legacy alias for the measured video delivery rate, in mebibits/s.
+    /// Legacy alias for the measured video delivery rate, in decimal Mbps.
     pub bitrate_mbps: f32,
     pub encode_ms: f32,
     /// The smoothed round trip to this peer.
     pub network_ms: f32,
-    /// Payload rate attempted on the video channel, in mebibits/s.
+    /// Payload rate attempted on the video channel, in decimal Mbps.
     pub send_rate_mbps: f32,
-    /// Payload rate covered by cumulative acknowledgements, in mebibits/s.
+    /// Payload rate covered by cumulative acknowledgements, in decimal Mbps.
     pub delivery_rate_mbps: f32,
     /// Duration of the last packet-rate sample, in milliseconds.
     pub transport_interval_ms: f32,

@@ -728,14 +728,14 @@ typedef struct lowlat_metrics {
     uint32_t stale;
     // Times congestion cost this guest rate.
     uint32_t cg_events;
-    // Legacy alias for the measured video delivery rate, in mebibits/s.
+    // Legacy alias for the measured video delivery rate, in decimal Mbps.
     float bitrate_mbps;
     float encode_ms;
     // The smoothed round trip to this peer.
     float network_ms;
-    // Payload rate attempted on the video channel, in mebibits/s.
+    // Payload rate attempted on the video channel, in decimal Mbps.
     float send_rate_mbps;
-    // Payload rate covered by cumulative acknowledgements, in mebibits/s.
+    // Payload rate covered by cumulative acknowledgements, in decimal Mbps.
     float delivery_rate_mbps;
     // Duration of the last packet-rate sample, in milliseconds.
     float transport_interval_ms;

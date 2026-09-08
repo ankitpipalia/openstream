@@ -2,7 +2,8 @@
 //!
 //! Every input is local transport state. **There is no congestion feedback
 //! message in either direction and none may be added.** The output actuates the
-//! encoder's bitrate through a live reconfigure; it does not pace the socket.
+//! encoder's bitrate through a live reconfigure; the session-level pacer
+//! separately uses that target to schedule bulk datagrams.
 //!
 //! The stale count this consumes is produced by the retransmission scan
 //! ([`crate::send`]). The two are one loop split across two modules, not
