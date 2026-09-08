@@ -5432,8 +5432,8 @@ mod tests {
 
         seat.set_pacing_rate(12.5);
         assert_eq!(
-            f32::from_bits(seat.pacing_rate_bits.load(Ordering::Acquire)),
-            12.5
+            seat.pacing_rate_bits.load(Ordering::Acquire),
+            12.5f32.to_bits()
         );
 
         // Invalid controller output must disable pacing rather than leave a
