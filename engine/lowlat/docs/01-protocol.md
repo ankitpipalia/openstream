@@ -381,8 +381,15 @@ controller's input.
 
 The resulting rate actuates the **encoder bitrate** through a live reconfigure. It is also the
 target for the optional session-local bulk-video pacer, which meters wire bytes with a bounded
-token bucket. A pacer MUST NOT delay acknowledgements or latency-sensitive control/input, and
-the reconfigure MUST NOT reinitialize the encoder or force a keyframe.
+token bucket. A pacer MUST NOT delay acknowledgements: they are emitted before data and do not
+consume bulk credit. Channel 0 control/input and channel 2 audio are scheduled ahead of video,
+but each receives a bounded byte quantum when a lower-priority channel has a due fragment, so a
+large ordered control transfer cannot create an unbounded burst ahead of video. Because control
+and input share one ordered sequence space, a later input message cannot leapfrog an earlier
+control fragment without changing the wire protocol. The video bucket is capped by both four
+current-path datagrams and approximately five milliseconds of target wire time, with a one-
+datagram floor for packet atomicity. The reconfigure MUST NOT reinitialize the encoder or force
+a keyframe.
 
 **A tick is a frame, not a timer.** The controller runs once per guest per encoded frame, from
 the pipeline that produced the frame. That fixes the periods above in wall-clock terms: at 60
@@ -821,6 +828,8 @@ bit 3 is set on every offer, so `_flags` of 8 alone is the ordinary case: H.264,
 | datagram size, absolute ceiling | 2000 | §8, MUST NOT exceed |
 | direct path clamp | 1472 | §8 |
 | ack cadence | 30 ms | §9 |
+| priority quantum | 4 default datagrams | §10, bounded control/audio burst when media is due |
+| video burst time cap | 5 ms | §10, with a one-datagram floor |
 | soft liveness timeout | 60 s | §9 |
 | hard liveness timeout | 120 s | §9 |
 | delivery deadline | 15 s | §9 |

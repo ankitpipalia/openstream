@@ -53,6 +53,22 @@ pub const VIDEO_CHANNEL: u8 = 1;
 /// The host-to-guest audio channel, which is scheduled ahead of bulk video.
 pub const AUDIO_CHANNEL: u8 = 2;
 
+const CONTROL_CHANNEL_INDEX: usize = crate::control::CONTROL_CHANNEL as usize;
+const AUDIO_CHANNEL_INDEX: usize = AUDIO_CHANNEL as usize;
+
+/// Maximum unpaced control bytes released before a lower-priority channel gets
+/// a turn, when channel 0 has a backlog. Channel 0 is one ordered stream that
+/// combines input and control, so the scheduler cannot safely move a later
+/// input message ahead of an earlier control fragment without changing the
+/// wire protocol. A bounded quantum is the safe protection against a bulk
+/// control transfer becoming an unbounded pre-video burst.
+pub const CONTROL_PRIORITY_QUANTUM_BYTES: usize =
+    crate::DEFAULT_DATAGRAM * crate::pacer::MAX_BURST_DATAGRAMS;
+
+/// Maximum unpaced audio bytes released before bulk video gets a turn.
+pub const AUDIO_PRIORITY_QUANTUM_BYTES: usize =
+    crate::DEFAULT_DATAGRAM * crate::pacer::MAX_BURST_DATAGRAMS;
+
 /// Output order after an acknowledgement has been emitted. Channel 0 carries
 /// control and input, so it is latency-sensitive; audio is small and should
 /// stay ahead of bulk video. The remaining channels retain their numeric
@@ -188,6 +204,9 @@ pub struct Session<'a> {
     /// this session a path-specific target, preserving the old sans-IO API for
     /// callers that have no congestion-control target yet.
     pacer: Pacer,
+    /// Wire bytes emitted from each bounded priority class in the current
+    /// drain pass. ACKs are not data and are intentionally not counted here.
+    drain_bytes: [usize; CHANNEL_COUNT],
 }
 
 impl<'a> Session<'a> {
@@ -235,6 +254,7 @@ impl<'a> Session<'a> {
             drain_channel: 0,
             drain_started: false,
             pacer: Pacer::new(now_ms),
+            drain_bytes: [0; CHANNEL_COUNT],
         }
     }
 
@@ -276,9 +296,23 @@ impl<'a> Session<'a> {
         self.pacer.set_rate(now_ms, rate_mbps);
     }
 
+    /// Set the path datagram size used by the pacer's burst calculation.
+    ///
+    /// This changes pacing only. A DPLPMTUD owner must update packetization and
+    /// this value as one path transition, and should call it only after the
+    /// send rings have been resized to emit the same packet size.
+    pub fn set_pacing_datagram_size(&mut self, datagram_bytes: usize) -> bool {
+        self.pacer.set_datagram_size(datagram_bytes)
+    }
+
     /// The path-specific pacing target, or zero while pacing is disabled.
     pub fn pacing_rate_mbps(&self) -> f64 {
         self.pacer.rate_mbps()
+    }
+
+    /// Effective pacing burst ceiling for the current target and path size.
+    pub fn pacing_burst_capacity_bytes(&self) -> usize {
+        self.pacer.burst_capacity_bytes()
     }
 
     /// Return the latest bounded packet-level transport snapshot.
@@ -609,6 +643,59 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// Return the bytes allowed in one pass for a potentially bulky priority
+    /// channel. A value is enforced only when a lower-priority channel has a
+    /// due fragment; otherwise a control-only or audio-only session drains
+    /// normally instead of being throttled by a fairness mechanism it does not
+    /// need.
+    const fn priority_quantum(channel: usize) -> Option<usize> {
+        match channel {
+            CONTROL_CHANNEL_INDEX => Some(CONTROL_PRIORITY_QUANTUM_BYTES),
+            AUDIO_CHANNEL_INDEX => Some(AUDIO_PRIORITY_QUANTUM_BYTES),
+            _ => None,
+        }
+    }
+
+    /// Whether a channel later in the current scheduler order has a fragment
+    /// ready to release. This is deliberately a read-only query: the decision
+    /// to yield a priority channel must not advance any send cursor.
+    fn has_due_after(&self, position: usize, now_ms: f64) -> bool {
+        let srtt = self.srtt_ms;
+        for order_position in position.saturating_add(1)..CHANNEL_COUNT {
+            let Some(&channel) = DRAIN_ORDER.get(order_position) else {
+                continue;
+            };
+            if self
+                .send
+                .get(channel)
+                .and_then(Option::as_ref)
+                .is_some_and(|ring| ring.next_due_len(now_ms, srtt, self.level).is_some())
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a bounded priority ring has work that should wake the shell.
+    ///
+    /// This matters after a priority quantum yields to media: once the media
+    /// has drained, the remaining control/audio backlog must be scheduled
+    /// promptly rather than waiting for the thirty-millisecond ACK cadence.
+    fn has_due_priority(&self, now_ms: f64) -> bool {
+        [CONTROL_CHANNEL_INDEX, AUDIO_CHANNEL_INDEX]
+            .into_iter()
+            .any(|channel| {
+                self.send
+                    .get(channel)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|ring| {
+                        ring.next_due_len(now_ms, self.srtt_ms, self.level)
+                            .is_some()
+                    })
+            })
+    }
+
     /// Milliseconds until the session next needs attention.
     ///
     /// The shell arms its wait from this. There is no fixed tick: a loop that
@@ -616,35 +703,47 @@ impl<'a> Session<'a> {
     /// deadlines, and both have shipped before.
     pub fn next_timer_ms(&self, now_ms: f64) -> f64 {
         let since_ack = now_ms - self.last_ack_sent_ms;
-        let ack = (ACK_CADENCE_MS - since_ack).max(0.0);
-        let Some(video) = self
+        let mut next = (ACK_CADENCE_MS - since_ack).max(0.0);
+        if let Some(video) = self
             .send
             .get(VIDEO_CHANNEL as usize)
             .and_then(Option::as_ref)
-        else {
-            return ack;
-        };
-        if !self.pacer.enabled() {
-            return ack;
+            && let Some(cleartext_len) = video.next_due_len(now_ms, self.srtt_ms, self.level)
+        {
+            let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
+            let wait = if self.pacer.enabled() {
+                self.pacer.wait_ms(now_ms, wire_len)
+            } else {
+                0.0
+            };
+            next = next.min(wait);
+            // When video is waiting for credit, do not turn a control backlog
+            // into a one-millisecond busy loop. The next wake is the precise
+            // refill event, where the bounded priority quantum is followed by
+            // the video packet.
+            if self.pacer.enabled() && wait.is_finite() && wait > 0.0 {
+                return next;
+            }
         }
-        let Some(cleartext_len) = video.next_due_len(now_ms, self.srtt_ms, self.level) else {
-            return ack;
-        };
-        let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
-        ack.min(self.pacer.wait_ms(now_ms, wire_len))
+        if self.has_due_priority(now_ms) {
+            next = 0.0;
+        }
+        next
     }
 
     /// Emit the next datagram, sealed and ready for the socket.
     ///
-    /// Drive until `None`. Acknowledgements and latency-sensitive channels are
-    /// drained before bulk video, so a keyframe burst cannot delay feedback or
-    /// input.
+    /// Drive until `None`. Acknowledgements are emitted first, then control and
+    /// audio are given bounded priority quanta before bulk video, so a keyframe
+    /// burst cannot delay feedback or turn a large control transfer into an
+    /// unbounded pre-video burst.
     pub fn get_output(&mut self, now_ms: f64, out: &mut [u8]) -> Option<Result<usize>> {
         if !self.drain_started {
             for ring in self.send.iter_mut().flatten() {
                 ring.begin_pass();
             }
             self.drain_channel = 0;
+            self.drain_bytes = [0; CHANNEL_COUNT];
             self.drain_started = true;
         }
 
@@ -669,6 +768,29 @@ impl<'a> Session<'a> {
             };
             let srtt = self.srtt_ms;
             let level = self.level;
+            let Some(cleartext_len) = self
+                .send
+                .get(index)
+                .and_then(Option::as_ref)
+                .and_then(|ring| ring.next_due_len(now_ms, srtt, level))
+            else {
+                self.drain_channel += 1;
+                continue;
+            };
+            let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
+            let priority_bytes = self.drain_bytes.get(index).copied().unwrap_or_default();
+            if let Some(quantum) = Self::priority_quantum(index)
+                && priority_bytes > 0
+                && priority_bytes.saturating_add(wire_len) > quantum
+                && self.has_due_after(self.drain_channel, now_ms)
+            {
+                // Channel 0 combines input and bulk control in one ordered
+                // sequence space, so this yields at a fragment boundary. It
+                // prevents a large control transfer from monopolising the
+                // socket while retaining the ordering the peer relies on.
+                self.drain_channel += 1;
+                continue;
+            }
             let Some(ring) = self.send.get_mut(index).and_then(Option::as_mut) else {
                 self.drain_channel += 1;
                 continue;
@@ -678,18 +800,11 @@ impl<'a> Session<'a> {
             // paced against the target for this path, and the token check is
             // performed before poll_send commits the slot as transmitted.
             let paced = index == VIDEO_CHANNEL as usize && self.pacer.enabled();
-            if paced {
-                let Some(cleartext_len) = ring.next_due_len(now_ms, srtt, level) else {
-                    self.drain_channel += 1;
-                    continue;
-                };
-                let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
-                if !self.pacer.can_consume(now_ms, wire_len) {
-                    // Keep the pass open. The next timer includes exactly the
-                    // refill delay, and no ring cursor or send counter has
-                    // moved yet.
-                    return None;
-                }
+            if paced && !self.pacer.can_consume(now_ms, wire_len) {
+                // Keep the pass open. The next timer includes exactly the
+                // refill delay, and no ring cursor or send counter has
+                // moved yet.
+                return None;
             }
             let Some(body) = out.get_mut(ENVELOPE_LEN..) else {
                 return Some(Err(Error::BufferTooSmall));
@@ -710,6 +825,11 @@ impl<'a> Session<'a> {
                             // must also happen in release builds.
                             let _consumed = self.pacer.try_consume(now_ms, len);
                             debug_assert!(_consumed);
+                        }
+                        if Self::priority_quantum(index).is_some() {
+                            if let Some(bytes) = self.drain_bytes.get_mut(index) {
+                                *bytes = bytes.saturating_add(len);
+                            }
                         }
                     }
                     return Some(result);
@@ -1096,6 +1216,75 @@ mod tests {
     }
 
     #[test]
+    fn bulk_control_yields_to_video_at_the_priority_quantum() {
+        const CONTROL_SLOTS: usize = 128;
+        let mut video_bodies = std::vec![0u8; SLOT * SLOTS];
+        let mut video_meta = std::vec![SendSlot::default(); SLOTS];
+        let mut control_bodies = std::vec![0u8; SLOT * CONTROL_SLOTS];
+        let mut control_meta = std::vec![SendSlot::default(); CONTROL_SLOTS];
+        let mut session =
+            Session::with_direction(Envelope::from_key(&KEY).unwrap(), Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new(&mut video_bodies, &mut video_meta, SLOT, VIDEO).unwrap(),
+            )
+            .unwrap();
+        session
+            .attach_send(
+                CONTROL,
+                SendRing::new(&mut control_bodies, &mut control_meta, SLOT, CONTROL).unwrap(),
+            )
+            .unwrap();
+
+        // Fill channel 0 with full-size control fragments, then put one video
+        // fragment behind them. A scheduler that treats every control byte as
+        // unconditionally priority would emit all 128 before reaching video.
+        let control_payload = [0xCCu8; SLOT - crate::message::LENGTH_PREFIX_LEN];
+        for _ in 0..CONTROL_SLOTS {
+            session
+                .send_message(CONTROL, &[], &control_payload)
+                .unwrap();
+        }
+        session.send_message(VIDEO, &[], b"video").unwrap();
+
+        let mut wire = [0u8; 256];
+        let mut scratch = [0u8; 256];
+        let mut control_bytes = 0usize;
+        let mut control_packets = 0usize;
+        let mut saw_video = false;
+        while let Some(result) = session.get_output(0.0, &mut wire) {
+            let written = result.unwrap();
+            let opened = session
+                .envelope
+                .open(&wire[..written], &mut scratch)
+                .unwrap();
+            let Packet::Data(data) = packet::parse(opened.cleartext).unwrap() else {
+                continue;
+            };
+            if data.channel == VIDEO {
+                saw_video = true;
+                break;
+            }
+            assert_eq!(data.channel, CONTROL);
+            control_packets += 1;
+            control_bytes += written;
+        }
+
+        assert!(saw_video, "control backlog starved the video channel");
+        assert!(control_packets < CONTROL_SLOTS);
+        assert!(
+            control_bytes <= CONTROL_PRIORITY_QUANTUM_BYTES,
+            "priority control emitted {control_bytes} bytes before video"
+        );
+
+        // The yielded control backlog must wake promptly once video has been
+        // served; waiting for the ACK cadence would add an avoidable 30 ms.
+        session.poll(0.0);
+        assert!(session.next_timer_ms(0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn side_channel_pressure_does_not_drive_the_video_controller() {
         const CONTROL_SLOTS: usize = 128;
         let mut video_bodies = std::vec![0u8; SLOT * SLOTS];
@@ -1167,9 +1356,10 @@ mod tests {
             sent = sent.saturating_add(written);
         }
         assert!(sent > 0);
+        let burst_capacity = session.pacing_burst_capacity_bytes();
         assert!(
-            sent <= crate::pacer::MAX_BURST_BYTES,
-            "the pacer emitted {sent} bytes in one burst"
+            sent <= burst_capacity,
+            "the pacer emitted {sent} bytes in one burst (capacity={burst_capacity})"
         );
         let wait = session.next_timer_ms(0.0);
         assert!(wait > 0.0 && wait < ACK_CADENCE_MS, "wait={wait}");

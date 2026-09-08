@@ -151,9 +151,11 @@ cumulative payload sent and cumulatively acknowledged, bounded-sample send and
 delivery rates, SRTT, in-flight/stale pressure, and retransmission count. Rates
 are decimal megabits per second, and the snapshot is available both in aggregate and
 per send channel so video capacity is not inflated by control or audio traffic. The native
-lowlat host applies the stream target to a bounded, per-guest video pacer; acknowledgements,
-control/input, and audio stay ahead of bulk video. Path-aware MTU probing and the portable
-`PeerSession` telemetry adapter remain open.
+lowlat host applies the stream target to a bounded, per-guest video pacer; acknowledgements
+are unpaced, while control/input and audio get bounded priority quanta ahead of bulk video.
+The video burst is capped both by packet count and by approximately five milliseconds of
+wire time at the current target; a path-MTU update can change the packet-count conversion.
+Path-aware MTU probing and the portable `PeerSession` telemetry adapter remain open.
 The rate controller consumes measured delivery rate during clean-path ramp-up;
 these counters are local diagnostics and do not add a congestion-feedback wire
 message. The OpenStream `PeerSession`/FFmpeg path still uses its separate

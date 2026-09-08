@@ -304,8 +304,10 @@ without changing the default OpenStream wire format.
   when guests share one encoder. Existing ABI consumers retain
   `bitrate_mbps` as a delivery-rate alias; the new counters are appended.
 - [x] Add a per-guest paced sender with a bounded byte budget for bulk video;
-  acknowledgements, control/input, and audio are scheduled ahead of it, and a
-  target can be applied independently to every network path.
+  acknowledgements are unpaced, while control/input and audio receive bounded
+  priority quanta ahead of it, and a target can be applied independently to
+  every network path. Burst credit is capped by both packet count and target
+  wire time, with a path-datagram-size hook ready for MTU probing.
 - [ ] Add path-aware MTU probing; preserve the 1200-byte safe floor and never
   raise the protocol ceiling.
 - [ ] Add a common packet-telemetry adapter for the portable `PeerSession` /
