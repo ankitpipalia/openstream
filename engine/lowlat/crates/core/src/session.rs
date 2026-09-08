@@ -41,6 +41,9 @@ pub const DELIVERY_DEADLINE_MS: f64 = 15_000.0;
 
 /// Weight given to a new round-trip sample.
 const SRTT_ALPHA: f64 = 0.1;
+/// Avoid turning a fast event-loop tick into a bursty one-millisecond rate
+/// sample. The controller retains the last sample until this interval elapses.
+const TRANSPORT_SAMPLE_MIN_MS: f64 = 100.0;
 
 /// What a datagram turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +73,36 @@ pub enum Health {
     /// that says nothing; this is a peer that still speaks and has stopped
     /// receiving, and the two are told apart only by whether a window moves.
     Undeliverable,
+}
+
+/// A bounded snapshot of the packet-level transport signals available to the
+/// sans-IO session.
+///
+/// The byte counters are cumulative and the rates are calculated over a
+/// minimum-sized sampling interval. `bytes_acked` is payload covered by the
+/// peer's cumulative acknowledgements, so `delivery_rate_mbps` describes what
+/// the path delivered rather than what the sender attempted to put on the
+/// socket. No peer clock or address is included.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TransportStats {
+    /// Duration of the last rate sample. Zero until the first sample exists.
+    pub interval_ms: f64,
+    /// Fragments currently in the send windows.
+    pub in_flight: u32,
+    /// Fragments classified as stale during the last send scan.
+    pub stale: u32,
+    /// Payload bytes handed to the wire, including retransmissions.
+    pub bytes_sent: u64,
+    /// Payload bytes covered by cumulative acknowledgements.
+    pub bytes_acked: u64,
+    /// Retransmission transmissions since the session began.
+    pub retransmitted_fragments: u64,
+    /// Attempted payload rate over the last sample interval.
+    pub send_rate_mbps: f64,
+    /// Delivered payload rate over the last sample interval.
+    pub delivery_rate_mbps: f64,
+    /// Smoothed fragment round trip in fractional milliseconds.
+    pub srtt_ms: f64,
 }
 
 /// One channel's delivery progress.
@@ -112,6 +145,12 @@ pub struct Session<'a> {
     /// that backs up: a figure summed across all of them is refreshed by the
     /// cheap traffic and never reports the expensive traffic going nowhere.
     delivery: [Delivery; CHANNEL_COUNT],
+    /// Latest packet-level telemetry snapshot.
+    transport_stats: TransportStats,
+    /// Cumulative counters at the start of the current rate sample.
+    last_sample_ms: f64,
+    last_sample_bytes_sent: u64,
+    last_sample_bytes_acked: u64,
     ack_due: bool,
     /// Why the pending acknowledgement is owed. Data arrival makes it an
     /// acknowledgement; the cadence alone makes it a keepalive.
@@ -157,6 +196,10 @@ impl<'a> Session<'a> {
                 acked_seen: 0,
                 since_ms: now_ms,
             }; CHANNEL_COUNT],
+            transport_stats: TransportStats::default(),
+            last_sample_ms: now_ms,
+            last_sample_bytes_sent: 0,
+            last_sample_bytes_acked: 0,
             ack_due: false,
             ack_kind: AckKind::Ack,
             trigger: (0, 0),
@@ -191,6 +234,11 @@ impl<'a> Session<'a> {
     /// Encoder rate the controller currently wants.
     pub fn rate_mbps(&self) -> f64 {
         self.controller.rate_mbps()
+    }
+
+    /// Return the latest bounded packet-level transport snapshot.
+    pub fn transport_stats(&self) -> TransportStats {
+        self.transport_stats
     }
 
     /// Liveness, judged against the last forward progress in each direction.
@@ -389,7 +437,7 @@ impl<'a> Session<'a> {
             self.ack_due = true;
             self.ack_kind = AckKind::Keepalive;
         }
-        let (window, stale) = self.pressure();
+        let (window, stale, bytes_sent, bytes_acked, retransmitted) = self.counters();
         // **An empty channel is progress, not a stall.** A channel with
         // nothing outstanding can produce no acknowledgement, and a deadline
         // that did not say so would end every session that stopped sending.
@@ -403,18 +451,56 @@ impl<'a> Session<'a> {
                 entry.since_ms = now_ms;
             }
         }
-        self.controller.tick(window, stale, 0.0);
+        let elapsed = now_ms - self.last_sample_ms;
+        if elapsed.is_finite()
+            && elapsed >= TRANSPORT_SAMPLE_MIN_MS
+            && now_ms >= self.last_sample_ms
+        {
+            let sent_delta = bytes_sent.saturating_sub(self.last_sample_bytes_sent);
+            let acked_delta = bytes_acked.saturating_sub(self.last_sample_bytes_acked);
+            let denominator = elapsed * 1_000.0;
+            let send_rate_mbps = sent_delta as f64 * 8.0 / denominator;
+            let delivery_rate_mbps = acked_delta as f64 * 8.0 / denominator;
+            self.transport_stats.interval_ms = elapsed;
+            self.transport_stats.send_rate_mbps = if send_rate_mbps.is_finite() {
+                send_rate_mbps.max(0.0)
+            } else {
+                0.0
+            };
+            self.transport_stats.delivery_rate_mbps = if delivery_rate_mbps.is_finite() {
+                delivery_rate_mbps.max(0.0)
+            } else {
+                0.0
+            };
+            self.last_sample_ms = now_ms;
+            self.last_sample_bytes_sent = bytes_sent;
+            self.last_sample_bytes_acked = bytes_acked;
+        }
+        self.transport_stats.in_flight = window;
+        self.transport_stats.stale = stale;
+        self.transport_stats.bytes_sent = bytes_sent;
+        self.transport_stats.bytes_acked = bytes_acked;
+        self.transport_stats.retransmitted_fragments = retransmitted;
+        self.transport_stats.srtt_ms = self.srtt_ms;
+        self.controller
+            .tick(window, stale, self.transport_stats.delivery_rate_mbps);
     }
 
-    /// Combined window and stale counts across channels, for the controller.
-    fn pressure(&self) -> (u32, u32) {
+    /// Combined queue and cumulative wire counters across attached channels.
+    fn counters(&self) -> (u32, u32, u64, u64, u64) {
         let mut window = 0u32;
         let mut stale = 0u32;
+        let mut bytes_sent = 0u64;
+        let mut bytes_acked = 0u64;
+        let mut retransmitted = 0u64;
         for ring in self.send.iter().flatten() {
             window = window.saturating_add(ring.in_flight());
             stale = stale.saturating_add(ring.stale());
+            bytes_sent = bytes_sent.saturating_add(ring.bytes_sent());
+            bytes_acked = bytes_acked.saturating_add(ring.bytes_acked());
+            retransmitted = retransmitted.saturating_add(ring.retransmitted());
         }
-        (window, stale)
+        (window, stale, bytes_sent, bytes_acked, retransmitted)
     }
 
     /// Milliseconds until the session next needs attention.
@@ -744,6 +830,52 @@ mod tests {
     }
 
     #[test]
+    fn transport_stats_report_delivery_rate_after_a_bounded_sample() {
+        let mut left_arena = Arena::new();
+        let mut right_arena = Arena::new();
+        let mut left = endpoint(&mut left_arena, 0.0);
+        let mut right = endpoint_guest(&mut right_arena, 0.0);
+
+        left.send_message(VIDEO, &[], b"payload").unwrap();
+        assert_eq!(pump(&mut left, &mut right, 1.0), 1);
+        let mut out = [0u8; 64];
+        assert!(right.take_message(VIDEO, &mut out).is_some());
+
+        // The receiver's data acknowledgement returns at t=50. The sender
+        // samples at t=100, after the 100 ms minimum interval, so its
+        // controller sees delivered bytes rather than a zero placeholder.
+        right.poll(50.0);
+        assert!(pump(&mut right, &mut left, 50.0) >= 1);
+        left.poll(100.0);
+
+        let stats = left.transport_stats();
+        // The transport counts the message framing prefix as sent payload;
+        // the outer encrypted envelope is intentionally not part of these
+        // low-level delivery counters.
+        assert_eq!(stats.bytes_sent, 11);
+        assert_eq!(stats.bytes_acked, 11);
+        assert_eq!(stats.retransmitted_fragments, 0);
+        assert_eq!(stats.in_flight, 0);
+        assert!((stats.interval_ms - 100.0).abs() < f64::EPSILON);
+        assert!(stats.send_rate_mbps > 0.0);
+        assert!(stats.delivery_rate_mbps > 0.0);
+        assert!(stats.srtt_ms > 0.0);
+    }
+
+    #[test]
+    fn transport_rate_sample_is_stable_across_fast_polls() {
+        let mut arena = Arena::new();
+        let mut session = endpoint(&mut arena, 0.0);
+        session.poll(50.0);
+        assert!(session.transport_stats().interval_ms.abs() < f64::EPSILON);
+        session.poll(99.0);
+        assert!(session.transport_stats().interval_ms.abs() < f64::EPSILON);
+        session.poll(100.0);
+        assert!((session.transport_stats().interval_ms - 100.0).abs() < f64::EPSILON);
+        assert!(session.transport_stats().send_rate_mbps.abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn the_nonce_counter_never_repeats() {
         let mut arena = Arena::new();
         let mut session = endpoint(&mut arena, 0.0);
@@ -986,7 +1118,7 @@ mod tests {
         }
 
         assert!(
-            left.pressure().0 > 0,
+            left.transport_stats().in_flight > 0,
             "the check is only worth anything with a window to misread"
         );
         assert_eq!(left.health(now), Health::Alive, "a delivering peer died");

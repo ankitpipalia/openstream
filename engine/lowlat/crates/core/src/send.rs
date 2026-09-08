@@ -45,6 +45,11 @@ pub struct SendSlot {
     retransmits: u16,
     first_sent_ms: f64,
     last_sent_ms: f64,
+    /// True once this fragment's payload has been included in the cumulative
+    /// delivery-byte counter. It is separate from `occupied`: a trigger ACK
+    /// may retire a slot before a later cumulative ACK advances the sender's
+    /// base across it.
+    acked_accounted: bool,
 }
 
 impl Default for SendSlot {
@@ -58,6 +63,7 @@ impl Default for SendSlot {
             retransmits: 0,
             first_sent_ms: 0.0,
             last_sent_ms: 0.0,
+            acked_accounted: false,
         }
     }
 }
@@ -87,6 +93,10 @@ pub struct SendRing<'a> {
     bytes_sent: u64,
     /// Fragments the peer has acknowledged since the ring was created.
     acked: u64,
+    /// Payload bytes covered by cumulative acknowledgements.
+    bytes_acked: u64,
+    /// Number of retransmission transmissions, including fast retransmits.
+    retransmitted: u64,
 }
 
 impl<'a> SendRing<'a> {
@@ -116,6 +126,8 @@ impl<'a> SendRing<'a> {
             stale: 0,
             bytes_sent: 0,
             acked: 0,
+            bytes_acked: 0,
+            retransmitted: 0,
         })
     }
 
@@ -142,6 +154,18 @@ impl<'a> SendRing<'a> {
     /// this figure moves.
     pub fn acked(&self) -> u64 {
         self.acked
+    }
+
+    /// Payload bytes covered by cumulative acknowledgements since the ring was
+    /// created. Each fragment is counted once, including when a trigger ACK
+    /// retired its slot before the cumulative frontier advanced over it.
+    pub fn bytes_acked(&self) -> u64 {
+        self.bytes_acked
+    }
+
+    /// Number of retransmission transmissions since the ring was created.
+    pub fn retransmitted(&self) -> u64 {
+        self.retransmitted
     }
 
     /// Outstanding count from the last completed scan.
@@ -230,6 +254,26 @@ impl<'a> SendRing<'a> {
             .filter(|_| (self.channel as usize) < ack.reported)
             .unwrap_or(self.base);
         if seq::gt(cumulative, self.base) && seq::le(cumulative, self.next) {
+            // Account delivered payload at the cumulative frontier rather than
+            // at the trigger slot. A trigger ACK can retire one slot while a
+            // peer reports a smaller frontier, and a later ACK must still
+            // contribute that slot exactly once to delivery-rate accounting.
+            let mut sequence = self.base;
+            while seq::lt(sequence, cumulative) {
+                let index = self.index(sequence);
+                let accounted = self.meta.get_mut(index).and_then(|slot| {
+                    if slot.sent && !slot.acked_accounted {
+                        slot.acked_accounted = true;
+                        Some(u64::from(slot.len))
+                    } else {
+                        None
+                    }
+                });
+                if let Some(bytes) = accounted {
+                    self.bytes_acked = self.bytes_acked.saturating_add(bytes);
+                }
+                sequence = sequence.wrapping_add(1);
+            }
             self.acked = self
                 .acked
                 .saturating_add(u64::from(cumulative.wrapping_sub(self.base)));
@@ -359,7 +403,8 @@ impl<'a> SendRing<'a> {
             let Some(entry) = self.meta.get_mut(index) else {
                 return Some(Err(Error::BadLength));
             };
-            if entry.sent {
+            let was_sent = entry.sent;
+            if was_sent {
                 if nacked {
                     entry.nack_resent = true;
                 } else {
@@ -372,6 +417,9 @@ impl<'a> SendRing<'a> {
             entry.last_sent_ms = now_ms;
             self.outstanding = self.outstanding.saturating_add(1);
             self.bytes_sent = self.bytes_sent.saturating_add(u64::from(slot.len));
+            if was_sent {
+                self.retransmitted = self.retransmitted.saturating_add(1);
+            }
 
             self.classify(index, now_ms, srtt_ms, level);
             self.cursor = self.cursor.wrapping_add(1);
@@ -659,6 +707,7 @@ mod tests {
         drain(&mut ring, 100.0, 10.0);
         let sample = ring.on_ack(&ack_with(1, false, 0), 137.5).unwrap();
         assert!((sample - 37.5).abs() < 1e-9);
+        assert_eq!(ring.bytes_acked(), 5);
     }
 
     #[test]
@@ -720,6 +769,7 @@ mod tests {
         // Past the timeout, so all three retransmit and become stale.
         assert_eq!(drain(&mut ring, 100.0, 5.0).len(), 3);
         assert_eq!(ring.stale(), 3);
+        assert_eq!(ring.retransmitted(), 3);
     }
 
     /// Age alone is enough, before any retransmission: the threshold is

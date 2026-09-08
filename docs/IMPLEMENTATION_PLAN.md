@@ -287,6 +287,34 @@ and send pointer/gamepad input without host capability exposure.
 
 Gate: feature matrix tests plus platform-specific manual acceptance runs.
 
+## Performance phase — transport/media hot path
+
+The architecture and feature work above are now ahead of the latency-critical
+implementation. This phase targets the remaining Parsec-class performance gap
+without changing the default OpenStream wire format.
+
+- [x] Low-level `lowlat-core` transport telemetry: cumulative sent and
+  cumulatively acknowledged payload bytes, delivered/send rate over a bounded
+  sampling interval, in-flight and stale pressure, SRTT, and retransmission
+  count; the local congestion controller consumes measured delivery rate
+  instead of a constant zero.
+- [ ] Propagate the low-level telemetry into the native Linux host's exported
+  diagnostics and rate loop, and keep per-guest delivery measurements separate
+  when guests share one encoder.
+- [ ] Add a paced sender with a bounded byte budget and path-aware MTU probing;
+  preserve the 1200-byte safe floor and never raise the protocol ceiling.
+- [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →
+  VideoToolbox capture/encode, with live VideoToolbox bitrate updates.
+- [ ] Add native Windows capture/encode and decoder-surface presentation;
+  prioritize zero-copy surfaces over API-name parity with D3D11.
+- [ ] Add capability-detected Android HEVC decode and benchmark NDK
+  MediaCodec/AAudio against the current Kotlin MediaCodec/AudioTrack path.
+
+Gate: packet-level telemetry is visible in a bounded diagnostic snapshot;
+synthetic loss, delay, reordering, and rate changes remain deterministic; and
+each native media backend has a measured capture-to-present latency report
+before it is enabled by default.
+
 ## Compatibility backend
 
 The Parsec-family compatibility backend is an optional track. It can use the

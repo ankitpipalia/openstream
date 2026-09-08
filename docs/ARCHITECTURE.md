@@ -146,6 +146,14 @@ The native Linux host uses those signals to lower or slowly raise the lowlat
 encoder ceiling; a portable external FFmpeg host reports the limitation and
 does not pretend that a bitrate change was applied.
 
+The imported sans-IO lowlat session also records packet-level local telemetry:
+cumulative payload sent and cumulatively acknowledged, bounded-sample send and
+delivery rates, SRTT, in-flight/stale pressure, and retransmission count. The
+rate controller consumes the measured delivery rate during clean-path ramp-up;
+these counters are local diagnostics and do not add a congestion-feedback wire
+message. The OpenStream `PeerSession`/FFmpeg path still uses its separate
+frame-ACK controller until a common telemetry adapter is added.
+
 ## OS boundaries
 
 The hot path is a small Rust core with no UI or platform policy. Platform
