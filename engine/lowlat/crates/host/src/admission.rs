@@ -15,7 +15,7 @@
 //! attempt becomes that guest's media socket for the whole session rather than
 //! being handed back.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, mpsc};
@@ -431,6 +431,18 @@ pub(crate) struct Telemetry {
     /// The three rates, as `f32` bits: an atomic float is not portable and the
     /// bits are.
     bitrate_bits: AtomicU32,
+    /// The rate attempted on the video channel, in mebibits per second.
+    send_rate_bits: AtomicU32,
+    /// The rate covered by cumulative acknowledgements, in mebibits per
+    /// second. `bitrate_bits` remains the legacy alias exposed by the original
+    /// ABI field.
+    delivery_rate_bits: AtomicU32,
+    /// Length of the bounded rate sample, in milliseconds.
+    transport_interval_bits: AtomicU32,
+    /// Cumulative payload counters from the per-guest session.
+    bytes_sent: AtomicU64,
+    bytes_acked: AtomicU64,
+    retransmitted_fragments: AtomicU64,
     encode_bits: AtomicU32,
     network_bits: AtomicU32,
 }
@@ -449,12 +461,24 @@ impl Telemetry {
     }
 
     /// What the loop measured this pass.
-    pub(crate) fn measured(&self, window: u32, stale: u32, mbps: f64, encode_ms: f64, srtt: f64) {
-        self.window.store(window, Ordering::Relaxed);
-        self.stale.store(stale, Ordering::Relaxed);
-        Self::store(&self.bitrate_bits, mbps);
+    pub(crate) fn measured(&self, transport: lowlat_core::session::TransportStats, encode_ms: f64) {
+        self.window.store(transport.in_flight, Ordering::Relaxed);
+        self.stale.store(transport.stale, Ordering::Relaxed);
+        // Preserve the original field's meaning for existing integrations:
+        // it has always reported the measured path rate, not the configured
+        // encoder ceiling. The explicit field below removes that ambiguity.
+        Self::store(&self.bitrate_bits, transport.delivery_rate_mbps);
+        Self::store(&self.send_rate_bits, transport.send_rate_mbps);
+        Self::store(&self.delivery_rate_bits, transport.delivery_rate_mbps);
+        Self::store(&self.transport_interval_bits, transport.interval_ms);
+        self.bytes_sent
+            .store(transport.bytes_sent, Ordering::Relaxed);
+        self.bytes_acked
+            .store(transport.bytes_acked, Ordering::Relaxed);
+        self.retransmitted_fragments
+            .store(transport.retransmitted_fragments, Ordering::Relaxed);
         Self::store(&self.encode_bits, encode_ms);
-        Self::store(&self.network_bits, srtt);
+        Self::store(&self.network_bits, transport.srtt_ms);
     }
 
     /// Note that this guest's loop has begun, and when.
@@ -518,6 +542,12 @@ impl Telemetry {
             stale: self.stale.load(Ordering::Relaxed),
             cg_events: self.cg_events.load(Ordering::Relaxed),
             bitrate_mbps: Self::load(&self.bitrate_bits),
+            send_rate_mbps: Self::load(&self.send_rate_bits),
+            delivery_rate_mbps: Self::load(&self.delivery_rate_bits),
+            transport_interval_ms: Self::load(&self.transport_interval_bits),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            bytes_acked: self.bytes_acked.load(Ordering::Relaxed),
+            retransmitted_fragments: self.retransmitted_fragments.load(Ordering::Relaxed),
             encode_ms: Self::load(&self.encode_bits),
             network_ms: Self::load(&self.network_bits),
         }
@@ -545,10 +575,24 @@ pub struct Metrics {
     pub window: u32,
     pub stale: u32,
     pub cg_events: u32,
+    /// Legacy alias for the measured video delivery rate, in mebibits/s.
     pub bitrate_mbps: f32,
     pub encode_ms: f32,
     /// The smoothed round trip to this peer.
     pub network_ms: f32,
+    /// Payload rate attempted on the video channel, in mebibits/s.
+    pub send_rate_mbps: f32,
+    /// Payload rate covered by cumulative acknowledgements, in mebibits/s.
+    pub delivery_rate_mbps: f32,
+    /// Duration of the last packet-rate sample, in milliseconds.
+    pub transport_interval_ms: f32,
+    /// Cumulative video-channel payload handed to the wire, including
+    /// retransmissions.
+    pub bytes_sent: u64,
+    /// Cumulative video-channel payload covered by cumulative acknowledgements.
+    pub bytes_acked: u64,
+    /// Cumulative video-channel retransmission transmissions.
+    pub retransmitted_fragments: u64,
 }
 
 /// Something the application asked of one running guest.
@@ -1607,7 +1651,8 @@ fn send_control(session: &mut Session<'_>, message: &control::Control<'_>) {
     let _ = session.send_message(CONTROL_CHANNEL, head, message.body);
 }
 
-/// Throughput on the video channel, as the rate controller wants it.
+/// Throughput on a send channel for diagnostics that have not yet moved to
+/// the core's acknowledgement-based sampler.
 ///
 /// **Mebibits per second over a measured interval**, and the interval has to
 /// be long enough to mean something: sampled every pass, most intervals are a
@@ -1829,7 +1874,6 @@ fn run_guest(args: Attached, wake: Wake, running: &lowlat_net::Running) {
     // What the tally said last pass, so a stamp is written when input arrived
     // rather than on every pass regardless.
     let mut counted = lowlat_inject::event::Tally::default();
-    let mut throughput = Throughput::default();
     // What this guest has been told about the pointer, and what it holds.
     let mut pointer = crate::cursor::Sender::new();
     let mut declared = false;
@@ -2345,22 +2389,20 @@ fn run_guest(args: Attached, wake: Wake, running: &lowlat_net::Running) {
         // What the stream's controller and gate are steered by. Cheap, and it
         // reads state this loop already owns.
         if let Some(seat) = seat.as_ref()
-            && let Some((window, stale, bytes)) =
-                shell.endpoint().session().send_pressure(VIDEO_CHANNEL)
+            && let Some(transport) = shell
+                .endpoint()
+                .session()
+                .channel_transport_stats(VIDEO_CHANNEL)
         {
-            let measured = throughput.sample(bytes, now);
+            let window = transport.in_flight;
+            let stale = transport.stale;
+            let measured = transport.delivery_rate_mbps;
             seat.report(window, stale, measured);
             // **Published where it is already computed.** These are the
             // controller's own inputs; an application asking what a guest is
             // doing gets the numbers the host is steering by rather than a
             // second set derived somewhere else.
-            args.telemetry.measured(
-                window,
-                stale,
-                measured,
-                seat.encode_latency_ms(),
-                shell.endpoint().session().srtt_ms(),
-            );
+            args.telemetry.measured(transport, seat.encode_latency_ms());
 
             // **The line a live run is read from.** Frames leaving, the window
             // the gate is judging, and what the path is actually carrying: a
@@ -2417,8 +2459,13 @@ fn run_guest(args: Attached, wake: Wake, running: &lowlat_net::Running) {
                 args.telemetry
                     .progressed(now, u32::try_from(sent).unwrap_or(u32::MAX));
                 lowlat_common::log_info!(
-                    "guest: attempt={} frames={sent} window={window} stale={stale} mbps={measured:.2} encode_ms={:.2} rx_frag={rx} rx_msg={inbound_messages} dg_in={} dg_out={} rej={} srtt={:.1} keys={} btn={} wheel={} motion={} pad={} snd={} snd_drop={} snd_mbps={sound_mbps:.3} mic={} mic_refused={} mic_panicked={}",
+                    "guest: attempt={} frames={sent} window={window} stale={stale} mbps={measured:.2} send_mbps={:.2} sample_ms={:.0} tx_bytes={} ack_bytes={} retrans={} encode_ms={:.2} rx_frag={rx} rx_msg={inbound_messages} dg_in={} dg_out={} rej={} srtt={:.1} keys={} btn={} wheel={} motion={} pad={} snd={} snd_drop={} snd_mbps={sound_mbps:.3} mic={} mic_refused={} mic_panicked={}",
                     args.attempt_id,
+                    transport.send_rate_mbps,
+                    transport.interval_ms,
+                    transport.bytes_sent,
+                    transport.bytes_acked,
+                    transport.retransmitted_fragments,
                     seat.encode_latency_ms(),
                     datagrams.datagrams_in,
                     datagrams.datagrams_out,
@@ -2919,6 +2966,38 @@ mod tests {
             read.keyboard_ms, 40,
             "a keyboard that did not move was restamped"
         );
+    }
+
+    #[test]
+    fn transport_snapshot_is_published_without_losing_counter_precision() {
+        let telemetry = Telemetry::default();
+        telemetry.measured(
+            lowlat_core::session::TransportStats {
+                interval_ms: 125.0,
+                in_flight: 7,
+                stale: 2,
+                bytes_sent: 9_000_000,
+                bytes_acked: 8_000_000,
+                retransmitted_fragments: 11,
+                send_rate_mbps: 42.5,
+                delivery_rate_mbps: 37.25,
+                srtt_ms: 18.0,
+            },
+            2.75,
+        );
+
+        let read = telemetry.read();
+        assert_eq!(read.window, 7);
+        assert_eq!(read.stale, 2);
+        assert_eq!(read.bytes_sent, 9_000_000);
+        assert_eq!(read.bytes_acked, 8_000_000);
+        assert_eq!(read.retransmitted_fragments, 11);
+        assert!((read.bitrate_mbps - 37.25).abs() < f32::EPSILON);
+        assert!((read.send_rate_mbps - 42.5).abs() < f32::EPSILON);
+        assert!((read.delivery_rate_mbps - 37.25).abs() < f32::EPSILON);
+        assert!((read.transport_interval_ms - 125.0).abs() < f32::EPSILON);
+        assert!((read.encode_ms - 2.75).abs() < f32::EPSILON);
+        assert!((read.network_ms - 18.0).abs() < f32::EPSILON);
     }
 
     #[test]

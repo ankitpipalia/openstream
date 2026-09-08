@@ -91,7 +91,7 @@ pub enum lowlat_status {
 /// The major version, raised only when something already published changes.
 pub const LOWLAT_ABI_MAJOR: u32 = 0;
 /// The minor version, raised when surface is appended.
-pub const LOWLAT_ABI_MINOR: u32 = 1;
+pub const LOWLAT_ABI_MINOR: u32 = 2;
 
 /// Major and minor, packed.
 ///
@@ -1957,10 +1957,24 @@ pub struct lowlat_metrics {
     pub stale: u32,
     /// Times congestion cost this guest rate.
     pub cg_events: u32,
+    /// Legacy alias for the measured video delivery rate, in mebibits/s.
     pub bitrate_mbps: f32,
     pub encode_ms: f32,
     /// The smoothed round trip to this peer.
     pub network_ms: f32,
+    /// Payload rate attempted on the video channel, in mebibits/s.
+    pub send_rate_mbps: f32,
+    /// Payload rate covered by cumulative acknowledgements, in mebibits/s.
+    pub delivery_rate_mbps: f32,
+    /// Duration of the last packet-rate sample, in milliseconds.
+    pub transport_interval_ms: f32,
+    /// Cumulative video-channel payload handed to the wire, including
+    /// retransmissions.
+    pub bytes_sent: u64,
+    /// Cumulative video-channel payload covered by cumulative acknowledgements.
+    pub bytes_acked: u64,
+    /// Cumulative video-channel retransmission transmissions.
+    pub retransmitted_fragments: u64,
 }
 
 /// Read what one guest is doing.
@@ -1984,8 +1998,11 @@ pub unsafe extern "C" fn lowlat_host_get_metrics(
             let Some(slot) = out.as_mut() else {
                 return LOWLAT_ERR_INVALID_ARGUMENT;
             };
-            if (slot.size as usize) < core::mem::size_of::<lowlat_metrics>() {
-                return LOWLAT_ERR_INVALID_ARGUMENT;
+            let provided = slot.size as usize;
+            let fixed_size =
+                core::mem::offset_of!(lowlat_metrics, network_ms) + core::mem::size_of::<f32>();
+            if provided < fixed_size {
+                return LOWLAT_ERR_TOO_SMALL;
             }
             let held = handle.held();
             let Some(seam) = held.seam.as_ref() else {
@@ -2008,6 +2025,43 @@ pub unsafe extern "C" fn lowlat_host_get_metrics(
             slot.stale = metrics.stale;
             slot.cg_events = metrics.cg_events;
             slot.bitrate_mbps = metrics.bitrate_mbps;
+            let optional_size = |field: usize, size: usize| provided >= field.saturating_add(size);
+            if optional_size(
+                core::mem::offset_of!(lowlat_metrics, send_rate_mbps),
+                core::mem::size_of::<f32>(),
+            ) {
+                slot.send_rate_mbps = metrics.send_rate_mbps;
+            }
+            if optional_size(
+                core::mem::offset_of!(lowlat_metrics, delivery_rate_mbps),
+                core::mem::size_of::<f32>(),
+            ) {
+                slot.delivery_rate_mbps = metrics.delivery_rate_mbps;
+            }
+            if optional_size(
+                core::mem::offset_of!(lowlat_metrics, transport_interval_ms),
+                core::mem::size_of::<f32>(),
+            ) {
+                slot.transport_interval_ms = metrics.transport_interval_ms;
+            }
+            if optional_size(
+                core::mem::offset_of!(lowlat_metrics, bytes_sent),
+                core::mem::size_of::<u64>(),
+            ) {
+                slot.bytes_sent = metrics.bytes_sent;
+            }
+            if optional_size(
+                core::mem::offset_of!(lowlat_metrics, bytes_acked),
+                core::mem::size_of::<u64>(),
+            ) {
+                slot.bytes_acked = metrics.bytes_acked;
+            }
+            if optional_size(
+                core::mem::offset_of!(lowlat_metrics, retransmitted_fragments),
+                core::mem::size_of::<u64>(),
+            ) {
+                slot.retransmitted_fragments = metrics.retransmitted_fragments;
+            }
             slot.encode_ms = metrics.encode_ms;
             slot.network_ms = metrics.network_ms;
             LOWLAT_OK
@@ -3768,6 +3822,12 @@ mod metrics_tests {
             bitrate_mbps: 0.0,
             encode_ms: 0.0,
             network_ms: 0.0,
+            send_rate_mbps: 0.0,
+            delivery_rate_mbps: 0.0,
+            transport_interval_ms: 0.0,
+            bytes_sent: 0,
+            bytes_acked: 0,
+            retransmitted_fragments: 0,
         }
     }
 
@@ -3811,6 +3871,18 @@ mod metrics_tests {
         assert_eq!(metrics.pointer_ms, 0);
         assert_eq!(metrics.gamepad_ms, 0);
 
+        // Appended fields are optional within the major version. A caller
+        // built against the previous header can still receive the original
+        // prefix, and the library must not write beyond its declared size.
+        let legacy_size =
+            core::mem::offset_of!(lowlat_metrics, network_ms) + core::mem::size_of::<f32>();
+        let mut legacy = empty();
+        legacy.size = u32::try_from(legacy_size).unwrap_or(u32::MAX);
+        assert_eq!(
+            unsafe { lowlat_host_get_metrics(handle, guest, &raw mut legacy) },
+            LOWLAT_OK
+        );
+
         assert_eq!(
             unsafe { lowlat_host_get_metrics(handle, 4242, &raw mut metrics) },
             LOWLAT_ERR_UNKNOWN_GUEST
@@ -3821,7 +3893,7 @@ mod metrics_tests {
         stale.size = 4;
         assert_eq!(
             unsafe { lowlat_host_get_metrics(handle, guest, &raw mut stale) },
-            LOWLAT_ERR_INVALID_ARGUMENT
+            LOWLAT_ERR_TOO_SMALL
         );
 
         unsafe { lowlat_destroy(handle) };

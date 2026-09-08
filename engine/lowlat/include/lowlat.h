@@ -12,7 +12,7 @@
 #define LOWLAT_ABI_MAJOR 0
 
 // The minor version, raised when surface is appended.
-#define LOWLAT_ABI_MINOR 1
+#define LOWLAT_ABI_MINOR 2
 
 // The longest attempt identifier carried across this boundary.
 //
@@ -728,10 +728,24 @@ typedef struct lowlat_metrics {
     uint32_t stale;
     // Times congestion cost this guest rate.
     uint32_t cg_events;
+    // Legacy alias for the measured video delivery rate, in mebibits/s.
     float bitrate_mbps;
     float encode_ms;
     // The smoothed round trip to this peer.
     float network_ms;
+    // Payload rate attempted on the video channel, in mebibits/s.
+    float send_rate_mbps;
+    // Payload rate covered by cumulative acknowledgements, in mebibits/s.
+    float delivery_rate_mbps;
+    // Duration of the last packet-rate sample, in milliseconds.
+    float transport_interval_ms;
+    // Cumulative video-channel payload handed to the wire, including
+    // retransmissions.
+    uint64_t bytes_sent;
+    // Cumulative video-channel payload covered by cumulative acknowledgements.
+    uint64_t bytes_acked;
+    // Cumulative video-channel retransmission transmissions.
+    uint64_t retransmitted_fragments;
 } lowlat_metrics;
 
 // A local candidate for the application to forward.

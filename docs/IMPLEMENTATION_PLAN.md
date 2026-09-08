@@ -297,10 +297,12 @@ without changing the default OpenStream wire format.
   cumulatively acknowledged payload bytes, delivered/send rate over a bounded
   sampling interval, in-flight and stale pressure, SRTT, and retransmission
   count; the local congestion controller consumes measured delivery rate
-  instead of a constant zero.
-- [ ] Propagate the low-level telemetry into the native Linux host's exported
-  diagnostics and rate loop, and keep per-guest delivery measurements separate
-  when guests share one encoder.
+  instead of a constant zero. Rates are mebibits per second and snapshots are
+  available per send channel as well as in aggregate.
+- [x] Propagate video-channel telemetry into the native Linux host's exported
+  diagnostics and rate loop, keeping each guest's delivery measurement separate
+  when guests share one encoder. Existing ABI consumers retain
+  `bitrate_mbps` as a delivery-rate alias; the new counters are appended.
 - [ ] Add a paced sender with a bounded byte budget and path-aware MTU probing;
   preserve the 1200-byte safe floor and never raise the protocol ceiling.
 - [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →

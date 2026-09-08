@@ -325,6 +325,12 @@ internal static class AppProtocol
         ["decodeLatency"] = 0.0,
         ["networkLatency"] = metrics.NetworkMs,
         ["bitrate"] = metrics.BitrateMbps,
+        ["sendRate"] = metrics.SendRateMbps,
+        ["deliveryRate"] = metrics.DeliveryRateMbps,
+        ["transportSampleMs"] = metrics.TransportIntervalMs,
+        ["bytesSent"] = metrics.BytesSent,
+        ["bytesAcked"] = metrics.BytesAcked,
+        ["retransmittedFragments"] = metrics.RetransmittedFragments,
     };
 
     /// The guests as the discovery listing carries them.

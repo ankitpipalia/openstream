@@ -133,6 +133,13 @@ smoothed round trip -- plus when each kind of input last arrived, which is the o
 application kicking idle guests can ask nobody else. **Zero means never, which is not zero
 milliseconds ago.**
 
+The original `bitrate_mbps` metric remains as a compatibility alias for the measured video
+delivery rate. The appended transport fields make the distinction explicit: attempted and
+delivered video rate, the bounded sample interval, cumulative video payload sent and
+acknowledged, and retransmission transmissions. Rates are mebibits per second. They are local
+diagnostics, not a new wire-level congestion message, and every field after `network_ms` is
+optional according to the caller's `size`.
+
 **There is no separate call to enable or disable a guest's input.** It was declared here and
 removed 2026-08-21 before anything was built against it: it is `lowlat_host_set_permissions`
 with every flag cleared, and two calls that write one field can disagree about what a guest is

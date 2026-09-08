@@ -271,6 +271,12 @@ internal struct Metrics
     public float BitrateMbps;
     public float EncodeMs;
     public float NetworkMs;
+    public float SendRateMbps;
+    public float DeliveryRateMbps;
+    public float TransportIntervalMs;
+    public ulong BytesSent;
+    public ulong BytesAcked;
+    public ulong RetransmittedFragments;
 }
 
 [StructLayout(LayoutKind.Sequential)]

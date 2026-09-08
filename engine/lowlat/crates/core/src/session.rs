@@ -82,7 +82,8 @@ pub enum Health {
 /// minimum-sized sampling interval. `bytes_acked` is payload covered by the
 /// peer's cumulative acknowledgements, so `delivery_rate_mbps` describes what
 /// the path delivered rather than what the sender attempted to put on the
-/// socket. No peer clock or address is included.
+/// socket. Rates use mebibits per second, matching
+/// [`crate::congestion::Controller`]. No peer clock or address is included.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TransportStats {
     /// Duration of the last rate sample. Zero until the first sample exists.
@@ -97,9 +98,9 @@ pub struct TransportStats {
     pub bytes_acked: u64,
     /// Retransmission transmissions since the session began.
     pub retransmitted_fragments: u64,
-    /// Attempted payload rate over the last sample interval.
+    /// Attempted payload rate over the last sample interval, in mebibits/s.
     pub send_rate_mbps: f64,
-    /// Delivered payload rate over the last sample interval.
+    /// Delivered payload rate over the last sample interval, in mebibits/s.
     pub delivery_rate_mbps: f64,
     /// Smoothed fragment round trip in fractional milliseconds.
     pub srtt_ms: f64,
@@ -147,10 +148,14 @@ pub struct Session<'a> {
     delivery: [Delivery; CHANNEL_COUNT],
     /// Latest packet-level telemetry snapshot.
     transport_stats: TransportStats,
+    /// Latest packet-level snapshot for each attached send channel. The
+    /// aggregate above is kept for the session controller; media callers use
+    /// this array so control and audio traffic cannot inflate video delivery.
+    channel_stats: [TransportStats; CHANNEL_COUNT],
     /// Cumulative counters at the start of the current rate sample.
     last_sample_ms: f64,
-    last_sample_bytes_sent: u64,
-    last_sample_bytes_acked: u64,
+    last_sample_bytes_sent: [u64; CHANNEL_COUNT],
+    last_sample_bytes_acked: [u64; CHANNEL_COUNT],
     ack_due: bool,
     /// Why the pending acknowledgement is owed. Data arrival makes it an
     /// acknowledgement; the cadence alone makes it a keepalive.
@@ -197,9 +202,10 @@ impl<'a> Session<'a> {
                 since_ms: now_ms,
             }; CHANNEL_COUNT],
             transport_stats: TransportStats::default(),
+            channel_stats: [TransportStats::default(); CHANNEL_COUNT],
             last_sample_ms: now_ms,
-            last_sample_bytes_sent: 0,
-            last_sample_bytes_acked: 0,
+            last_sample_bytes_sent: [0; CHANNEL_COUNT],
+            last_sample_bytes_acked: [0; CHANNEL_COUNT],
             ack_due: false,
             ack_kind: AckKind::Ack,
             trigger: (0, 0),
@@ -239,6 +245,26 @@ impl<'a> Session<'a> {
     /// Return the latest bounded packet-level transport snapshot.
     pub fn transport_stats(&self) -> TransportStats {
         self.transport_stats
+    }
+
+    /// Return the latest bounded packet-level snapshot for one send channel.
+    ///
+    /// The snapshot is deliberately channel-local: a high-rate video stream
+    /// must not mistake control or audio traffic for delivered video capacity.
+    pub fn channel_transport_stats(&self, channel: u8) -> Option<TransportStats> {
+        let ring = self.send.get(channel as usize)?.as_ref()?;
+        let mut stats = self.channel_stats.get(channel as usize).copied()?;
+        // A send happens after `Session::poll()` in the normal shell order.
+        // Refresh the cumulative/window fields here so a diagnostic reader
+        // never reports the previous turn's queue state or byte totals; the
+        // bounded rate sample itself remains owned by `poll()`.
+        stats.in_flight = ring.in_flight();
+        stats.stale = ring.stale();
+        stats.bytes_sent = ring.bytes_sent();
+        stats.bytes_acked = ring.bytes_acked();
+        stats.retransmitted_fragments = ring.retransmitted();
+        stats.srtt_ms = self.srtt_ms;
+        Some(stats)
     }
 
     /// Liveness, judged against the last forward progress in each direction.
@@ -437,7 +463,6 @@ impl<'a> Session<'a> {
             self.ack_due = true;
             self.ack_kind = AckKind::Keepalive;
         }
-        let (window, stale, bytes_sent, bytes_acked, retransmitted) = self.counters();
         // **An empty channel is progress, not a stall.** A channel with
         // nothing outstanding can produce no acknowledgement, and a deadline
         // that did not say so would end every session that stopped sending.
@@ -452,55 +477,84 @@ impl<'a> Session<'a> {
             }
         }
         let elapsed = now_ms - self.last_sample_ms;
-        if elapsed.is_finite()
+        let sampled = elapsed.is_finite()
             && elapsed >= TRANSPORT_SAMPLE_MIN_MS
-            && now_ms >= self.last_sample_ms
-        {
-            let sent_delta = bytes_sent.saturating_sub(self.last_sample_bytes_sent);
-            let acked_delta = bytes_acked.saturating_sub(self.last_sample_bytes_acked);
-            let denominator = elapsed * 1_000.0;
-            let send_rate_mbps = sent_delta as f64 * 8.0 / denominator;
-            let delivery_rate_mbps = acked_delta as f64 * 8.0 / denominator;
-            self.transport_stats.interval_ms = elapsed;
-            self.transport_stats.send_rate_mbps = if send_rate_mbps.is_finite() {
-                send_rate_mbps.max(0.0)
+            && now_ms >= self.last_sample_ms;
+        for (ring, stats) in self.send.iter().zip(self.channel_stats.iter_mut()) {
+            if let Some(ring) = ring.as_ref() {
+                stats.in_flight = ring.in_flight();
+                stats.stale = ring.stale();
+                stats.bytes_sent = ring.bytes_sent();
+                stats.bytes_acked = ring.bytes_acked();
+                stats.retransmitted_fragments = ring.retransmitted();
+                stats.srtt_ms = self.srtt_ms;
             } else {
-                0.0
-            };
-            self.transport_stats.delivery_rate_mbps = if delivery_rate_mbps.is_finite() {
-                delivery_rate_mbps.max(0.0)
-            } else {
-                0.0
-            };
+                *stats = TransportStats::default();
+            }
+        }
+        if sampled {
+            for ((stats, last_sent), last_acked) in self
+                .channel_stats
+                .iter_mut()
+                .zip(self.last_sample_bytes_sent.iter_mut())
+                .zip(self.last_sample_bytes_acked.iter_mut())
+            {
+                let sent_delta = stats.bytes_sent.saturating_sub(*last_sent);
+                let acked_delta = stats.bytes_acked.saturating_sub(*last_acked);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "the counter is a byte total; f64 is sufficient for a rate sample"
+                )]
+                let send_bits = sent_delta as f64 * 8.0;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "the counter is a byte total; f64 is sufficient for a rate sample"
+                )]
+                let acked_bits = acked_delta as f64 * 8.0;
+                let seconds = elapsed / 1000.0;
+                let send_rate_mbps = send_bits / seconds / 1_048_576.0;
+                let delivery_rate_mbps = acked_bits / seconds / 1_048_576.0;
+                stats.interval_ms = elapsed;
+                stats.send_rate_mbps = if send_rate_mbps.is_finite() {
+                    send_rate_mbps.max(0.0)
+                } else {
+                    0.0
+                };
+                stats.delivery_rate_mbps = if delivery_rate_mbps.is_finite() {
+                    delivery_rate_mbps.max(0.0)
+                } else {
+                    0.0
+                };
+                *last_sent = stats.bytes_sent;
+                *last_acked = stats.bytes_acked;
+            }
             self.last_sample_ms = now_ms;
-            self.last_sample_bytes_sent = bytes_sent;
-            self.last_sample_bytes_acked = bytes_acked;
         }
-        self.transport_stats.in_flight = window;
-        self.transport_stats.stale = stale;
-        self.transport_stats.bytes_sent = bytes_sent;
-        self.transport_stats.bytes_acked = bytes_acked;
-        self.transport_stats.retransmitted_fragments = retransmitted;
-        self.transport_stats.srtt_ms = self.srtt_ms;
-        self.controller
-            .tick(window, stale, self.transport_stats.delivery_rate_mbps);
-    }
-
-    /// Combined queue and cumulative wire counters across attached channels.
-    fn counters(&self) -> (u32, u32, u64, u64, u64) {
-        let mut window = 0u32;
-        let mut stale = 0u32;
-        let mut bytes_sent = 0u64;
-        let mut bytes_acked = 0u64;
-        let mut retransmitted = 0u64;
-        for ring in self.send.iter().flatten() {
-            window = window.saturating_add(ring.in_flight());
-            stale = stale.saturating_add(ring.stale());
-            bytes_sent = bytes_sent.saturating_add(ring.bytes_sent());
-            bytes_acked = bytes_acked.saturating_add(ring.bytes_acked());
-            retransmitted = retransmitted.saturating_add(ring.retransmitted());
+        let mut aggregate = TransportStats {
+            interval_ms: self.transport_stats.interval_ms,
+            ..TransportStats::default()
+        };
+        for stats in &self.channel_stats {
+            aggregate.in_flight = aggregate.in_flight.saturating_add(stats.in_flight);
+            aggregate.stale = aggregate.stale.saturating_add(stats.stale);
+            aggregate.bytes_sent = aggregate.bytes_sent.saturating_add(stats.bytes_sent);
+            aggregate.bytes_acked = aggregate.bytes_acked.saturating_add(stats.bytes_acked);
+            aggregate.retransmitted_fragments = aggregate
+                .retransmitted_fragments
+                .saturating_add(stats.retransmitted_fragments);
+            aggregate.send_rate_mbps += stats.send_rate_mbps;
+            aggregate.delivery_rate_mbps += stats.delivery_rate_mbps;
         }
-        (window, stale, bytes_sent, bytes_acked, retransmitted)
+        if sampled {
+            aggregate.interval_ms = elapsed;
+        }
+        aggregate.srtt_ms = self.srtt_ms;
+        self.transport_stats = aggregate;
+        self.controller.tick(
+            self.transport_stats.in_flight,
+            self.transport_stats.stale,
+            self.transport_stats.delivery_rate_mbps,
+        );
     }
 
     /// Milliseconds until the session next needs attention.
@@ -857,9 +911,17 @@ mod tests {
         assert_eq!(stats.retransmitted_fragments, 0);
         assert_eq!(stats.in_flight, 0);
         assert!((stats.interval_ms - 100.0).abs() < f64::EPSILON);
-        assert!(stats.send_rate_mbps > 0.0);
-        assert!(stats.delivery_rate_mbps > 0.0);
+        let expected_rate = 11.0 * 8.0 / 0.1 / 1_048_576.0;
+        assert!((stats.send_rate_mbps - expected_rate).abs() < 1e-12);
+        assert!((stats.delivery_rate_mbps - expected_rate).abs() < 1e-12);
         assert!(stats.srtt_ms > 0.0);
+        let video = left
+            .channel_transport_stats(VIDEO)
+            .expect("the video send ring is attached");
+        assert_eq!(video.bytes_sent, stats.bytes_sent);
+        assert_eq!(video.bytes_acked, stats.bytes_acked);
+        assert!((video.delivery_rate_mbps - stats.delivery_rate_mbps).abs() < f64::EPSILON);
+        assert!(left.channel_transport_stats(2).is_none());
     }
 
     #[test]
