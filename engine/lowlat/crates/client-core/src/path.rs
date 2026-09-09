@@ -295,6 +295,19 @@ impl MigrationController {
                 return vec![];
             }
             self.last_request = Some(request_id);
+            if kind == PathKind::Ice {
+                let generation = self
+                    .active_generation
+                    .checked_add(1)
+                    .unwrap_or(self.active_generation);
+                return vec![MigrationAction::Send(
+                    ingress,
+                    PathControl::Abort {
+                        generation,
+                        reason: AbortReason::Unsupported,
+                    },
+                )];
+            }
             return MigrationToken::random()
                 .and_then(|token| self.start(kind.into(), token, now))
                 .unwrap_or_default();
@@ -1063,6 +1076,83 @@ mod path_migration {
         );
         assert_eq!(client.active_generation, 1);
         assert!(client.pending.is_none());
+    }
+
+    #[test]
+    fn host_rejects_an_ice_request_with_a_bounded_abort() {
+        let now = Instant::now();
+        let mut host = MigrationController::new(Role::Host);
+        let actions = host.receive(
+            PathSlot(1),
+            PathControl::Request {
+                request_id: 7,
+                kind: PathKind::Ice,
+            },
+            now,
+        );
+        assert!(matches!(
+            actions.as_slice(),
+            [MigrationAction::Send(
+                PathSlot(1),
+                PathControl::Abort {
+                    generation: 2,
+                    reason: AbortReason::Unsupported,
+                }
+            )]
+        ));
+        assert_eq!(host.active_generation, 1);
+        assert_eq!(host.state, MigrationState::Idle);
+        assert!(host.pending.is_none());
+        assert!(
+            host.receive(
+                PathSlot(1),
+                PathControl::Request {
+                    request_id: 7,
+                    kind: PathKind::Ice,
+                },
+                now,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn rollback_is_allowed_before_responder_commit_but_not_after() {
+        let now = Instant::now();
+        let (mut host, _client) = prepared_pair(now);
+        let actions = host.fail_preparation(AbortReason::ProbeFailed);
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                MigrationAction::Send(
+                    PathSlot(1),
+                    PathControl::Abort {
+                        generation: 2,
+                        reason: AbortReason::ProbeFailed,
+                    }
+                ),
+                MigrationAction::Discard
+            ]
+        ));
+        assert_eq!(host.state, MigrationState::Failed);
+        assert_eq!(host.active_generation, 1);
+
+        let (mut host, mut client) = prepared_pair(now);
+        host.receive(PathSlot(1), ready(), now);
+        let commit = PathControl::Commit {
+            generation: 2,
+            token: TOKEN,
+        };
+        client.receive(PathSlot(1), commit, now);
+        host.old_path_failed();
+        let _ = host.tick(now + MIGRATION_DEADLINE);
+        assert_eq!(host.state, MigrationState::CommitUnconfirmed);
+        assert_eq!(host.active_generation, 1);
+        assert_eq!(
+            host.application_slot(),
+            Err(PathMigrationError::CommitUnconfirmed)
+        );
+        assert_eq!(client.active_generation, 2);
     }
 
     #[test]

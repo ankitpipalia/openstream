@@ -1368,6 +1368,9 @@ impl PeerSession {
         }
         let actions = self.migration.tick(Instant::now());
         self.apply_migration_actions(actions).await?;
+        if self.migration.state == MigrationState::CommitUnconfirmed {
+            return Err(PathMigrationError::CommitUnconfirmed.into());
+        }
         if self.migration.busy() {
             return Err(PathMigrationError::MigrationAlreadyPending.into());
         }
