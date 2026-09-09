@@ -263,6 +263,30 @@ impl UdpTransport {
         self.telemetry.set_path_generation(generation);
     }
 
+    /// Start application telemetry at activation, excluding replacement probes.
+    pub fn activate_generation(&mut self, generation: PathGeneration) {
+        self.telemetry = TransportTelemetry::new();
+        self.telemetry.set_path_generation(generation);
+    }
+
+    /// Write a datagram already sealed by the owning session. The caller
+    /// retains the single cipher/counter domain across multiple sockets.
+    pub async fn send_sealed(&self, datagram: &[u8], record: bool) -> Result<usize, Error> {
+        if self.peer.is_none() {
+            return Err(Error::NotConnected);
+        }
+        self.send_datagram(datagram, record).await
+    }
+
+    /// Read bounded wire bytes for an ingress-aware session multiplexer.
+    /// Authentication and accounting belong to that single session owner.
+    pub async fn recv_sealed(&self, datagram: &mut [u8; MAX_DATAGRAM]) -> Result<usize, Error> {
+        if self.peer.is_none() {
+            return Err(Error::NotConnected);
+        }
+        self.recv_datagram(datagram, false).await
+    }
+
     /// Return cumulative observations for completed application socket I/O.
     /// Registration and setup packets are deliberately excluded.
     pub fn telemetry_counters(&self) -> TransportSample {

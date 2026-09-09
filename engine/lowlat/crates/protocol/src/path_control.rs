@@ -9,6 +9,8 @@ pub const VERSION: u8 = 1;
 pub const MAX_PATH_CONTROL_BYTES: usize = 64;
 /// Number of opaque, generation-scoped token bytes.
 pub const PATH_TOKEN_BYTES: usize = 16;
+/// Dedicated encrypted control channel, separate from ordered application control.
+pub const PATH_CONTROL_CHANNEL: u8 = 255;
 
 const HEADER_LEN: usize = 4;
 const REQUEST_LEN: usize = HEADER_LEN + 4;
