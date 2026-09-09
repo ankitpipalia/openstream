@@ -16,10 +16,7 @@ use openstream_protocol::relay::Role as RelayRole;
 use openstream_protocol::{
     IdentityError, IdentityKey, KeyExchange, Kind, MAX_DATAGRAM, Packet, Session as CipherSession,
 };
-use openstream_transport::{
-    FIRST_PATH_GENERATION, PathGeneration, PathMtuState, PathState, PeerTransportSnapshot,
-    TransportPathKind, TransportSample, UdpTransport,
-};
+use openstream_transport::{PathGeneration, PeerTransportSnapshot, TransportSample, UdpTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -35,6 +32,10 @@ use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc_ice::url::Url as IceUrl;
 use webrtc_util::conn::Conn as IceConn;
+
+mod path;
+
+use path::{PathRuntime, PeerPathBackend};
 
 /// Wire-level capability protocol version.
 pub const CAPABILITY_VERSION: u8 = 1;
@@ -939,15 +940,6 @@ impl fmt::Debug for IcePath {
     }
 }
 
-#[derive(Debug)]
-enum DataPath {
-    Direct {
-        transport: Box<UdpTransport>,
-        candidate: CandidateKind,
-    },
-    Ice(IcePath),
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct PathCounters {
     sent_packets: u64,
@@ -1044,14 +1036,11 @@ fn decimal_mbps(bytes: u64, interval_ms: u64) -> f64 {
 /// service: role-scoped WebSocket, candidate exchange, ephemeral key exchange,
 /// and an authenticated UDP socket. Codec and OS-device policy remain above
 /// this type.
-#[derive(Debug)]
 pub struct PeerSession {
     signal: Endpoint,
-    transport: DataPath,
+    path: PathRuntime,
     cipher: CipherSession,
     stats: SessionStats,
-    path_generation: PathGeneration,
-    path_started_at: Instant,
     path_baseline: Option<PathSampleBaseline>,
     ice_counters: PathCounters,
     /// A peer can win the path probe and send its first capability message
@@ -1060,6 +1049,16 @@ pub struct PeerSession {
     prefetched: Option<Packet>,
     /// Last direct-path keepalive sent by the owning event loop.
     last_keepalive: std::time::Instant,
+}
+
+impl fmt::Debug for PeerSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerSession")
+            .field("connection_path", &self.connection_path())
+            .field("path_generation", &self.path_generation())
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Bounded ordered control helper layered over a [`PeerSession`].
@@ -1421,20 +1420,22 @@ impl PeerSession {
         };
         candidate_forwarder.abort();
 
+        let now = Instant::now();
         Ok(Self {
             signal,
-            transport: DataPath::Ice(IcePath {
-                _agent: agent,
-                conn,
-            }),
+            path: PathRuntime::initial_active(
+                PeerPathBackend::Ice(IcePath {
+                    _agent: agent,
+                    conn,
+                }),
+                now,
+            ),
             cipher: CipherSession::new(keys.tx, keys.rx),
             stats: SessionStats::default(),
-            path_generation: FIRST_PATH_GENERATION,
-            path_started_at: Instant::now(),
             path_baseline: None,
             ice_counters: PathCounters::default(),
             prefetched: None,
-            last_keepalive: std::time::Instant::now(),
+            last_keepalive: now,
         })
     }
 
@@ -1636,24 +1637,31 @@ impl PeerSession {
             // One cipher across all candidates: counters stay monotonic per
             // direction, so delayed probes from a failed candidate can never
             // collide with or pollute the winning path's counters.
-            if let ProbeResult::Established(prefetched) = probe_path(&transport, &mut cipher).await
-            {
+            let path = PeerPathBackend::Direct {
+                transport: Box::new(transport),
+                candidate: candidate.kind,
+            };
+            if let ProbeResult::Established(prefetched) = path.probe(&mut cipher).await {
+                let now = Instant::now();
                 return Ok(Self {
                     signal,
-                    transport: DataPath::Direct {
-                        transport: Box::new(transport),
-                        candidate: candidate.kind,
-                    },
+                    path: PathRuntime::initial_active(path, now),
                     cipher,
                     stats: SessionStats::default(),
-                    path_generation: FIRST_PATH_GENERATION,
-                    path_started_at: Instant::now(),
                     path_baseline: None,
                     ice_counters: PathCounters::default(),
                     prefetched,
-                    last_keepalive: std::time::Instant::now(),
+                    last_keepalive: now,
                 });
             }
+            let PeerPathBackend::Direct {
+                transport: failed_transport,
+                ..
+            } = path
+            else {
+                unreachable!("direct candidate probe uses a direct backend");
+            };
+            transport = *failed_transport;
         }
         Err(Error::NoReachableCandidate)
     }
@@ -1668,52 +1676,28 @@ impl PeerSession {
     /// This reports only routing metadata. It never exposes bearer tokens,
     /// TURN credentials, session keys, or peer addresses.
     pub fn connection_path(&self) -> ConnectionPath {
-        match &self.transport {
-            DataPath::Direct { candidate, .. } => ConnectionPath::DirectUdp {
+        match self.path.active().backend() {
+            PeerPathBackend::Direct { candidate, .. } => ConnectionPath::DirectUdp {
                 candidate: *candidate,
             },
-            DataPath::Ice(_) => ConnectionPath::Ice,
+            PeerPathBackend::Ice(_) => ConnectionPath::Ice,
         }
     }
 
     /// Return the current path generation without exposing peer routing data.
     pub fn path_generation(&self) -> PathGeneration {
-        self.path_generation
+        self.path.active().generation()
     }
 
     /// Return an address- and credential-free snapshot of the selected path.
     pub fn transport_snapshot(&mut self, now: Instant) -> PeerTransportSnapshot {
-        let (path, counters) = match &self.transport {
-            DataPath::Direct {
-                transport,
-                candidate,
-            } => (
-                match candidate {
-                    CandidateKind::Relay => TransportPathKind::OpaqueRelay,
-                    CandidateKind::Host
-                    | CandidateKind::Mapped
-                    | CandidateKind::ServerReflexive => TransportPathKind::DirectUdp,
-                },
-                transport.telemetry_counters(),
-            ),
-            DataPath::Ice(_) => (
-                TransportPathKind::Ice,
-                self.ice_counters.sample(self.path_generation),
-            ),
+        let counters = match self.path.active().backend() {
+            PeerPathBackend::Direct { transport, .. } => transport.telemetry_counters(),
+            PeerPathBackend::Ice(_) => self.ice_counters.sample(self.path_generation()),
         };
-        PeerTransportSnapshot {
-            path,
-            path_generation: self.path_generation,
-            state: PathState::Active,
-            path_age_ms: u64::try_from(
-                now.saturating_duration_since(self.path_started_at)
-                    .as_millis(),
-            )
-            .unwrap_or(u64::MAX),
-            datagram_size: None,
-            path_mtu_state: PathMtuState::Unavailable,
-            sample: sample_path_counters(counters, now, &mut self.path_baseline),
-        }
+        let mut snapshot = self.path.snapshot(now);
+        snapshot.sample = sample_path_counters(counters, now, &mut self.path_baseline);
+        snapshot
     }
 
     /// Return a copy of the local transport counters for diagnostics.
@@ -1727,9 +1711,9 @@ impl PeerSession {
     /// process that is terminated without reaching this method relies on the
     /// bounded router lease to expire.
     pub async fn release_upnp(&mut self) -> Result<(), Error> {
-        match &mut self.transport {
-            DataPath::Direct { transport, .. } => transport.release_upnp().await?,
-            DataPath::Ice(_) => {}
+        match self.path.active_mut().backend_mut() {
+            PeerPathBackend::Direct { transport, .. } => transport.release_upnp().await?,
+            PeerPathBackend::Ice(_) => {}
         }
         Ok(())
     }
@@ -1738,7 +1722,7 @@ impl PeerSession {
     /// caller's event loop reaches the keepalive interval. Full ICE already
     /// owns consent freshness, so this is intentionally a no-op there.
     pub async fn maintain_liveness(&mut self) -> Result<(), Error> {
-        if !matches!(&self.transport, DataPath::Direct { .. })
+        if !matches!(self.path.active().backend(), PeerPathBackend::Direct { .. })
             || self.last_keepalive.elapsed() < DIRECT_KEEPALIVE_INTERVAL
         {
             return Ok(());
@@ -1761,12 +1745,12 @@ impl PeerSession {
         flags: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
-        let ice_path = matches!(&self.transport, DataPath::Ice(_));
-        let sent = match &self.transport {
-            DataPath::Direct { transport, .. } => Ok(transport
+        let ice_path = matches!(self.path.active().backend(), PeerPathBackend::Ice(_));
+        let sent = match self.path.active().backend() {
+            PeerPathBackend::Direct { transport, .. } => Ok(transport
                 .send(&mut self.cipher, kind, channel, flags, payload)
                 .await?),
-            DataPath::Ice(path) => {
+            PeerPathBackend::Ice(path) => {
                 let datagram = self
                     .cipher
                     .seal(kind, channel, flags, payload)
@@ -1791,8 +1775,8 @@ impl PeerSession {
             let (packet, wire_bytes) = if let Some(packet) = self.prefetched.take() {
                 (packet, None)
             } else {
-                match &self.transport {
-                    DataPath::Direct { transport, .. } => tokio::time::timeout(
+                match self.path.active().backend() {
+                    PeerPathBackend::Direct { transport, .. } => tokio::time::timeout(
                         DIRECT_IDLE_TIMEOUT,
                         transport.recv_untracked(&mut self.cipher),
                     )
@@ -1800,7 +1784,7 @@ impl PeerSession {
                     .map_err(|_| Error::Timeout("direct data path liveness"))?
                     .map_err(Error::from)
                     .map(|(packet, bytes)| (packet, Some(bytes)))?,
-                    DataPath::Ice(path) => {
+                    PeerPathBackend::Ice(path) => {
                         let mut datagram = [0_u8; MAX_DATAGRAM];
                         let length = path
                             .conn
@@ -1823,9 +1807,9 @@ impl PeerSession {
                 continue;
             }
             if let Some(bytes) = wire_bytes {
-                match &self.transport {
-                    DataPath::Direct { transport, .. } => transport.record_received(bytes),
-                    DataPath::Ice(_) => self.ice_counters.record_received(bytes),
+                match self.path.active().backend() {
+                    PeerPathBackend::Direct { transport, .. } => transport.record_received(bytes),
+                    PeerPathBackend::Ice(_) => self.ice_counters.record_received(bytes),
                 }
             }
             if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE {
@@ -2320,14 +2304,15 @@ mod tests {
         let now = Instant::now();
         PeerSession {
             signal: test_endpoint(),
-            transport: DataPath::Direct {
-                transport: Box::new(transport),
-                candidate: CandidateKind::Host,
-            },
+            path: PathRuntime::initial_active(
+                PeerPathBackend::Direct {
+                    transport: Box::new(transport),
+                    candidate: CandidateKind::Host,
+                },
+                now,
+            ),
             cipher: CipherSession::new(TEST_KEY, TEST_KEY),
             stats: SessionStats::default(),
-            path_generation: FIRST_PATH_GENERATION,
-            path_started_at: now,
             path_baseline: None,
             ice_counters: PathCounters::default(),
             prefetched: None,
