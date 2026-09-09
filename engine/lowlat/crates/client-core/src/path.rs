@@ -305,23 +305,64 @@ impl MigrationController {
             token,
         } = record
         {
-            if self.role == Role::Client
-                && ingress == PathSlot(self.active_generation)
-                && self.pending.is_none()
-                && self.draining.is_none()
-                && self.active_generation.checked_add(1) == Some(generation)
-                && token != [0; PATH_TOKEN_BYTES]
+            if self.role != Role::Client
+                || ingress != PathSlot(self.active_generation)
+                || self.active_generation.checked_add(1) != Some(generation)
+                || token == [0; PATH_TOKEN_BYTES]
             {
-                if kind == PathKind::Ice {
-                    return vec![MigrationAction::Send(
-                        ingress,
-                        PathControl::Abort {
-                            generation,
-                            reason: AbortReason::Unsupported,
-                        },
-                    )];
+                return vec![];
+            }
+            let target = kind.into();
+            if let Some(p) = self.pending.as_ref() {
+                if p.generation != generation || p.token.bytes() != token || p.target != target {
+                    return vec![];
                 }
-                return self.prepare(generation, kind.into(), MigrationToken(token), now);
+                let new = PathSlot(generation);
+                return if p.proved {
+                    vec![MigrationAction::Send(
+                        ingress,
+                        PathControl::Ready {
+                            generation,
+                            token,
+                            datagram_size: safe_datagram_size(),
+                        },
+                    )]
+                } else if p.opened {
+                    vec![MigrationAction::Send(
+                        new,
+                        PathControl::Probe { generation, token },
+                    )]
+                } else {
+                    vec![]
+                };
+            }
+            if self.draining.is_some() {
+                return vec![];
+            }
+            if kind == PathKind::Ice {
+                return vec![MigrationAction::Send(
+                    ingress,
+                    PathControl::Abort {
+                        generation,
+                        reason: AbortReason::Unsupported,
+                    },
+                )];
+            }
+            return self.prepare(generation, target, MigrationToken(token), now);
+        }
+        if let PathControl::Abort { generation, .. } = record {
+            let aborts_current_attempt = self.pending.as_ref().is_some_and(|pending| {
+                pending.generation == generation
+                    && ingress == PathSlot(self.active_generation)
+                    && matches!(
+                        self.state,
+                        MigrationState::Preparing | MigrationState::Ready
+                    )
+            });
+            if aborts_current_attempt {
+                self.pending = None;
+                self.state = MigrationState::Failed;
+                return vec![MigrationAction::Discard];
             }
             return vec![];
         }
@@ -353,8 +394,9 @@ impl MigrationController {
             }
             | PathControl::Commit { generation, token }
             | PathControl::CommitAck { generation, token } => (*generation, *token),
-            // Abort has no token. It cannot roll back a possibly committed
-            // migration, nor cancel a later attempt reusing N+1.
+            // Abort has no token. It is handled above only for the current
+            // pre-commit attempt; it cannot roll back a committed migration
+            // or disambiguate a later attempt reusing N+1.
             _ => return vec![],
         };
         if generation != p.generation || token != p.token.0 || now >= p.deadline {
@@ -439,16 +481,27 @@ impl MigrationController {
         self.old_failed = true;
     }
 
-    pub(crate) fn fail_preparation(&mut self) -> Vec<MigrationAction> {
+    pub(crate) fn fail_preparation(&mut self, reason: AbortReason) -> Vec<MigrationAction> {
         if self.state == MigrationState::CommitPending
             || self.state == MigrationState::CommitUnconfirmed
         {
             self.state = MigrationState::CommitUnconfirmed;
             return vec![];
         }
-        self.pending = None;
+        let Some(pending) = self.pending.take() else {
+            return vec![];
+        };
         self.state = MigrationState::Failed;
-        vec![MigrationAction::Discard]
+        vec![
+            MigrationAction::Send(
+                PathSlot(self.active_generation),
+                PathControl::Abort {
+                    generation: pending.generation,
+                    reason,
+                },
+            ),
+            MigrationAction::Discard,
+        ]
     }
 
     pub(crate) fn tick(&mut self, now: Instant) -> Vec<MigrationAction> {
@@ -460,7 +513,7 @@ impl MigrationController {
             return vec![];
         };
         if now >= p.deadline {
-            return self.fail_preparation();
+            return self.fail_preparation(AbortReason::Timeout);
         }
         if now < p.next_retry {
             return vec![];
@@ -471,16 +524,11 @@ impl MigrationController {
         let old = PathSlot(self.active_generation);
         let new = PathSlot(generation);
         if self.state == MigrationState::CommitPending {
-            // Always try prepared-new as well on retry: UDP send success is
-            // not evidence that the old route still delivers datagrams.
             let commit = PathControl::Commit { generation, token };
             return if self.old_failed {
                 vec![MigrationAction::Send(new, commit)]
             } else {
-                vec![
-                    MigrationAction::Send(old, commit.clone()),
-                    MigrationAction::Send(new, commit),
-                ]
+                vec![MigrationAction::Send(old, commit)]
             };
         }
         let mut actions = vec![];
@@ -1084,9 +1132,28 @@ mod path_migration {
         assert_eq!(host.state, MigrationState::Failed);
         assert!(host.pending.is_none());
         assert!(driver.records.is_empty());
-        assert!(host
-            .fail_preparation(AbortReason::ProbeFailed)
-            .is_empty());
+        assert!(host.fail_preparation(AbortReason::ProbeFailed).is_empty());
+    }
+
+    #[test]
+    fn commit_retries_stay_on_old_path_until_old_path_fails() {
+        let now = Instant::now();
+        let (mut host, _) = prepared_pair(now);
+        host.receive(PathSlot(1), ready(), now);
+
+        let mut driver = RecordingDriver::default();
+        driver.apply(host.tick(now + COMMIT_RETRY));
+        assert_eq!(driver.records.len(), 1);
+        let (slot, record) = driver.take(0);
+        assert_eq!(slot, PathSlot(1));
+        assert!(matches!(record, PathControl::Commit { .. }));
+
+        host.old_path_failed();
+        driver.apply(host.tick(now + COMMIT_RETRY * 2));
+        assert_eq!(driver.records.len(), 1);
+        let (slot, record) = driver.take(0);
+        assert_eq!(slot, PathSlot(2));
+        assert!(matches!(record, PathControl::Commit { .. }));
     }
 
     #[test]

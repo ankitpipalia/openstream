@@ -1118,10 +1118,12 @@ impl MigrationConfig {
             role,
             local_candidates: local_candidates
                 .into_iter()
+                .filter(|candidate| valid_local_candidate(candidate.address))
                 .take(MAX_REMOTE_CANDIDATES)
                 .collect(),
             peer_candidates: peer_candidates
                 .into_iter()
+                .filter(|candidate| valid_local_candidate(candidate.address))
                 .take(MAX_REMOTE_CANDIDATES)
                 .collect(),
             relay_address: pairing
@@ -1461,7 +1463,9 @@ impl PeerSession {
     }
 
     async fn abort_preparation(&mut self) {
-        let actions = self.migration.fail_preparation();
+        let actions = self
+            .migration
+            .fail_preparation(openstream_protocol::path_control::AbortReason::ProbeFailed);
         let _ = self.apply_migration_actions(actions).await;
     }
 
@@ -2970,6 +2974,10 @@ fn trusted_relay_candidate(candidate: Candidate, trusted_relay: Option<SocketAdd
         && candidate.address.port() != 0
         && !candidate.address.ip().is_unspecified()
         && !candidate.address.ip().is_multicast()
+}
+
+fn valid_local_candidate(address: SocketAddr) -> bool {
+    address.port() != 0 && !address.ip().is_unspecified() && !address.ip().is_multicast()
 }
 
 #[cfg(test)]
