@@ -3185,6 +3185,7 @@ mod tests {
             tokio::pin!(close);
             tokio::time::timeout(Duration::from_millis(500), async {
                 let first = tokio::select! {
+                    biased;
                     result = &mut close => {
                         result.expect("close session");
                         panic!("close returned before relay cleanup was observed");
