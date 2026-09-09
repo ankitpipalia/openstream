@@ -33,7 +33,7 @@ mod turn;
 /// WebSocket API capability. Instead, role holders fetch a relay ticket over
 /// the authenticated REST API (`GET /v1/session/{id}/relay`) and present
 /// that in the plaintext relay registration. A ticket is
-/// `hex(HMAC-SHA256(relay_secret, "relay-ticket-v1" || 0x00 || session_id ||
+/// `hex(HMAC-SHA256(server HMAC input, "relay-ticket-v1" || 0x00 || session_id ||
 /// 0x00 || role_class || 0x00 || subject)) || "." || subject`, so it is
 /// session-, role-class-, and principal-bound, relay-only (useless on the
 /// WebSocket API), and invalidated by session expiry/revocation and by server
