@@ -738,6 +738,100 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_snapshot_reports_feedback_state_for_age_and_ack() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            100,
+        );
+        telemetry.frame_sent(7, 1_024, 100);
+        assert_eq!(telemetry.snapshot_at(50).oldest_frame_age_ms, 0);
+
+        telemetry.frame_sent(8, 2_048, 150);
+        let before_ack = telemetry.snapshot_at(200);
+        assert_eq!(before_ack.oldest_frame_age_ms, 100);
+        assert_eq!(before_ack.smoothed_frame_ack_ms, None);
+
+        telemetry.frame_ack(
+            FrameAck {
+                frame_id: 7,
+                lost_frames: 0,
+            },
+            200,
+        );
+        let after_ack = telemetry.snapshot();
+        assert_eq!(after_ack.oldest_frame_age_ms, 50);
+        assert_eq!(after_ack.smoothed_frame_ack_ms, Some(100.0));
+    }
+
+    #[test]
+    fn telemetry_snapshot_reports_feedback_state_loss_until_tick() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        telemetry.frame_sent(10, 1_024, 100);
+        telemetry.frame_ack(
+            FrameAck {
+                frame_id: 10,
+                lost_frames: 3,
+            },
+            200,
+        );
+
+        assert_eq!(telemetry.snapshot().frame_loss_since_tick, 3);
+        assert_eq!(telemetry.tick(250), None);
+        assert_eq!(telemetry.snapshot().frame_loss_since_tick, 0);
+    }
+
+    #[test]
+    fn telemetry_snapshot_reports_feedback_state_counts_evictions() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        let max_pending = u32::try_from(adaptive::MAX_PENDING_FRAMES).expect("test bound fits");
+        for frame_id in 0..=max_pending {
+            telemetry.frame_sent(frame_id, 1_024, 100 + u64::from(frame_id));
+        }
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.pending_frames, adaptive::MAX_PENDING_FRAMES);
+        assert_eq!(snapshot.frame_loss_since_tick, 1);
+    }
+
+    #[test]
+    fn telemetry_snapshot_reports_feedback_state_survives_generation_change() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        telemetry.frame_sent(7, 1_024, 100);
+        telemetry.frame_sent(8, 2_048, 150);
+        telemetry.frame_ack(
+            FrameAck {
+                frame_id: 7,
+                lost_frames: 2,
+            },
+            200,
+        );
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION, 1.0), 210);
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION + 1, 100.0), 300);
+
+        let snapshot = telemetry.snapshot_at(350);
+        assert_eq!(snapshot.oldest_frame_age_ms, 200);
+        assert_eq!(snapshot.smoothed_frame_ack_ms, Some(100.0));
+        assert_eq!(snapshot.frame_loss_since_tick, 2);
+        assert_eq!(snapshot.pending_frames, 1);
+        assert_eq!(snapshot.path_generation, FIRST_PATH_GENERATION + 1);
+        assert_eq!(snapshot.path_sample_baseline, None);
+        assert!((snapshot.bitrate_mbps - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn fragments_round_trip_in_reverse_order() {
         let source = vec![0x37; MAX_FRAGMENT_BYTES * 2 + 11];
         let encoded = fragment_frame(7, 1234, true, &source).expect("fragment");

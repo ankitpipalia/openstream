@@ -25,6 +25,9 @@ pub struct PeerTelemetrySnapshot {
     pub bitrate_mbps: f64,
     pub pending_frames: usize,
     pub pending_encoded_bytes: usize,
+    pub oldest_frame_age_ms: u64,
+    pub smoothed_frame_ack_ms: Option<f64>,
+    pub frame_loss_since_tick: u32,
 }
 
 /// Coordinates path observations with receiver-proven video feedback.
@@ -35,21 +38,24 @@ pub struct PeerTelemetryAdapter {
     pending: BTreeMap<u32, PendingFrame>,
     path: Option<PeerTransportSnapshot>,
     path_sample_baseline: Option<TransportSample>,
+    last_now_ms: u64,
 }
 
 impl PeerTelemetryAdapter {
-    pub fn new(adaptive: AdaptiveBitrate, generation: PathGeneration, _now_ms: u64) -> Self {
+    pub fn new(adaptive: AdaptiveBitrate, generation: PathGeneration, now_ms: u64) -> Self {
         Self {
             adaptive,
             generation,
             pending: BTreeMap::new(),
             path: None,
             path_sample_baseline: None,
+            last_now_ms: now_ms,
         }
     }
 
     /// Record a local path snapshot without using its rates as encoder input.
     pub fn observe_path(&mut self, snapshot: &PeerTransportSnapshot, now_ms: u64) {
+        self.last_now_ms = self.last_now_ms.max(now_ms);
         if snapshot.path_generation < self.generation {
             return;
         }
@@ -65,6 +71,7 @@ impl PeerTelemetryAdapter {
 
     /// Record one complete encoded frame after all of its fragments are sent.
     pub fn frame_sent(&mut self, frame_id: u32, encoded_bytes: usize, now_ms: u64) {
+        self.last_now_ms = self.last_now_ms.max(now_ms);
         if self.pending.len() >= MAX_PENDING_FRAMES {
             if let Some(oldest) = self
                 .pending
@@ -87,6 +94,7 @@ impl PeerTelemetryAdapter {
 
     /// Apply authenticated receiver evidence for a completed video frame.
     pub fn frame_ack(&mut self, ack: FrameAck, now_ms: u64) {
+        self.last_now_ms = self.last_now_ms.max(now_ms);
         if self
             .adaptive
             .frame_acknowledged_with_loss(ack.frame_id, now_ms, ack.lost_frames)
@@ -108,6 +116,7 @@ impl PeerTelemetryAdapter {
 
     /// Advance encoder policy from frame feedback only.
     pub fn tick(&mut self, now_ms: u64) -> Option<BitrateDecision> {
+        self.last_now_ms = self.last_now_ms.max(now_ms);
         self.adaptive.tick(now_ms)
     }
 
@@ -119,7 +128,19 @@ impl PeerTelemetryAdapter {
         self.pending.len()
     }
 
+    /// Return a snapshot using the latest timestamp observed by the adapter.
     pub fn snapshot(&self) -> PeerTelemetrySnapshot {
+        self.snapshot_at(self.last_now_ms)
+    }
+
+    /// Return a snapshot with a fresh monotonic timestamp for pending-frame age.
+    pub fn snapshot_at(&self, now_ms: u64) -> PeerTelemetrySnapshot {
+        let oldest_frame_age_ms = self
+            .pending
+            .values()
+            .map(|frame| frame.sent_at_ms)
+            .min()
+            .map_or(0, |sent_at_ms| now_ms.saturating_sub(sent_at_ms));
         PeerTelemetrySnapshot {
             path_generation: self.generation,
             path: self.path,
@@ -129,6 +150,9 @@ impl PeerTelemetryAdapter {
             pending_encoded_bytes: self.pending.values().fold(0_usize, |total, frame| {
                 total.saturating_add(frame.encoded_bytes)
             }),
+            oldest_frame_age_ms,
+            smoothed_frame_ack_ms: self.adaptive.smoothed_ack_ms(),
+            frame_loss_since_tick: self.adaptive.frame_loss_since_tick(),
         }
     }
 }

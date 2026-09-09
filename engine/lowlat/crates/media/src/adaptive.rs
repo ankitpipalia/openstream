@@ -89,6 +89,10 @@ impl AdaptiveBitrate {
         self.smoothed_ack_ms
     }
 
+    pub(crate) fn frame_loss_since_tick(&self) -> u32 {
+        self.loss_since_tick
+    }
+
     /// Prevent a path transition from immediately reusing an earlier healthy
     /// interval to raise the encoder target.
     pub(crate) fn suppress_ramp_until(&mut self, now_ms: u64) {
