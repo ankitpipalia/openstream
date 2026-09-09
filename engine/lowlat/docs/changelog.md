@@ -23,7 +23,7 @@ expose tickets in diagnostics.
 
 The live acceptance is deliberately split into two truthful checks:
 
-- `scripts/path-migration-smoke.sh` proves direct → opaque relay → direct,
+- `scripts/path-migration-smoke.sh` proves direct -> opaque relay -> direct,
   three committed generations, frame-ACK continuity, and one cipher/session.
 - `scripts/ice-migration-capability.sh` proves that the current
   `webrtc-ice 0.17.2` boundary returns `UnsupportedIceRestart` without
