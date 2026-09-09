@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use openstream_protocol::relay;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, watch};
 use uuid::Uuid;
@@ -241,15 +242,37 @@ impl core::fmt::Debug for Session {
 
 /// One relay endpoint registration: the source address plus which session
 /// token owns it, and when it last carried traffic (idle slots are reaped).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RelaySlot {
     addr: SocketAddr,
     /// Redacted owner identity: "host", "client", or a guest id.
     owner: String,
+    /// Hash of the registration ticket. Keeping only a digest lets the relay
+    /// distinguish a stale cleanup request from a newer registration without
+    /// retaining or rendering the bearer capability itself.
+    ticket_digest: [u8; 32],
     last_seen: Instant,
     window_started: Instant,
     window_bytes: usize,
     window_packets: u32,
+}
+
+impl core::fmt::Debug for RelaySlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RelaySlot")
+            .field("addr", &self.addr)
+            .field("owner", &self.owner)
+            .field("ticket_digest", &"[redacted]")
+            .field("last_seen", &self.last_seen)
+            .field("window_started", &self.window_started)
+            .field("window_bytes", &self.window_bytes)
+            .field("window_packets", &self.window_packets)
+            .finish()
+    }
+}
+
+fn relay_ticket_digest(ticket: &str) -> [u8; 32] {
+    Sha256::digest(ticket.as_bytes()).into()
 }
 
 impl RelaySlot {
@@ -1617,6 +1640,65 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                     continue;
                 }
                 let datagram = &buffer[..length];
+                if let Ok(unregister) = relay::decode_unregister(datagram) {
+                    let acknowledged = {
+                        let mut sessions = state.sessions.lock().await;
+                        match sessions.get_mut(unregister.session_id) {
+                            None => false,
+                            Some(session) if session.expires_at <= Instant::now() => false,
+                            Some(session) => {
+                                let owner = relay_ticket::verify(
+                                    &state.relay_secret,
+                                    unregister.session_id,
+                                    unregister.token,
+                                )
+                                .and_then(|ticket| match unregister.role {
+                                    relay::Role::Host
+                                        if ticket.class == "host"
+                                            && ticket.subject == "host"
+                                            && session.host.is_some() => Some("host".to_string()),
+                                    relay::Role::Client
+                                        if ticket.class == "client"
+                                            && ((ticket.subject == "client"
+                                                && session.client.is_some())
+                                                || session.guests.iter().any(|guest| {
+                                                    guest.id == ticket.subject
+                                                        && guest.active
+                                                        && guest.sender.is_some()
+                                                })) => Some(ticket.subject),
+                                    _ => None,
+                                });
+                                if let Some(owner) = owner {
+                                    let ticket_digest = relay_ticket_digest(unregister.token);
+                                    let slot = match unregister.role {
+                                        relay::Role::Host => &mut session.relay_host,
+                                        relay::Role::Client => &mut session.relay_client,
+                                    };
+                                    // A cleanup request is acknowledged even
+                                    // when it is stale or duplicated, but it
+                                    // can clear only the exact
+                                    // source/owner/ticket tuple.
+                                    if slot.as_ref().is_some_and(|current| {
+                                        current.addr == source
+                                            && current.owner == owner
+                                            && current.ticket_digest == ticket_digest
+                                    }) {
+                                        *slot = None;
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                        }
+                    };
+                    if acknowledged {
+                        let _ = socket
+                            .send_to(&relay::encode_unregister_ack(unregister.role), source)
+                            .await;
+                    }
+                    continue;
+                }
                 if let Ok(registration) = relay::decode_registration(datagram) {
                     let accepted = {
                         let mut sessions = state.sessions.lock().await;
@@ -1677,6 +1759,9 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                                                 let slot = RelaySlot {
                                                     addr: source,
                                                     owner,
+                                                    ticket_digest: relay_ticket_digest(
+                                                        registration.token,
+                                                    ),
                                                     last_seen: Instant::now(),
                                                     window_started: Instant::now(),
                                                     window_bytes: 0,
@@ -1786,10 +1871,14 @@ mod tests {
     };
     use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue};
+    use openstream_protocol::relay;
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tokio::net::UdpSocket;
     use tokio::sync::{Mutex, mpsc};
+    use tokio::time::timeout;
 
     #[test]
     fn no_admin_token_refuses_everything_without_explicit_dev_opt_in() {
@@ -1897,6 +1986,7 @@ mod tests {
         let mut slot = RelaySlot {
             addr: "127.0.0.1:9000".parse().expect("address"),
             owner: "host".into(),
+            ticket_digest: [0; 32],
             last_seen: start,
             window_started: start,
             window_bytes: 0,
@@ -1971,6 +2061,136 @@ mod tests {
             .try_send(Message::Close(None))
             .expect("close fits in the bounded queue");
         assert!(matches!(receiver.recv().await, Some(Message::Close(None))));
+    }
+
+    #[tokio::test]
+    async fn relay_unregistration_is_idempotent_and_preserves_newer_registration() {
+        let secret = b"test-relay-secret-0123456789".to_vec();
+        let (host_sender, _) = mpsc::channel(1);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            admin_token: None,
+            allow_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: secret.clone(),
+        };
+        state.sessions.lock().await.insert(
+            "session-1".into(),
+            Session {
+                expires_at: Instant::now() + Duration::from_secs(60),
+                host_token: "host-token".into(),
+                client_token: "client-token".into(),
+                host: Some(host_sender),
+                client: None,
+                host_generation: 1,
+                client_generation: 0,
+                pending_host: std::collections::VecDeque::new(),
+                pending_client: std::collections::VecDeque::new(),
+                pending_host_bytes: 0,
+                pending_client_bytes: 0,
+                relay_host: None,
+                relay_client: None,
+                guests: std::collections::VecDeque::new(),
+                max_guests: 1,
+            },
+        );
+
+        let relay_socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let relay_address = relay_socket.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let relay_task = tokio::spawn(super::run_relay(relay_socket, state.clone(), shutdown_rx));
+
+        let old_socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let new_socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let ticket = relay_ticket::mint(&secret, "session-1", "host", "host");
+
+        old_socket
+            .send_to(
+                &relay::encode_registration("session-1", relay::Role::Host, &ticket)
+                    .expect("encode old registration"),
+                relay_address,
+            )
+            .await
+            .unwrap();
+        receive_relay_ack(&old_socket, relay::Role::Host).await;
+
+        new_socket
+            .send_to(
+                &relay::encode_registration("session-1", relay::Role::Host, &ticket)
+                    .expect("encode new registration"),
+                relay_address,
+            )
+            .await
+            .unwrap();
+        receive_relay_ack(&new_socket, relay::Role::Host).await;
+
+        old_socket
+            .send_to(
+                &relay::encode_unregister("session-1", relay::Role::Host, &ticket)
+                    .expect("encode stale unregister"),
+                relay_address,
+            )
+            .await
+            .unwrap();
+        receive_unregister_ack(&old_socket, relay::Role::Host).await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            assert_eq!(
+                sessions["session-1"]
+                    .relay_host
+                    .as_ref()
+                    .map(|slot| slot.addr),
+                Some(new_socket.local_addr().unwrap())
+            );
+        }
+
+        new_socket
+            .send_to(
+                &relay::encode_unregister("session-1", relay::Role::Host, &ticket)
+                    .expect("encode current unregister"),
+                relay_address,
+            )
+            .await
+            .unwrap();
+        receive_unregister_ack(&new_socket, relay::Role::Host).await;
+        assert!(
+            state.sessions.lock().await["session-1"]
+                .relay_host
+                .is_none()
+        );
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("relay exits")
+            .expect("relay task joins");
+    }
+
+    async fn receive_relay_ack(socket: &UdpSocket, role: relay::Role) {
+        let mut bytes = [0_u8; 5];
+        let (length, _) = timeout(Duration::from_secs(1), socket.recv_from(&mut bytes))
+            .await
+            .expect("registration ACK arrives")
+            .expect("receive registration ACK");
+        assert!(relay::is_ack(&bytes[..length], role));
+    }
+
+    async fn receive_unregister_ack(socket: &UdpSocket, role: relay::Role) {
+        let mut bytes = [0_u8; 5];
+        let (length, _) = timeout(Duration::from_secs(1), socket.recv_from(&mut bytes))
+            .await
+            .expect("unregister ACK arrives")
+            .expect("receive unregister ACK");
+        assert!(relay::is_unregister_ack(&bytes[..length], role));
     }
 
     #[test]

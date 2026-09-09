@@ -338,6 +338,43 @@ impl UdpTransport {
         }
     }
 
+    /// Remove this socket's role-scoped relay registration. The request is
+    /// retried for a short bounded interval and is deliberately excluded from
+    /// transport telemetry because it is lifecycle/setup traffic. The relay
+    /// acknowledges stale or duplicate requests too, making this operation
+    /// safe to call from more than one cleanup path.
+    pub async fn unregister_relay(
+        &self,
+        session_id: &str,
+        role: RelayRole,
+        ticket: &str,
+    ) -> Result<usize, Error> {
+        if self.peer.is_none() {
+            return Err(Error::NotConnected);
+        }
+        let request = relay::encode_unregister(session_id, role, ticket)?;
+        let deadline = Instant::now() + Duration::from_millis(750);
+        let mut acknowledgement = [0_u8; 5];
+        let mut sent_bytes = 0_usize;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::Timeout);
+            }
+            sent_bytes = sent_bytes.saturating_add(self.socket.send(&request).await?);
+            let remaining = deadline.saturating_duration_since(now);
+            let wait = remaining.min(Duration::from_millis(75));
+            match timeout(wait, self.socket.recv(&mut acknowledgement)).await {
+                Ok(Ok(length)) if relay::is_unregister_ack(&acknowledgement[..length], role) => {
+                    return Ok(sent_bytes);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return Err(Error::Io(error)),
+                Err(_) => {}
+            }
+        }
+    }
+
     /// Send one encrypted datagram.
     pub async fn send(
         &self,
@@ -523,5 +560,37 @@ mod tests {
             .unwrap();
         assert!(sent > 0);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_unregistration_retries_until_the_relay_acknowledges_it() {
+        let relay = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let relay_address = relay.local_addr().unwrap();
+        let mut transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        transport.connect(relay_address).await.unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut packet = [0_u8; 512];
+            let (length, source) = relay.recv_from(&mut packet).await.unwrap();
+            let unregister = relay::decode_unregister(&packet[..length]).unwrap();
+            assert_eq!(unregister.role, RelayRole::Client);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            relay
+                .send_to(&relay::encode_unregister_ack(RelayRole::Client), source)
+                .await
+                .unwrap();
+            length
+        });
+
+        let sent = transport
+            .unregister_relay("session", RelayRole::Client, "ticket")
+            .await
+            .unwrap();
+        let first_packet_length = server.await.unwrap();
+        assert!(sent > first_packet_length);
     }
 }

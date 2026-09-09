@@ -367,6 +367,9 @@ pub mod relay {
     const MAGIC: [u8; 2] = *b"OR";
     const VERSION: u8 = 1;
     const REGISTER: u8 = 1;
+    const REGISTER_ACK: u8 = 2;
+    const UNREGISTER: u8 = 3;
+    const UNREGISTER_ACK: u8 = 4;
 
     /// Fixed bytes before the variable-length session and token fields.
     pub const HEADER_LEN: usize = 9;
@@ -430,7 +433,8 @@ pub mod relay {
     }
 
     /// Encode a role-token registration for the relay.
-    pub fn encode_registration(
+    fn encode_record(
+        record_type: u8,
         session_id: &str,
         role: Role,
         token: &str,
@@ -449,7 +453,7 @@ pub mod relay {
         let mut bytes = Vec::with_capacity(HEADER_LEN + session_id.len() + token.len());
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
-        bytes.push(REGISTER);
+        bytes.push(record_type);
         bytes.push(role as u8);
         bytes.extend_from_slice(&session_len.to_be_bytes());
         bytes.extend_from_slice(&token_len.to_be_bytes());
@@ -458,8 +462,26 @@ pub mod relay {
         Ok(bytes)
     }
 
-    /// Decode a relay registration without allocating attacker-controlled data.
-    pub fn decode_registration(bytes: &[u8]) -> Result<Registration<'_>, Error> {
+    /// Encode a role-token registration for the relay.
+    pub fn encode_registration(
+        session_id: &str,
+        role: Role,
+        token: &str,
+    ) -> Result<Vec<u8>, Error> {
+        encode_record(REGISTER, session_id, role, token)
+    }
+
+    /// Encode an idempotent request to remove one role's current relay slot.
+    /// The session, role, and ticket are repeated so the relay can reject a
+    /// stale request without disturbing a newer registration.
+    pub fn encode_unregister(session_id: &str, role: Role, token: &str) -> Result<Vec<u8>, Error> {
+        encode_record(UNREGISTER, session_id, role, token)
+    }
+
+    /// Decode one expected relay record without allocating attacker-controlled
+    /// data. Registration and unregister records intentionally share the same
+    /// bounded body but cannot be confused by their type byte.
+    fn decode_record(bytes: &[u8], expected_type: u8) -> Result<Registration<'_>, Error> {
         if bytes.len() < HEADER_LEN {
             return Err(Error::Short);
         }
@@ -469,7 +491,7 @@ pub mod relay {
         if bytes[2] != VERSION {
             return Err(Error::UnsupportedVersion);
         }
-        if bytes[3] != REGISTER {
+        if bytes[3] != expected_type {
             return Err(Error::InvalidType);
         }
         let role = Role::decode(bytes[4])?;
@@ -498,10 +520,21 @@ pub mod relay {
         })
     }
 
+    /// Decode a relay registration without allocating attacker-controlled data.
+    pub fn decode_registration(bytes: &[u8]) -> Result<Registration<'_>, Error> {
+        decode_record(bytes, REGISTER)
+    }
+
+    /// Decode an idempotent relay unregister request without allocating
+    /// attacker-controlled data.
+    pub fn decode_unregister(bytes: &[u8]) -> Result<Registration<'_>, Error> {
+        decode_record(bytes, UNREGISTER)
+    }
+
     /// Encode a small response so a peer can distinguish registration from
     /// encrypted traffic while probing the relay path.
     pub fn encode_ack(role: Role) -> [u8; 5] {
-        [MAGIC[0], MAGIC[1], VERSION, REGISTER + 1, role as u8]
+        [MAGIC[0], MAGIC[1], VERSION, REGISTER_ACK, role as u8]
     }
 
     /// Check the fixed-size acknowledgement for one role's registration.
@@ -512,6 +545,16 @@ pub mod relay {
     /// peers selected the same end-to-end session keys.
     pub fn is_ack(bytes: &[u8], role: Role) -> bool {
         bytes == encode_ack(role)
+    }
+
+    /// Encode the fixed-size acknowledgement for an unregister request.
+    pub fn encode_unregister_ack(role: Role) -> [u8; 5] {
+        [MAGIC[0], MAGIC[1], VERSION, UNREGISTER_ACK, role as u8]
+    }
+
+    /// Check the fixed-size acknowledgement for one role's unregister request.
+    pub fn is_unregister_ack(bytes: &[u8], role: Role) -> bool {
+        bytes == encode_unregister_ack(role)
     }
 
     #[cfg(test)]
@@ -545,6 +588,38 @@ pub mod relay {
             assert!(is_ack(&encode_ack(Role::Host), Role::Host));
             assert!(!is_ack(&encode_ack(Role::Host), Role::Client));
             assert!(!is_ack(b"OR\x01\x03\x01", Role::Host));
+        }
+
+        #[test]
+        fn unregister_round_trips_as_borrowed_fields() {
+            let encoded = encode_unregister("session-id", Role::Client, "client-token")
+                .expect("encode unregister");
+            assert_eq!(
+                decode_unregister(&encoded).expect("decode unregister"),
+                Registration {
+                    role: Role::Client,
+                    session_id: "session-id",
+                    token: "client-token",
+                }
+            );
+            assert_ne!(
+                encoded,
+                encode_registration("session-id", Role::Client, "client-token")
+                    .expect("encode registration")
+            );
+        }
+
+        #[test]
+        fn unregister_acknowledgement_is_role_specific() {
+            assert!(is_unregister_ack(
+                &encode_unregister_ack(Role::Host),
+                Role::Host
+            ));
+            assert!(!is_unregister_ack(
+                &encode_unregister_ack(Role::Host),
+                Role::Client
+            ));
+            assert!(!is_unregister_ack(&encode_ack(Role::Host), Role::Host));
         }
     }
 }
