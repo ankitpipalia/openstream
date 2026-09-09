@@ -44,7 +44,7 @@ mod linux {
     use lowlat_core::envelope::Envelope;
     use lowlat_core::pmtu::{PathConfig, PathMtuState};
     use lowlat_core::send::{SendRing, SendSlot};
-    use lowlat_core::session::Session;
+    use lowlat_core::session::{Health, Session};
     use lowlat_net::{Shell, Socket, Wake};
 
     /// How long to keep running after a path is found.
@@ -101,6 +101,18 @@ mod linux {
             .map_err(|error| format!("flush milestone: {error}"))
     }
 
+    fn watchdog_recovery_due(health: Health, already_recovered: bool) -> bool {
+        health == Health::Undeliverable && !already_recovered
+    }
+
+    #[test]
+    fn watchdog_recovery_requires_undeliverable_and_is_one_shot() {
+        assert!(!watchdog_recovery_due(Health::Alive, false));
+        assert!(!watchdog_recovery_due(Health::Stalled, false));
+        assert!(watchdog_recovery_due(Health::Undeliverable, false));
+        assert!(!watchdog_recovery_due(Health::Undeliverable, true));
+    }
+
     fn peer(args: &[String]) -> Result<(), String> {
         // Only the port is taken from the bind address. Every fixture namespace
         // holds exactly one host address, and the socket is dual stack and bound to
@@ -115,6 +127,7 @@ mod linux {
         let pmtu_recover = flag(args, "--pmtu-recover").map(PathBuf::from);
         let pmtu_raise = flag(args, "--pmtu-raise").map(PathBuf::from);
         let pmtu_ready_again = flag(args, "--pmtu-ready-again").map(PathBuf::from);
+        let pmtu_watchdog = args.iter().any(|arg| arg == "--pmtu-watchdog");
         let stream = args.iter().any(|arg| arg == "--stream");
         let timeout_ms: f64 = required(args, "--timeout-ms")?
             .parse()
@@ -228,6 +241,7 @@ mod linux {
         let mut stream_received_after_recovery = 0u64;
         let mut pmtu_round = 0u8;
         let mut pmtu_recovered_at = None;
+        let mut watchdog_recovered = false;
         let mut pmtu_raise_requested = false;
         let mut pmtu_ready_again_written = false;
         let mut transition_complete_at = None;
@@ -244,7 +258,7 @@ mod linux {
                 println!("timeout");
                 return Ok(());
             }
-            let settle_from = if pmtu_recover.is_some() || pmtu_raise.is_some() {
+            let settle_from = if pmtu_recover.is_some() || pmtu_watchdog || pmtu_raise.is_some() {
                 transition_complete_at
             } else {
                 settled_at
@@ -301,6 +315,35 @@ mod linux {
                     "  {now_ms:.0} {:?} rx={} tx={}",
                     turn.woke, turn.received, turn.sent
                 );
+            }
+
+            if pmtu_watchdog
+                && watchdog_recovery_due(shell.endpoint().health(now_ms), watchdog_recovered)
+            {
+                match shell.recover_path_black_hole(now_ms) {
+                    PathMtuRecovery::Recovered {
+                        previous_datagram_size,
+                        datagram_size,
+                        dropped_video_fragments,
+                    } => {
+                        watchdog_recovered = true;
+                        println!(
+                            "pmtu-watchdog-recovered old={} new={} dropped={}",
+                            previous_datagram_size, datagram_size, dropped_video_fragments
+                        );
+                        flush_milestone()?;
+                        pmtu_recovered_at = Some(now_ms);
+                        if pmtu_raise.is_none() {
+                            transition_complete_at = Some(now_ms);
+                        }
+                    }
+                    PathMtuRecovery::Blocked => {
+                        return Err("pmtu recovery blocked by queued reliable data".to_string());
+                    }
+                    PathMtuRecovery::NotConfigured | PathMtuRecovery::Unusable => {
+                        return Err("pmtu recovery found no usable configured path".to_string());
+                    }
+                }
             }
 
             if stream {
@@ -387,7 +430,8 @@ mod linux {
                 flush_milestone()?;
             }
 
-            if let Some(path) = pmtu_recover.as_ref()
+            if !pmtu_watchdog
+                && let Some(path) = pmtu_recover.as_ref()
                 && pmtu_recovered_at.is_none()
                 && path.exists()
             {

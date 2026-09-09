@@ -11,47 +11,85 @@
 //! it. Without it this skips with a stated reason rather than failing, because a
 //! skip that reads as a failure trains people to ignore failures.
 
-#![cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::path::Path;
+    use std::process::Command;
 
-use std::path::Path;
-use std::process::Command;
+    /// The script reports this exact line when every topology behaved as expected.
+    const SUCCESS: &str = "0 failed";
 
-/// The script reports this exact line when every topology behaved as expected.
-const SUCCESS: &str = "0 failed";
+    /// And this when it could not run at all.
+    const SKIPPED: &str = "skipped:";
 
-/// And this when it could not run at all.
-const SKIPPED: &str = "skipped:";
+    #[test]
+    fn the_topology_matrix_holds_against_a_real_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
 
-#[test]
-fn the_topology_matrix_holds_against_a_real_kernel() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+        let output = Command::new("bash")
+            .arg("scripts/netns-fixtures.sh")
+            .current_dir(root)
+            // Cargo built both endpoints for this test, so the script never has to
+            // guess where they are or whether they are current. The peers are the
+            // real shell; `punch` stays as the reflexive server, which no shell
+            // provides.
+            .env("PUNCH", env!("CARGO_BIN_EXE_punch"))
+            .env("PEER", env!("CARGO_BIN_EXE_shell-punch"))
+            .output()
+            .expect("bash is required to run the namespace fixtures");
 
-    let output = Command::new("bash")
-        .arg("scripts/netns-fixtures.sh")
-        .current_dir(root)
-        // Cargo built both endpoints for this test, so the script never has to
-        // guess where they are or whether they are current. The peers are the
-        // real shell; `punch` stays as the reflexive server, which no shell
-        // provides.
-        .env("PUNCH", env!("CARGO_BIN_EXE_punch"))
-        .env("PEER", env!("CARGO_BIN_EXE_shell-punch"))
-        .output()
-        .expect("bash is required to run the namespace fixtures");
+        let report = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
-    let report = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        if report.contains(SKIPPED) {
+            eprintln!("namespace fixtures skipped: {}", report.trim());
+            return;
+        }
 
-    if report.contains(SKIPPED) {
-        eprintln!("namespace fixtures skipped: {}", report.trim());
-        return;
+        assert!(
+            report.contains(SUCCESS),
+            "namespace fixtures reported failures\n--- stdout ---\n{report}\n--- stderr ---\n{stderr}"
+        );
+        println!("{}", report.trim());
     }
 
-    assert!(
-        report.contains(SUCCESS),
-        "namespace fixtures reported failures\n--- stdout ---\n{report}\n--- stderr ---\n{stderr}"
-    );
-    println!("{}", report.trim());
+    #[test]
+    fn the_automatic_pmtu_watchdog_recovers_against_a_real_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root");
+
+        let output = Command::new("bash")
+            .arg("scripts/netns-fixtures.sh")
+            .arg("mtu-watchdog")
+            .current_dir(root)
+            .env("PUNCH", env!("CARGO_BIN_EXE_punch"))
+            .env("PEER", env!("CARGO_BIN_EXE_shell-punch"))
+            .output()
+            .expect("bash is required to run the namespace fixtures");
+
+        let report = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if report.contains(SKIPPED) {
+            eprintln!("namespace watchdog fixture skipped: {}", report.trim());
+            return;
+        }
+
+        assert!(
+            report.contains(SUCCESS),
+            "namespace watchdog fixture reported failures\n--- stdout ---\n{report}\n--- stderr ---\n{stderr}"
+        );
+        println!("{}", report.trim());
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn namespace_fixtures_require_linux() {
+    eprintln!("skipped: network namespace fixtures require Linux");
 }
