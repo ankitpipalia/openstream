@@ -54,6 +54,44 @@ fail=0
 
 log() { printf '%s\n' "$*"; }
 
+# Verify the kernel operations every topology needs before entering the matrix.
+# A process can have EUID 0 while a container runtime has withheld CAP_SYS_ADMIN
+# or CAP_NET_ADMIN; treating that environmental limit as a topology failure
+# would make a skipped fixture indistinguishable from a regression.
+namespace_prerequisites() {
+    local tool namespace link
+    for tool in ip nft sysctl; do
+        if ! command -v "$tool" >/dev/null; then
+            log "skipped: network namespace fixtures need $tool"
+            return 1
+        fi
+    done
+
+    namespace="llpf$$"
+    link="llpv$$"
+    if ! ip netns add "$namespace" >/dev/null 2>&1; then
+        log "skipped: network namespace fixtures cannot create network namespaces"
+        return 1
+    fi
+    if ! ip netns exec "$namespace" sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+        ip netns del "$namespace" 2>/dev/null
+        log "skipped: network namespace fixtures cannot configure network namespaces"
+        return 1
+    fi
+    if ! ip netns exec "$namespace" nft list tables >/dev/null 2>&1; then
+        ip netns del "$namespace" 2>/dev/null
+        log "skipped: network namespace fixtures cannot use nft in network namespaces"
+        return 1
+    fi
+    if ! ip link add "$link" type veth peer name "${link}p" >/dev/null 2>&1; then
+        ip netns del "$namespace" 2>/dev/null
+        log "skipped: network namespace fixtures cannot create veth pairs"
+        return 1
+    fi
+    ip link del "$link"
+    ip netns del "$namespace"
+}
+
 cleanup() {
     for ns in $NAMESPACES; do
         ip netns del "$ns" 2>/dev/null
@@ -611,6 +649,9 @@ if [[ ! -x $PUNCH ]]; then
 fi
 if [[ ! -x $PEER ]]; then
     log "skipped: no endpoint at $PEER; build it first"
+    exit 0
+fi
+if ! namespace_prerequisites; then
     exit 0
 fi
 
