@@ -1500,6 +1500,35 @@ fn validate_signal_message(text: &str) -> Result<(), &'static str> {
                 return Err("candidate_count_invalid");
             }
         }
+        "path_candidate" => {
+            if object.len() != 6
+                || object.get("kind").and_then(serde_json::Value::as_str) != Some("direct_udp")
+                || !valid_hex_field(object, "token", 16)
+            {
+                return Err("path_candidate_fields_invalid");
+            }
+            let generation = object
+                .get("generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("path_candidate_generation_missing")?;
+            if generation == 0 {
+                return Err("path_candidate_generation_invalid");
+            }
+            let ip = object
+                .get("ip")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("path_candidate_ip_missing")?;
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                return Err("path_candidate_ip_invalid");
+            }
+            let port = object
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("path_candidate_port_missing")?;
+            if !(1..=u64::from(u16::MAX)).contains(&port) {
+                return Err("path_candidate_port_invalid");
+            }
+        }
         "key" => {
             if !valid_hex_field(object, "public_key", 32)
                 || !valid_hex_field(object, "identity_public_key", 32)
@@ -2202,6 +2231,11 @@ mod tests {
             .is_ok()
         );
         assert!(validate_signal_message(r#"{"type":"candidate_done","count":1}"#).is_ok());
+        assert!(validate_signal_message(&format!(
+            r#"{{"type":"path_candidate","generation":2,"token":"{}","kind":"direct_udp","ip":"127.0.0.1","port":4001}}"#,
+            "aa".repeat(16),
+        ))
+        .is_ok());
         assert!(
             validate_signal_message(&format!(
                 r#"{{"type":"key","public_key":"{}","identity_public_key":"{}","signature":"{}"}}"#,
@@ -2231,6 +2265,7 @@ mod tests {
             r#"{"type":"unknown"}"#,
             r#"{"type":"candidate","kind":"host","ip":"not-an-ip","port":4000}"#,
             r#"{"type":"candidate","kind":"host","ip":"127.0.0.1","port":0}"#,
+            r#"{"type":"path_candidate","generation":2,"token":"00","kind":"direct_udp","ip":"127.0.0.1","port":4001}"#,
             r#"{"type":"key","public_key":"00"}"#,
             r#"{"type":"ice_candidate","candidate":""}"#,
         ] {
