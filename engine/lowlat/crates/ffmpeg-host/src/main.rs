@@ -423,6 +423,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let now = Instant::now();
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
                 telemetry.observe_path(&session.transport_snapshot(now), now_ms);
+                let adaptive_decision = telemetry.tick(now_ms);
                 let display_target = pending_display.filter(|_| {
                     last_display_switch
                         .is_none_or(|previous| now.duration_since(previous) >= DISPLAY_SWITCH_MIN_INTERVAL)
@@ -481,7 +482,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let force_keyframe_restart = keyframe_requested
                     && last_restart
                         .is_none_or(|previous| now.duration_since(previous) >= restart_policy.min_interval);
-                let adaptive_decision = telemetry.tick(now_ms);
                 let adaptive_target = adaptive_decision.as_ref().and_then(|decision| {
                     restart_policy.should_restart(
                         profile.bitrate_mbps,

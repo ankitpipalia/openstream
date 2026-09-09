@@ -1638,7 +1638,6 @@ impl PeerSession {
             // collide with or pollute the winning path's counters.
             if let ProbeResult::Established(prefetched) = probe_path(&transport, &mut cipher).await
             {
-                transport.reset_telemetry();
                 return Ok(Self {
                     signal,
                     transport: DataPath::Direct {
@@ -1789,16 +1788,18 @@ impl PeerSession {
     /// Receive and authenticate one encrypted data packet.
     pub async fn recv(&mut self) -> Result<Packet, Error> {
         loop {
-            let packet = if let Some(packet) = self.prefetched.take() {
-                packet
+            let (packet, wire_bytes) = if let Some(packet) = self.prefetched.take() {
+                (packet, None)
             } else {
                 match &self.transport {
-                    DataPath::Direct { transport, .. } => {
-                        tokio::time::timeout(DIRECT_IDLE_TIMEOUT, transport.recv(&mut self.cipher))
-                            .await
-                            .map_err(|_| Error::Timeout("direct data path liveness"))?
-                            .map_err(Error::from)?
-                    }
+                    DataPath::Direct { transport, .. } => tokio::time::timeout(
+                        DIRECT_IDLE_TIMEOUT,
+                        transport.recv_untracked(&mut self.cipher),
+                    )
+                    .await
+                    .map_err(|_| Error::Timeout("direct data path liveness"))?
+                    .map_err(Error::from)
+                    .map(|(packet, bytes)| (packet, Some(bytes)))?,
                     DataPath::Ice(path) => {
                         let mut datagram = [0_u8; MAX_DATAGRAM];
                         let length = path
@@ -1806,10 +1807,11 @@ impl PeerSession {
                             .recv(&mut datagram)
                             .await
                             .map_err(|error| Error::Ice(error.to_string()))?;
-                        self.ice_counters.record_received(length);
-                        self.cipher
+                        let packet = self
+                            .cipher
                             .open(&datagram[..length])
-                            .map_err(|error| Error::InvalidMessage(error.to_string()))?
+                            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+                        (packet, Some(length))
                     }
                 }
             };
@@ -1819,6 +1821,12 @@ impl PeerSession {
             // them here so they cannot be parsed as capabilities.
             if is_path_probe_packet(&packet) {
                 continue;
+            }
+            if let Some(bytes) = wire_bytes {
+                match &self.transport {
+                    DataPath::Direct { transport, .. } => transport.record_received(bytes),
+                    DataPath::Ice(_) => self.ice_counters.record_received(bytes),
+                }
             }
             if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE {
                 self.send(Kind::Control, 0, 0, PATH_KEEPALIVE_ACK).await?;
@@ -2193,7 +2201,7 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
         }
         if now >= next_probe {
             if transport
-                .send(cipher, Kind::Control, 0, 0, PATH_PROBE)
+                .send_untracked(cipher, Kind::Control, 0, 0, PATH_PROBE)
                 .await
                 .is_err()
             {
@@ -2207,16 +2215,17 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
         let remaining = deadline.saturating_duration_since(now);
         let until_retry = next_probe.saturating_duration_since(now);
         let wait = remaining.min(until_retry.max(Duration::from_millis(1)));
-        let packet = match tokio::time::timeout(wait, transport.recv(cipher)).await {
-            Ok(Ok(packet)) => packet,
-            Ok(Err(_)) => continue,
-            // The timeout normally means the retry interval elapsed. The
-            // top of the loop sends the next probe or ends at the deadline.
-            Err(_) => continue,
-        };
+        let (packet, wire_bytes) =
+            match tokio::time::timeout(wait, transport.recv_untracked(cipher)).await {
+                Ok(Ok(packet)) => packet,
+                Ok(Err(_)) => continue,
+                // The timeout normally means the retry interval elapsed. The
+                // top of the loop sends the next probe or ends at the deadline.
+                Err(_) => continue,
+            };
         if packet.kind == Kind::Control && packet.payload == PATH_PROBE {
             if transport
-                .send(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
+                .send_untracked(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
                 .await
                 .is_err()
             {
@@ -2229,7 +2238,7 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
             // receive an ACK can leave its counterpart waiting forever for
             // the response to its own probe.
             if transport
-                .send(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
+                .send_untracked(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
                 .await
                 .is_err()
             {
@@ -2239,6 +2248,7 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
         } else {
             // The authenticated peer may already have moved on to capability
             // negotiation. Keep its first packet for `PeerSession::recv`.
+            transport.record_received(wire_bytes);
             return ProbeResult::Established(Some(packet));
         }
     }
@@ -2297,6 +2307,111 @@ fn trusted_relay_candidate(candidate: Candidate, trusted_relay: Option<SocketAdd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: [u8; 32] = [0x4d; 32];
+
+    fn test_endpoint() -> Endpoint {
+        let (outgoing, _outgoing_receiver) = mpsc::channel::<Message>(1);
+        let (_incoming_sender, incoming) = mpsc::channel::<Result<Value, Error>>(1);
+        Endpoint { outgoing, incoming }
+    }
+
+    fn direct_test_session(transport: UdpTransport) -> PeerSession {
+        let now = Instant::now();
+        PeerSession {
+            signal: test_endpoint(),
+            transport: DataPath::Direct {
+                transport: Box::new(transport),
+                candidate: CandidateKind::Host,
+            },
+            cipher: CipherSession::new(TEST_KEY, TEST_KEY),
+            stats: SessionStats::default(),
+            path_generation: FIRST_PATH_GENERATION,
+            path_started_at: now,
+            path_baseline: None,
+            ice_counters: PathCounters::default(),
+            prefetched: None,
+            last_keepalive: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_setup_packets_do_not_pollute_application_counters() {
+        let mut sender = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut receiver = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        sender.connect(receiver_addr).await.unwrap();
+        receiver.connect(sender_addr).await.unwrap();
+        let mut peer = direct_test_session(receiver);
+        let baseline_at = Instant::now();
+        assert!(peer.transport_snapshot(baseline_at).sample.is_none());
+
+        let mut cipher = CipherSession::new(TEST_KEY, TEST_KEY);
+        sender
+            .send(&mut cipher, Kind::Control, 0, 0, PATH_PROBE)
+            .await
+            .unwrap();
+        let sent_application = sender
+            .send(&mut cipher, Kind::Control, 0, 0, b"application")
+            .await
+            .unwrap();
+
+        let packet = peer.recv().await.unwrap();
+        assert_eq!(packet.payload, b"application");
+        let sample = peer
+            .transport_snapshot(baseline_at + Duration::from_secs(1))
+            .sample
+            .expect("application sample");
+        assert_eq!(sample.received_packets, 1);
+        assert_eq!(
+            sample.received_wire_bytes,
+            u64::try_from(sent_application).expect("wire length fits")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetched_application_io_is_preserved_across_probe_boundary() {
+        let mut probe_transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut peer_transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let probe_addr = probe_transport.local_addr().unwrap();
+        let peer_addr = peer_transport.local_addr().unwrap();
+        probe_transport.connect(peer_addr).await.unwrap();
+        peer_transport.connect(probe_addr).await.unwrap();
+
+        let peer = tokio::spawn(async move {
+            let mut cipher = CipherSession::new(TEST_KEY, TEST_KEY);
+            let probe = peer_transport.recv(&mut cipher).await.unwrap();
+            assert_eq!(probe.payload, PATH_PROBE);
+            peer_transport
+                .send(&mut cipher, Kind::Control, 0, 0, b"prefetched")
+                .await
+                .unwrap()
+        });
+        let mut cipher = CipherSession::new(TEST_KEY, TEST_KEY);
+        let result = probe_path(&probe_transport, &mut cipher).await;
+        let prefetched_wire_bytes = peer.await.unwrap();
+
+        let ProbeResult::Established(Some(packet)) = result else {
+            panic!("probe did not preserve the prefetched application packet");
+        };
+        assert_eq!(packet.payload, b"prefetched");
+        let counters = probe_transport.telemetry_counters();
+        assert_eq!(counters.sent_packets, 0);
+        assert_eq!(counters.received_packets, 1);
+        assert_eq!(
+            counters.received_wire_bytes,
+            u64::try_from(prefetched_wire_bytes).expect("wire length fits")
+        );
+    }
 
     fn pairing() -> Pairing {
         Pairing {

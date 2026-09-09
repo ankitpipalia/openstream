@@ -269,15 +269,10 @@ impl UdpTransport {
         self.telemetry.counters()
     }
 
-    /// Discard relay-registration and nomination observations before normal
-    /// application traffic begins on the selected path.
-    pub fn reset_telemetry(&self) {
-        self.telemetry.sent_packets.store(0, Ordering::Relaxed);
-        self.telemetry.sent_wire_bytes.store(0, Ordering::Relaxed);
-        self.telemetry.received_packets.store(0, Ordering::Relaxed);
-        self.telemetry
-            .received_wire_bytes
-            .store(0, Ordering::Relaxed);
+    /// Record a successfully received encrypted datagram after the caller has
+    /// classified it as application traffic.
+    pub fn record_received(&self, bytes: usize) {
+        self.telemetry.record_received(bytes);
     }
 
     /// Register this connected socket with the optional OpenStream relay.
@@ -332,7 +327,24 @@ impl UdpTransport {
             return Err(Error::NotConnected);
         }
         let datagram = session.seal(kind, channel, flags, payload)?;
-        self.send_datagram(&datagram).await
+        self.send_datagram(&datagram, true).await
+    }
+
+    /// Send an encrypted setup datagram without including it in application
+    /// telemetry. Used by bounded path nomination before a path is active.
+    pub async fn send_untracked(
+        &self,
+        session: &mut Session,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<usize, Error> {
+        if self.peer.is_none() {
+            return Err(Error::NotConnected);
+        }
+        let datagram = session.seal(kind, channel, flags, payload)?;
+        self.send_datagram(&datagram, false).await
     }
 
     /// Receive, authenticate, and decode the next datagram.
@@ -341,11 +353,23 @@ impl UdpTransport {
             return Err(Error::NotConnected);
         }
         let mut datagram = [0_u8; MAX_DATAGRAM];
-        let length = self.recv_datagram(&mut datagram).await?;
+        let length = self.recv_datagram(&mut datagram, true).await?;
         Ok(session.open(&datagram[..length])?)
     }
 
-    async fn send_datagram(&self, datagram: &[u8]) -> Result<usize, Error> {
+    /// Receive an encrypted datagram without recording it. The caller must
+    /// record the returned wire length only after classifying the decoded
+    /// packet as application traffic.
+    pub async fn recv_untracked(&self, session: &mut Session) -> Result<(Packet, usize), Error> {
+        if self.peer.is_none() {
+            return Err(Error::NotConnected);
+        }
+        let mut datagram = [0_u8; MAX_DATAGRAM];
+        let length = self.recv_datagram(&mut datagram, false).await?;
+        Ok((session.open(&datagram[..length])?, length))
+    }
+
+    async fn send_datagram(&self, datagram: &[u8], record: bool) -> Result<usize, Error> {
         if datagram.len() > MAX_DATAGRAM {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -353,13 +377,21 @@ impl UdpTransport {
             )));
         }
         let sent = self.socket.send(datagram).await?;
-        self.telemetry.record_sent(sent);
+        if record {
+            self.telemetry.record_sent(sent);
+        }
         Ok(sent)
     }
 
-    async fn recv_datagram(&self, datagram: &mut [u8; MAX_DATAGRAM]) -> Result<usize, Error> {
+    async fn recv_datagram(
+        &self,
+        datagram: &mut [u8; MAX_DATAGRAM],
+        record: bool,
+    ) -> Result<usize, Error> {
         let received = self.socket.recv(datagram).await?;
-        self.telemetry.record_received(received);
+        if record {
+            self.telemetry.record_received(received);
+        }
         Ok(received)
     }
 }
