@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod path_control;
+
 /// Ordered control envelope carried inside an authenticated `Kind::Control`
 /// datagram. The outer AES-GCM counter still authenticates every packet; this
 /// inner sequence lets callers retransmit and deliver control messages in
@@ -1059,8 +1061,196 @@ fn nonce(counter: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_control::{
+        AbortReason, Error as PathControlError, MAX_PATH_CONTROL_BYTES, PATH_TOKEN_BYTES,
+        PathControl, PathKind,
+    };
 
     const KEY: [u8; 32] = [0x42; 32];
+
+    const TOKEN: [u8; PATH_TOKEN_BYTES] = [0xA5; PATH_TOKEN_BYTES];
+
+    fn path_control_records() -> Vec<PathControl> {
+        vec![
+            PathControl::Request {
+                request_id: 7,
+                kind: PathKind::DirectUdp,
+            },
+            PathControl::Prepare {
+                generation: 1,
+                kind: PathKind::OpaqueRelay,
+                token: TOKEN,
+            },
+            PathControl::Probe {
+                generation: 2,
+                token: TOKEN,
+            },
+            PathControl::ProbeAck {
+                generation: 3,
+                token: TOKEN,
+            },
+            PathControl::Ready {
+                generation: 4,
+                token: TOKEN,
+                datagram_size: 1200,
+            },
+            PathControl::Commit {
+                generation: 5,
+                token: TOKEN,
+            },
+            PathControl::CommitAck {
+                generation: 6,
+                token: TOKEN,
+            },
+        ]
+    }
+
+    #[test]
+    fn path_control_round_trips_every_record_and_abort_reason() {
+        let mut records = path_control_records();
+        records.extend(
+            [
+                AbortReason::Unsupported,
+                AbortReason::Timeout,
+                AbortReason::CandidateUnavailable,
+                AbortReason::ProbeFailed,
+                AbortReason::PmtuUnavailable,
+                AbortReason::ResourceLimit,
+                AbortReason::CommitUnconfirmed,
+            ]
+            .into_iter()
+            .map(|reason| PathControl::Abort {
+                generation: 7,
+                reason,
+            }),
+        );
+
+        for record in records {
+            let encoded = record.encode().expect("encode path control");
+            assert!(encoded.len() <= MAX_PATH_CONTROL_BYTES);
+            assert_eq!(PathControl::decode(&encoded), Ok(record));
+        }
+    }
+
+    #[test]
+    fn path_control_rejects_invalid_header_and_record_fields() {
+        let encoded = PathControl::Request {
+            request_id: 7,
+            kind: PathKind::DirectUdp,
+        }
+        .encode()
+        .expect("encode request");
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[0] = 0;
+        assert_eq!(
+            PathControl::decode(&unsupported_version),
+            Err(PathControlError::UnsupportedVersion(0))
+        );
+        unsupported_version[0] = 2;
+        assert_eq!(
+            PathControl::decode(&unsupported_version),
+            Err(PathControlError::UnsupportedVersion(2))
+        );
+
+        let mut unknown_type = encoded.clone();
+        unknown_type[1] = 0xFF;
+        assert_eq!(
+            PathControl::decode(&unknown_type),
+            Err(PathControlError::UnknownRecordType(0xFF))
+        );
+
+        let mut reserved_bits = encoded.clone();
+        reserved_bits[3] = 1;
+        assert_eq!(
+            PathControl::decode(&reserved_bits),
+            Err(PathControlError::ReservedBits(1))
+        );
+
+        let mut invalid_kind = encoded;
+        invalid_kind[2] = 0xFF;
+        assert_eq!(
+            PathControl::decode(&invalid_kind),
+            Err(PathControlError::InvalidPathKind(0xFF))
+        );
+    }
+
+    #[test]
+    fn path_control_rejects_invalid_generations_tokens_and_datagram_size() {
+        let mut zero_generation = PathControl::Probe {
+            generation: 1,
+            token: TOKEN,
+        }
+        .encode()
+        .expect("encode probe");
+        zero_generation[4..12].fill(0);
+        assert_eq!(
+            PathControl::decode(&zero_generation),
+            Err(PathControlError::ZeroGeneration)
+        );
+
+        let mut zero_token = PathControl::Probe {
+            generation: 1,
+            token: TOKEN,
+        }
+        .encode()
+        .expect("encode probe");
+        zero_token[12..28].fill(0);
+        assert_eq!(
+            PathControl::decode(&zero_token),
+            Err(PathControlError::ZeroToken)
+        );
+
+        let mut invalid_datagram_size = PathControl::Ready {
+            generation: 1,
+            token: TOKEN,
+            datagram_size: 1200,
+        }
+        .encode()
+        .expect("encode ready");
+        invalid_datagram_size[28..30].fill(0);
+        assert_eq!(
+            PathControl::decode(&invalid_datagram_size),
+            Err(PathControlError::InvalidDatagramSize(0))
+        );
+    }
+
+    #[test]
+    fn path_control_rejects_truncated_and_oversized_payloads() {
+        let encoded = PathControl::Prepare {
+            generation: 1,
+            kind: PathKind::Ice,
+            token: TOKEN,
+        }
+        .encode()
+        .expect("encode prepare");
+        for length in 0..encoded.len() {
+            assert!(matches!(
+                PathControl::decode(&encoded[..length]),
+                Err(PathControlError::Truncated { .. })
+            ));
+        }
+        let oversized = vec![0_u8; MAX_PATH_CONTROL_BYTES + 1];
+        assert_eq!(
+            PathControl::decode(&oversized),
+            Err(PathControlError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn path_control_duplicate_encodings_decode_to_equal_records() {
+        let record = PathControl::Commit {
+            generation: 9,
+            token: TOKEN,
+        };
+        let first = record.encode().expect("encode first duplicate");
+        let second = record.encode().expect("encode second duplicate");
+        assert_eq!(first, second);
+        assert_eq!(
+            PathControl::decode(&first).expect("decode first"),
+            PathControl::decode(&second).expect("decode second")
+        );
+    }
 
     #[test]
     fn encrypted_packet_round_trips() {

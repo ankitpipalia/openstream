@@ -129,6 +129,9 @@ pub struct Capabilities {
     /// Whether the peer can consume or generate force-feedback events.
     #[serde(default)]
     pub rumble: bool,
+    /// Whether the peer explicitly supports generation-scoped path migration.
+    #[serde(default)]
+    pub path_migration: bool,
 }
 
 impl Capabilities {
@@ -182,6 +185,7 @@ impl Capabilities {
             multi_monitor: false,
             pen: false,
             rumble: false,
+            path_migration: false,
         }
     }
 
@@ -215,7 +219,17 @@ impl Capabilities {
             multi_monitor: false,
             pen: false,
             rumble: true,
+            path_migration: false,
         }
+    }
+
+    /// Explicitly advertise support for the path-migration control protocol.
+    ///
+    /// Ordinary capability profiles remain single-path by default. Migration
+    /// acceptance peers opt in deliberately with this builder.
+    pub fn with_path_migration(mut self) -> Self {
+        self.path_migration = true;
+        self
     }
 }
 
@@ -248,6 +262,7 @@ pub struct NegotiatedCapabilities {
     pub multi_monitor: bool,
     pub pen: bool,
     pub rumble: bool,
+    pub path_migration: bool,
 }
 
 /// Capability negotiation failures.
@@ -341,6 +356,7 @@ pub fn negotiate(
         multi_monitor: host.multi_monitor && client.multi_monitor,
         pen: host.pen && client.pen,
         rumble: host.rumble && client.rumble,
+        path_migration: host.path_migration && client.path_migration,
     })
 }
 
@@ -2638,6 +2654,7 @@ mod tests {
         assert!(!decoded.video_10_bit);
         assert!(!decoded.clipboard);
         assert!(!decoded.rumble);
+        assert!(!decoded.path_migration);
 
         let mut host = Capabilities::host_default();
         host.video_10_bit = true;
@@ -2663,6 +2680,37 @@ mod tests {
         assert!(negotiated.multi_monitor);
         assert!(negotiated.pen);
         assert!(!negotiated.rumble);
+    }
+
+    #[test]
+    fn path_migration_requires_explicit_opt_in_from_both_peers() {
+        let old_host = Capabilities::host_default();
+        let old_client = Capabilities::client_default();
+        assert!(!old_host.path_migration);
+        assert!(!old_client.path_migration);
+        assert!(
+            !negotiate(&old_host, &old_client)
+                .expect("legacy peers negotiate")
+                .path_migration
+        );
+
+        let migration_host = Capabilities::host_default().with_path_migration();
+        let migration_client = Capabilities::client_default().with_path_migration();
+        assert!(
+            !negotiate(&migration_host, &old_client)
+                .expect("old client declines migration")
+                .path_migration
+        );
+        assert!(
+            !negotiate(&old_host, &migration_client)
+                .expect("old host declines migration")
+                .path_migration
+        );
+        assert!(
+            negotiate(&migration_host, &migration_client)
+                .expect("both peers opt in")
+                .path_migration
+        );
     }
 
     #[test]
