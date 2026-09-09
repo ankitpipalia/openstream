@@ -19,8 +19,8 @@ use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
 };
 use openstream_media::{
-    AdaptiveBitrate, AudioFrame, KEYFRAME_REQUEST, MAX_FRAGMENT_BYTES, PeerTelemetryAdapter,
-    fragment_frame,
+    AdaptiveBitrate, AudioFrame, BitrateDecision, KEYFRAME_REQUEST, MAX_FRAGMENT_BYTES,
+    PeerTelemetryAdapter, fragment_frame,
 };
 use openstream_platform::clipboard as platform_clipboard;
 use openstream_platform::clipboard_policy::ClipboardPolicy;
@@ -51,6 +51,15 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 /// independent of adaptive bitrate restarts because monitor selection is a
 /// user-visible control action.
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+fn remember_adaptive_decision(
+    pending: &mut Option<BitrateDecision>,
+    decision: Option<BitrateDecision>,
+) {
+    if decision.is_some() {
+        *pending = decision;
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -211,6 +220,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     let restart_policy = reconfigure::RestartPolicy::from_env();
     let mut last_restart: Option<Instant> = None;
+    // `AdaptiveBitrate::tick` emits one-shot decisions. Keep one pending when
+    // a display switch takes precedence so the bounded restart policy can
+    // apply it on a later control tick.
+    let mut pending_adaptive_decision: Option<BitrateDecision> = None;
     let mut audio_process = if audio_requested {
         Some(ChildGuard::new(spawn_audio_ffmpeg()?))
     } else {
@@ -424,6 +437,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
                 telemetry.observe_path(&session.transport_snapshot(now), now_ms);
                 let adaptive_decision = telemetry.tick(now_ms);
+                remember_adaptive_decision(&mut pending_adaptive_decision, adaptive_decision);
                 let display_target = pending_display.filter(|_| {
                     last_display_switch
                         .is_none_or(|previous| now.duration_since(previous) >= DISPLAY_SWITCH_MIN_INTERVAL)
@@ -482,7 +496,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let force_keyframe_restart = keyframe_requested
                     && last_restart
                         .is_none_or(|previous| now.duration_since(previous) >= restart_policy.min_interval);
-                let adaptive_target = adaptive_decision.as_ref().and_then(|decision| {
+                let adaptive_target = pending_adaptive_decision.as_ref().and_then(|decision| {
                     restart_policy.should_restart(
                         profile.bitrate_mbps,
                         decision.bitrate_mbps,
@@ -490,6 +504,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         last_restart,
                     )
                 });
+                let applied_adaptive_decision = !force_keyframe_restart && adaptive_target.is_some();
                 let target = if force_keyframe_restart {
                     Some(profile.bitrate_mbps)
                 } else {
@@ -535,6 +550,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             access_units = AccessUnitizer::for_codec(negotiated.video);
                             last_restart = Some(now);
                             keyframe_requested = false;
+                            if applied_adaptive_decision {
+                                pending_adaptive_decision = None;
+                            }
                         }
                         Err(error) => {
                             eprintln!(
@@ -1385,13 +1403,33 @@ fn validate_custom_ffmpeg_args(args: &[String]) -> Result<&[String], String> {
 #[cfg(test)]
 mod tests {
     use openstream_client_core::VideoCodec;
+    use openstream_media::{BitrateDecision, BitrateReason};
 
     use super::{
         AccessUnitizer, MAX_FFMPEG_ARGS, MAX_VIDEO_FILTER_BYTES, capture_arguments,
         configured_video_filter, contains_idr, display_capture_input, enumerate_host_displays,
-        queue_display_selection, resolve_display_index, resolve_encode_profile, split_command_line,
-        topology_with_selected, validate_custom_ffmpeg_args,
+        queue_display_selection, remember_adaptive_decision, resolve_display_index,
+        resolve_encode_profile, split_command_line, topology_with_selected,
+        validate_custom_ffmpeg_args,
     };
+
+    #[test]
+    fn display_switch_does_not_drop_pending_adaptive_decision() {
+        let decision = BitrateDecision {
+            bitrate_mbps: 7.0,
+            reason: BitrateReason::Loss,
+            pending_frames: 8,
+            oldest_frame_age_ms: 300,
+            smoothed_ack_ms: Some(120.0),
+        };
+        let mut pending = None;
+
+        remember_adaptive_decision(&mut pending, Some(decision));
+        // A display-switch branch does not produce a new telemetry decision.
+        remember_adaptive_decision(&mut pending, None);
+
+        assert_eq!(pending, Some(decision));
+    }
 
     #[test]
     fn detects_three_and_four_byte_idr_start_codes() {
