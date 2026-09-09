@@ -11,6 +11,7 @@ authors = ["OpenStream contributors"]
 lowlat-audio.workspace = true
 lowlat-core.workspace = true
 openstream-protocol = { path = "../protocol" }
+openstream-transport = { path = "../transport" }
 
 [lints]
 workspace = true

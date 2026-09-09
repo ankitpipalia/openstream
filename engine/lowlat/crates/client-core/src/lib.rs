@@ -8,7 +8,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use openstream_protocol::control::{Channel as ControlChannel, Frame as ControlFrame};
@@ -16,7 +16,10 @@ use openstream_protocol::relay::Role as RelayRole;
 use openstream_protocol::{
     IdentityError, IdentityKey, KeyExchange, Kind, MAX_DATAGRAM, Packet, Session as CipherSession,
 };
-use openstream_transport::UdpTransport;
+use openstream_transport::{
+    FIRST_PATH_GENERATION, PathGeneration, PathMtuState, PathState, PeerTransportSnapshot,
+    TransportPathKind, TransportSample, UdpTransport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -945,6 +948,96 @@ enum DataPath {
     Ice(IcePath),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PathCounters {
+    sent_packets: u64,
+    sent_wire_bytes: u64,
+    received_packets: u64,
+    received_wire_bytes: u64,
+}
+
+impl PathCounters {
+    fn record_sent(&mut self, bytes: usize) {
+        self.sent_packets = self.sent_packets.saturating_add(1);
+        self.sent_wire_bytes = self
+            .sent_wire_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    fn record_received(&mut self, bytes: usize) {
+        self.received_packets = self.received_packets.saturating_add(1);
+        self.received_wire_bytes = self
+            .received_wire_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    fn sample(self, path_generation: PathGeneration) -> TransportSample {
+        TransportSample {
+            path_generation,
+            sent_packets: self.sent_packets,
+            sent_wire_bytes: self.sent_wire_bytes,
+            received_packets: self.received_packets,
+            received_wire_bytes: self.received_wire_bytes,
+            sample_interval_ms: 0,
+            send_rate_mbps: 0.0,
+            receive_rate_mbps: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathSampleBaseline {
+    observed_at: Instant,
+    counters: TransportSample,
+}
+
+fn sample_path_counters(
+    counters: TransportSample,
+    now: Instant,
+    baseline: &mut Option<PathSampleBaseline>,
+) -> Option<TransportSample> {
+    let previous = match baseline.replace(PathSampleBaseline {
+        observed_at: now,
+        counters,
+    }) {
+        Some(previous) if previous.counters.path_generation == counters.path_generation => previous,
+        _ => return None,
+    };
+    let sample_interval_ms = u64::try_from(
+        now.saturating_duration_since(previous.observed_at)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    if sample_interval_ms == 0 {
+        return None;
+    }
+    let send_rate_mbps = decimal_mbps(
+        counters
+            .sent_wire_bytes
+            .saturating_sub(previous.counters.sent_wire_bytes),
+        sample_interval_ms,
+    );
+    let receive_rate_mbps = decimal_mbps(
+        counters
+            .received_wire_bytes
+            .saturating_sub(previous.counters.received_wire_bytes),
+        sample_interval_ms,
+    );
+    Some(TransportSample {
+        sample_interval_ms,
+        send_rate_mbps,
+        receive_rate_mbps,
+        ..counters
+    })
+}
+
+fn decimal_mbps(bytes: u64, interval_ms: u64) -> f64 {
+    if interval_ms == 0 {
+        return 0.0;
+    }
+    bytes as f64 * 8_000.0 / (interval_ms as f64 * 1_000_000.0)
+}
+
 /// A fully established OpenStream peer session.
 ///
 /// This is the shared choreography used by a GUI, a mobile bridge, or a host
@@ -957,6 +1050,10 @@ pub struct PeerSession {
     transport: DataPath,
     cipher: CipherSession,
     stats: SessionStats,
+    path_generation: PathGeneration,
+    path_started_at: Instant,
+    path_baseline: Option<PathSampleBaseline>,
+    ice_counters: PathCounters,
     /// A peer can win the path probe and send its first capability message
     /// before the other side has left the probe loop. Preserve that
     /// authenticated packet instead of dropping it at the phase boundary.
@@ -1332,6 +1429,10 @@ impl PeerSession {
             }),
             cipher: CipherSession::new(keys.tx, keys.rx),
             stats: SessionStats::default(),
+            path_generation: FIRST_PATH_GENERATION,
+            path_started_at: Instant::now(),
+            path_baseline: None,
+            ice_counters: PathCounters::default(),
             prefetched: None,
             last_keepalive: std::time::Instant::now(),
         })
@@ -1537,6 +1638,7 @@ impl PeerSession {
             // collide with or pollute the winning path's counters.
             if let ProbeResult::Established(prefetched) = probe_path(&transport, &mut cipher).await
             {
+                transport.reset_telemetry();
                 return Ok(Self {
                     signal,
                     transport: DataPath::Direct {
@@ -1545,6 +1647,10 @@ impl PeerSession {
                     },
                     cipher,
                     stats: SessionStats::default(),
+                    path_generation: FIRST_PATH_GENERATION,
+                    path_started_at: Instant::now(),
+                    path_baseline: None,
+                    ice_counters: PathCounters::default(),
                     prefetched,
                     last_keepalive: std::time::Instant::now(),
                 });
@@ -1568,6 +1674,46 @@ impl PeerSession {
                 candidate: *candidate,
             },
             DataPath::Ice(_) => ConnectionPath::Ice,
+        }
+    }
+
+    /// Return the current path generation without exposing peer routing data.
+    pub fn path_generation(&self) -> PathGeneration {
+        self.path_generation
+    }
+
+    /// Return an address- and credential-free snapshot of the selected path.
+    pub fn transport_snapshot(&mut self, now: Instant) -> PeerTransportSnapshot {
+        let (path, counters) = match &self.transport {
+            DataPath::Direct {
+                transport,
+                candidate,
+            } => (
+                match candidate {
+                    CandidateKind::Relay => TransportPathKind::OpaqueRelay,
+                    CandidateKind::Host
+                    | CandidateKind::Mapped
+                    | CandidateKind::ServerReflexive => TransportPathKind::DirectUdp,
+                },
+                transport.telemetry_counters(),
+            ),
+            DataPath::Ice(_) => (
+                TransportPathKind::Ice,
+                self.ice_counters.sample(self.path_generation),
+            ),
+        };
+        PeerTransportSnapshot {
+            path,
+            path_generation: self.path_generation,
+            state: PathState::Active,
+            path_age_ms: u64::try_from(
+                now.saturating_duration_since(self.path_started_at)
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            datagram_size: None,
+            path_mtu_state: PathMtuState::Unavailable,
+            sample: sample_path_counters(counters, now, &mut self.path_baseline),
         }
     }
 
@@ -1616,6 +1762,7 @@ impl PeerSession {
         flags: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
+        let ice_path = matches!(&self.transport, DataPath::Ice(_));
         let sent = match &self.transport {
             DataPath::Direct { transport, .. } => Ok(transport
                 .send(&mut self.cipher, kind, channel, flags, payload)
@@ -1631,6 +1778,9 @@ impl PeerSession {
                     .map_err(|error| Error::Ice(error.to_string()))
             }
         }?;
+        if ice_path {
+            self.ice_counters.record_sent(sent);
+        }
         self.stats.sent_packets = self.stats.sent_packets.saturating_add(1);
         self.stats.sent_wire_bytes = self.stats.sent_wire_bytes.saturating_add(sent as u64);
         Ok(sent)
@@ -1656,6 +1806,7 @@ impl PeerSession {
                             .recv(&mut datagram)
                             .await
                             .map_err(|error| Error::Ice(error.to_string()))?;
+                        self.ice_counters.record_received(length);
                         self.cipher
                             .open(&datagram[..length])
                             .map_err(|error| Error::InvalidMessage(error.to_string()))?
@@ -2503,5 +2654,38 @@ mod tests {
         assert_eq!(legacy_value.get("turn"), Some(&serde_json::Value::Null));
         let decoded: Pairing = serde_json::from_str(&legacy).expect("decode legacy pairing");
         assert_eq!(decoded.turn, None);
+    }
+
+    #[test]
+    fn generation_local_path_baseline_uses_decimal_mbps() {
+        let now = std::time::Instant::now();
+        let mut baseline = None;
+        let initial = openstream_transport::TransportSample {
+            path_generation: openstream_transport::FIRST_PATH_GENERATION,
+            sent_packets: 0,
+            sent_wire_bytes: 0,
+            received_packets: 0,
+            received_wire_bytes: 0,
+            sample_interval_ms: 0,
+            send_rate_mbps: 0.0,
+            receive_rate_mbps: 0.0,
+        };
+        assert_eq!(sample_path_counters(initial, now, &mut baseline), None);
+
+        let sampled = sample_path_counters(
+            openstream_transport::TransportSample {
+                sent_packets: 1,
+                sent_wire_bytes: 125_000,
+                received_packets: 2,
+                received_wire_bytes: 250_000,
+                ..initial
+            },
+            now + Duration::from_secs(1),
+            &mut baseline,
+        )
+        .expect("one-second sample");
+        assert_eq!(sampled.sample_interval_ms, 1_000);
+        assert!((sampled.send_rate_mbps - 1.0).abs() < f64::EPSILON);
+        assert!((sampled.receive_rate_mbps - 2.0).abs() < f64::EPSILON);
     }
 }

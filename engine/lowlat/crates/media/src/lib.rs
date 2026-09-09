@@ -13,12 +13,14 @@ pub mod displays;
 pub mod input;
 pub mod metrics;
 pub mod microphone;
+pub mod telemetry;
 
 use openstream_protocol::MAX_PLAINTEXT;
 
 pub mod adaptive;
 
 pub use adaptive::{AdaptiveBitrate, BitrateDecision, BitrateReason};
+pub use telemetry::{PeerTelemetryAdapter, PeerTelemetrySnapshot};
 
 const MAGIC: [u8; 2] = *b"VF";
 const VERSION: u8 = 1;
@@ -665,6 +667,75 @@ impl Default for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openstream_transport::{
+        FIRST_PATH_GENERATION, PathMtuState, PathState, PeerTransportSnapshot, TransportPathKind,
+        TransportSample,
+    };
+
+    fn transport_snapshot(generation: u64, rate_mbps: f64) -> PeerTransportSnapshot {
+        PeerTransportSnapshot {
+            path: TransportPathKind::DirectUdp,
+            path_generation: generation,
+            state: PathState::Active,
+            path_age_ms: 10,
+            datagram_size: None,
+            path_mtu_state: PathMtuState::Unavailable,
+            sample: Some(TransportSample {
+                path_generation: generation,
+                sent_packets: 1,
+                sent_wire_bytes: 1_000,
+                received_packets: 1,
+                received_wire_bytes: 1_000,
+                sample_interval_ms: 10,
+                send_rate_mbps: rate_mbps,
+                receive_rate_mbps: rate_mbps,
+            }),
+        }
+    }
+
+    #[test]
+    fn generation_change_preserves_pending_frames_but_resets_path_baseline() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        telemetry.frame_sent(7, 1_024, 0);
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION, 1.0), 10);
+        assert!(telemetry.snapshot().path_sample_baseline.is_some());
+
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION + 1, 100.0), 20);
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(telemetry.pending_frames(), 1);
+        assert!((telemetry.bitrate_mbps() - 10.0).abs() < f64::EPSILON);
+        assert_eq!(snapshot.path_generation, FIRST_PATH_GENERATION + 1);
+        assert_eq!(snapshot.path_sample_baseline, None);
+    }
+
+    #[test]
+    fn local_rate_samples_do_not_change_adaptive_bitrate() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        telemetry.frame_sent(7, 1_024, 0);
+        telemetry.frame_ack(
+            FrameAck {
+                frame_id: 7,
+                lost_frames: 0,
+            },
+            10,
+        );
+
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION, 1.0), 20);
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION, 100.0), 30);
+
+        assert_eq!(telemetry.tick(100), None);
+        assert!((telemetry.bitrate_mbps() - 10.0).abs() < f64::EPSILON);
+        assert_eq!(telemetry.pending_frames(), 0);
+    }
 
     #[test]
     fn fragments_round_trip_in_reverse_order() {

@@ -8,9 +8,11 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use openstream_protocol::relay::{self, Role as RelayRole};
 use openstream_protocol::{Error as ProtocolError, Kind, MAX_DATAGRAM, Packet, Session};
+use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant, timeout};
 
@@ -19,6 +21,122 @@ mod upnp;
 
 pub use stun::Error as StunError;
 pub use upnp::{Error as UpnpError, Mapping as UpnpMapping};
+
+/// The first path generation assigned to a newly established peer path.
+pub const FIRST_PATH_GENERATION: u64 = 1;
+
+/// Monotonically increasing identifier for a selected peer path.
+pub type PathGeneration = u64;
+
+/// The kind of path carrying authenticated OpenStream datagrams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportPathKind {
+    DirectUdp,
+    OpaqueRelay,
+    Ice,
+}
+
+/// Lifecycle state for one selected peer path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathState {
+    Preparing,
+    Ready,
+    CommitPending,
+    Active,
+    Draining,
+    Retired,
+    Failed,
+    Closed,
+}
+
+/// Path-MTU discovery state exposed by a transport implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathMtuState {
+    Base,
+    Searching,
+    SearchComplete,
+    Error,
+    Unavailable,
+}
+
+/// Cumulative local transport observations plus a rate sample for one path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TransportSample {
+    pub path_generation: PathGeneration,
+    pub sent_packets: u64,
+    pub sent_wire_bytes: u64,
+    pub received_packets: u64,
+    pub received_wire_bytes: u64,
+    pub sample_interval_ms: u64,
+    pub send_rate_mbps: f64,
+    pub receive_rate_mbps: f64,
+}
+
+/// Address- and credential-free telemetry for the selected peer path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PeerTransportSnapshot {
+    pub path: TransportPathKind,
+    pub path_generation: PathGeneration,
+    pub state: PathState,
+    pub path_age_ms: u64,
+    pub datagram_size: Option<usize>,
+    pub path_mtu_state: PathMtuState,
+    pub sample: Option<TransportSample>,
+}
+
+#[derive(Debug)]
+struct TransportTelemetry {
+    path_generation: AtomicU64,
+    sent_packets: AtomicU64,
+    sent_wire_bytes: AtomicU64,
+    received_packets: AtomicU64,
+    received_wire_bytes: AtomicU64,
+}
+
+impl TransportTelemetry {
+    fn new() -> Self {
+        Self {
+            path_generation: AtomicU64::new(FIRST_PATH_GENERATION),
+            sent_packets: AtomicU64::new(0),
+            sent_wire_bytes: AtomicU64::new(0),
+            received_packets: AtomicU64::new(0),
+            received_wire_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn set_path_generation(&self, generation: PathGeneration) {
+        self.path_generation
+            .store(generation.max(FIRST_PATH_GENERATION), Ordering::Relaxed);
+    }
+
+    fn record_sent(&self, bytes: usize) {
+        self.sent_packets.fetch_add(1, Ordering::Relaxed);
+        self.sent_wire_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn record_received(&self, bytes: usize) {
+        self.received_packets.fetch_add(1, Ordering::Relaxed);
+        self.received_wire_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    fn counters(&self) -> TransportSample {
+        TransportSample {
+            path_generation: self.path_generation.load(Ordering::Relaxed),
+            sent_packets: self.sent_packets.load(Ordering::Relaxed),
+            sent_wire_bytes: self.sent_wire_bytes.load(Ordering::Relaxed),
+            received_packets: self.received_packets.load(Ordering::Relaxed),
+            received_wire_bytes: self.received_wire_bytes.load(Ordering::Relaxed),
+            sample_interval_ms: 0,
+            send_rate_mbps: 0.0,
+            receive_rate_mbps: 0.0,
+        }
+    }
+}
 
 /// Errors returned by the UDP wrapper.
 #[derive(Debug)]
@@ -76,6 +194,7 @@ pub struct UdpTransport {
     socket: UdpSocket,
     peer: Option<SocketAddr>,
     upnp_mapping: Option<UpnpMapping>,
+    telemetry: TransportTelemetry,
 }
 
 impl UdpTransport {
@@ -85,6 +204,7 @@ impl UdpTransport {
             socket: UdpSocket::bind(local).await?,
             peer: None,
             upnp_mapping: None,
+            telemetry: TransportTelemetry::new(),
         })
     }
 
@@ -136,6 +256,28 @@ impl UdpTransport {
             .map_err(|_| Error::Timeout)??;
         self.peer = Some(peer);
         Ok(())
+    }
+
+    /// Set the generation reported with subsequent local transport samples.
+    pub fn set_path_generation(&self, generation: PathGeneration) {
+        self.telemetry.set_path_generation(generation);
+    }
+
+    /// Return cumulative observations for completed application socket I/O.
+    /// Registration and setup packets are deliberately excluded.
+    pub fn telemetry_counters(&self) -> TransportSample {
+        self.telemetry.counters()
+    }
+
+    /// Discard relay-registration and nomination observations before normal
+    /// application traffic begins on the selected path.
+    pub fn reset_telemetry(&self) {
+        self.telemetry.sent_packets.store(0, Ordering::Relaxed);
+        self.telemetry.sent_wire_bytes.store(0, Ordering::Relaxed);
+        self.telemetry.received_packets.store(0, Ordering::Relaxed);
+        self.telemetry
+            .received_wire_bytes
+            .store(0, Ordering::Relaxed);
     }
 
     /// Register this connected socket with the optional OpenStream relay.
@@ -190,7 +332,7 @@ impl UdpTransport {
             return Err(Error::NotConnected);
         }
         let datagram = session.seal(kind, channel, flags, payload)?;
-        Ok(self.socket.send(&datagram).await?)
+        self.send_datagram(&datagram).await
     }
 
     /// Receive, authenticate, and decode the next datagram.
@@ -199,8 +341,26 @@ impl UdpTransport {
             return Err(Error::NotConnected);
         }
         let mut datagram = [0_u8; MAX_DATAGRAM];
-        let length = self.socket.recv(&mut datagram).await?;
+        let length = self.recv_datagram(&mut datagram).await?;
         Ok(session.open(&datagram[..length])?)
+    }
+
+    async fn send_datagram(&self, datagram: &[u8]) -> Result<usize, Error> {
+        if datagram.len() > MAX_DATAGRAM {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OpenStream datagram exceeds transport bound",
+            )));
+        }
+        let sent = self.socket.send(datagram).await?;
+        self.telemetry.record_sent(sent);
+        Ok(sent)
+    }
+
+    async fn recv_datagram(&self, datagram: &mut [u8; MAX_DATAGRAM]) -> Result<usize, Error> {
+        let received = self.socket.recv(datagram).await?;
+        self.telemetry.record_received(received);
+        Ok(received)
     }
 }
 
@@ -231,6 +391,37 @@ mod tests {
         let packet = right.recv(&mut rx).await.unwrap();
         assert_eq!(packet.kind, Kind::Control);
         assert_eq!(packet.payload, br#"{"type":"hello"}"#);
+    }
+
+    #[tokio::test]
+    async fn udp_counters_count_only_completed_socket_io() {
+        let mut left = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut right = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let left_addr = left.local_addr().unwrap();
+        let right_addr = right.local_addr().unwrap();
+        left.connect(right_addr).await.unwrap();
+        right.connect(left_addr).await.unwrap();
+
+        let mut tx = Session::new(KEY, KEY);
+        let mut rx = Session::new(KEY, KEY);
+        let sent = left
+            .send(&mut tx, Kind::Control, 0, 0, b"authenticated")
+            .await
+            .unwrap();
+        let packet = right.recv(&mut rx).await.unwrap();
+
+        let sent_counters = left.telemetry_counters();
+        let received_counters = right.telemetry_counters();
+        let sent_wire_bytes = u64::try_from(sent).expect("datagram length fits in u64");
+        assert_eq!(packet.payload, b"authenticated");
+        assert_eq!(sent_counters.sent_packets, 1);
+        assert_eq!(sent_counters.sent_wire_bytes, sent_wire_bytes);
+        assert_eq!(received_counters.received_packets, 1);
+        assert_eq!(received_counters.received_wire_bytes, sent_wire_bytes);
     }
 
     #[tokio::test]

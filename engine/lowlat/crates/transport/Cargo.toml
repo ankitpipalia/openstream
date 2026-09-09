@@ -10,6 +10,7 @@ authors = ["OpenStream contributors"]
 [dependencies]
 getrandom.workspace = true
 openstream-protocol = { path = "../protocol" }
+serde.workspace = true
 tokio.workspace = true
 url.workspace = true
 
