@@ -455,7 +455,17 @@ impl UdpTransport {
             if now >= deadline {
                 return Err(Error::Timeout);
             }
-            sent_bytes = sent_bytes.saturating_add(socket.send(&request).await?);
+            let sent = timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                socket.send(&request),
+            )
+            .await
+            .map_err(|_| Error::Timeout)??;
+            sent_bytes = sent_bytes.saturating_add(sent);
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::Timeout);
+            }
             let remaining = deadline.saturating_duration_since(now);
             let wait = remaining.min(Duration::from_millis(75));
             match timeout(wait, socket.recv(&mut acknowledgement)).await {

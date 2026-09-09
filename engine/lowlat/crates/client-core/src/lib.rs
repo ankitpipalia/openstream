@@ -3115,7 +3115,9 @@ mod tests {
             .expect("bind relay");
         let relay_address = relay_socket.local_addr().expect("relay address");
         let (unregisters, mut observed) = mpsc::channel(4);
+        let (ack_release, ack_gate) = oneshot::channel();
         let relay_task = tokio::spawn(async move {
+            let mut ack_gate = Some(ack_gate);
             let mut packet = [0; MAX_DATAGRAM];
             let mut unregister_count = 0;
             loop {
@@ -3134,6 +3136,9 @@ mod tests {
                         .send(unregister_count)
                         .await
                         .expect("observe unregister");
+                    if let Some(ack_gate) = ack_gate.take() {
+                        ack_gate.await.expect("release unregister ACK");
+                    }
                     relay_socket
                         .send_to(&relay::encode_unregister_ack(unregister.role), source)
                         .await
@@ -3175,14 +3180,26 @@ mod tests {
             deadline,
         ));
 
-        session.close().await.expect("close session");
+        {
+            let close = session.close();
+            tokio::pin!(close);
+            tokio::time::timeout(Duration::from_millis(500), async {
+                let first = tokio::select! {
+                    result = &mut close => {
+                        result.expect("close session");
+                        panic!("close returned before relay cleanup was observed");
+                    }
+                    first = observed.recv() => first.expect("relay cleanup observation"),
+                };
+                assert_eq!(first, 1, "drain cleanup must unregister once");
+                ack_release.send(()).expect("release unregister ACK");
+                close.await.expect("close session");
+            })
+            .await
+            .expect("draining close was not prompt");
+        }
         session.close().await.expect("close session again");
 
-        let first = tokio::time::timeout(Duration::from_millis(500), observed.recv())
-            .await
-            .expect("drain cleanup was not prompt")
-            .expect("relay cleanup observation");
-        assert_eq!(first, 1, "drain cleanup must unregister once");
         assert!(
             tokio::time::timeout(Duration::from_millis(100), observed.recv())
                 .await
