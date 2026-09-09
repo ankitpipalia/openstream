@@ -120,7 +120,7 @@ impl Batch {
                 socket.as_raw_fd(),
                 self.msgs.as_mut_ptr(),
                 libc::c_uint::try_from(RECV_BATCH).unwrap_or(1),
-                libc::MSG_DONTWAIT,
+                libc::MSG_DONTWAIT as _,
                 core::ptr::null_mut(),
             )
         };

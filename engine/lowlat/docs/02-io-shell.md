@@ -180,6 +180,37 @@ was the difference between zero and complete delivery of a keyframe burst on loo
 Windows, falling back to per-datagram send. One syscall per batch. This matters more as the
 datagram size rises, since the packet rate falls but the burst size does not.
 
+**The shell owns direct-path PMTU discovery.** After the connectivity engine nominates a peer,
+the Linux shell asks a separate short-lived dual-stack UDP socket for the kernel's route MTU. It
+never connects a duplicate of the live candidate-driven socket: duplicated descriptors share the
+same kernel socket state, so doing that would pin the media socket to one candidate. If the route
+query is unavailable, the shell uses the 1500-byte outer-MTU value only as a ceiling; the
+authenticated exact-size probes remain the authority for the datagram size actually adopted.
+
+The endpoint merges the PMTU deadline into the normal wait deadline and emits padding-only
+`PROBE` packets only after connectivity has selected a destination. Probe acknowledgements and
+ordinary group acknowledgements leave ahead of a new upward probe. The confirmed size is applied
+to packetization and pacing together.
+
+**Downgrade is channel-aware.** A delivery watchdog may request a black-hole recovery. The
+endpoint first verifies that every reliable queued fragment fits the base body capacity. It then
+drops only queued video, preserves sequence monotonicity, lowers packetization and pacing
+together, and restarts the delivery watchdog so retained control has time to retransmit. The host
+requests a fresh IDR/keyframe. A reliable control fragment that cannot be represented at the
+smaller size blocks the transition rather than being silently discarded; the application must
+reconstruct or terminate it. The receiving video consumer must use its message/keyframe policy to
+escape the resulting abandoned sequence gap.
+
+The opt-in live fixture is:
+
+```sh
+sudo scripts/netns-fixtures.sh mtu-transition
+```
+
+It runs the real shell over two Linux namespaces, changes both links from 1500 to 1300 and back,
+and requires initial discovery, base recovery, post-recovery delivery, and a second upward search.
+It skips when namespaces/root or the prebuilt fixture binaries are unavailable.
+
 ## §7 Buffers and allocation
 
 - **The shell allocates nothing on a data path.** Receive slots, rings, and scratch are

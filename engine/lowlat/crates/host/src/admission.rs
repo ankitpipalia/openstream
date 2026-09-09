@@ -2553,7 +2553,39 @@ fn run_guest(args: Attached, wake: Wake, running: &lowlat_net::Running) {
                         control.0,
                         control.1
                     );
-                    Some(Outcome::Undeliverable)
+                    match shell.recover_path_black_hole(now) {
+                        lowlat_core::endpoint::PathMtuRecovery::Recovered {
+                            previous_datagram_size,
+                            datagram_size,
+                            dropped_video_fragments,
+                        } => {
+                            lowlat_common::log_warn!(
+                                "guest: path black hole, reducing datagram size {} -> {} and \
+                                 dropping {} video fragments",
+                                previous_datagram_size,
+                                datagram_size,
+                                dropped_video_fragments
+                            );
+                            // The next encoded picture must be an IDR. The
+                            // abandoned video sequence gap is intentionally
+                            // not repaired with stale predicted frames.
+                            if let Some(seat) = seat.as_ref() {
+                                seat.request_refresh();
+                            }
+                            None
+                        }
+                        lowlat_core::endpoint::PathMtuRecovery::Blocked => {
+                            lowlat_common::log_error!(
+                                "guest: path MTU recovery blocked by an oversized reliable \
+                                 control fragment"
+                            );
+                            Some(Outcome::Undeliverable)
+                        }
+                        lowlat_core::endpoint::PathMtuRecovery::NotConfigured
+                        | lowlat_core::endpoint::PathMtuRecovery::Unusable => {
+                            Some(Outcome::Undeliverable)
+                        }
+                    }
                 }
                 _ => None,
             };

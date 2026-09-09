@@ -18,6 +18,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 use lowlat_core::MAX_DATAGRAM;
+use lowlat_core::pmtu::{IpVersion, Path, PathConfig};
 
 /// Receive slot size, derived from the protocol ceiling and never from the
 /// probed datagram size.
@@ -54,6 +55,13 @@ const DSCP_EF: libc::c_int = 0xB8;
 
 /// The TTL everything but a mapping probe leaves at.
 pub const DEFAULT_TTL: u8 = 64;
+
+/// Fallback outer route MTU used when the kernel cannot answer a route query.
+///
+/// This is an upper bound for the DPLPMTUD ladder, not a claim that every path
+/// is Ethernet. The authenticated probes still have to confirm every larger
+/// OpenStream datagram before packetization adopts it.
+pub const DEFAULT_PATH_MTU: usize = 1500;
 
 /// Hop limit used for a mapping probe.
 ///
@@ -301,6 +309,75 @@ impl Socket {
         from_storage(&storage).ok_or_else(|| io::Error::other("unrecognised local address"))
     }
 
+    /// Build a path-specific PMTU configuration for a nominated peer.
+    ///
+    /// Linux exposes the route MTU through `IP_MTU`/`IPV6_MTU` only after a
+    /// datagram socket is connected. The media socket must remain unconnected
+    /// while candidates and reflexive servers are being checked, so this uses a
+    /// short-lived query socket and leaves the live socket's destination
+    /// semantics unchanged. A route query can legitimately fail
+    /// for an unreachable or not-yet-created route; in that case the normal
+    /// Ethernet value is only a conservative ceiling and DPLPMTUD remains the
+    /// authority for what is actually usable.
+    pub fn path_config(&self, peer: SocketAddr, path: Path) -> PathConfig {
+        let ip_version = if peer.is_ipv4() {
+            IpVersion::V4
+        } else {
+            IpVersion::V6
+        };
+        let path_mtu = self.route_mtu(peer).unwrap_or(DEFAULT_PATH_MTU);
+        PathConfig::new(path, ip_version, path_mtu)
+    }
+
+    fn route_mtu(&self, peer: SocketAddr) -> io::Result<usize> {
+        // Do not dup `self.fd` here. Descriptors produced by dup still refer to
+        // the same kernel UDP socket, so connecting the duplicate can connect
+        // the live media socket as a side effect and make later `sendto` calls
+        // reject candidates other than that route. A separate unbound socket
+        // gives us the route query without changing the candidate-driven shell.
+        // SAFETY: a plain socket(2) with constant arguments; the returned
+        // descriptor is handed straight to OwnedFd, which closes it on every
+        // error path.
+        let raw = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is a fresh descriptor we own and have not registered
+        // anywhere else.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Match the live socket's dual-stack and no-fragment route semantics.
+        // The latter makes the reported route MTU the one relevant to the
+        // authenticated probes rather than a value obtained from a different
+        // fragmentation policy.
+        set_int_fd(fd.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0)?;
+        set_int_fd(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DO,
+        )?;
+        set_int_fd(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_DO,
+        )?;
+        let (addr, addr_len) = to_storage(peer);
+        // SAFETY: `addr` is fully initialised and `addr_len` is its exact size.
+        let rc =
+            unsafe { libc::connect(fd.as_raw_fd(), core::ptr::addr_of!(addr).cast(), addr_len) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (level, option) = if peer.is_ipv4() {
+            (libc::IPPROTO_IP, libc::IP_MTU)
+        } else {
+            (libc::IPPROTO_IPV6, libc::IPV6_MTU)
+        };
+        let mtu = get_int_fd(fd.as_raw_fd(), level, option)?;
+        usize::try_from(mtu).map_err(|_| io::Error::other("route MTU outside usize range"))
+    }
+
     /// Set the hop limit on both families.
     ///
     /// Lowering this for a mapping probe is the one option change permitted
@@ -494,6 +571,49 @@ pub(crate) fn from_storage(storage: &libc::sockaddr_storage) -> Option<SocketAdd
     }
 }
 
+fn get_int_fd(fd: RawFd, level: libc::c_int, name: libc::c_int) -> io::Result<i32> {
+    let mut value: libc::c_int = 0;
+    let mut len = socklen(mem::size_of::<libc::c_int>());
+    // SAFETY: `value` is a c_int and `len` describes it exactly; the kernel
+    // writes at most that many bytes and updates `len`.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            core::ptr::addr_of_mut!(value).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(value)
+}
+
+fn set_int_fd(
+    fd: RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> io::Result<()> {
+    // SAFETY: `value` is a c_int and the length passed is its exact size; all
+    // options used by the route-query socket have that representation.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            core::ptr::addr_of!(value).cast(),
+            socklen(mem::size_of::<libc::c_int>()),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +742,34 @@ mod tests {
         left.send_to(b"hello", to).expect("send");
 
         assert!(right.wait_readable(500.0).expect("poll"), "nothing arrived");
+    }
+
+    /// Route-MTU discovery must not connect the candidate-driven media socket.
+    /// Connecting a duplicated descriptor would mutate the same kernel socket,
+    /// and the second destination would then fail with `EISCONN`.
+    #[test]
+    fn a_route_mtu_query_does_not_pin_the_media_socket_to_one_peer() {
+        let media = Socket::open(0).expect("open media");
+        let first = Socket::open(0).expect("open first");
+        let second = Socket::open(0).expect("open second");
+
+        let mut first_addr = first.local_addr().expect("first addr");
+        first_addr.set_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let mut second_addr = second.local_addr().expect("second addr");
+        second_addr.set_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+
+        let config = media.path_config(first_addr, Path::Direct);
+        assert_eq!(config.path, Path::Direct);
+        assert_eq!(
+            config.ip_version,
+            lowlat_core::pmtu::IpVersion::V6,
+            "the localhost route should be queried as IPv6"
+        );
+
+        media.send_to(b"first", first_addr).expect("first send");
+        media.send_to(b"second", second_addr).expect("second send");
+        assert!(first.wait_readable(500.0).expect("first poll"));
+        assert!(second.wait_readable(500.0).expect("second poll"));
     }
 
     /// A v4-mapped address is IPv4 and must come back as such, whatever the

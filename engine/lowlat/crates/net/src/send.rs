@@ -282,7 +282,7 @@ fn offload_send(socket: &Socket, staged: &[u8], segment: usize, to: SocketAddr) 
     msg.msg_iovlen = 1;
     msg.msg_control = control.0.as_mut_ptr().cast();
     // SAFETY: CMSG_SPACE is a pure size computation over a constant.
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(SEGMENT_FIELD) } as usize;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(SEGMENT_FIELD) } as _;
 
     // SAFETY: the control buffer is aligned and large enough for one control
     // message carrying a u16, which is what CMSG_SPACE above reserved.
@@ -293,7 +293,7 @@ fn offload_send(socket: &Socket, staged: &[u8], segment: usize, to: SocketAddr) 
         }
         (*cmsg).cmsg_level = SOL_UDP;
         (*cmsg).cmsg_type = UDP_SEGMENT;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(SEGMENT_FIELD) as usize;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(SEGMENT_FIELD) as _;
         core::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), segment);
     }
 

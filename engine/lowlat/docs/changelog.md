@@ -3,6 +3,58 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## The path now proves how large each datagram may be
+
+**The direct lowlat shell now owns path-aware DPLPMTUD instead of assuming the
+1229-byte protocol floor forever.** Once connectivity nominates a peer, a
+separate route-query socket derives an outer-path ceiling without connecting or
+mutating the live media socket. The endpoint then sends authenticated,
+padding-only probes and accepts only an exact probe ID and datagram-size echo.
+IPv4, IPv6, TURN Send Indication and TURN ChannelData overheads are represented
+explicitly, while the protocol ceiling remains 2000 bytes.
+
+- **One missing probe proves nothing.** A ladder rung receives three attempts;
+  stale, reordered and size-mismatched acknowledgements are ignored. A
+  completed search is retried after ten minutes, and changing path
+  configuration discards everything learned on the previous route.
+- **Packetization and pacing move together.** A confirmed PLPMTU is applied to
+  every send ring and the per-path pacer as one transaction, so the scheduler
+  cannot pace one datagram size while the packetizer emits another.
+- **A black hole has an application recovery policy.** Reliable control is
+  preflighted and retained. Oversized queued video is discarded without
+  reusing sequence numbers, the transport returns to the 1229-byte base, the
+  delivery watchdog receives a fresh window, and the Linux host requests an
+  IDR. Reliable data that cannot fit at the base blocks recovery instead of
+  being silently lost.
+- **The shell event loop owns probe deadlines.** Probe ACKs remain ahead of new
+  upward probes, PMTU timers participate in the same deadline calculation as
+  connectivity and media, and local socket refusal releases a probe reservation
+  without being counted as network evidence.
+
+The production boundary is deliberate: automatic configuration is complete for
+the native direct lowlat shell. A relay shell can provide its framing-aware
+`PathConfig`, but full direct-to-TURN migration acceptance and the portable
+`PeerSession`/FFmpeg telemetry adapter remain separate open work.
+
+**The integration gate now changes a live Linux route.** Two real encrypted
+endpoints run in network namespaces over a veth pair, discover a 1472-byte IPv4
+datagram, survive a 1500 to 1300 MTU reduction by returning to 1229, carry new
+messages after recovery, restore the link, and discover 1472 again. The complete
+kernel namespace matrix passes seven topologies, including the expected
+symmetric-NAT failure.
+
+Running that gate in a persistent Apple `container machine` exposed two test
+assumptions that host-only checks could not:
+
+- Linux musl gives `recvmmsg` flags and ancillary-message length fields
+  different C integer types from glibc. The syscall boundary now casts to the
+  target libc's declared type and builds on both ABIs.
+- The live fixture had constructed both encrypted sessions as hosts, so each
+  correctly rejected the other's direction bit while connectivity still looked
+  established. The fixture now declares host and guest roles explicitly, and
+  its post-recovery settle window starts when PMTU recovery finishes rather than
+  at the original connection time.
+
 ## One quality setting on the boundary
 
 **`lowlat_quality` in the host configuration**, three values, settled when

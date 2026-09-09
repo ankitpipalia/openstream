@@ -30,6 +30,7 @@ mod linux {
 
     use std::env;
     use std::fs;
+    use std::io::{self, Write};
     use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::mpsc;
@@ -39,8 +40,9 @@ mod linux {
     use lowlat_common::clock::{Time, elapsed_ms};
     use lowlat_core::channel::{RecvRing, SlotMeta};
     use lowlat_core::conn::{Conn, Credentials, State};
-    use lowlat_core::endpoint::Endpoint;
+    use lowlat_core::endpoint::{Endpoint, PathMtuRecovery};
     use lowlat_core::envelope::Envelope;
+    use lowlat_core::pmtu::{PathConfig, PathMtuState};
     use lowlat_core::send::{SendRing, SendSlot};
     use lowlat_core::session::Session;
     use lowlat_net::{Shell, Socket, Wake};
@@ -53,13 +55,24 @@ mod linux {
     /// result that says nothing about the topology.
     const SETTLE_MS: f64 = 600.0;
 
-    /// Ring geometry. No media crosses these fixtures; the session exists because
-    /// an endpoint owns one, and the shell drives the endpoint rather than the
-    /// connectivity engine on its own.
-    const SLOT: usize = 256;
+    /// Ring geometry. The ordinary topology fixture carries no application
+    /// media, but keeping storage at the protocol ceiling lets the optional
+    /// live-PMTU mode send a packet that becomes too large after the namespace
+    /// link is lowered.
+    const STORAGE_BODY: usize = lowlat_core::MAX_DATAGRAM
+        - lowlat_core::envelope::ENVELOPE_LEN
+        - lowlat_core::packet::HEADER_LEN;
+    const ACTIVE_BODY: usize = lowlat_core::DEFAULT_DATAGRAM
+        - lowlat_core::envelope::ENVELOPE_LEN
+        - lowlat_core::packet::HEADER_LEN;
     const SLOTS: usize = 64;
     const CHANNEL: u8 = 1;
     const KEY: [u8; 32] = [0x77u8; 32];
+
+    /// One frame-like application message. It fits in one datagram at a
+    /// discovered 1472-byte IPv4 PLPMTU and becomes two fragments at BASE.
+    const STREAM_PAYLOAD: usize = 1400;
+    const STREAM_BURST: usize = 4;
 
     pub(super) fn run() {
         let args: Vec<String> = env::args().collect();
@@ -78,6 +91,16 @@ mod linux {
         flag(args, name).ok_or_else(|| format!("missing {name}"))
     }
 
+    /// Milestones are consumed by a supervising namespace fixture while this
+    /// process is still running. Explicitly flush redirected stdout so the
+    /// supervisor observes the state transition rather than waiting for a
+    /// block-buffer to fill or the process to exit.
+    fn flush_milestone() -> Result<(), String> {
+        io::stdout()
+            .flush()
+            .map_err(|error| format!("flush milestone: {error}"))
+    }
+
     fn peer(args: &[String]) -> Result<(), String> {
         // Only the port is taken from the bind address. Every fixture namespace
         // holds exactly one host address, and the socket is dual stack and bound to
@@ -88,6 +111,11 @@ mod linux {
             .map_err(|_| "bad --bind".to_string())?;
         let publish = flag(args, "--publish").map(PathBuf::from);
         let expect = flag(args, "--await").map(PathBuf::from);
+        let pmtu_ready = flag(args, "--pmtu-ready").map(PathBuf::from);
+        let pmtu_recover = flag(args, "--pmtu-recover").map(PathBuf::from);
+        let pmtu_raise = flag(args, "--pmtu-raise").map(PathBuf::from);
+        let pmtu_ready_again = flag(args, "--pmtu-ready-again").map(PathBuf::from);
+        let stream = args.iter().any(|arg| arg == "--stream");
         let timeout_ms: f64 = required(args, "--timeout-ms")?
             .parse()
             .map_err(|_| "bad --timeout-ms".to_string())?;
@@ -103,28 +131,36 @@ mod linux {
             remote_pwd: required(args, "--remote-pwd")?,
         };
 
-        let mut recv_bodies = vec![0u8; SLOT * SLOTS];
+        let mut recv_bodies = vec![0u8; STORAGE_BODY * SLOTS];
         let mut recv_meta = vec![SlotMeta::default(); SLOTS];
-        let mut send_bodies = vec![0u8; SLOT * SLOTS];
+        let mut send_bodies = vec![0u8; STORAGE_BODY * SLOTS];
         let mut send_meta = vec![SendSlot::default(); SLOTS];
 
         let conn = Conn::new(credentials, [seed_byte; 16], 0.0);
-        let mut session = Session::new(
-            Envelope::from_key(&KEY).map_err(|e| format!("key: {e}"))?,
-            1,
-            0.0,
-        );
+        let envelope = Envelope::from_key(&KEY).map_err(|e| format!("key: {e}"))?;
+        let mut session = match flag(args, "--session-role").unwrap_or("host") {
+            "host" => Session::new(envelope, 1, 0.0),
+            "guest" => Session::new_guest(envelope, 1, 0.0),
+            _ => return Err("bad --session-role".to_string()),
+        };
         session
             .attach_recv(
                 CHANNEL,
-                RecvRing::new(&mut recv_bodies, &mut recv_meta, SLOT).map_err(|e| e.to_string())?,
+                RecvRing::new(&mut recv_bodies, &mut recv_meta, STORAGE_BODY)
+                    .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
         session
             .attach_send(
                 CHANNEL,
-                SendRing::new(&mut send_bodies, &mut send_meta, SLOT, CHANNEL)
-                    .map_err(|e| e.to_string())?,
+                SendRing::new_with_capacity(
+                    &mut send_bodies,
+                    &mut send_meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    CHANNEL,
+                )
+                .map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
 
@@ -185,16 +221,43 @@ mod linux {
         let started = Time::now();
         let mut published = false;
         let mut settled_at: Option<f64> = None;
+        let mut stream_sequence = 0u64;
+        let mut stream_sent = 0u64;
+        let mut stream_sent_after_recovery = 0u64;
+        let mut stream_received = 0u64;
+        let mut stream_received_after_recovery = 0u64;
+        let mut pmtu_round = 0u8;
+        let mut pmtu_recovered_at = None;
+        let mut pmtu_raise_requested = false;
+        let mut pmtu_ready_again_written = false;
+        let mut transition_complete_at = None;
 
         loop {
             let now_ms = elapsed_ms(started);
             if now_ms > timeout_ms {
+                if stream {
+                    println!(
+                        "stream sent={stream_sent} sent_after_recovery={stream_sent_after_recovery} \
+                         received={stream_received} after_recovery={stream_received_after_recovery}"
+                    );
+                }
                 println!("timeout");
                 return Ok(());
             }
-            if let Some(at) = settled_at
+            let settle_from = if pmtu_recover.is_some() || pmtu_raise.is_some() {
+                transition_complete_at
+            } else {
+                settled_at
+            };
+            if let Some(at) = settle_from
                 && now_ms > at + SETTLE_MS
             {
+                if stream {
+                    println!(
+                        "stream sent={stream_sent} sent_after_recovery={stream_sent_after_recovery} \
+                         received={stream_received} after_recovery={stream_received_after_recovery}"
+                    );
+                }
                 return Ok(());
             }
 
@@ -209,6 +272,25 @@ mod linux {
                             arrived = Some(addr);
                         }
                     }
+                    if stream && settled_at.is_some() {
+                        let mut payload = [0u8; STREAM_PAYLOAD];
+                        for _ in 0..STREAM_BURST {
+                            payload[..8].copy_from_slice(&stream_sequence.to_be_bytes());
+                            if endpoint
+                                .session()
+                                .send_message(CHANNEL, b"MTU!", &payload)
+                                .is_err()
+                            {
+                                break;
+                            }
+                            stream_sequence = stream_sequence.wrapping_add(1);
+                            stream_sent = stream_sent.saturating_add(1);
+                            if pmtu_recovered_at.is_some() {
+                                stream_sent_after_recovery =
+                                    stream_sent_after_recovery.saturating_add(1);
+                            }
+                        }
+                    }
                 })
                 .map_err(|e| format!("turn: {e}"))?;
             if let Some(addr) = arrived {
@@ -219,6 +301,35 @@ mod linux {
                     "  {now_ms:.0} {:?} rx={} tx={}",
                     turn.woke, turn.received, turn.sent
                 );
+            }
+
+            if stream {
+                let mut inbound = [0u8; STORAGE_BODY * 2];
+                loop {
+                    match shell
+                        .endpoint()
+                        .session()
+                        .take_message(CHANNEL, &mut inbound)
+                    {
+                        Some(Ok(_)) => {
+                            stream_received = stream_received.saturating_add(1);
+                            if pmtu_recovered_at.is_some() {
+                                stream_received_after_recovery =
+                                    stream_received_after_recovery.saturating_add(1);
+                            }
+                        }
+                        Some(Err(_)) => break,
+                        None => break,
+                    }
+                }
+                // A PMTU downgrade deliberately abandons old video sequence
+                // numbers. Resume at the furthest complete frame-like message
+                // rather than leaving the receiver permanently behind the gap.
+                if shell.endpoint().session().has_gap(CHANNEL) {
+                    let _ = shell.endpoint().session().escape_stall(CHANNEL, |body| {
+                        body.get(4..8).is_some_and(|header| header == b"MTU!")
+                    });
+                }
             }
 
             if !published && let Some(mapped) = shell.endpoint().conn().reflexive().next() {
@@ -237,10 +348,86 @@ mod linux {
                     }
                 }
                 State::Failed(failure) => {
+                    if stream {
+                        println!(
+                            "stream sent={stream_sent} sent_after_recovery={stream_sent_after_recovery} \
+                             received={stream_received} after_recovery={stream_received_after_recovery}"
+                        );
+                    }
                     println!("failed {failure:?}");
                     return Ok(());
                 }
                 _ => {}
+            }
+
+            let complete = shell
+                .path_mtu()
+                .is_some_and(|mtu| mtu.state() == PathMtuState::SearchComplete);
+            if complete && pmtu_round == 0 {
+                if let Some(path) = pmtu_ready.as_ref() {
+                    fs::write(path, "ready").map_err(|e| format!("pmtu ready: {e}"))?;
+                }
+                pmtu_round = 1;
+                println!(
+                    "pmtu-ready datagram={}",
+                    shell.path_mtu().map_or(0, |mtu| mtu.datagram_size())
+                );
+                flush_milestone()?;
+            } else if complete && pmtu_raise_requested && !pmtu_ready_again_written {
+                if let Some(path) = pmtu_ready_again.as_ref() {
+                    fs::write(path, "ready-again").map_err(|e| format!("pmtu ready again: {e}"))?;
+                }
+                pmtu_ready_again_written = true;
+                pmtu_round = pmtu_round.saturating_add(1);
+                transition_complete_at = Some(now_ms);
+                println!(
+                    "pmtu-ready-again datagram={}",
+                    shell.path_mtu().map_or(0, |mtu| mtu.datagram_size())
+                );
+                flush_milestone()?;
+            }
+
+            if let Some(path) = pmtu_recover.as_ref()
+                && pmtu_recovered_at.is_none()
+                && path.exists()
+            {
+                match shell.recover_path_black_hole(now_ms) {
+                    PathMtuRecovery::Recovered {
+                        previous_datagram_size,
+                        datagram_size,
+                        dropped_video_fragments,
+                    } => {
+                        println!(
+                            "pmtu-recovered old={} new={} dropped={}",
+                            previous_datagram_size, datagram_size, dropped_video_fragments
+                        );
+                        flush_milestone()?;
+                        pmtu_recovered_at = Some(now_ms);
+                        if pmtu_raise.is_none() {
+                            transition_complete_at = Some(now_ms);
+                        }
+                    }
+                    PathMtuRecovery::Blocked => {
+                        return Err("pmtu recovery blocked by queued reliable data".to_string());
+                    }
+                    PathMtuRecovery::NotConfigured | PathMtuRecovery::Unusable => {
+                        return Err("pmtu recovery found no usable configured path".to_string());
+                    }
+                }
+            }
+
+            if let Some(path) = pmtu_raise.as_ref()
+                && !pmtu_raise_requested
+                && (pmtu_recover.is_none() || pmtu_recovered_at.is_some())
+                && path.exists()
+            {
+                if !shell.configure_path_mtu(PathConfig::direct_v4(1500), now_ms) {
+                    return Err("pmtu raise could not reset the direct path".to_string());
+                }
+                pmtu_raise_requested = true;
+                pmtu_ready_again_written = false;
+                println!("pmtu-raise-requested");
+                flush_milestone()?;
             }
         }
     }

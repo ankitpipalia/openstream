@@ -335,9 +335,15 @@ cannot restore a path that cannot carry the mandatory base packet.
 
 The session applies a confirmed size transactionally to both packetization and pacing. Send rings
 reserve storage for the 2000-byte ceiling but fragment new messages at the currently confirmed
-body capacity. A transition is refused while an attached ring contains a fragment too large for
-the new size; the caller must drain or reset that queue before lowering the path. This prevents
-the pacer and packetizer from disagreeing about what is allowed on the wire.
+body capacity. An upward transition is safe because existing fragments were created at a smaller
+capacity. On a black-hole downgrade, the production endpoint preflights all reliable channels,
+abandons only queued video fragments, preserves their sequence monotonicity, and applies the base
+size to packetization and pacing together. A reliable fragment too large for the new size blocks
+the downgrade rather than being silently discarded; the caller must reconstruct or terminate that
+message. After video is abandoned, the host requests a fresh IDR/keyframe and the receiving video
+consumer must escape the abandoned sequence gap at a decodable message boundary. The delivery
+watchdog is restarted for the retained reliable channels so they have a full base-path retransmit
+window before a second failure is judged.
 
 A 1400-byte datagram carries 1364 bytes of payload against the default's 1193, about 14
 percent more per packet. A 100 KB keyframe drops from 86 packets to 76. The benefit is fewer

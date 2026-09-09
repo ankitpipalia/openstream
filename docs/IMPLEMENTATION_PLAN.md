@@ -313,6 +313,13 @@ without changing the default OpenStream wire format.
   ceilings, SEARCH_COMPLETE maintenance reprobes, black-hole fallback, and a
   transactional packetization/pacer update. The protocol floor remains 1229
   bytes and the 2000-byte ceiling is never raised.
+- [x] Wire direct-path DPLPMTUD into the production `lowlat-net` shell: use a
+  route-query socket without mutating the live media socket, merge probe timers
+  into the event loop, and atomically apply confirmed sizes to packetization and
+  pacing.
+- [x] Add channel-aware black-hole recovery: preserve reliable control, discard
+  only queued video, restart the delivery watchdog, request a fresh host IDR,
+  and cover a real-socket namespace transition from MTU 1500 to 1300 and back.
 - [ ] Add a common packet-telemetry adapter for the portable `PeerSession` /
   FFmpeg path so it uses the same delivery estimator as the native lowlat host.
 - [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →

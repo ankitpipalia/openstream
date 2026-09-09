@@ -333,6 +333,13 @@ impl<'a> Session<'a> {
         self.pacer.set_datagram_size(datagram_bytes)
     }
 
+    /// Current datagram size tracked by the pacer. This mirrors
+    /// [`Self::path_datagram_size`] and is exposed so integration tests and
+    /// diagnostics can verify that packetization and pacing changed together.
+    pub fn pacing_datagram_size(&self) -> usize {
+        self.pacer.datagram_size()
+    }
+
     /// Apply a path MTU transition to packetization and pacing as one
     /// operation.
     ///
@@ -368,6 +375,70 @@ impl<'a> Session<'a> {
         true
     }
 
+    /// Whether a path downgrade can be applied without losing a reliable
+    /// message.
+    ///
+    /// Video is the one channel whose queued fragments may be abandoned during
+    /// black-hole recovery. Every other attached send ring must already fit the
+    /// smaller body capacity. This check is separate from
+    /// [`Self::set_path_datagram_size`] because the video ring is expected to
+    /// contain exactly the fragments that made the old path unusable.
+    pub fn can_recover_video_path_datagram_size(&self, datagram_bytes: usize) -> bool {
+        if datagram_bytes >= self.path_datagram_size
+            || !(crate::DEFAULT_DATAGRAM..=crate::MAX_DATAGRAM).contains(&datagram_bytes)
+        {
+            return false;
+        }
+        let body = datagram_bytes.saturating_sub(ENVELOPE_LEN + packet::HEADER_LEN);
+        self.send.iter().enumerate().all(|(channel, ring)| {
+            let Some(ring) = ring.as_ref() else {
+                return true;
+            };
+            if channel == VIDEO_CHANNEL as usize {
+                // The ring must be able to hold the replacement fragments even
+                // though its currently occupied slots are about to be dropped.
+                ring.storage_capacity() >= body
+            } else {
+                // Control and any other reliable channel remain untouched.
+                // Refuse the transition rather than silently losing a message
+                // whose logical contents cannot be reconstructed here.
+                ring.can_set_fragment_capacity(body)
+            }
+        })
+    }
+
+    /// Drop queued video fragments and apply a smaller path size atomically.
+    ///
+    /// Returns the number of abandoned video fragments. `None` means the
+    /// transition was refused before mutating any ring; in particular, an
+    /// oversized reliable-control fragment is never discarded as a side effect
+    /// of recovering video.
+    pub fn recover_video_path_datagram_size(&mut self, datagram_bytes: usize) -> Option<u32> {
+        if !self.can_recover_video_path_datagram_size(datagram_bytes) {
+            return None;
+        }
+
+        // The preflight above proves this cannot fail for a valid protocol
+        // size. Change the pacer before dropping any media so a future pacer
+        // implementation cannot leave the session half-recovered after a
+        // rejected size update.
+        if !self.pacer.set_datagram_size(datagram_bytes) {
+            return None;
+        }
+        let dropped = self
+            .send
+            .get_mut(VIDEO_CHANNEL as usize)
+            .and_then(Option::as_mut)
+            .map_or(0, SendRing::discard_pending);
+        let body = datagram_bytes.saturating_sub(ENVELOPE_LEN + packet::HEADER_LEN);
+        for ring in self.send.iter_mut().flatten() {
+            let changed = ring.set_fragment_capacity(body);
+            debug_assert!(changed);
+        }
+        self.path_datagram_size = datagram_bytes;
+        Some(dropped)
+    }
+
     /// Apply the currently confirmed size from a DPLPMTUD controller.
     pub fn apply_path_mtu(&mut self, mtu: &crate::pmtu::PathMtu) -> bool {
         if mtu.state() == crate::pmtu::PathMtuState::Error {
@@ -379,6 +450,39 @@ impl<'a> Session<'a> {
     /// Current datagram size used by packetization and pacing.
     pub fn path_datagram_size(&self) -> usize {
         self.path_datagram_size
+    }
+
+    /// Whether any control feedback is waiting to leave the session.
+    ///
+    /// Group acknowledgements and exact PMTU acknowledgements are both
+    /// latency-critical feedback. The endpoint uses this read-only predicate
+    /// before reserving an upward PMTU probe, so a probe can never jump ahead
+    /// of an ACK that would release the peer's send window.
+    pub fn feedback_pending(&self) -> bool {
+        self.ack_due || self.pending_probe_ack.is_some()
+    }
+
+    /// Whether a probe acknowledgement is waiting to be emitted. Endpoint
+    /// scheduling uses this to keep probe feedback ahead of a new upward probe.
+    pub fn probe_ack_pending(&self) -> bool {
+        self.pending_probe_ack.is_some()
+    }
+
+    /// Restart the delivery watchdog after a path has been reduced to BASE.
+    ///
+    /// A PMTU black-hole recovery deliberately keeps reliable control fragments
+    /// in their existing sequence space. They therefore need a fresh timeout
+    /// window to retransmit at the recovered size; otherwise the host can call
+    /// recovery a second time before the BASE path has had a chance to prove it
+    /// works, and mistake that expected retry period for a second failure.
+    pub fn reset_delivery_watchdog(&mut self, now_ms: f64) {
+        if !now_ms.is_finite() {
+            return;
+        }
+        self.last_progress_ms = now_ms;
+        for entry in &mut self.delivery {
+            entry.since_ms = now_ms;
+        }
     }
 
     /// Emit one exact-size authenticated path-MTU probe returned by
@@ -1308,6 +1412,127 @@ mod tests {
         session.send_message(VIDEO, &[], &[0x5A; 1300]).unwrap();
         assert!(!session.set_path_datagram_size(crate::DEFAULT_DATAGRAM));
         assert_eq!(session.path_datagram_size(), 1400);
+    }
+
+    #[test]
+    fn video_path_recovery_discards_old_fragments_and_keeps_sequence_space() {
+        const STORAGE_BODY: usize = crate::MAX_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        const ACTIVE_BODY: usize =
+            crate::DEFAULT_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        let mut bodies = std::vec![0u8; STORAGE_BODY * 8];
+        let mut meta = std::vec![SendSlot::default(); 8];
+        let envelope = Envelope::from_key(&KEY).unwrap();
+        let mut session = Session::with_direction(envelope, Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new_with_capacity(
+                    &mut bodies,
+                    &mut meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    VIDEO,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(session.set_path_datagram_size(1400));
+        session.send_message(VIDEO, &[], &[0x5A; 1300]).unwrap();
+        let before = session.send_pressure(VIDEO).unwrap();
+        assert_eq!(before.0, 1);
+
+        assert!(session.can_recover_video_path_datagram_size(crate::DEFAULT_DATAGRAM));
+        assert_eq!(
+            session.recover_video_path_datagram_size(crate::DEFAULT_DATAGRAM),
+            Some(1)
+        );
+        assert_eq!(session.path_datagram_size(), crate::DEFAULT_DATAGRAM);
+        assert_eq!(session.send_pressure(VIDEO).unwrap().0, 0);
+
+        // The next message is assigned after the abandoned sequence rather
+        // than reusing it, so delayed old packets cannot alias new media.
+        session.send_message(VIDEO, &[], b"fresh").unwrap();
+        assert_eq!(session.send_pressure(VIDEO).unwrap().0, 1);
+    }
+
+    #[test]
+    fn path_recovery_does_not_discard_an_oversized_reliable_control_message() {
+        const STORAGE_BODY: usize = crate::MAX_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        const ACTIVE_BODY: usize =
+            crate::DEFAULT_DATAGRAM - ENVELOPE_LEN - crate::packet::HEADER_LEN;
+        let mut video_bodies = std::vec![0u8; STORAGE_BODY * 8];
+        let mut video_meta = std::vec![SendSlot::default(); 8];
+        let mut control_bodies = std::vec![0u8; STORAGE_BODY * 8];
+        let mut control_meta = std::vec![SendSlot::default(); 8];
+        let envelope = Envelope::from_key(&KEY).unwrap();
+        let mut session = Session::with_direction(envelope, Direction::Host, 1, 0.0);
+        session
+            .attach_send(
+                VIDEO,
+                SendRing::new_with_capacity(
+                    &mut video_bodies,
+                    &mut video_meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    VIDEO,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        session
+            .attach_send(
+                crate::control::CONTROL_CHANNEL,
+                SendRing::new_with_capacity(
+                    &mut control_bodies,
+                    &mut control_meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    crate::control::CONTROL_CHANNEL,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(session.set_path_datagram_size(1400));
+        session
+            .send_message(crate::control::CONTROL_CHANNEL, &[], &[0xC3; 1300])
+            .unwrap();
+        session.send_message(VIDEO, &[], b"video").unwrap();
+
+        assert!(!session.can_recover_video_path_datagram_size(crate::DEFAULT_DATAGRAM));
+        assert_eq!(
+            session.recover_video_path_datagram_size(crate::DEFAULT_DATAGRAM),
+            None
+        );
+        assert_eq!(session.path_datagram_size(), 1400);
+        assert_eq!(session.send_pressure(VIDEO).unwrap().0, 1);
+        assert_eq!(
+            session
+                .send_pressure(crate::control::CONTROL_CHANNEL)
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    #[test]
+    fn delivery_watchdog_restarts_after_base_path_recovery() {
+        let mut arena = Arena::new();
+        let mut session = endpoint_pair(&mut arena, 0.0, true);
+        session
+            .send_message(CONTROL, &[], b"reliable-control")
+            .unwrap();
+        discard(&mut session, 0.0);
+
+        let stalled_at = DELIVERY_DEADLINE_MS + 1.0;
+        session.poll(stalled_at);
+        assert_eq!(session.health(stalled_at), Health::Undeliverable);
+
+        session.reset_delivery_watchdog(stalled_at);
+        assert_eq!(session.health(stalled_at), Health::Alive);
+        assert_eq!(
+            session.health(stalled_at + DELIVERY_DEADLINE_MS - 1.0),
+            Health::Alive
+        );
     }
 
     /// The acknowledgement path closes the loop: the sender's window must free

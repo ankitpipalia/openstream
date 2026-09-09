@@ -13,7 +13,8 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-use lowlat_core::endpoint::Endpoint;
+use lowlat_core::endpoint::{Endpoint, PathMtuRecovery};
+use lowlat_core::pmtu::{Path, PathConfig};
 
 use crate::recv;
 use crate::send;
@@ -103,6 +104,11 @@ pub struct Shell<'a> {
     outbound: send::Batch,
     scratch: Box<[u8]>,
     stats: Stats,
+    /// Whether a caller explicitly configured PMTU or the automatic direct
+    /// path setup already ran. Keeping this separate from the endpoint's
+    /// optional controller prevents a narrow test ring or an invalid path from
+    /// causing a warning and configuration attempt on every turn.
+    path_mtu_attempted: bool,
 }
 
 impl<'a> Shell<'a> {
@@ -121,6 +127,7 @@ impl<'a> Shell<'a> {
             outbound: send::Batch::new(),
             scratch: vec![0u8; crate::socket::RECV_SLOT].into_boxed_slice(),
             stats: Stats::default(),
+            path_mtu_attempted: false,
         }
     }
 
@@ -142,6 +149,27 @@ impl<'a> Shell<'a> {
     /// Wake accounting so far.
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// Configure a path-specific DPLPMTUD controller.
+    ///
+    /// The endpoint may not have nominated a path yet; configuration is still
+    /// safe because probes remain suppressed until a destination exists. This
+    /// method is the hook for relay shells that know their TURN framing. Direct
+    /// callers can omit it and use the automatic route-aware configuration.
+    pub fn configure_path_mtu(&mut self, config: PathConfig, now_ms: f64) -> bool {
+        self.path_mtu_attempted = true;
+        self.endpoint.configure_path_mtu(config, now_ms)
+    }
+
+    /// Current PMTU controller, when configured.
+    pub fn path_mtu(&self) -> Option<&lowlat_core::pmtu::PathMtu> {
+        self.endpoint.path_mtu()
+    }
+
+    /// Apply the delivery-watchdog black-hole recovery policy.
+    pub fn recover_path_black_hole(&mut self, now_ms: f64) -> PathMtuRecovery {
+        self.endpoint.recover_path_black_hole(now_ms)
     }
 
     /// One pass of the loop.
@@ -181,6 +209,7 @@ impl<'a> Shell<'a> {
             0
         };
         self.endpoint.poll(now_ms);
+        self.ensure_path_mtu(now_ms);
         let sent = self.drain(now_ms)?;
 
         let woke = if received > 0 {
@@ -201,6 +230,35 @@ impl<'a> Shell<'a> {
             received,
             sent,
         })
+    }
+
+    /// Install the default direct-path controller once connectivity nominates
+    /// a destination. The route query is best effort and returns a conservative
+    /// 1500-byte outer ceiling when the kernel cannot provide one.
+    fn ensure_path_mtu(&mut self, now_ms: f64) {
+        if self.path_mtu_attempted {
+            return;
+        }
+        let Some(peer) = self.endpoint.path() else {
+            return;
+        };
+        let config = self.socket.path_config(peer, Path::Direct);
+        self.path_mtu_attempted = true;
+        if !self.endpoint.configure_path_mtu(config, now_ms) {
+            lowlat_common::log_warn!(
+                "net: unable to enable path MTU discovery, path continues at {} bytes",
+                lowlat_core::DEFAULT_DATAGRAM
+            );
+        } else {
+            lowlat_common::log_info!(
+                "net: path MTU discovery enabled peer={} outer_mtu={} max_datagram={}",
+                peer,
+                config.path_mtu,
+                self.endpoint
+                    .path_mtu()
+                    .map_or(lowlat_core::DEFAULT_DATAGRAM, |mtu| mtu.max_datagram_size())
+            );
+        }
     }
 
     /// Wait for either descriptor, or the deadline.
@@ -328,6 +386,12 @@ mod tests {
 
     const SLOT: usize = 256;
     const SLOTS: usize = 64;
+    const STORAGE_BODY: usize = lowlat_core::MAX_DATAGRAM
+        - lowlat_core::envelope::ENVELOPE_LEN
+        - lowlat_core::packet::HEADER_LEN;
+    const ACTIVE_BODY: usize = lowlat_core::DEFAULT_DATAGRAM
+        - lowlat_core::envelope::ENVELOPE_LEN
+        - lowlat_core::packet::HEADER_LEN;
     const KEY: [u8; 32] = [0x77u8; 32];
     const CHANNEL: u8 = 1;
 
@@ -344,6 +408,24 @@ mod tests {
                 recv_bodies: vec![0u8; SLOT * SLOTS],
                 recv_meta: vec![SlotMeta::default(); SLOTS],
                 send_bodies: vec![0u8; SLOT * SLOTS],
+                send_meta: vec![SendSlot::default(); SLOTS],
+            }
+        }
+    }
+
+    struct WideArena {
+        recv_bodies: Vec<u8>,
+        recv_meta: Vec<SlotMeta>,
+        send_bodies: Vec<u8>,
+        send_meta: Vec<SendSlot>,
+    }
+
+    impl WideArena {
+        fn new() -> Self {
+            Self {
+                recv_bodies: vec![0u8; STORAGE_BODY * SLOTS],
+                recv_meta: vec![SlotMeta::default(); SLOTS],
+                send_bodies: vec![0u8; STORAGE_BODY * SLOTS],
                 send_meta: vec![SendSlot::default(); SLOTS],
             }
         }
@@ -408,6 +490,51 @@ mod tests {
         )
     }
 
+    fn wide_shell_directed<'a>(
+        arena: &'a mut WideArena,
+        ours: (&'a str, &'a str),
+        theirs: (&'a str, &'a str),
+        seed: u8,
+        direction: Direction,
+    ) -> Shell<'a> {
+        let conn = Conn::new(
+            Credentials {
+                local_ufrag: ours.0,
+                local_pwd: ours.1,
+                remote_ufrag: theirs.0,
+                remote_pwd: theirs.1,
+            },
+            [seed; 16],
+            0.0,
+        );
+        let mut session =
+            Session::with_direction(Envelope::from_key(&KEY).unwrap(), direction, 1, 0.0);
+        session
+            .attach_recv(
+                CHANNEL,
+                RecvRing::new(&mut arena.recv_bodies, &mut arena.recv_meta, STORAGE_BODY).unwrap(),
+            )
+            .unwrap();
+        session
+            .attach_send(
+                CHANNEL,
+                SendRing::new_with_capacity(
+                    &mut arena.send_bodies,
+                    &mut arena.send_meta,
+                    STORAGE_BODY,
+                    ACTIVE_BODY,
+                    CHANNEL,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        Shell::new(
+            Socket::open(0).expect("socket"),
+            Wake::new().expect("wake"),
+            Endpoint::new(conn, session),
+        )
+    }
+
     fn loopback_of(shell: &Shell<'_>) -> SocketAddr {
         let mut addr = shell.socket().local_addr().expect("addr");
         addr.set_ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
@@ -467,6 +594,58 @@ mod tests {
             "right found no path"
         );
         assert_eq!(arrived.as_deref(), Some(&b"hdrbody"[..]));
+    }
+
+    /// The real socket shell owns the complete direct-path PMTU lifecycle. A
+    /// loopback connection is enough to prove that automatic route discovery,
+    /// exact-size probes, authenticated acknowledgements and packetization
+    /// adoption all occur without a caller manually driving the endpoint.
+    #[test]
+    fn real_shells_complete_direct_path_mtu_discovery() {
+        let mut left_arena = WideArena::new();
+        let mut right_arena = WideArena::new();
+        let mut left = wide_shell_directed(&mut left_arena, LEFT, RIGHT, 0xA1, Direction::Host);
+        let mut right = wide_shell_directed(&mut right_arena, RIGHT, LEFT, 0xB2, Direction::Guest);
+
+        let left_addr = loopback_of(&left);
+        let right_addr = loopback_of(&right);
+        left.endpoint().conn().add_candidate(right_addr).unwrap();
+        right.endpoint().conn().add_candidate(left_addr).unwrap();
+
+        let mut now = 0.0;
+        while now < 4_000.0 {
+            left.turn(now, |_| {}).expect("left turn");
+            right.turn(now, |_| {}).expect("right turn");
+            let left_complete = left
+                .path_mtu()
+                .is_some_and(|mtu| mtu.state() == lowlat_core::pmtu::PathMtuState::SearchComplete);
+            let right_complete = right
+                .path_mtu()
+                .is_some_and(|mtu| mtu.state() == lowlat_core::pmtu::PathMtuState::SearchComplete);
+            if left.endpoint().path().is_some()
+                && right.endpoint().path().is_some()
+                && left_complete
+                && right_complete
+            {
+                break;
+            }
+            now += 10.0;
+        }
+
+        let left_size = {
+            let mtu = left.path_mtu().expect("left never configured PMTU");
+            assert_eq!(mtu.state(), lowlat_core::pmtu::PathMtuState::SearchComplete);
+            mtu.datagram_size()
+        };
+        let right_size = {
+            let mtu = right.path_mtu().expect("right never configured PMTU");
+            assert_eq!(mtu.state(), lowlat_core::pmtu::PathMtuState::SearchComplete);
+            mtu.datagram_size()
+        };
+        assert!(left_size > lowlat_core::DEFAULT_DATAGRAM);
+        assert!(right_size > lowlat_core::DEFAULT_DATAGRAM);
+        assert_eq!(left.endpoint().session().path_datagram_size(), left_size);
+        assert_eq!(right.endpoint().session().path_datagram_size(), right_size);
     }
 
     /// The wake gets the loop moving without waiting out the deadline, which is

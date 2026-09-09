@@ -41,6 +41,9 @@ jobs:
       - name: ASCII check
         run: python3 scripts/check-ascii.py
 
+      - name: Shell fixture syntax
+        run: bash -n scripts/netns-fixtures.sh
+
       - name: Format
         run: cargo fmt --all --check
 

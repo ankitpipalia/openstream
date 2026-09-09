@@ -189,6 +189,142 @@ run_pair() {
     wait "$b" 2>/dev/null
 }
 
+# file -> wait for a fixture process to publish a milestone.
+wait_for_file() {
+    local file=$1
+    local tries=0
+    while [[ ! -e $file && $tries -lt 1200 ]]; do
+        sleep 0.01
+        tries=$((tries + 1))
+    done
+    [[ -e $file ]]
+}
+
+# file pattern -> wait until a process has written a milestone line.
+wait_for_line() {
+    local file=$1 pattern=$2
+    local tries=0
+    while [[ $tries -lt 1200 ]]; do
+        if [[ -f $file ]] && grep -Eq "$pattern" "$file"; then
+            return 0
+        fi
+        sleep 0.01
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+# pid... -> stop a fixture pair without leaving a process holding a namespace
+# alive after a setup or assertion failure.
+stop_processes() {
+    local pid
+    for pid in "$@"; do
+        [[ -n $pid ]] || continue
+        kill "$pid" 2>/dev/null
+    done
+    for pid in "$@"; do
+        [[ -n $pid ]] || continue
+        wait "$pid" 2>/dev/null || true
+    done
+}
+
+# ns bind_addr candidate ready recover raise ready_again ufrag pwd peer_ufrag
+# peer_pwd seed session_role out
+start_mtu_peer() {
+    ip netns exec "$1" "$PEER" peer \
+        --bind "$2" \
+        --candidate "$3" \
+        --pmtu-ready "$4" \
+        --pmtu-recover "$5" \
+        --pmtu-raise "$6" \
+        --pmtu-ready-again "$7" \
+        --stream \
+        --local-ufrag "$8" --local-pwd "$9" \
+        --remote-ufrag "${10}" --remote-pwd "${11}" \
+        --seed "${12}" --session-role "${13}" \
+        --timeout-ms "$TIMEOUT_MS" $VERBOSE \
+        >"${14}" 2>&1 &
+}
+
+# A direct, two-namespace stream whose interface MTU changes while packets are
+# in flight. This is intentionally separate from the NAT matrix: it tests the
+# production Shell's live PMTU wiring and recovery policy, not candidate
+# discovery. The caller lowers and raises both links only after both endpoints
+# have completed their first upward search.
+topology_mtu_transition() {
+    mkns llha llhb || return 1
+    wire llha inta 192.168.30.1/30 llhb intb 192.168.30.2/30 || return 1
+    ip -n llha link set inta mtu 1500 || return 1
+    ip -n llhb link set intb mtu 1500 || return 1
+
+    start_mtu_peer llha 192.168.30.1:$LEFT_PORT 192.168.30.2:$RIGHT_PORT \
+        "$RUN/a.ready" "$RUN/a.recover" "$RUN/a.raise" "$RUN/a.ready-again" \
+        "$LEFT_UFRAG" "$LEFT_PWD" "$RIGHT_UFRAG" "$RIGHT_PWD" 161 host "$RUN/a.out"
+    local a=$!
+    start_mtu_peer llhb 192.168.30.2:$RIGHT_PORT 192.168.30.1:$LEFT_PORT \
+        "$RUN/b.ready" "$RUN/b.recover" "$RUN/b.raise" "$RUN/b.ready-again" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 guest "$RUN/b.out"
+    local b=$!
+
+    if ! wait_for_file "$RUN/a.ready" || ! wait_for_file "$RUN/b.ready"; then
+        log "  FAIL mtu-transition: initial PMTU search did not complete"
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    # Force the already-confirmed 1472-byte IPv4 datagrams above the new
+    # 1300-byte link MTU. The shell's send path observes EMSGSIZE as loss; the
+    # explicit recovery trigger models the delivery watchdog's decision after
+    # its deadline, which keeps this fixture fast and deterministic.
+    if ! ip -n llha link set inta mtu 1300 || ! ip -n llhb link set intb mtu 1300; then
+        stop_processes "$a" "$b"
+        return 1
+    fi
+    touch "$RUN/a.recover" "$RUN/b.recover"
+
+    if ! wait_for_line "$RUN/a.out" '^pmtu-recovered ' \
+        || ! wait_for_line "$RUN/b.out" '^pmtu-recovered '; then
+        log "  FAIL mtu-transition: black-hole recovery did not complete"
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    # Restore the link and ask each shell to start a fresh upward search. This
+    # verifies that a recovered BASE path is not a permanent downgrade.
+    if ! ip -n llha link set inta mtu 1500 || ! ip -n llhb link set intb mtu 1500; then
+        stop_processes "$a" "$b"
+        return 1
+    fi
+    touch "$RUN/a.raise" "$RUN/b.raise"
+
+    if ! wait_for_file "$RUN/a.ready-again" || ! wait_for_file "$RUN/b.ready-again"; then
+        log "  FAIL mtu-transition: upward re-probe did not complete"
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    local a_status=0 b_status=0
+    wait "$a" || a_status=$?
+    wait "$b" || b_status=$?
+    if [[ $a_status -ne 0 || $b_status -ne 0 ]] \
+        || ! grep -Eq '^pmtu-ready datagram=1472' "$RUN/a.out" \
+        || ! grep -Eq '^pmtu-ready datagram=1472' "$RUN/b.out" \
+        || ! grep -Eq '^pmtu-recovered old=1472 new=1229 ' "$RUN/a.out" \
+        || ! grep -Eq '^pmtu-recovered old=1472 new=1229 ' "$RUN/b.out" \
+        || ! grep -Eq '^pmtu-ready-again datagram=1472' "$RUN/a.out" \
+        || ! grep -Eq '^pmtu-ready-again datagram=1472' "$RUN/b.out" \
+        || ! grep -Eq '^stream sent=[1-9][0-9]* sent_after_recovery=[1-9][0-9]* received=[1-9][0-9]* after_recovery=[1-9][0-9]*' "$RUN/a.out" \
+        || ! grep -Eq '^stream sent=[1-9][0-9]* sent_after_recovery=[1-9][0-9]* received=[1-9][0-9]* after_recovery=[1-9][0-9]*' "$RUN/b.out"; then
+        log "  FAIL mtu-transition: endpoint output did not prove a surviving stream"
+        log "    left:  $(grep -E '^(established|pmtu-|stream )' "$RUN/a.out" | tr '\n' ' ')"
+        log "    right: $(grep -E '^(established|pmtu-|stream )' "$RUN/b.out" | tr '\n' ' ')"
+        return 1
+    fi
+
+    pass=$((pass + 1))
+    log "  PASS mtu-transition: live 1500 -> 1300 -> 1500 survived on both endpoints"
+}
+
 # name expected -> compare both outcomes against "established" or "failed"
 judge() {
     local name=$1 expected=$2
@@ -397,7 +533,7 @@ fi
 
 trap cleanup EXIT
 
-ALL="port-restricted full-cone restricted-cone symmetric carrier-grade hairpin"
+ALL="port-restricted full-cone restricted-cone symmetric carrier-grade hairpin mtu-transition"
 if [[ $# -gt 0 ]]; then
     topologies=("$@")
 else

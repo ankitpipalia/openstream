@@ -200,6 +200,32 @@ impl<'a> SendRing<'a> {
         true
     }
 
+    /// Abandon every queued fragment while preserving the sequence space.
+    ///
+    /// This is deliberately different from resetting the ring to sequence
+    /// zero. A path downgrade can make already-emitted media impossible to
+    /// retransmit at the new packet size, but reusing old sequence numbers
+    /// would make the peer confuse the replacement picture with stale data.
+    /// Advancing `base` to `next` releases the local window while the receiver
+    /// can use its media-resynchronisation policy to skip the abandoned gap.
+    ///
+    /// The caller must use this only for a channel whose application protocol
+    /// permits loss (currently the video channel). Reliable control must be
+    /// preflighted and left untouched when it cannot be represented after a
+    /// path change.
+    pub fn discard_pending(&mut self) -> u32 {
+        let dropped = self.in_flight();
+        for slot in self.meta.iter_mut() {
+            *slot = SendSlot::default();
+        }
+        self.base = self.next;
+        self.cursor = self.next;
+        self.nack_below = None;
+        self.outstanding = 0;
+        self.stale = 0;
+        dropped
+    }
+
     /// Fragments the peer has not acknowledged.
     pub fn in_flight(&self) -> u32 {
         self.next.wrapping_sub(self.base)
@@ -701,6 +727,28 @@ mod tests {
         assert!(!ring.can_set_fragment_capacity(ACTIVE));
         assert!(!ring.set_fragment_capacity(ACTIVE));
         assert_eq!(ring.fragment_capacity(), 48);
+    }
+
+    #[test]
+    fn discard_pending_releases_window_without_reusing_sequence_numbers() {
+        let mut storage = Storage::new();
+        let mut ring = storage.ring();
+        let message = Message::new(&[], b"pending").unwrap();
+        let first = ring.enqueue(&message).unwrap();
+        assert_eq!(first, 1);
+        let next_before = ring.next_sequence();
+        assert_eq!(ring.in_flight(), 1);
+
+        let dropped = ring.discard_pending();
+
+        assert_eq!(dropped, 1);
+        assert_eq!(ring.in_flight(), 0);
+        assert_eq!(ring.next_sequence(), next_before);
+        assert_eq!(ring.window_free(), SLOTS);
+
+        let second = ring.enqueue(&message).unwrap();
+        assert_eq!(second, 1);
+        assert_eq!(ring.next_sequence(), next_before + second);
     }
 
     #[test]

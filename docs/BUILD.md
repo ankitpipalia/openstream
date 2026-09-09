@@ -9,6 +9,7 @@ cargo test --workspace --locked
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
+bash -n scripts/netns-fixtures.sh
 ```
 
 The parser fuzz package is intentionally excluded from the normal workspace
@@ -133,6 +134,23 @@ The GitHub Actions smoke job repeats the full-ICE loopback, runs a three-second
 encrypted FFmpeg test-pattern loopback, and executes the host-checkable mobile
 acceptance harness. These checks are deliberately separate from physical GPU,
 capture-device, TURN/public-NAT, and mobile-device acceptance.
+
+The direct lowlat shell also has an opt-in Linux namespace test for live PMTU
+recovery. Build the fixture endpoints, then run:
+
+```sh
+cd engine/lowlat
+CARGO_TARGET_DIR=/tmp/lowlat-target cargo build --locked --release \
+  -p lowlat-sim --bin punch --bin shell-punch
+sudo PUNCH=/tmp/lowlat-target/release/punch \
+  PEER=/tmp/lowlat-target/release/shell-punch \
+  scripts/netns-fixtures.sh mtu-transition
+```
+
+It changes a real veth path from MTU 1500 to 1300 and back and requires both
+endpoints to discover `1472`, recover to the 1229-byte floor, deliver new
+messages after the downgrade, and discover `1472` again. It is skipped when
+Linux namespaces or root privileges are unavailable.
 
 The application-owned relay was then exercised with
 `OPENSTREAM_FORCE_RELAY=1`. The pairing response advertised the relay,
