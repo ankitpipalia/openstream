@@ -3,6 +3,7 @@
 .idea/
 .vscode/
 .commandcode/
+.worktrees/
 
 # Rust/Cargo build output
 **/target/
