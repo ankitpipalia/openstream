@@ -345,6 +345,7 @@ jobs:
           -w /workspace/engine/lowlat
           docker.io/library/rust:1.85.0-alpine3.21@sha256:715f7a1b6b3a538f7b55c0be7db7e5bb0461fe9ea1d0004a481ab0c5d59542ad
           /workspace/engine/lowlat/scripts/alpine-musl-ci.sh
+        working-directory: .
 
   ci-gate:
     name: CI gate
