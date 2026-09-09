@@ -113,6 +113,16 @@ and no unbounded memory growth.
 - [x] Independent expired-session reaper, WebSocket close notification, and
   graceful HTTP/relay shutdown on SIGTERM or Ctrl-C.
 
+- [x] Shared generation-aware `PeerPath` lifecycle for the portable session,
+  with one cipher/replay state across a two-phase host-authoritative
+  direct↔opaque-relay migration, bounded old-path drain, relay unregister
+  cleanup, and frame-ACK continuity. The live three-generation acceptance is
+  `scripts/path-migration-smoke.sh`.
+- [x] Truthful ICE migration capability boundary: `webrtc-ice 0.17.2`
+  reports `UnsupportedIceRestart` instead of reconnecting or pretending that
+  TURN migration passed. `scripts/ice-migration-capability.sh` is the
+  host-checkable evidence.
+
 Gate: two local processes connect through loopback, LAN, the application relay,
 and configured full ICE; tokens are never accepted after expiry or revocation.
 The remaining connectivity gate is an external coturn deployment plus a
@@ -320,8 +330,18 @@ without changing the default OpenStream wire format.
 - [x] Add channel-aware black-hole recovery: preserve reliable control, discard
   only queued video, restart the delivery watchdog, request a fresh host IDR,
   and cover a real-socket namespace transition from MTU 1500 to 1300 and back.
-- [ ] Add a common packet-telemetry adapter for the portable `PeerSession` /
-  FFmpeg path so it uses the same delivery estimator as the native lowlat host.
+- [x] Add a common packet-telemetry boundary for the portable `PeerSession` /
+  FFmpeg path: generation-scoped `PeerTransportSnapshot` values feed a
+  reusable `PeerTelemetryAdapter`, while local packet rates remain diagnostic
+  and encoder decisions remain grounded in end-to-end `FrameAck` evidence.
+- [x] Add the host-authoritative direct↔opaque-relay↔direct path migration
+  choreography, versioned path-control messages, idempotent commit/ACK
+  handling, replay-window/reliable-control recovery tests, and the live
+  three-generation acceptance harness. ICE/TURN replacement remains the typed
+  unsupported boundary above.
+- [x] Add the automatic `Health::Undeliverable` PMTU-watchdog fixture and make
+  the pinned Alpine/musl ABI validation a required `CI gate` input. The
+  privileged Apple Linux run is documented separately from host-only CI.
 - [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →
   VideoToolbox capture/encode, with live VideoToolbox bitrate updates.
 - [ ] Add native Windows capture/encode and decoder-surface presentation;

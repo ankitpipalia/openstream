@@ -28,6 +28,44 @@ connectivity gate; entries marked "not yet run" are honest gaps, not claims.
 | CGNAT (shared address space) | CGNAT, same provider | Direct only with opt-in shared-space candidates | Not yet run |
 | Any | Any, UDP blocked | TURN/TCP or failure with typed outcome | Not yet run (UDP-only relay at present) |
 
+## OpenStream-owned path migration
+
+Direct and the application-owned opaque relay are separate OpenStream path
+generations. The host prepares and authenticates the replacement, commits it
+with `PATH_COMMIT`/`PATH_COMMIT_ACK`, keeps the old path receive-only for a
+bounded drain, and preserves one cipher/replay domain and end-to-end frame
+identity. The acceptance harness proves the complete sequence:
+
+```sh
+./scripts/path-migration-smoke.sh
+```
+
+Expected evidence is one session surviving:
+
+```text
+generation 1: direct_udp
+generation 2: opaque_relay
+generation 3: direct_udp
+```
+
+The harness also verifies frame acknowledgements across all three generations
+and relay unregister cleanup. It does not prove TURN migration, public-NAT
+reachability, or stock Parsec compatibility.
+
+ICE/TURN migration is a separate capability boundary. With the repository's
+current `webrtc-ice 0.17.2` dependency, the supported result is the typed
+`UnsupportedIceRestart` outcome; no new cipher/session is created and the
+active ICE path remains unchanged:
+
+```sh
+./scripts/ice-migration-capability.sh
+```
+
+This loopback check proves truthful capability reporting only. A future ICE
+implementation may replace the result after it can satisfy the same
+prepare/prove/commit/rollback contract. Until then, external coturn remains
+an unverified connectivity and migration gate.
+
 ## External coturn interoperability
 
 1. Install coturn and copy `deploy/turnserver.conf.example`, replacing
