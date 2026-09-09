@@ -23,5 +23,8 @@ url.workspace = true
 webrtc-ice.workspace = true
 webrtc-util.workspace = true
 
+[dev-dependencies]
+openstream-media = { path = "../media" }
+
 [lints]
 workspace = true

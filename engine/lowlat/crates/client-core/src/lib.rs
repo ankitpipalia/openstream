@@ -17,7 +17,9 @@ use openstream_protocol::relay::Role as RelayRole;
 use openstream_protocol::{
     IdentityError, IdentityKey, KeyExchange, Kind, MAX_DATAGRAM, Packet, Session as CipherSession,
 };
-use openstream_transport::{PathGeneration, PeerTransportSnapshot, TransportSample, UdpTransport};
+use openstream_transport::{
+    PathGeneration, PathState, PeerTransportSnapshot, TransportSample, UdpTransport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -1179,42 +1181,59 @@ async fn receive_backend(
 
 struct DrainingPath {
     incoming: mpsc::Receiver<(PathSlot, Vec<u8>)>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for DrainingPath {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 impl DrainingPath {
     fn new(old: PeerPath, deadline: Instant) -> Self {
         let (outgoing, incoming) = mpsc::channel(32);
-        // This task owns the old socket, so its lifetime ends on time even
-        // when the application's receive loop is idle or cancelled.
-        let task = tokio::spawn(async move {
-            let mut datagram = [0; MAX_DATAGRAM];
-            let PeerPathBackend::Direct { transport, .. } = old.backend() else {
-                return;
+        let (generation, backend) = old.into_backend();
+        // This task owns the old socket and relay cleanup guard, so both the
+        // receive-only lifetime and remote registration cleanup remain finite
+        // even when the application's receive loop is idle or cancelled.
+        tokio::spawn(async move {
+            let (transport, relay_registration) = match backend {
+                PeerPathBackend::Direct {
+                    transport,
+                    relay_registration,
+                    ..
+                } => (Some(transport), relay_registration),
+                PeerPathBackend::Ice(_) => (None, None),
             };
-            loop {
-                let result = tokio::time::timeout_at(
-                    TokioInstant::from_std(deadline),
-                    transport.recv_sealed(&mut datagram),
-                )
-                .await;
-                let Ok(Ok(length)) = result else {
-                    break;
-                };
-                let _ =
-                    outgoing.try_send((PathSlot(old.generation()), datagram[..length].to_vec()));
+            if let Some(transport) = transport {
+                let mut datagram = [0; MAX_DATAGRAM];
+                loop {
+                    let result = tokio::time::timeout_at(
+                        TokioInstant::from_std(deadline),
+                        transport.recv_sealed(&mut datagram),
+                    )
+                    .await;
+                    let Ok(Ok(length)) = result else {
+                        break;
+                    };
+                    if outgoing
+                        .try_send((PathSlot(generation), datagram[..length].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
-            // Drop releases this socket and its local relay registration
-            // once. The current relay wire protocol has no unregister verb;
-            // its server-side slot expires under the existing relay lease.
+            if let Some(relay_registration) = relay_registration {
+                let _ = relay_registration.unregister().await;
+            }
         });
-        Self { incoming, task }
+        Self { incoming }
+    }
+}
+
+async fn cleanup_peer_path(path: PeerPath) {
+    let (_generation, backend) = path.into_backend();
+    if let PeerPathBackend::Direct {
+        relay_registration: Some(relay_registration),
+        ..
+    } = backend
+    {
+        let _ = relay_registration.unregister().await;
     }
 }
 
@@ -1529,7 +1548,9 @@ impl PeerSession {
                 }
                 MigrationAction::Discard => {
                     self.opening = None;
-                    self.path.prepared = None;
+                    if let Some(prepared) = self.path.prepared.take() {
+                        cleanup_peer_path(prepared).await;
+                    }
                 }
             }
         }
@@ -1610,13 +1631,18 @@ impl PeerSession {
                     } else {
                         CandidateKind::Host
                     },
+                    relay_registration: None,
                 },
                 opening.generation,
                 Instant::now(),
             ));
         }
         let opening = self.opening.as_mut().expect("opening work");
-        let PeerPathBackend::Direct { transport, .. } = self
+        let PeerPathBackend::Direct {
+            transport,
+            relay_registration,
+            ..
+        } = self
             .path
             .prepared
             .as_mut()
@@ -1662,17 +1688,19 @@ impl PeerSession {
                 Role::Host => RelayRole::Host,
                 Role::Client => RelayRole::Client,
             };
-            transport
-                .register_relay(
-                    &config.session_id,
-                    role,
-                    &config
-                        .relay_ticket
-                        .as_ref()
-                        .ok_or(PathMigrationError::PathUnavailable)?
-                        .0,
-                )
-                .await?;
+            let ticket = &config
+                .relay_ticket
+                .as_ref()
+                .ok_or(PathMigrationError::PathUnavailable)?
+                .0;
+            let cleanup_guard = transport.relay_registration(&config.session_id, role, ticket)?;
+            let registration_result = transport
+                .register_relay(&config.session_id, role, ticket)
+                .await;
+            // Install the guard before propagating a registration error: the
+            // relay may have accepted the request even when its ACK was lost.
+            *relay_registration = Some(cleanup_guard);
+            registration_result?;
         }
         opening.connected = true;
         let actions = self.migration.opened(Instant::now());
@@ -2188,7 +2216,7 @@ impl PeerSession {
             if transport.connect(candidate.address).await.is_err() {
                 continue;
             }
-            if candidate.kind == CandidateKind::Relay {
+            let relay_registration = if candidate.kind == CandidateKind::Relay {
                 let relay_role = match role {
                     Role::Host => RelayRole::Host,
                     Role::Client => RelayRole::Client,
@@ -2196,16 +2224,25 @@ impl PeerSession {
                 let Some(ticket) = pairing.relay_ticket(role) else {
                     continue;
                 };
-                transport
+                let cleanup_guard =
+                    transport.relay_registration(&pairing.session_id, relay_role, ticket)?;
+                let registration_result = transport
                     .register_relay(&pairing.session_id, relay_role, ticket)
-                    .await?;
-            }
+                    .await;
+                // On an error the guard drops on this scope and schedules an
+                // unregister for a registration whose ACK may have been lost.
+                registration_result?;
+                Some(cleanup_guard)
+            } else {
+                None
+            };
             // One cipher across all candidates: counters stay monotonic per
             // direction, so delayed probes from a failed candidate can never
             // collide with or pollute the winning path's counters.
             let path = PeerPathBackend::Direct {
                 transport: Box::new(transport),
                 candidate: candidate.kind,
+                relay_registration,
             };
             if let ProbeResult::Established(prefetched) = path.probe(&mut cipher).await {
                 let now = Instant::now();
@@ -2295,6 +2332,31 @@ impl PeerSession {
         Ok(())
     }
 
+    /// Stop this session and perform bounded relay cleanup for every path it
+    /// still owns. The transport guards also schedule best-effort cleanup when
+    /// the session is dropped without an explicit close, but callers that can
+    /// await shutdown should use this method so the relay slot is released
+    /// immediately rather than waiting for its idle lease.
+    pub async fn close(&mut self) -> Result<(), Error> {
+        self.opening = None;
+        self.migration_inbox.clear();
+        if let Some(prepared) = self.path.prepared.take() {
+            cleanup_peer_path(prepared).await;
+        }
+        let active_registration = match self.path.active_mut().backend_mut() {
+            PeerPathBackend::Direct {
+                relay_registration, ..
+            } => relay_registration.take(),
+            PeerPathBackend::Ice(_) => None,
+        };
+        if let Some(active_registration) = active_registration {
+            let _ = active_registration.unregister().await;
+        }
+        self.draining.take();
+        self.path.close_all();
+        Ok(())
+    }
+
     /// Send an authenticated liveness packet for a direct UDP path when the
     /// caller's event loop reaches the keepalive interval. Full ICE already
     /// owns consent freshness, so this is intentionally a no-op there.
@@ -2329,6 +2391,9 @@ impl PeerSession {
         flags: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
+        if self.path.active().state() == PathState::Closed {
+            return Err(PathMigrationError::PathUnavailable.into());
+        }
         let slot = self.migration.application_slot()?;
         self.send_sealed_on(slot, kind, channel, flags, payload, true)
             .await
@@ -3000,6 +3065,7 @@ mod tests {
                 PeerPathBackend::Direct {
                     transport: Box::new(transport),
                     candidate: CandidateKind::Host,
+                    relay_registration: None,
                 },
                 now,
             ),

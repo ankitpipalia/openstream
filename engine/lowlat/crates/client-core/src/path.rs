@@ -5,7 +5,7 @@ use openstream_protocol::path_control::{AbortReason, PATH_TOKEN_BYTES, PathContr
 
 use openstream_transport::{
     FIRST_PATH_GENERATION, PathGeneration, PathMtuState, PathState, PeerTransportSnapshot,
-    TransportPathKind, UdpTransport,
+    RelayRegistration, TransportPathKind, UdpTransport,
 };
 
 use crate::{CandidateKind, IcePath, Role};
@@ -486,7 +486,10 @@ impl MigrationController {
             || self.state == MigrationState::CommitUnconfirmed
         {
             self.state = MigrationState::CommitUnconfirmed;
-            return vec![];
+            // The old path must never be resumed after the responder may have
+            // committed. The prepared socket is therefore failed closed; the
+            // session remains unusable until its owner tears it down.
+            return vec![MigrationAction::Discard];
         }
         let Some(pending) = self.pending.take() else {
             return vec![];
@@ -614,6 +617,10 @@ impl PeerPath {
         &mut self.backend
     }
 
+    pub(crate) fn into_backend(self) -> (PathGeneration, PeerPathBackend) {
+        (self.generation, self.backend)
+    }
+
     pub(crate) fn generation(&self) -> PathGeneration {
         self.generation
     }
@@ -662,6 +669,7 @@ pub(crate) enum PeerPathBackend {
     Direct {
         transport: Box<UdpTransport>,
         candidate: CandidateKind,
+        relay_registration: Option<RelayRegistration>,
     },
     Ice(IcePath),
 }
@@ -1290,6 +1298,7 @@ mod tests {
                     .expect("bind transport"),
             ),
             candidate: CandidateKind::Host,
+            relay_registration: None,
         }
     }
 

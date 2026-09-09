@@ -8,7 +8,8 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use openstream_protocol::relay::{self, Role as RelayRole};
 use openstream_protocol::{Error as ProtocolError, Kind, MAX_DATAGRAM, Packet, Session};
@@ -191,17 +192,76 @@ impl From<upnp::Error> for Error {
 /// A connected UDP socket carrying authenticated OpenStream packets.
 #[derive(Debug)]
 pub struct UdpTransport {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     peer: Option<SocketAddr>,
     upnp_mapping: Option<UpnpMapping>,
     telemetry: TransportTelemetry,
+}
+
+/// One role-scoped relay registration tied to a socket. The ticket is kept
+/// private and redacted from diagnostics. Explicitly awaiting [`unregister`]
+/// is preferred; dropping the guard in a live Tokio runtime schedules the same
+/// bounded cleanup as a best-effort fallback.
+pub struct RelayRegistration {
+    socket: Arc<UdpSocket>,
+    session_id: String,
+    role: RelayRole,
+    ticket: String,
+    cleaned: AtomicBool,
+}
+
+impl core::fmt::Debug for RelayRegistration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RelayRegistration")
+            .field("session_id", &self.session_id)
+            .field("role", &self.role)
+            .field("ticket", &"[redacted]")
+            .field("cleaned", &self.cleaned.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl RelayRegistration {
+    /// Unregister at most once. A stale or duplicate request is still
+    /// acknowledged by the server, so cleanup remains idempotent end-to-end.
+    pub async fn unregister(&self) -> Result<usize, Error> {
+        if self.cleaned.swap(true, Ordering::AcqRel) {
+            return Ok(0);
+        }
+        UdpTransport::unregister_relay_socket(
+            &self.socket,
+            &self.session_id,
+            self.role,
+            &self.ticket,
+        )
+        .await
+    }
+}
+
+impl Drop for RelayRegistration {
+    fn drop(&mut self) {
+        if self.cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let socket = Arc::clone(&self.socket);
+        let session_id = self.session_id.clone();
+        let role = self.role;
+        let ticket = self.ticket.clone();
+        handle.spawn(async move {
+            let _ =
+                UdpTransport::unregister_relay_socket(&socket, &session_id, role, &ticket).await;
+        });
+    }
 }
 
 impl UdpTransport {
     /// Bind one local UDP socket. Port `0` asks the OS to choose a free port.
     pub async fn bind(local: SocketAddr) -> Result<Self, Error> {
         Ok(Self {
-            socket: UdpSocket::bind(local).await?,
+            socket: Arc::new(UdpSocket::bind(local).await?),
             peer: None,
             upnp_mapping: None,
             telemetry: TransportTelemetry::new(),
@@ -349,9 +409,43 @@ impl UdpTransport {
         role: RelayRole,
         ticket: &str,
     ) -> Result<usize, Error> {
+        let registration = self.relay_registration(session_id, role, ticket)?;
+        registration.unregister().await
+    }
+
+    /// Create a one-shot cleanup guard for a relay registration owned by this
+    /// connected socket. The guard can be awaited explicitly; dropping it in a
+    /// Tokio runtime schedules a best-effort unregister if the caller did not.
+    /// Its atomic state makes explicit cleanup and drop cleanup mutually
+    /// exclusive.
+    pub fn relay_registration(
+        &self,
+        session_id: &str,
+        role: RelayRole,
+        ticket: &str,
+    ) -> Result<RelayRegistration, Error> {
         if self.peer.is_none() {
             return Err(Error::NotConnected);
         }
+        let _ = relay::encode_unregister(session_id, role, ticket)?;
+        Ok(RelayRegistration {
+            socket: Arc::clone(&self.socket),
+            session_id: session_id.to_owned(),
+            role,
+            ticket: ticket.to_owned(),
+            cleaned: AtomicBool::new(false),
+        })
+    }
+
+    /// Send one unregister record with bounded retries. This is kept as a
+    /// helper so the explicit API and the cleanup guard use identical wire
+    /// behavior.
+    async fn unregister_relay_socket(
+        socket: &UdpSocket,
+        session_id: &str,
+        role: RelayRole,
+        ticket: &str,
+    ) -> Result<usize, Error> {
         let request = relay::encode_unregister(session_id, role, ticket)?;
         let deadline = Instant::now() + Duration::from_millis(750);
         let mut acknowledgement = [0_u8; 5];
@@ -361,10 +455,10 @@ impl UdpTransport {
             if now >= deadline {
                 return Err(Error::Timeout);
             }
-            sent_bytes = sent_bytes.saturating_add(self.socket.send(&request).await?);
+            sent_bytes = sent_bytes.saturating_add(socket.send(&request).await?);
             let remaining = deadline.saturating_duration_since(now);
             let wait = remaining.min(Duration::from_millis(75));
-            match timeout(wait, self.socket.recv(&mut acknowledgement)).await {
+            match timeout(wait, socket.recv(&mut acknowledgement)).await {
                 Ok(Ok(length)) if relay::is_unregister_ack(&acknowledgement[..length], role) => {
                     return Ok(sent_bytes);
                 }
