@@ -1,6 +1,6 @@
 # Shared Path Controller and Portable Telemetry Design
 
-**Status:** approved for implementation on 2026-09-09.
+**Status:** approved for implementation planning on 2026-09-09; review revisions incorporated.
 
 **Goal:** Add a reusable transport-path lifecycle to `PeerSession`, generation-safe telemetry for the portable FFmpeg path, real automatic PMTU watchdog coverage, and a pinned musl validation gate without changing the existing lowlat wire protocol or upgrading `webrtc-ice`.
 
@@ -90,17 +90,74 @@ If preparation fails, the active path and its path-local state remain unchanged.
 
 The implementation must use a finite rollback/drain deadline derived from the active path's bounded RTT estimate, clamped to explicit minimum and maximum values. There is no indefinite dual-send mode.
 
+### Distributed commit and idempotence
+
+Version 1 gives migration authority to the host. The client may request a
+migration, but it never allocates a path generation or sends `PATH_PREPARE` on
+its own. This removes simultaneous-migration glare from the first protocol
+version.
+
+The commit message direction and commit points are fixed:
+
+1. The host sends `PATH_PREPARE` on the currently active path. Both endpoints
+   prepare and authenticate the replacement; `PATH_READY` responses travel on
+   the currently active path so the existing path remains the coordination
+   channel.
+2. After both `PATH_READY` responses are valid, the host sends `PATH_COMMIT`
+   on the still-active old path. The message names the next generation and the
+   bounded replacement token. The host does not send application data while
+   this commit is pending.
+3. The client validates the commit, records generation N+1 as committed, makes
+   the replacement its send path, changes the old path to receive-only, and
+   sends `PATH_COMMIT_ACK` on the replacement path. The responder's durable
+   commit point is the state transition before this acknowledgement is sent.
+4. The host accepts the acknowledgement only when it arrives authenticated on
+   the replacement path and names the exact pending generation/token. It then
+   makes N+1 active, changes the old path to draining, and resumes application
+   sends on the replacement.
+
+`PATH_COMMIT` is retried on the old path while that path is usable. If the old
+path fails after the replacement is ready, the same idempotent commit may be
+retried on the prepared replacement path. The client accepts a duplicate
+commit for the same generation/token on either of those two paths and repeats
+the acknowledgement on the replacement. A duplicate acknowledgement is
+harmless. A commit for an older generation, a different token, or a generation
+already retired is ignored or rejected without changing the active path.
+
+Loss of `PATH_COMMIT_ACK` alone must not make the host silently reactivate the
+old path: the client may already have committed N+1. The host remains in a
+bounded `CommitPending` state, retries the idempotent commit/ack exchange, and
+keeps both receive paths available for the bounded handoff window. If the
+commit cannot be confirmed before the absolute migration deadline, the result
+is a typed `CommitUnconfirmed` outcome; the implementation must not resume
+application sends on the old path while claiming the new path is active. A
+rollback is permitted only before the responder has accepted `PATH_COMMIT`.
+
+`PATH_ABORT` is sent on the old active path only while the attempt is still in
+`Preparing` or `Ready`. After a valid commit has been accepted, the protocol
+does not attempt an ambiguous rollback; it either obtains the idempotent
+acknowledgement or reports the typed terminal outcome. This is the deterministic
+rule that prevents split-brain path generations.
+
+The host serializes one migration attempt per session. A client request is a
+bounded, deduplicated `PATH_REQUEST` control message (or the equivalent
+authenticated signaling request); it asks the host to choose a replacement,
+but carries no generation authority or credential. While a request or host
+attempt is pending, duplicate requests coalesce and a second replacement is
+not allocated.
+
 ### Path state model
 
-The common lifecycle reports these states:
+The common lifecycle reports these states. `CommitPending` is an explicit
+coordination state between `Ready` and `Active`, not a second active path:
 
 ```text
-Preparing → Ready → Active → Draining → Retired
-             │                  │
-             └────── Failed ◄────┘
+Preparing → Ready → CommitPending → Active → Draining → Retired
+     │          │          │            │         │
+     └──────────┴──────────┴────────────┴─────────┴──→ Failed / Closed
 ```
 
-`Preparing`, `Ready`, `Active`, `Draining`, `Failed`, and `Retired` describe lifecycle state only. They do not dictate how a backend obtains a path.
+`Preparing`, `Ready`, `CommitPending`, `Active`, `Draining`, `Retired`, `Failed`, and `Closed` describe lifecycle state only. They do not dictate how a backend obtains a path.
 
 The common path snapshot contains:
 
@@ -151,6 +208,7 @@ The vocabulary is versioned and capability-gated. A peer that does not advertise
 The minimum messages are:
 
 ```text
+PATH_REQUEST   bounded client request, no generation authority
 PATH_PREPARE   generation, path kind, path token/identifier
 PATH_READY     generation, exact validated datagram size
 PATH_COMMIT    generation
@@ -161,6 +219,21 @@ PATH_ABORT     generation, typed reason
 Fields are bounded, reserved bits are rejected, and a message for a generation other than the current active or the one explicitly being prepared is ignored or rejected according to its phase. Tokens identify a candidate/path attempt but never contain bearer credentials or keys.
 
 The existing capability exchange gains an optional, default-false migration capability so older clients remain compatible. The default behavior remains unchanged until both peers advertise support and the caller requests a migration.
+
+### Simultaneous migration and glare
+
+The host is the sole generation allocator and migration initiator in version 1.
+The client can request a migration, report a failed path, or accept a host
+request, but it cannot create a competing replacement generation. If a client
+request is in flight when a host `PATH_PREPARE` arrives, the client cancels the
+request and joins the host attempt. If a duplicate host prepare arrives, the
+client replies with the same `PATH_READY` for the matching generation/token
+without allocating another path. A client never responds to a peer-generated
+client request with a second `PATH_PREPARE`.
+
+This role rule is deliberately narrower than a symmetric tie-break algorithm:
+it gives one endpoint ownership of generation ordering and makes retries
+idempotent before either side opens a second replacement.
 
 ## Portable telemetry boundary
 
@@ -184,6 +257,16 @@ The counters are cumulative within a generation and reset when a new generation 
 `UdpTransport` updates the counters around actual socket send/receive operations, including relay registration only in a separately identified setup counter or excluding registration consistently. Registration traffic must not inflate video delivery calculations.
 
 The ICE adapter exposes the same fields from the `Conn` boundary where the dependency makes them observable. Missing backend signals remain explicitly unavailable; they are not inferred as zero loss or zero delay.
+
+`send_rate_mbps` and `receive_rate_mbps` are local diagnostic/path-pressure
+measurements, not usable network capacity. A high local send rate can mean that
+the socket accepted a burst while the peer or network is congested. The
+portable encoder controller must continue to use end-to-end `FrameAck`, frame
+loss/gap, and acknowledgement age as delivery evidence. A path-local rate may
+feed diagnostics, a bounded pacer, or a future controller only when a backend
+also exposes an explicit authenticated delivery acknowledgement; it must not
+by itself cause `AdaptiveBitrate` to ramp the encoder up or claim a capacity
+estimate.
 
 ### `PeerSession` snapshot
 
@@ -227,6 +310,39 @@ The adapter owns calls to `AdaptiveBitrate::frame_sent`, `frame_acknowledged_wit
 The adapter never exposes lowlat-only cumulative ACK-window fields, `SendRing` occupancy, or packet retransmission counts for `PeerSession`. Those remain available only from the lowlat transport snapshot where they are real.
 
 On a generation change, the adapter keeps pending end-to-end frames, resets path-local rate baselines, keeps the current encoder bitrate, and prevents ramp-up for one healthy interval. An old-generation frame acknowledgement is still accepted because frame identity is end-to-end rather than path-local.
+
+The adapter's unit tests must prove that changing only a local
+`send_rate_mbps`/`receive_rate_mbps` sample does not change an
+`AdaptiveBitrate` decision. Only a frame sent/acknowledged/lost event may alter
+the portable encoder controller until a separate delivery-acknowledgement
+interface is implemented.
+
+### Replay-window tradeoff during a handoff
+
+The one `CipherSession` invariant means the existing 64-counter receive replay
+window remains global across all paths. Preparation traffic is therefore
+strictly bounded: path probes and path-control retries have explicit finite
+per-attempt limits and replacement paths carry no application media before
+commit. Even so, packets already in flight on the old path can arrive more
+than 64 counters behind packets received on the replacement path. Those old
+best-effort media packets are allowed to be discarded by the replay window;
+the migration protocol does not weaken replay protection or create a second
+window.
+
+Reliable logical control is handled differently. Its inner sequence and
+acknowledgement state survives the generation change, while each retransmitted
+outer encrypted record receives a fresh counter on the new path. After commit,
+the session retries any outstanding reliable-control frame on the new path;
+an old-path copy that falls outside the replay window cannot permanently lose
+the logical message. Redundant `FrameAck` messages remain end-to-end and may be
+dropped because later cumulative acknowledgements supersede them.
+
+The deterministic protocol test must create more than 64 counter separation
+between an old-path media record and a new-path control record, deliver the
+old record late, assert that replay protection rejects it, then retransmit a
+reliable logical-control frame on the new path and assert that the same inner
+sequence is delivered exactly once. This makes the intentional tradeoff
+visible rather than leaving it as an assumption.
 
 ## PMTU and pacing transition
 
@@ -323,15 +439,21 @@ The first implementation target is direct↔opaque-relay migration because OpenS
 The implementation must add deterministic tests for:
 
 - generation allocation and reset boundaries;
+- host-authoritative generation allocation when both sides request a migration;
+- duplicate client requests and duplicate host prepares coalescing without a second replacement;
 - prepare failure leaving the active path unchanged;
 - exact authenticated replacement probe/ack;
+- `PATH_COMMIT` traveling on the old active path and `PATH_COMMIT_ACK` traveling on the new path;
+- lost commit acknowledgement, duplicate commit, duplicate acknowledgement, and typed `CommitUnconfirmed` handling;
 - commit acknowledgement and old-path retirement;
 - bounded rollback after replacement failure;
 - duplicate, stale, reordered, and wrong-generation path-control messages;
 - one cipher/replay domain across old and new paths;
+- more than 64 counter separation across old/new paths, with late best-effort media rejected and reliable logical control retransmitted successfully;
 - no application data before commit;
 - per-generation counter baselines and no cross-generation rate samples;
 - adapter frame ACK behavior across a generation change;
+- a local transport-rate-only change leaving `AdaptiveBitrate` unchanged;
 - watchdog recovery occurring once;
 - Alpine/musl C and C++ ABI consumers.
 
