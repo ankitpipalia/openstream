@@ -432,11 +432,11 @@ impl<'a> Conn<'a> {
         // One probe per attempt, at the first candidate to arrive. It exists to
         // open the local mapping, not to reach anyone, so repeating it per
         // candidate would buy nothing and cost budget.
-        if !self.probe_sent
-            && let Some(to) = self.candidates.iter().flatten().next().map(|c| c.addr)
-        {
-            self.probe_sent = true;
-            return Some(self.emit_check(to, Ttl::Probe, now_ms, out));
+        if !self.probe_sent {
+            if let Some(to) = self.candidates.iter().flatten().next().map(|c| c.addr) {
+                self.probe_sent = true;
+                return Some(self.emit_check(to, Ttl::Probe, now_ms, out));
+            }
         }
 
         // Learning our own address is worth doing early, so it outranks peer
@@ -470,11 +470,10 @@ impl<'a> Conn<'a> {
 
         let (index, to) = due;
         let result = self.emit_check(to, Ttl::Default, now_ms, out);
-        if let Ok(egress) = &result
-            && let Some(candidate) = self.candidates.get_mut(index).and_then(Option::as_mut)
-        {
-            candidate.last_check_ms = Some(now_ms);
-            let _ = egress;
+        if result.is_ok() {
+            if let Some(candidate) = self.candidates.get_mut(index).and_then(Option::as_mut) {
+                candidate.last_check_ms = Some(now_ms);
+            }
         }
         Some(result)
     }

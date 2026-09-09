@@ -498,27 +498,28 @@ fn a_full_session_replays_the_received_direction() {
                     // fragment, so nothing needs reassembling to reach it.
                     // A fixture we wrote would only prove the parser agrees
                     // with us; this is what a peer actually sent.
-                    if let Some(content) = data.body.get(message::LENGTH_PREFIX_LEN..)
-                        && let Ok(parsed) = control::parse(content)
-                        && parsed.opcode == control::op::INIT
-                    {
-                        let asked = init::parse(parsed.body)
-                            .expect("the recorded initialization was refused");
-                        assert_eq!(asked.version, init::VERSION);
-                        assert_eq!(
-                            parsed.a0 as usize,
-                            parsed.body.len(),
-                            "argument 0 is not the body length"
-                        );
-                        assert!(
-                            !asked.has_size_limit(),
-                            "the no-limit sentinel was read as a limit"
-                        );
-                        assert!(
-                            asked.flags & init::FLAG_BASE != 0,
-                            "the base flag was absent from a real offer"
-                        );
-                        inits_accepted += 1;
+                    if let Some(content) = data.body.get(message::LENGTH_PREFIX_LEN..) {
+                        if let Ok(parsed) = control::parse(content) {
+                            if parsed.opcode == control::op::INIT {
+                                let asked = init::parse(parsed.body)
+                                    .expect("the recorded initialization was refused");
+                                assert_eq!(asked.version, init::VERSION);
+                                assert_eq!(
+                                    parsed.a0 as usize,
+                                    parsed.body.len(),
+                                    "argument 0 is not the body length"
+                                );
+                                assert!(
+                                    !asked.has_size_limit(),
+                                    "the no-limit sentinel was read as a limit"
+                                );
+                                assert!(
+                                    asked.flags & init::FLAG_BASE != 0,
+                                    "the base flag was absent from a real offer"
+                                );
+                                inits_accepted += 1;
+                            }
+                        }
                     }
                 }
                 _ => {}

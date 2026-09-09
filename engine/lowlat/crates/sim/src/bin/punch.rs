@@ -176,52 +176,56 @@ fn peer(args: &[String]) -> Result<(), String> {
             println!("timeout");
             return Ok(());
         }
-        if let Some(at) = settled_at
-            && now_ms > at + SETTLE_MS
-        {
-            return Ok(());
+        if let Some(at) = settled_at {
+            if now_ms > at + SETTLE_MS {
+                return Ok(());
+            }
         }
 
         // The other side's candidate, once signaling has carried it.
-        if !awaited
-            && let Some(path) = expect.as_ref()
-            && let Ok(text) = fs::read_to_string(path)
-            && let Ok(addr) = text.trim().parse::<SocketAddr>()
-        {
-            conn.add_candidate(addr).map_err(|e| e.to_string())?;
-            awaited = true;
-            println!("candidate {addr}");
+        if !awaited {
+            if let Some(path) = expect.as_ref() {
+                if let Ok(text) = fs::read_to_string(path) {
+                    if let Ok(addr) = text.trim().parse::<SocketAddr>() {
+                        conn.add_candidate(addr).map_err(|e| e.to_string())?;
+                        awaited = true;
+                        println!("candidate {addr}");
+                    }
+                }
+            }
         }
 
         drain(&socket, &mut conn, now_ms, &mut tx, verbose)?;
 
         match socket.recv_from(&mut rx) {
             Ok((len, from)) => {
-                if let Some(datagram) = rx.get(..len)
-                    && demux::classify(datagram) == Datagram::Check
-                {
-                    if verbose {
-                        let kind = match Message::parse(datagram).map(|m| m.method()) {
-                            Ok(Method::BindingRequest) => "check",
-                            Ok(Method::BindingSuccess) => "answer",
-                            _ => "other",
-                        };
-                        println!("  {now_ms:.0} rx {kind} <- {from}");
-                    }
-                    match conn.process_input(datagram, from) {
-                        Ok(Inbound::Reflexive(mapped)) => {
-                            if !published && let Some(path) = publish.as_ref() {
-                                fs::write(path, mapped.to_string())
-                                    .map_err(|e| format!("publish: {e}"))?;
+                if let Some(datagram) = rx.get(..len) {
+                    if demux::classify(datagram) == Datagram::Check {
+                        if verbose {
+                            let kind = match Message::parse(datagram).map(|m| m.method()) {
+                                Ok(Method::BindingRequest) => "check",
+                                Ok(Method::BindingSuccess) => "answer",
+                                _ => "other",
+                            };
+                            println!("  {now_ms:.0} rx {kind} <- {from}");
+                        }
+                        match conn.process_input(datagram, from) {
+                            Ok(Inbound::Reflexive(mapped)) => {
+                                if !published {
+                                    if let Some(path) = publish.as_ref() {
+                                        fs::write(path, mapped.to_string())
+                                            .map_err(|e| format!("publish: {e}"))?;
+                                    }
+                                    published = true;
+                                    println!("reflexive {mapped} via {from}");
+                                }
                             }
-                            published = true;
-                            println!("reflexive {mapped} via {from}");
+                            Ok(Inbound::PathEstablished(addr)) if settled_at.is_none() => {
+                                println!("established {addr}");
+                                settled_at = Some(now_ms);
+                            }
+                            _ => {}
                         }
-                        Ok(Inbound::PathEstablished(addr)) if settled_at.is_none() => {
-                            println!("established {addr}");
-                            settled_at = Some(now_ms);
-                        }
-                        _ => {}
                     }
                 }
             }

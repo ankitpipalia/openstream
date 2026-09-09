@@ -194,14 +194,14 @@ impl<'a> Endpoint<'a> {
                         (mtu.on_probe_ack(id, size, now_ms) && mtu.datagram_size() != previous)
                             .then_some(mtu.datagram_size())
                     });
-                    if let Some(new_size) = new_size
-                        && !self.session.set_path_datagram_size(new_size)
-                    {
-                        // A peer has proved the path, but this caller's ring
-                        // storage cannot represent the new packetization. Do
-                        // not leave an active controller claiming a size the
-                        // session cannot emit.
-                        self.path_mtu = None;
+                    if let Some(new_size) = new_size {
+                        if !self.session.set_path_datagram_size(new_size) {
+                            // A peer has proved the path, but this caller's ring
+                            // storage cannot represent the new packetization. Do
+                            // not leave an active controller claiming a size the
+                            // session cannot emit.
+                            self.path_mtu = None;
+                        }
                     }
                 }
                 Ok(Inbound::Media(inbound))
@@ -213,11 +213,10 @@ impl<'a> Endpoint<'a> {
     pub fn poll(&mut self, now_ms: f64) {
         self.conn.poll(now_ms);
         self.session.poll(now_ms);
-        if let Some(mtu) = self.path_mtu.as_mut()
-            && mtu.in_flight_probe().is_some()
-            && mtu.next_timer_ms(now_ms) <= 0.0
-        {
-            let _ = mtu.on_probe_timeout(now_ms);
+        if let Some(mtu) = self.path_mtu.as_mut() {
+            if mtu.in_flight_probe().is_some() && mtu.next_timer_ms(now_ms) <= 0.0 {
+                let _ = mtu.on_probe_timeout(now_ms);
+            }
         }
     }
 
@@ -266,20 +265,20 @@ impl<'a> Endpoint<'a> {
             });
         }
 
-        if let Some(mtu) = self.path_mtu.as_mut()
-            && let Some(probe) = mtu.start_probe(now_ms)
-        {
-            return Some(match self.session.emit_path_probe(probe, out) {
-                Ok(len) => Ok(Egress {
-                    to,
-                    ttl: Ttl::Default,
-                    len,
-                }),
-                Err(error) => {
-                    let _ = mtu.on_probe_send_failed();
-                    Err(error)
-                }
-            });
+        if let Some(mtu) = self.path_mtu.as_mut() {
+            if let Some(probe) = mtu.start_probe(now_ms) {
+                return Some(match self.session.emit_path_probe(probe, out) {
+                    Ok(len) => Ok(Egress {
+                        to,
+                        ttl: Ttl::Default,
+                        len,
+                    }),
+                    Err(error) => {
+                        let _ = mtu.on_probe_send_failed();
+                        Err(error)
+                    }
+                });
+            }
         }
 
         Some(match self.session.get_output(now_ms, out)? {

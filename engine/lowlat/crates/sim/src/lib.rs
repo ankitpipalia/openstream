@@ -257,17 +257,18 @@ impl Sim {
 
         // Hairpin is decided by the sender's own translators: a datagram
         // addressed to one of them never leaves the local network.
-        if let Some(nat) = self
+        let hairpin_nat = self
             .hosts
             .get(from.0)
             .into_iter()
             .flat_map(|host| host.chain.iter())
             .filter_map(|id| self.nats.get(id.0))
-            .find(|nat| nat.external_ip() == to.ip())
-            && !nat.hairpins()
-        {
-            self.dropped.push(Dropped::NoHairpin);
-            return;
+            .find(|nat| nat.external_ip() == to.ip());
+        if let Some(nat) = hairpin_nat {
+            if !nat.hairpins() {
+                self.dropped.push(Dropped::NoHairpin);
+                return;
+            }
         }
 
         let Some((target, delivered_from)) = self.resolve(source, to) else {

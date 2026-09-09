@@ -160,10 +160,10 @@ fn kernel_drops(port: u16) -> u64 {
         if u16::from_str_radix(hex_port, 16) != Ok(port) {
             continue;
         }
-        if let Some(drops) = line.split_whitespace().next_back()
-            && let Ok(value) = drops.parse()
-        {
-            return value;
+        if let Some(drops) = line.split_whitespace().next_back() {
+            if let Ok(value) = drops.parse() {
+                return value;
+            }
         }
     }
     0
@@ -351,10 +351,11 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
                 // Bounded per pass for the same reason as the sender: a drain
                 // that never yields cannot notice the run has ended.
                 let mut drained = 0;
-                while drained < SLOTS
-                    && let Some(Ok(len)) =
-                        right.endpoint().session().take_message(CHANNEL, &mut out)
-                {
+                while drained < SLOTS {
+                    let Some(Ok(len)) = right.endpoint().session().take_message(CHANNEL, &mut out)
+                    else {
+                        break;
+                    };
                     drained += 1;
                     if len >= 8 {
                         let seq = u64::from_be_bytes(out[..8].try_into().expect("eight bytes"));
