@@ -5,6 +5,9 @@
 .commandcode/
 .worktrees/
 
+# Local agent planning/review artifacts; versioned plans live under docs/.
+.superpowers/sdd/
+
 # Rust/Cargo build output
 **/target/
 **/*.rs.bk
