@@ -22,7 +22,8 @@ use openstream_transport::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -1181,16 +1182,19 @@ async fn receive_backend(
 
 struct DrainingPath {
     incoming: mpsc::Receiver<(PathSlot, Vec<u8>)>,
+    cancel: oneshot::Sender<()>,
+    task: JoinHandle<()>,
 }
 
 impl DrainingPath {
     fn new(old: PeerPath, deadline: Instant) -> Self {
         let (outgoing, incoming) = mpsc::channel(32);
+        let (cancel, mut cancelled) = oneshot::channel();
         let (generation, backend) = old.into_backend();
         // This task owns the old socket and relay cleanup guard, so both the
         // receive-only lifetime and remote registration cleanup remain finite
         // even when the application's receive loop is idle or cancelled.
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let (transport, relay_registration) = match backend {
                 PeerPathBackend::Direct {
                     transport,
@@ -1202,11 +1206,13 @@ impl DrainingPath {
             if let Some(transport) = transport {
                 let mut datagram = [0; MAX_DATAGRAM];
                 loop {
-                    let result = tokio::time::timeout_at(
-                        TokioInstant::from_std(deadline),
-                        transport.recv_sealed(&mut datagram),
-                    )
-                    .await;
+                    let result = tokio::select! {
+                        _ = &mut cancelled => break,
+                        result = tokio::time::timeout_at(
+                            TokioInstant::from_std(deadline),
+                            transport.recv_sealed(&mut datagram),
+                        ) => result,
+                    };
                     let Ok(Ok(length)) = result else {
                         break;
                     };
@@ -1222,7 +1228,16 @@ impl DrainingPath {
                 let _ = relay_registration.unregister().await;
             }
         });
-        Self { incoming }
+        Self {
+            incoming,
+            cancel,
+            task,
+        }
+    }
+
+    async fn close(self) {
+        let _ = self.cancel.send(());
+        let _ = self.task.await;
     }
 }
 
@@ -1547,7 +1562,9 @@ impl PeerSession {
                     self.last_keepalive = Instant::now();
                 }
                 MigrationAction::Retire => {
-                    self.draining = None;
+                    if let Some(draining) = self.draining.take() {
+                        draining.close().await;
+                    }
                 }
                 MigrationAction::Discard => {
                     self.opening = None;
@@ -2355,7 +2372,9 @@ impl PeerSession {
         if let Some(active_registration) = active_registration {
             let _ = active_registration.unregister().await;
         }
-        self.draining.take();
+        if let Some(draining) = self.draining.take() {
+            draining.close().await;
+        }
         self.path.close_all();
         Ok(())
     }
@@ -3085,6 +3104,97 @@ mod tests {
             draining: None,
             migration_inbox: Default::default(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_releases_draining_path_before_deadline() {
+        use openstream_protocol::relay;
+
+        let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay");
+        let relay_address = relay_socket.local_addr().expect("relay address");
+        let (unregisters, mut observed) = mpsc::channel(4);
+        let relay_task = tokio::spawn(async move {
+            let mut packet = [0; MAX_DATAGRAM];
+            let mut unregister_count = 0;
+            loop {
+                let (length, source) = relay_socket
+                    .recv_from(&mut packet)
+                    .await
+                    .expect("receive relay packet");
+                if let Ok(registration) = relay::decode_registration(&packet[..length]) {
+                    relay_socket
+                        .send_to(&relay::encode_ack(registration.role), source)
+                        .await
+                        .expect("ack registration");
+                } else if let Ok(unregister) = relay::decode_unregister(&packet[..length]) {
+                    unregister_count += 1;
+                    unregisters
+                        .send(unregister_count)
+                        .await
+                        .expect("observe unregister");
+                    relay_socket
+                        .send_to(&relay::encode_unregister_ack(unregister.role), source)
+                        .await
+                        .expect("ack unregister");
+                }
+            }
+        });
+
+        let mut draining_transport = UdpTransport::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind draining transport");
+        draining_transport
+            .connect(relay_address)
+            .await
+            .expect("connect draining transport");
+        let registration = draining_transport
+            .relay_registration("session", RelayRole::Host, "ticket")
+            .expect("create relay registration");
+        draining_transport
+            .register_relay("session", RelayRole::Host, "ticket")
+            .await
+            .expect("register draining transport");
+
+        let active_transport = UdpTransport::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind active transport");
+        let mut session = direct_test_session(active_transport);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        session.draining = Some(DrainingPath::new(
+            PeerPath::replacement(
+                PeerPathBackend::Direct {
+                    transport: Box::new(draining_transport),
+                    candidate: CandidateKind::Relay,
+                    relay_registration: Some(registration),
+                },
+                2,
+                Instant::now(),
+            ),
+            deadline,
+        ));
+
+        session.close().await.expect("close session");
+        session.close().await.expect("close session again");
+
+        let first = tokio::time::timeout(Duration::from_millis(500), observed.recv())
+            .await
+            .expect("drain cleanup was not prompt")
+            .expect("relay cleanup observation");
+        assert_eq!(first, 1, "drain cleanup must unregister once");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), observed.recv())
+                .await
+                .is_err(),
+            "repeated close sent a duplicate unregister"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "cleanup reached the drain deadline"
+        );
+
+        relay_task.abort();
     }
 
     #[tokio::test]
