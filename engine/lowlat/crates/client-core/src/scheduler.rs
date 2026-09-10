@@ -42,6 +42,7 @@ impl OutboundClass {
 /// A clear packet retained until the scheduler admits it for emission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPacket {
+    pub(crate) queue_id: u64,
     pub class: OutboundClass,
     pub kind: Kind,
     pub channel: u8,
@@ -95,6 +96,7 @@ pub struct OutboundScheduler {
     generation: u64,
     critical_debt_bytes: usize,
     audio_debt_bytes: usize,
+    next_queue_id: u64,
 }
 
 impl OutboundScheduler {
@@ -109,6 +111,7 @@ impl OutboundScheduler {
             generation: DEFAULT_GENERATION,
             critical_debt_bytes: 0,
             audio_debt_bytes: 0,
+            next_queue_id: 0,
         };
         scheduler.set_wire_rate_mbps(now_ms, DEFAULT_WIRE_RATE_MBPS);
         scheduler
@@ -123,6 +126,21 @@ impl OutboundScheduler {
         payload: &[u8],
         logical_retransmission: bool,
     ) -> Result<QueueOutcome, SchedulerError> {
+        self.queue_with_id(kind, channel, flags, payload, logical_retransmission)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Queue one clear packet and return the identity used to match its
+    /// eventual emission. The identity is local to this scheduler and never
+    /// reaches the wire.
+    pub(crate) fn queue_with_id(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+        logical_retransmission: bool,
+    ) -> Result<(QueueOutcome, u64), SchedulerError> {
         if kind == Kind::Control && channel == TRANSPORT_META_CHANNEL {
             return Err(SchedulerError::InvalidPacket);
         }
@@ -135,7 +153,9 @@ impl OutboundScheduler {
         }
 
         let class = OutboundClass::from_kind(kind);
+        let queue_id = self.next_queue_id();
         let packet = PendingPacket {
+            queue_id,
             class,
             kind,
             channel,
@@ -155,10 +175,10 @@ impl OutboundScheduler {
             }
             let _ = queue.pop_front();
             queue.push_back(packet);
-            return Ok(QueueOutcome::DroppedOldest);
+            return Ok((QueueOutcome::DroppedOldest, queue_id));
         }
         queue.push_back(packet);
-        Ok(QueueOutcome::Queued)
+        Ok((QueueOutcome::Queued, queue_id))
     }
 
     /// Admit and remove the next packet, without sealing it.
@@ -262,6 +282,12 @@ impl OutboundScheduler {
     /// Current path generation associated with this scheduler.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    fn next_queue_id(&mut self) -> u64 {
+        let queue_id = self.next_queue_id;
+        self.next_queue_id = self.next_queue_id.wrapping_add(1);
+        queue_id
     }
 
     fn new_pacer(now_ms: f64) -> Pacer {
