@@ -87,4 +87,3 @@ The phase is complete only when the new crate's unit tests, the unchanged
 lowlat core tests, workspace Clippy with warnings denied, and the locked full
 workspace test suite pass. The extracted crate must compile independently with
 `cargo test -p openstream-transport-policy`.
-
