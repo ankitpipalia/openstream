@@ -514,47 +514,75 @@ mod tests {
     }
 
     #[test]
-    fn invalid_configurations_are_rejected() {
+    fn invalid_configurations_report_exact_errors() {
         let base = PacerConfig::compatibility_default();
-        for config in [
-            PacerConfig {
-                min_datagram_bytes: 0,
-                ..base
-            },
-            PacerConfig {
-                min_datagram_bytes: 2001,
-                ..base
-            },
-            PacerConfig {
-                max_datagram_bytes: 1228,
-                ..base
-            },
-            PacerConfig {
-                max_datagram_bytes: 0,
-                ..base
-            },
-            PacerConfig {
-                max_burst_datagrams: 0,
-                ..base
-            },
-            PacerConfig {
-                max_burst_time_ms: 0.0,
-                ..base
-            },
-            PacerConfig {
-                max_burst_time_ms: -1.0,
-                ..base
-            },
-            PacerConfig {
-                max_burst_time_ms: f64::NAN,
-                ..base
-            },
-            PacerConfig {
-                max_burst_time_ms: f64::INFINITY,
-                ..base
-            },
-        ] {
-            assert!(config.validate().is_err(), "invalid config was accepted");
+        let cases = [
+            (
+                PacerConfig {
+                    min_datagram_bytes: 0,
+                    ..base
+                },
+                ConfigError::ZeroDatagramSize,
+            ),
+            (
+                PacerConfig {
+                    min_datagram_bytes: 2001,
+                    ..base
+                },
+                ConfigError::MinimumExceedsMaximum,
+            ),
+            (
+                PacerConfig {
+                    max_datagram_bytes: 1228,
+                    ..base
+                },
+                ConfigError::MinimumExceedsMaximum,
+            ),
+            (
+                PacerConfig {
+                    max_datagram_bytes: 0,
+                    ..base
+                },
+                ConfigError::ZeroDatagramSize,
+            ),
+            (
+                PacerConfig {
+                    max_burst_datagrams: 0,
+                    ..base
+                },
+                ConfigError::ZeroBurstDatagrams,
+            ),
+            (
+                PacerConfig {
+                    max_burst_time_ms: 0.0,
+                    ..base
+                },
+                ConfigError::InvalidBurstTime,
+            ),
+            (
+                PacerConfig {
+                    max_burst_time_ms: -1.0,
+                    ..base
+                },
+                ConfigError::InvalidBurstTime,
+            ),
+            (
+                PacerConfig {
+                    max_burst_time_ms: f64::NAN,
+                    ..base
+                },
+                ConfigError::InvalidBurstTime,
+            ),
+            (
+                PacerConfig {
+                    max_burst_time_ms: f64::INFINITY,
+                    ..base
+                },
+                ConfigError::InvalidBurstTime,
+            ),
+        ];
+        for (config, expected) in cases {
+            assert_eq!(config.validate(), Err(expected));
         }
     }
 
@@ -607,6 +635,24 @@ mod tests {
         // 1 Mbps is 125 bytes per millisecond.
         assert!((pacer.wait_ms(0.0, 125) - 1.0).abs() < 1e-9);
         assert!(pacer.try_consume(1.0, 125));
+    }
+
+    #[test]
+    fn fractional_millisecond_refill_uses_decimal_rate() {
+        let mut pacer = Pacer::new(0.0);
+        pacer.set_rate(0.0, RATE);
+        assert!(pacer.try_consume(0.0, DEFAULT_DATAGRAM));
+
+        // At 1 Mbps the pacer refills 125 bytes per millisecond, so these
+        // fractional timestamps expose the fractional-byte boundaries rather
+        // than rounding elapsed time to whole milliseconds.
+        assert!(pacer.can_consume(0.5, 62));
+        assert!(!pacer.can_consume(0.5, 63));
+        assert!((pacer.wait_ms(0.5, 63) - 0.004).abs() < 1e-12);
+
+        assert!(pacer.can_consume(1.25, 156));
+        assert!(!pacer.can_consume(1.25, 157));
+        assert!((pacer.wait_ms(1.25, 157) - 0.006).abs() < 1e-12);
     }
 
     #[test]
@@ -714,6 +760,22 @@ mod tests {
 
     fn controller() -> Controller {
         Controller::new(DEFAULT_LEVEL, 1.0, 100.0)
+    }
+
+    fn assert_controller_state_eq(actual: &Controller, expected: &Controller) {
+        assert_eq!(actual.level, expected.level);
+        assert_eq!(actual.min_mbps.to_bits(), expected.min_mbps.to_bits());
+        assert_eq!(actual.max_mbps.to_bits(), expected.max_mbps.to_bits());
+        assert_eq!(
+            actual.current_mbps.to_bits(),
+            expected.current_mbps.to_bits()
+        );
+        assert_eq!(actual.peak_mbps.to_bits(), expected.peak_mbps.to_bits());
+        assert_eq!(actual.increase_ticks, expected.increase_ticks);
+        assert_eq!(actual.decrease_ticks, expected.decrease_ticks);
+        assert_eq!(actual.step, expected.step);
+        assert_eq!(actual.reset_pending, expected.reset_pending);
+        assert_eq!(actual.total_decreases, expected.total_decreases);
     }
 
     #[test]
@@ -834,11 +896,7 @@ mod tests {
             controller.tick_observation(CongestionObservation::default()),
             None
         );
-        assert_eq!(
-            controller.rate_mbps().to_bits(),
-            before.rate_mbps().to_bits()
-        );
-        assert_eq!(controller.total_decreases(), before.total_decreases());
+        assert_controller_state_eq(&controller, &before);
     }
 
     #[test]
@@ -862,23 +920,49 @@ mod tests {
             let mut controller = Controller::new(DEFAULT_LEVEL, 1.0, 100.0);
             let before = controller.clone();
             assert_eq!(controller.tick_observation(observation), None);
-            assert_eq!(
-                controller.rate_mbps().to_bits(),
-                before.rate_mbps().to_bits()
-            );
-            assert_eq!(controller.total_decreases(), before.total_decreases());
+            assert_controller_state_eq(&controller, &before);
         }
     }
 
     #[test]
-    fn complete_observation_returns_a_decision() {
-        let mut controller = Controller::new(DEFAULT_LEVEL, 1.0, 100.0);
-        let result = controller.tick_observation(CongestionObservation {
-            in_flight: Some(10),
-            stale: Some(0),
-            delivery_rate_mbps: Some(5.0),
-            srtt_ms: Some(20.0),
-        });
-        assert_eq!(result, Some(controller.rate_mbps()));
+    fn complete_observation_matches_direct_ticks_with_and_without_rate() {
+        let mut observation_with_rate = controller();
+        let mut direct_with_rate = controller();
+        let mut observation_without_rate = controller();
+        let mut direct_without_rate = controller();
+
+        for _ in 0..INCREASE_PERIOD * 2 {
+            let observation = CongestionObservation {
+                in_flight: Some(10),
+                stale: Some(0),
+                delivery_rate_mbps: Some(5.0),
+                srtt_ms: Some(20.0),
+            };
+            let expected = direct_with_rate.tick(10, 0, 5.0);
+            assert_eq!(
+                observation_with_rate.tick_observation(observation),
+                Some(expected)
+            );
+
+            let observation = CongestionObservation {
+                in_flight: Some(10),
+                stale: Some(0),
+                delivery_rate_mbps: None,
+                srtt_ms: Some(20.0),
+            };
+            let expected = direct_without_rate.tick(10, 0, 0.0);
+            assert_eq!(
+                observation_without_rate.tick_observation(observation),
+                Some(expected)
+            );
+        }
+
+        assert_controller_state_eq(&observation_with_rate, &direct_with_rate);
+        assert_controller_state_eq(&observation_without_rate, &direct_without_rate);
+        assert_eq!(observation_with_rate.peak_mbps.to_bits(), 5.0f64.to_bits());
+        assert_eq!(
+            observation_without_rate.peak_mbps.to_bits(),
+            1.0f64.to_bits()
+        );
     }
 }
