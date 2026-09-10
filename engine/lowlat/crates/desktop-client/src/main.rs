@@ -21,8 +21,8 @@ use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Repla
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window};
 use openstream_client_core::{
-    Capabilities, ConnectionPath, Pairing, PeerSession, ReliableControl, Role, VideoCodec,
-    parse_stun_servers,
+    Capabilities, ConnectionPath, FlushOutcome, Pairing, PeerSession, ReliableControl, Role,
+    VideoCodec, parse_stun_servers,
 };
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
@@ -987,7 +987,10 @@ async fn network_loop(
     let mut control_tick = tokio::time::interval(Duration::from_millis(100));
     let mut clipboard_tick = tokio::time::interval(Duration::from_millis(500));
     loop {
-        session.flush_outbound().await?;
+        let outbound_backpressured = matches!(
+            session.flush_outbound_recoverably().await?,
+            FlushOutcome::Backpressured
+        );
         while let Ok(input) = input_rx.try_recv() {
             match input {
                 UiInput::Event(event) => {
@@ -1013,7 +1016,11 @@ async fn network_loop(
                 }
             }
         }
-        let outbound_wake = session.next_outbound_wake();
+        let outbound_wake = if outbound_backpressured {
+            None
+        } else {
+            session.next_outbound_wake()
+        };
         tokio::select! {
             packet = session.recv() => {
                 let packet = packet?;
@@ -1189,11 +1196,11 @@ async fn network_loop(
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
             }
             _ = wait_for_outbound_wake(outbound_wake) => {
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
             }
             _ = metrics_tick.tick() => {
                 let _ = ui_tx.send(UiMessage::Metrics(metrics.snapshot().overlay_line()));

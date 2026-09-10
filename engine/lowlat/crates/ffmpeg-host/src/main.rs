@@ -13,8 +13,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
-    Capabilities, Pairing, PeerSession, QueueOutcome, ReliableControl, Role, VideoCodec,
-    parse_stun_servers,
+    Capabilities, FlushOutcome, Pairing, PeerSession, QueueOutcome, ReliableControl, Role,
+    VideoCodec, parse_stun_servers,
 };
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
@@ -269,8 +269,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut peer_ended = false;
     'stream: while Instant::now() < deadline {
-        session.flush_outbound().await?;
-        let outbound_wake = session.next_outbound_wake();
+        let outbound_backpressured = matches!(
+            session.flush_outbound_recoverably().await?,
+            FlushOutcome::Backpressured
+        );
+        let outbound_wake = if outbound_backpressured {
+            None
+        } else {
+            session.next_outbound_wake()
+        };
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::select! {
             result = tokio::time::timeout(remaining, session.recv()) => {
@@ -435,7 +442,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     reliable_control.send(&mut session, &rumble.encode()).await?;
                 }
                 reliable_control.retry(&mut session).await?;
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
                 let now = Instant::now();
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -584,7 +591,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             _ = wait_for_outbound_wake(outbound_wake) => {
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 break;

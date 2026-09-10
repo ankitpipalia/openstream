@@ -11,7 +11,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use openstream_client_core::{
-    Capabilities, Pairing, PeerSession, ReliableControl, Role, VideoCodec, parse_stun_servers,
+    Capabilities, FlushOutcome, Pairing, PeerSession, ReliableControl, Role, VideoCodec,
+    parse_stun_servers,
 };
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
@@ -99,8 +100,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut waiting_for_keyframe = false;
     let mut control_tick = tokio::time::interval(Duration::from_millis(100));
     while tokio::time::Instant::now() < deadline {
-        session.flush_outbound().await?;
-        let outbound_wake = session.next_outbound_wake();
+        let outbound_backpressured = matches!(
+            session.flush_outbound_recoverably().await?,
+            FlushOutcome::Backpressured
+        );
+        let outbound_wake = if outbound_backpressured {
+            None
+        } else {
+            session.next_outbound_wake()
+        };
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let packet = tokio::select! {
             packet = tokio::time::timeout(remaining, session.recv()) => {
@@ -111,12 +119,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
                 continue;
             }
             _ = wait_for_outbound_wake(outbound_wake) => {
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
                 continue;
             }
         };

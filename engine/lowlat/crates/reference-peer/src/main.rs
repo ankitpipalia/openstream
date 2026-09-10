@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use openstream_client_core::{
-    CandidateKind, Capabilities, ConnectionPath, MigrationTarget, Pairing, PeerSession,
-    QueueOutcome, Role, parse_stun_servers,
+    CandidateKind, Capabilities, ConnectionPath, FlushOutcome, MigrationTarget, Pairing,
+    PeerSession, QueueOutcome, Role, parse_stun_servers,
 };
 use openstream_media::{Assembler, Fragment, FrameAck, MAX_FRAGMENT_BYTES, fragment_frame};
 use openstream_protocol::Kind;
@@ -204,8 +204,15 @@ async fn send_frame_and_wait_ack(
         queue_video_fragment(session, &fragment)?;
     }
     loop {
-        session.flush_outbound().await?;
-        let outbound_wake = session.next_outbound_wake();
+        let outbound_backpressured = matches!(
+            session.flush_outbound_recoverably().await?,
+            FlushOutcome::Backpressured
+        );
+        let outbound_wake = if outbound_backpressured {
+            None
+        } else {
+            session.next_outbound_wake()
+        };
         tokio::select! {
             packet = session.recv() => {
                 let packet = packet?;
@@ -216,7 +223,7 @@ async fn send_frame_and_wait_ack(
                 }
             }
             _ = wait_for_outbound_wake(outbound_wake) => {
-                session.flush_outbound().await?;
+                session.flush_outbound_recoverably().await?;
             }
         }
     }

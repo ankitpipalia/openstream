@@ -541,6 +541,15 @@ pub struct FlushReport {
     pub outer_retransmissions: u64,
 }
 
+/// Outcome of a flush when delivery history applies bounded backpressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// The scheduler flush completed without delivery-history backpressure.
+    Flushed(FlushReport),
+    /// Queued application work remains until a transport ACK frees history.
+    Backpressured,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmittedPacket {
     queue_id: u64,
@@ -2672,6 +2681,20 @@ impl PeerSession {
     /// Delivery history is updated only after the socket write succeeds.
     pub async fn flush_outbound(&mut self) -> Result<FlushReport, Error> {
         Ok(self.flush_outbound_inner().await?.report)
+    }
+
+    /// Flush application output while keeping delivery-history saturation
+    /// recoverable for receive-driven event loops.
+    ///
+    /// [`Error::OutboundHistoryFull`] is returned by the underlying flush
+    /// only after the scheduler has retained the packet that could not be
+    /// admitted. All other errors remain fatal and are returned unchanged.
+    pub async fn flush_outbound_recoverably(&mut self) -> Result<FlushOutcome, Error> {
+        match self.flush_outbound().await {
+            Ok(report) => Ok(FlushOutcome::Flushed(report)),
+            Err(Error::OutboundHistoryFull) => Ok(FlushOutcome::Backpressured),
+            Err(error) => Err(error),
+        }
     }
 
     /// Return the exact pacer delay before the next queued packet can run.

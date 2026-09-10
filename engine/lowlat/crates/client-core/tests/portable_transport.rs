@@ -1,12 +1,13 @@
 use std::fs;
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use openstream_client_core::{
-    DeliveryClassSnapshot, Pairing, PeerDeliverySnapshot, PeerSession, Role,
+    DeliveryClassSnapshot, FlushOutcome, Pairing, PeerDeliverySnapshot, PeerSession, Role,
 };
 use openstream_media::{AdaptiveBitrate, PeerTelemetryAdapter};
 use openstream_protocol::{Kind, MAX_PLAINTEXT, Session as CipherSession};
@@ -159,54 +160,31 @@ async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>,
 #[test]
 fn no_immediate_media_bypass_source_check() {
     let client_core_manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let portable_source_roots = [
-        (
-            "ffmpeg-host",
-            client_core_manifest.join("../ffmpeg-host/src"),
-        ),
-        (
-            "reference-peer",
-            client_core_manifest.join("../reference-peer/src"),
-        ),
-        ("client", client_core_manifest.join("../client/src")),
-        (
-            "desktop-client",
-            client_core_manifest.join("../desktop-client/src"),
-        ),
-    ];
-    let forbidden = [
-        ("private immediate send", "send_immediate_on("),
-        ("raw sealed write", "write_sealed_on("),
-        ("raw sealed send", "send_sealed_on("),
-        ("raw datagram send", "send_datagram("),
-        ("direct high-rate video send", "session.send(Kind::Video"),
-        ("direct high-rate audio send", "session.send(Kind::Audio"),
-    ];
     let mut violations = Vec::new();
+    let allowed_client_core_file = client_core_manifest
+        .join("src/lib.rs")
+        .canonicalize()
+        .expect("canonicalize allowlisted client-core internals");
 
-    for (crate_name, root) in portable_source_roots {
-        for path in rust_source_paths(&root) {
+    for (crate_name, root) in portable_source_roots(client_core_manifest) {
+        let root = root
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize {crate_name} source root: {error}"));
+        let source_paths = rust_source_paths(&root)
+            .unwrap_or_else(|error| panic!("read {crate_name} source tree: {error}"));
+        assert!(
+            !source_paths.is_empty(),
+            "{crate_name} source root contains no Rust files: {}",
+            root.display()
+        );
+        for path in source_paths {
             let source = fs::read_to_string(&path).expect("read portable consumer source");
-            let compact_source: String = source
-                .chars()
-                .filter(|character| !character.is_whitespace())
-                .collect();
-            let relative_path = path
-                .strip_prefix(client_core_manifest)
-                .unwrap_or(&path)
-                .display();
-            for (label, needle) in forbidden {
-                if compact_source.contains(needle) {
-                    let location = source.lines().enumerate().find_map(|(line_number, line)| {
-                        line.contains(needle).then_some(line_number + 1)
-                    });
-                    match location {
-                        Some(line_number) => violations.push(format!(
-                            "{crate_name}:{relative_path}:{line_number}: {label}"
-                        )),
-                        None => violations.push(format!("{crate_name}:{relative_path}: {label}")),
-                    }
-                }
+            if crate_name == "client-core" && path == allowed_client_core_file {
+                continue;
+            }
+            let relative_path = path.strip_prefix(&root).unwrap_or(&path).display();
+            for label in forbidden_send_calls(&source) {
+                violations.push(format!("{crate_name}:{relative_path}: {label}"));
             }
         }
     }
@@ -218,19 +196,206 @@ fn no_immediate_media_bypass_source_check() {
     );
 }
 
-fn rust_source_paths(root: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(root).expect("read portable consumer source directory") {
-        let entry = entry.expect("read portable consumer source entry");
-        let path = entry.path();
-        if path.is_dir() {
-            paths.extend(rust_source_paths(&path));
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
-            paths.push(path);
+#[test]
+fn no_bypass_source_scan_ignores_comments_and_literals() {
+    let source = r###"
+        // session.send(Kind::Video, 0, 0, payload)
+        const TEXT: &str = "send_immediate_on(";
+        let comment = r##"write_sealed_on("##;
+    "###;
+
+    assert!(forbidden_send_calls(source).is_empty());
+}
+
+#[test]
+fn no_bypass_source_scan_reports_actual_send_calls() {
+    let source = "session.send(Kind::Video, 0, 0, payload); self.send_immediate_on(payload);";
+
+    assert_eq!(
+        forbidden_send_calls(source),
+        vec!["private immediate send", "direct high-rate video send"]
+    );
+}
+
+const PORTABLE_CONSUMER_CRATES: &[&str] =
+    &["ffmpeg-host", "reference-peer", "client", "desktop-client"];
+
+const FORBIDDEN_SEND_CALLS: &[(&str, &str)] = &[
+    ("private immediate send", "send_immediate_on("),
+    ("private sealed write", "write_sealed_on("),
+    ("private path-control immediate send", "send_path_control("),
+    (
+        "private transport-ack immediate send",
+        "send_transport_ack(",
+    ),
+    ("private application send", "send_application_with_flag("),
+    ("private scheduler flush", "flush_outbound_inner("),
+    ("direct high-rate video send", ".send(Kind::Video,"),
+    ("direct high-rate audio send", ".send(Kind::Audio,"),
+];
+
+fn portable_source_roots(client_core_manifest: &Path) -> Vec<(&'static str, PathBuf)> {
+    let lowlat_root = client_core_manifest
+        .parent()
+        .expect("client-core manifest is nested under the lowlat workspace");
+    let mut roots = vec![("client-core", client_core_manifest.join("src"))];
+    roots.extend(
+        PORTABLE_CONSUMER_CRATES
+            .iter()
+            .map(|crate_name| (*crate_name, lowlat_root.join(crate_name).join("src"))),
+    );
+    roots
+}
+
+fn forbidden_send_calls(source: &str) -> Vec<&'static str> {
+    let compact_source = compact_rust_code(source);
+    FORBIDDEN_SEND_CALLS
+        .iter()
+        .filter_map(|(label, needle)| compact_source.contains(needle).then_some(*label))
+        .collect()
+}
+
+fn compact_rust_code(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut code = String::with_capacity(source.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            if index < bytes.len() {
+                code.push('\n');
+                index += 1;
+            }
+        } else if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_block_comment(bytes, index, &mut code);
+        } else if let Some(end) = raw_string_end(bytes, index) {
+            code.push(' ');
+            index = end;
+        } else if bytes[index] == b'"' {
+            code.push(' ');
+            index = quoted_literal_end(bytes, index);
+        } else if bytes[index] == b'b' && bytes.get(index + 1) == Some(&b'"') {
+            code.push(' ');
+            index = quoted_literal_end(bytes, index + 1);
+        } else if bytes[index] == b'\'' {
+            if let Some(end) = char_literal_end(bytes, index) {
+                code.push(' ');
+                index = end;
+            } else {
+                code.push(char::from(bytes[index]));
+                index += 1;
+            }
+        } else {
+            code.push(char::from(bytes[index]));
+            index += 1;
         }
     }
+    code.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn skip_block_comment(bytes: &[u8], mut index: usize, code: &mut String) -> usize {
+    let mut depth = 1;
+    index += 2;
+    while index < bytes.len() && depth > 0 {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            depth += 1;
+            index += 2;
+        } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+            depth -= 1;
+            index += 2;
+        } else {
+            if bytes[index] == b'\n' {
+                code.push('\n');
+            }
+            index += 1;
+        }
+    }
+    code.push(' ');
+    index
+}
+
+fn raw_string_end(bytes: &[u8], index: usize) -> Option<usize> {
+    let raw_start = if bytes.get(index) == Some(&b'r') {
+        index
+    } else if bytes.get(index) == Some(&b'b') && bytes.get(index + 1) == Some(&b'r') {
+        index + 1
+    } else {
+        return None;
+    };
+    let mut delimiter = raw_start + 1;
+    let mut hashes = 0;
+    while bytes.get(delimiter) == Some(&b'#') {
+        hashes += 1;
+        delimiter += 1;
+    }
+    if bytes.get(delimiter) != Some(&b'"') {
+        return None;
+    }
+    let content_start = delimiter + 1;
+    let mut cursor = content_start;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"'
+            && (0..hashes).all(|offset| bytes.get(cursor + 1 + offset) == Some(&b'#'))
+        {
+            return Some(cursor + 1 + hashes);
+        }
+        cursor += 1;
+    }
+    Some(bytes.len())
+}
+
+fn quoted_literal_end(bytes: &[u8], quote: usize) -> usize {
+    let mut index = quote + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2);
+        } else if bytes[index] == b'"' {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn char_literal_end(bytes: &[u8], quote: usize) -> Option<usize> {
+    let mut index = quote + 1;
+    if bytes.get(index) == Some(&b'\\') {
+        index = index.checked_add(2)?;
+    } else if bytes.get(index).is_some_and(|byte| *byte != b'\n') {
+        index += 1;
+    } else {
+        return None;
+    }
+    (bytes.get(index) == Some(&b'\'')).then_some(index + 1)
+}
+
+fn rust_source_paths(root: &Path) -> io::Result<Vec<PathBuf>> {
+    fn visit(root: &Path, paths: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                visit(&path, paths)?;
+            } else if file_type.is_file()
+                && path.extension().is_some_and(|extension| extension == "rs")
+            {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    visit(root, &mut paths)?;
     paths.sort();
-    paths
+    Ok(paths)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -255,6 +420,64 @@ async fn no_immediate_media_bypass_behavior() {
     let report = sender.flush_outbound().await.unwrap();
     assert_eq!(report.sent_packets, 1);
     assert_eq!(report.pending_packets, 4);
+    assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
+
+    sender.close().await.unwrap();
+    receiver.close().await.unwrap();
+    bridge.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_backpressure_keeps_receive_path_alive() {
+    let (mut sender, mut receiver, bridge, _loopback) = connected_test_sessions().await;
+    sender.set_wire_pacing_rate(0.0).unwrap();
+
+    // Fill every delivery-history slot without letting the receiver process
+    // the packets and return transport ACKs.
+    for _ in 0..256 {
+        sender.queue(Kind::Control, 0, 0, b"history").unwrap();
+    }
+    let report = sender.flush_outbound().await.unwrap();
+    assert_eq!(report.sent_packets, 256);
+    assert_eq!(sender.outbound_pending(), 0);
+
+    sender.queue(Kind::Video, 0, 0, b"retained").unwrap();
+    assert_eq!(
+        sender.flush_outbound_recoverably().await.unwrap(),
+        FlushOutcome::Backpressured
+    );
+    assert_eq!(sender.outbound_pending(), 1);
+
+    for _ in 0..256 {
+        assert_eq!(receiver.recv().await.unwrap().kind, Kind::Control);
+    }
+
+    for _ in 0..256 {
+        if sender
+            .transport_delivery_snapshot(Instant::now())
+            .aggregate
+            .in_flight
+            == 0
+        {
+            break;
+        }
+        tokio::time::timeout(Duration::from_millis(100), sender.recv_step())
+            .await
+            .expect("sender receives a transport ACK")
+            .expect("transport ACK is valid");
+    }
+    assert_eq!(
+        sender
+            .transport_delivery_snapshot(Instant::now())
+            .aggregate
+            .in_flight,
+        0
+    );
+
+    assert!(matches!(
+        sender.flush_outbound_recoverably().await.unwrap(),
+        FlushOutcome::Flushed(report) if report.sent_packets == 1 && report.pending_packets == 0
+    ));
     assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
 
     sender.close().await.unwrap();
