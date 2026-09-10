@@ -21,8 +21,10 @@ Cross-backend packet telemetry and scheduler integration remain open.
 
 This entry records a policy extraction, not portable transport parity and not
 Parsec or BUD compatibility. Native media pipelines, physical mobile-device
-validation, external coturn/public-NAT acceptance, virtual OS devices, and
-stock Parsec interoperability remain open or unverified.
+validation, external coturn/public-NAT acceptance, remaining platform
+virtual-device integrations beyond existing Linux uinput support (including
+virtual gamepads, displays, microphones, and tablets), and stock Parsec
+interoperability remain open or unverified.
 
 ## One encrypted session can change its OpenStream path
 
@@ -60,7 +62,9 @@ boundaries are recorded in the repository-root build and NAT documentation.
 
 This phase does not claim external coturn/public-NAT acceptance, native
 ScreenCaptureKit/VideoToolbox or Windows zero-copy media, mobile-device
-validation, virtual OS devices, or stock Parsec interoperability.
+validation, remaining platform virtual-device integrations beyond existing
+Linux uinput support (including virtual gamepads, displays, microphones, and
+tablets), or stock Parsec interoperability.
 
 ## The path now proves how large each datagram may be
 

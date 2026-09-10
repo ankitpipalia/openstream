@@ -104,10 +104,11 @@ datagrams through its role-token-validated application relay.
 ### Shared transport policy boundary
 
 Pure transport policy now lives in `openstream-transport-policy`, a
-dependency-free `#![no_std]` crate. It contains the bounded `Pacer` and
-`PacerConfig`, plus the packet-congestion `Controller` and
-`CongestionObservation` state machines. It owns deterministic policy only; it
-does not own sockets, wire-format encoding, or session I/O.
+dependency-free `#![no_std]` crate. It contains the bounded `Pacer` state
+machine and `PacerConfig`, plus the packet-congestion `Controller` state
+machine and its `CongestionObservation` observation input type. It owns
+deterministic policy only; it does not own sockets, wire-format encoding, or
+session I/O.
 
 `lowlat-core` re-exports those policy types for compatibility. It still owns
 lowlat packet encoding, retransmission rings, PMTU probes, and session
