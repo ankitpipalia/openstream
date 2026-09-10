@@ -56,7 +56,7 @@
 - `Pacer::with_config(now_ms: f64, config: PacerConfig) -> Result<Self, ConfigError>` constructs a custom validated pacer.
 - Existing `Pacer` methods retain their names and signatures: `rate_mbps`, `enabled`, `datagram_size`, `set_datagram_size`, `burst_capacity_bytes`, `set_rate`, `can_consume`, `try_consume`, and `wait_ms`.
 
-- [ ] **Step 1: Add the new crate and its failing contract tests.**
+- [x] **Step 1: Add the new crate and its failing contract tests.**
 
   Create the workspace member and a `#![no_std]` crate with no dependency
   section. Write tests for the exact contracts before copying the algorithm:
@@ -114,7 +114,7 @@
   Expected result before implementation: compilation or test failure because
   the new public types do not exist.
 
-- [ ] **Step 2: Implement the configuration and pacing state machine.**
+- [x] **Step 2: Implement the configuration and pacing state machine.**
 
   Move the current algorithm from `core/src/pacer.rs` into the new crate.
   Replace `crate::DEFAULT_DATAGRAM` and `crate::MAX_DATAGRAM` with the
@@ -132,7 +132,7 @@
   Invalid or backward timestamps must return no credit and must not move the
   stored clock backward.
 
-- [ ] **Step 3: Run the new crate tests and the copied behavior tests.**
+- [x] **Step 3: Run the new crate tests and the copied behavior tests.**
 
   Add the current lowlat tests with constants rewritten against the
   compatibility configuration. Verify the following exact cases:
@@ -144,7 +144,7 @@
   Expected result: all new configuration, clock, rate, packet-bound, time-
   bound, and datagram-size tests pass.
 
-- [ ] **Step 4: Replace the lowlat implementation with a compatibility module.**
+- [x] **Step 4: Replace the lowlat implementation with a compatibility module.**
 
   Change `core/src/pacer.rs` to re-export `Pacer`, `PacerConfig`, the burst
   constants, and the error type from `openstream-transport-policy`. Keep this
@@ -159,7 +159,7 @@
   `lowlat-core`'s dependency table. Do not modify `Session` or any packet
   code; its existing `Pacer::new` call must compile unchanged.
 
-- [ ] **Step 5: Verify lowlat compatibility.**
+- [x] **Step 5: Verify lowlat compatibility.**
 
   Run:
 
@@ -171,7 +171,7 @@
   Expected result: the existing lowlat pacing, session, packet, PMTU, and
   endpoint tests pass without source changes to their callers.
 
-- [ ] **Step 6: Commit the independently reviewable extraction.**
+- [x] **Step 6: Commit the independently reviewable extraction.**
 
   ```bash
   git add engine/lowlat/Cargo.toml engine/lowlat/crates/transport-policy \
@@ -197,7 +197,7 @@
 - `Controller::new(level: usize, min_mbps: f64, max_mbps: f64) -> Self`, `set_bounds`, `max_mbps`, `total_decreases`, `rate_mbps`, `is_congested`, and `tick(window, stale, measured_mbps)` preserve the existing signatures and behavior.
 - `Controller::tick_observation(&mut self, observation: CongestionObservation) -> Option<f64>` returns `None` without changing state unless `in_flight` and `stale` are both `Some`; when present it delegates to the compatibility algorithm and uses `delivery_rate_mbps.unwrap_or(0.0)` as the measured-rate input.
 
-- [ ] **Step 1: Add neutral observation tests before moving the implementation.**
+- [x] **Step 1: Add neutral observation tests before moving the implementation.**
 
   Add these tests to the new policy crate:
 
@@ -224,7 +224,7 @@
   }
   ```
 
-- [ ] **Step 2: Move the existing controller and add the observation method.**
+- [x] **Step 2: Move the existing controller and add the observation method.**
 
   Copy the current `Controller`, `Level`, constants, and tests into the
   dependency-free policy crate. Keep the exact increase/decrease periods,
@@ -233,14 +233,14 @@
   `tick_observation` method described above. Do not feed this type into
   `AdaptiveBitrate` or portable code in this task.
 
-- [ ] **Step 3: Replace `core/src/congestion.rs` with compatibility exports.**
+- [x] **Step 3: Replace `core/src/congestion.rs` with compatibility exports.**
 
   Re-export the extracted symbols so existing `session.rs` and `send.rs`
   imports continue to compile without edits. Keep the module-level
   documentation explaining that lowlat stale counts come from `SendRing` and
   that no peer feedback message exists.
 
-- [ ] **Step 4: Run focused and full regression tests.**
+- [x] **Step 4: Run focused and full regression tests.**
 
   ```bash
   cargo test -p openstream-transport-policy -- --test-threads=1
@@ -253,7 +253,7 @@
   packet evidence is inert, all existing lowlat tests remain green, and no
   workspace consumer sees a changed public lowlat API.
 
-- [ ] **Step 5: Commit the congestion extraction.**
+- [x] **Step 5: Commit the congestion extraction.**
 
   ```bash
   git add engine/lowlat/crates/transport-policy/src/lib.rs \
@@ -271,7 +271,7 @@
 - Modify: `docs/IMPLEMENTATION_PLAN.md`
 - Modify: `engine/lowlat/docs/changelog.md`
 
-- [ ] **Step 1: Document the actual boundary.**
+- [x] **Step 1: Document the actual boundary.**
 
   State that pure pacing and packet-congestion policy now live in
   `openstream-transport-policy`, while `lowlat-core` still owns lowlat packet
@@ -279,13 +279,13 @@
   State explicitly that portable `PeerSession` has not yet gained an
   outbound scheduler or packet delivery estimator.
 
-- [ ] **Step 2: Update the implementation checklist and changelog.**
+- [x] **Step 2: Update the implementation checklist and changelog.**
 
   Mark only the extraction tasks complete. Keep portable scheduler,
   cross-backend packet telemetry, native media pipelines, and live external
   network acceptance open. Do not claim Parsec/BUD compatibility.
 
-- [ ] **Step 3: Run documentation and repository checks.**
+- [x] **Step 3: Run documentation and repository checks.**
 
   ```bash
   git diff --check
@@ -295,7 +295,7 @@
   cargo deny check
   ```
 
-- [ ] **Step 4: Commit the documentation update.**
+- [x] **Step 4: Commit the documentation update.**
 
   ```bash
   git add docs/ARCHITECTURE.md docs/IMPLEMENTATION_PLAN.md engine/lowlat/docs/changelog.md
@@ -320,4 +320,3 @@ cargo deny check
 The branch is ready for review only if every command exits zero, the diff
 contains no generated artifacts or credentials, and the public behavior is
 still described as a policy extraction rather than portable transport parity.
-
