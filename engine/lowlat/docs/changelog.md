@@ -3,6 +3,27 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Pure transport policy is now shareable
+
+Pure pacing and packet-congestion policy now live in the dependency-free
+`#![no_std]` `openstream-transport-policy` crate. It provides the bounded
+`Pacer` and packet-congestion `Controller` state machines. `lowlat-core`
+re-exports those types for compatibility but still owns lowlat packet
+encoding, retransmission rings, PMTU probes, and session orchestration.
+The extraction does not change the wire format, socket behavior, or lowlat
+packet scheduling.
+
+Portable `PeerSession` still has no outbound packet scheduler or packet
+delivery estimator. Its `PeerTelemetryAdapter` remains an end-to-end
+frame-feedback and generation-scoped local-diagnostics boundary; it does not
+fabricate lowlat packet delivery, ACK, retransmission, or send-ring metrics.
+Cross-backend packet telemetry and scheduler integration remain open.
+
+This entry records a policy extraction, not portable transport parity and not
+Parsec or BUD compatibility. Native media pipelines, physical mobile-device
+validation, external coturn/public-NAT acceptance, virtual OS devices, and
+stock Parsec interoperability remain open or unverified.
+
 ## One encrypted session can change its OpenStream path
 
 The portable `PeerSession` now exposes generation-scoped `PeerTransportSnapshot`

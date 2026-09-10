@@ -303,6 +303,20 @@ The architecture and feature work above are now ahead of the latency-critical
 implementation. This phase targets the remaining Parsec-class performance gap
 without changing the default OpenStream wire format.
 
+- [x] Extract the pure bounded pacing policy into the dependency-free
+  `openstream-transport-policy` crate. `lowlat-core` keeps compatibility
+  re-exports and remains the lowlat integration owner.
+- [x] Extract the neutral packet-congestion policy and
+  `CongestionObservation` into `openstream-transport-policy`. The shared crate
+  remains policy-only and does not own sockets, packet encoding, retransmission
+  rings, PMTU probes, or session orchestration.
+- [ ] Add a shared outbound packet scheduler and packet delivery estimator to
+  portable `PeerSession` and the FFmpeg path. The portable path still relies
+  on end-to-end `FrameAck` feedback for encoder decisions.
+- [ ] Share packet-level telemetry and scheduler integration across lowlat and
+  portable backends without fabricating delivery, ACK, retransmission, or
+  send-ring metrics where a backend cannot provide them.
+
 - [x] Low-level `lowlat-core` transport telemetry: cumulative sent and
   cumulatively acknowledged payload bytes, delivered/send rate over a bounded
   sampling interval, in-flight and stale pressure, SRTT, and retransmission
@@ -313,11 +327,12 @@ without changing the default OpenStream wire format.
   diagnostics and rate loop, keeping each guest's delivery measurement separate
   when guests share one encoder. Existing ABI consumers retain
   `bitrate_mbps` as a delivery-rate alias; the new counters are appended.
-- [x] Add a per-guest paced sender with a bounded byte budget for bulk video;
-  acknowledgements are unpaced, while control/input and audio receive bounded
-  priority quanta ahead of it, and a target can be applied independently to
-  every network path. Burst credit is capped by both packet count and target
-  wire time, with a path-datagram-size hook ready for MTU probing.
+- [x] Add a per-guest paced sender to the native lowlat host with a bounded
+  byte budget for bulk video; acknowledgements are unpaced, while control/input
+  and audio receive bounded priority quanta ahead of it, and a target can be
+  applied independently to every network path. Burst credit is capped by both
+  packet count and target wire time, with a path-datagram-size hook ready for
+  MTU probing.
 - [x] Add path-aware DPLPMTUD: exact authenticated padding probes and probe
   acknowledgements, three-attempt loss tolerance, IPv4/IPv6/relay-derived
   ceilings, SEARCH_COMPLETE maintenance reprobes, black-hole fallback, and a
@@ -330,10 +345,11 @@ without changing the default OpenStream wire format.
 - [x] Add channel-aware black-hole recovery: preserve reliable control, discard
   only queued video, restart the delivery watchdog, request a fresh host IDR,
   and cover a real-socket namespace transition from MTU 1500 to 1300 and back.
-- [x] Add a common packet-telemetry boundary for the portable `PeerSession` /
-  FFmpeg path: generation-scoped `PeerTransportSnapshot` values feed a
-  reusable `PeerTelemetryAdapter`, while local packet rates remain diagnostic
-  and encoder decisions remain grounded in end-to-end `FrameAck` evidence.
+- [x] Add a common end-to-end frame-feedback boundary for the portable
+  `PeerSession` / FFmpeg path: generation-scoped `PeerTransportSnapshot`
+  values feed a reusable `PeerTelemetryAdapter`, while local packet rates
+  remain diagnostic and encoder decisions remain grounded in end-to-end
+  `FrameAck` evidence. This is not a packet delivery estimator.
 - [x] Add the host-authoritative direct↔opaque-relay↔direct path migration
   choreography, versioned path-control messages, idempotent commit/ACK
   handling, replay-window/reliable-control recovery tests, and the live
@@ -352,7 +368,9 @@ without changing the default OpenStream wire format.
 Gate: packet-level telemetry is visible in a bounded diagnostic snapshot;
 synthetic loss, delay, reordering, and rate changes remain deterministic; and
 each native media backend has a measured capture-to-present latency report
-before it is enabled by default.
+before it is enabled by default. This gate does not close the open portable
+packet scheduler, cross-backend packet telemetry, native media, or external
+coturn/public-NAT acceptance work.
 
 ## Compatibility backend
 
