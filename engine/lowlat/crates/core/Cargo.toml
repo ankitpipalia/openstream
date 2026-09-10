@@ -13,6 +13,7 @@ authors.workspace = true
 # no_std, no alloc: default features pull in `alloc` and `getrandom`, and the
 # core needs neither. It derives nonces rather than generating them, which is
 # what keeps replay and simulation deterministic.
+openstream-transport-policy = { workspace = true }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 # Connectivity check authentication. Same family and the same reason for
 # default-features = false: fixed-size state on the stack, no alloc, no RNG.

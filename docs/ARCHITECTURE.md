@@ -85,10 +85,12 @@ The current prototype is `openstream-protocol` in
 monotonic counters, a 1200-byte initial UDP payload limit, and replay checks.
 `openstream-media` adds bounded encoded-video fragmentation/reassembly. The
 Linux host and headless client exercise fragmented access units and frame
-ACKs. Both host paths use the shared ACK-age/gap bitrate policy; native Linux
-applies decisions through its live encoder control, while the external FFmpeg
-path can opt into a hysteresis- and cooldown-gated rolling encoder restart
-with `OPENSTREAM_FFMPEG_RECONFIGURE=restart`. Fixed-rate remains the explicit
+ACKs. Both host paths use the shared ACK-age/gap bitrate policy. That
+end-to-end frame-feedback policy is separate from packet pacing and packet
+congestion policy. Native Linux applies decisions through its live encoder
+control, while the external FFmpeg path can opt into a hysteresis- and
+cooldown-gated rolling encoder restart with
+`OPENSTREAM_FFMPEG_RECONFIGURE=restart`. Fixed-rate remains the explicit
 portable default because an external FFmpeg process has no live encoder-control
 ABI. The prototype is not a claim of BUD compatibility.
 Direct authenticated nomination remains the default. When `OPENSTREAM_UPNP=1`
@@ -98,6 +100,27 @@ socket after a bounded SSDP/SOAP IGD mapping attempt. When `OPENSTREAM_ICE=1` or
 peer-reflexive/relay candidates, nomination, consent freshness, and optional
 TURN allocation. The signaling service also forwards opaque encrypted
 datagrams through its role-token-validated application relay.
+
+### Shared transport policy boundary
+
+Pure transport policy now lives in `openstream-transport-policy`, a
+dependency-free `#![no_std]` crate. It contains the bounded `Pacer` state
+machine and `PacerConfig`, plus the packet-congestion `Controller` state
+machine and its `CongestionObservation` observation input type. It owns
+deterministic policy only; it does not own sockets, wire-format encoding, or
+session I/O.
+
+`lowlat-core` re-exports those policy types for compatibility. It still owns
+lowlat packet encoding, retransmission rings, PMTU probes, and session
+orchestration, and supplies packet evidence to the policy. Extracting the
+policy preserves the existing lowlat behavior; it does not automatically give
+portable transports the lowlat scheduler.
+
+Portable `PeerSession` still has no outbound packet scheduler or packet
+delivery estimator. Its `PeerTelemetryAdapter` remains a generation-scoped
+local-diagnostics and end-to-end frame-feedback boundary. It does not
+fabricate packet delivery, ACK, retransmission, or send-ring metrics.
+Cross-backend packet telemetry and scheduler integration remain open.
 
 `openstream-ffmpeg-host` is the first real cross-platform source adapter. It
 invokes FFmpeg as an external process, using the explicit `x11grab` or
