@@ -247,13 +247,18 @@ root:
 
 The script runs
 `cargo test -p openstream-client-core --test portable_transport --all-features --locked -- --test-threads=1`
-from `engine/lowlat`. Existing deterministic coverage includes delayed or
-constrained ACK recovery, 64-counter bitmap/reordering boundaries, duplicate
-and ACK-of-ACK suppression, bounded queue saturation and priority fairness,
-generation-isolated late ACKs, asymmetric ACK feedback, and cipher/`FrameAck`
-continuity. The result is explicitly loopback/synthetic only. It does not
-claim external coturn, public NAT, WAN loss/reordering, hardware capture or
-encoding, native media acceptance, or Parsec/BUD compatibility.
+from `engine/lowlat`. The 19-test suite includes authenticated two-session
+opaque-relay acceptance for dropped/delayed transport ACK recovery, duplicate
+ACK and ACK-of-ACK suppression, a 64-counter video reordering boundary,
+generation-isolated late ACKs, bounded history backpressure, scheduler
+priority/fairness, and post-migration reliable `FrameAck` continuity. The
+relay fixture quiesces setup traffic, matches actions by direction and packet
+class, asserts both peers selected the relay, and serializes the process-wide
+force-relay environment across tests.
+
+The result is explicitly loopback/synthetic only. It does not claim external
+coturn, public NAT, WAN loss/reordering, portable DPLPMTUD, hardware capture
+or encoding, native zero-copy media acceptance, or Parsec/BUD compatibility.
 
 The current `webrtc-ice = 0.17.2` boundary is tested separately:
 

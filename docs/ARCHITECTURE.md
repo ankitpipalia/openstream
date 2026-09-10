@@ -112,15 +112,28 @@ session I/O.
 
 `lowlat-core` re-exports those policy types for compatibility. It still owns
 lowlat packet encoding, retransmission rings, PMTU probes, and session
-orchestration, and supplies packet evidence to the policy. Extracting the
-policy preserves the existing lowlat behavior; it does not automatically give
-portable transports the lowlat scheduler.
+orchestration, and supplies packet evidence to the policy. The portable
+`PeerSession` now uses the same policy boundary without depending on lowlat
+I/O or `webrtc-ice` details.
 
-Portable `PeerSession` still has no outbound packet scheduler or packet
-delivery estimator. Its `PeerTelemetryAdapter` remains a generation-scoped
-local-diagnostics and end-to-end frame-feedback boundary. It does not
-fabricate packet delivery, ACK, retransmission, or send-ring metrics.
-Cross-backend packet telemetry and scheduler integration remain open.
+Portable `PeerSession` owns a bounded class-aware outbound scheduler and a
+channel-254 transport-meta ACK path. A fixed delivery-history ring records
+authenticated sent-packet evidence and exposes aggregate plus video/audio/
+critical snapshots with generation-scoped SRTT, delivery rate, in-flight,
+stale, and retry observations. ACKs are coalesced and non-ack-eliciting;
+application `send()` routes established media/control traffic through the
+scheduler, while only typed setup/path-control operations use immediate I/O.
+All four portable consumers (FFmpeg host, reference peer, client, and desktop
+client) use the queue/flush/wake API.
+
+These packet observations are local diagnostics and path-pressure evidence,
+not fabricated peer delivery claims. The portable encoder remains driven by
+end-to-end `FrameAck`/gap/age evidence; packet delivery statistics cannot by
+themselves change its bitrate. Portable transport starts at the 1200-byte
+sealed-datagram ceiling and does not yet implement portable DPLPMTUD. The
+lowlat and portable backends therefore share policy semantics and scheduling
+contracts, while their path I/O and remaining PMTU/media capabilities stay
+separate.
 
 `openstream-ffmpeg-host` is the first real cross-platform source adapter. It
 invokes FFmpeg as an external process, using the explicit `x11grab` or
@@ -172,7 +185,10 @@ The native Linux host uses those signals to lower or slowly raise the lowlat
 encoder ceiling. The portable external FFmpeg host routes the same frame
 feedback through `PeerTelemetryAdapter`; when explicitly configured for
 rolling reconfiguration, it applies a bounded restart with a fresh IDR.
-Without that opt-in, it remains fixed-rate and reports the encoder-control
+The portable packet scheduler remains bounded and paced in either mode. The
+encoder itself remains fixed-rate unless
+`OPENSTREAM_FFMPEG_RECONFIGURE=restart` is enabled, because an external FFmpeg
+process has no portable live-rate ABI; the implementation reports that
 limitation rather than pretending a bitrate change was applied.
 
 The imported sans-IO lowlat session also records packet-level local telemetry:
@@ -188,8 +204,12 @@ The lowlat session now has a path-aware DPLPMTUD controller with exact authentic
 probes, three-attempt loss tolerance, IPv4/IPv6/relay-derived ceilings, maintenance reprobes,
 and black-hole fallback. A confirmed size is applied atomically to ceiling-sized send-ring
 storage, active packetization, and pacing; lowering is refused while an attached ring still
-contains larger fragments. The portable `PeerSession` exposes generation-scoped snapshots,
-and `PeerTelemetryAdapter` consumes those snapshots alongside end-to-end frame feedback.
+contains larger fragments. The portable `PeerSession` exposes generation-scoped
+packet snapshots and `PeerTelemetryAdapter` consumes those snapshots alongside
+end-to-end frame feedback. Path-local packet counters, pacer state, and
+delivery samples reset on a path-generation change; the cipher/replay domain,
+reliable-control ordering, frame IDs, and `FrameAck` history remain
+session-wide.
 The rate controller consumes measured delivery rate during clean-path ramp-up;
 these counters are local diagnostics and do not add a congestion-feedback wire
 message. The portable FFmpeg path uses the common frame-feedback adapter; its
