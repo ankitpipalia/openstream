@@ -575,10 +575,10 @@ mod tests {
         {
             left.turn(now, |_| {}).expect("left turn");
             right.turn(now, |_| {}).expect("right turn");
-            if arrived.is_none()
-                && let Some(Ok(len)) = right.endpoint().session().take_message(CHANNEL, &mut out)
-            {
-                arrived = Some(out[..len].to_vec());
+            if arrived.is_none() {
+                if let Some(Ok(len)) = right.endpoint().session().take_message(CHANNEL, &mut out) {
+                    arrived = Some(out[..len].to_vec());
+                }
             }
             now += 10.0;
         }

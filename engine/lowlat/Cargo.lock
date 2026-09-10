@@ -1808,6 +1808,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "if-addrs",
+ "openstream-media",
  "openstream-protocol",
  "openstream-transport",
  "rustls",
@@ -1880,6 +1881,7 @@ dependencies = [
  "lowlat-audio",
  "lowlat-core",
  "openstream-protocol",
+ "openstream-transport",
 ]
 
 [[package]]
@@ -1945,6 +1947,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "openstream-protocol",
+ "serde",
  "tokio",
  "url",
 ]

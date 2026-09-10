@@ -52,6 +52,7 @@ pub struct AdaptiveBitrate {
     smoothed_ack_ms: Option<f64>,
     loss_since_tick: u32,
     healthy_since_ms: Option<u64>,
+    ramp_suppressed_until_ms: u64,
     last_change_ms: u64,
 }
 
@@ -68,6 +69,7 @@ impl AdaptiveBitrate {
             smoothed_ack_ms: None,
             loss_since_tick: 0,
             healthy_since_ms: None,
+            ramp_suppressed_until_ms: 0,
             last_change_ms: 0,
         }
     }
@@ -85,6 +87,17 @@ impl AdaptiveBitrate {
     /// Smoothed host-observed acknowledgement age.
     pub fn smoothed_ack_ms(&self) -> Option<f64> {
         self.smoothed_ack_ms
+    }
+
+    pub(crate) fn frame_loss_since_tick(&self) -> u32 {
+        self.loss_since_tick
+    }
+
+    /// Prevent a path transition from immediately reusing an earlier healthy
+    /// interval to raise the encoder target.
+    pub(crate) fn suppress_ramp_until(&mut self, now_ms: u64) {
+        self.healthy_since_ms = Some(now_ms);
+        self.ramp_suppressed_until_ms = now_ms.saturating_add(RAMP_INTERVAL_MS);
     }
 
     /// Record a frame before its fragments are sent.
@@ -153,7 +166,9 @@ impl AdaptiveBitrate {
             (Some(BitrateReason::Backlog), self.current_mbps * 0.75)
         } else if healthy {
             let healthy_since = *self.healthy_since_ms.get_or_insert(now_ms);
-            if now_ms.saturating_sub(healthy_since) >= RAMP_INTERVAL_MS {
+            if now_ms >= self.ramp_suppressed_until_ms
+                && now_ms.saturating_sub(healthy_since) >= RAMP_INTERVAL_MS
+            {
                 (Some(BitrateReason::RampUp), self.current_mbps * 1.10)
             } else {
                 (None, self.current_mbps)
@@ -188,7 +203,7 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }
 }
 
-fn sequence_at_or_before(sequence: u32, reference: u32) -> bool {
+pub(crate) fn sequence_at_or_before(sequence: u32, reference: u32) -> bool {
     sequence == reference || reference.wrapping_sub(sequence) < 0x8000_0000
 }
 

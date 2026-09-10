@@ -8,18 +8,22 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use openstream_protocol::control::{Channel as ControlChannel, Frame as ControlFrame};
+use openstream_protocol::path_control::{PATH_CONTROL_CHANNEL, PathControl};
 use openstream_protocol::relay::Role as RelayRole;
 use openstream_protocol::{
     IdentityError, IdentityKey, KeyExchange, Kind, MAX_DATAGRAM, Packet, Session as CipherSession,
 };
-use openstream_transport::UdpTransport;
+use openstream_transport::{
+    PathGeneration, PathState, PeerTransportSnapshot, TransportSample, UdpTransport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -32,6 +36,16 @@ use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc_ice::url::Url as IceUrl;
 use webrtc_util::conn::Conn as IceConn;
+
+mod path;
+
+use path::{
+    COMMIT_RETRY, MigrationAction, MigrationController, PathRuntime, PathSlot, PeerPath,
+    PeerPathBackend,
+};
+pub use path::{
+    MigrationReport, MigrationState, MigrationTarget, MigrationToken, PathMigrationError,
+};
 
 /// Wire-level capability protocol version.
 pub const CAPABILITY_VERSION: u8 = 1;
@@ -125,6 +139,9 @@ pub struct Capabilities {
     /// Whether the peer can consume or generate force-feedback events.
     #[serde(default)]
     pub rumble: bool,
+    /// Whether the peer explicitly supports generation-scoped path migration.
+    #[serde(default)]
+    pub path_migration: bool,
 }
 
 impl Capabilities {
@@ -178,6 +195,7 @@ impl Capabilities {
             multi_monitor: false,
             pen: false,
             rumble: false,
+            path_migration: false,
         }
     }
 
@@ -211,7 +229,17 @@ impl Capabilities {
             multi_monitor: false,
             pen: false,
             rumble: true,
+            path_migration: false,
         }
+    }
+
+    /// Explicitly advertise support for the path-migration control protocol.
+    ///
+    /// Ordinary capability profiles remain single-path by default. Migration
+    /// acceptance peers opt in deliberately with this builder.
+    pub fn with_path_migration(mut self) -> Self {
+        self.path_migration = true;
+        self
     }
 }
 
@@ -244,6 +272,7 @@ pub struct NegotiatedCapabilities {
     pub multi_monitor: bool,
     pub pen: bool,
     pub rumble: bool,
+    pub path_migration: bool,
 }
 
 /// Capability negotiation failures.
@@ -337,6 +366,7 @@ pub fn negotiate(
         multi_monitor: host.multi_monitor && client.multi_monitor,
         pen: host.pen && client.pen,
         rumble: host.rumble && client.rumble,
+        path_migration: host.path_migration && client.path_migration,
     })
 }
 
@@ -682,6 +712,7 @@ pub fn configured_ice_urls() -> Result<Vec<IceUrl>, Error> {
 /// Errors produced by the signaling client.
 #[derive(Debug)]
 pub enum Error {
+    PathMigration(PathMigrationError),
     Connect(Box<tokio_tungstenite::tungstenite::Error>),
     Serialize(serde_json::Error),
     Deserialize(serde_json::Error),
@@ -720,6 +751,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PathMigration(error) => write!(f, "path migration failed: {error}"),
             Self::Connect(error) => write!(f, "signaling connection failed: {error}"),
             Self::Serialize(error) => write!(f, "signaling message could not be encoded: {error}"),
             Self::Deserialize(error) => {
@@ -762,6 +794,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<PathMigrationError> for Error {
+    fn from(error: PathMigrationError) -> Self {
+        Self::PathMigration(error)
+    }
+}
 
 impl From<openstream_transport::Error> for Error {
     fn from(error: openstream_transport::Error) -> Self {
@@ -936,13 +974,94 @@ impl fmt::Debug for IcePath {
     }
 }
 
-#[derive(Debug)]
-enum DataPath {
-    Direct {
-        transport: Box<UdpTransport>,
-        candidate: CandidateKind,
-    },
-    Ice(IcePath),
+#[derive(Debug, Clone, Copy, Default)]
+struct PathCounters {
+    sent_packets: u64,
+    sent_wire_bytes: u64,
+    received_packets: u64,
+    received_wire_bytes: u64,
+}
+
+impl PathCounters {
+    fn record_sent(&mut self, bytes: usize) {
+        self.sent_packets = self.sent_packets.saturating_add(1);
+        self.sent_wire_bytes = self
+            .sent_wire_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    fn record_received(&mut self, bytes: usize) {
+        self.received_packets = self.received_packets.saturating_add(1);
+        self.received_wire_bytes = self
+            .received_wire_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    fn sample(self, path_generation: PathGeneration) -> TransportSample {
+        TransportSample {
+            path_generation,
+            sent_packets: self.sent_packets,
+            sent_wire_bytes: self.sent_wire_bytes,
+            received_packets: self.received_packets,
+            received_wire_bytes: self.received_wire_bytes,
+            sample_interval_ms: 0,
+            send_rate_mbps: 0.0,
+            receive_rate_mbps: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathSampleBaseline {
+    observed_at: Instant,
+    counters: TransportSample,
+}
+
+fn sample_path_counters(
+    counters: TransportSample,
+    now: Instant,
+    baseline: &mut Option<PathSampleBaseline>,
+) -> Option<TransportSample> {
+    let previous = match baseline.replace(PathSampleBaseline {
+        observed_at: now,
+        counters,
+    }) {
+        Some(previous) if previous.counters.path_generation == counters.path_generation => previous,
+        _ => return None,
+    };
+    let sample_interval_ms = u64::try_from(
+        now.saturating_duration_since(previous.observed_at)
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    if sample_interval_ms == 0 {
+        return None;
+    }
+    let send_rate_mbps = decimal_mbps(
+        counters
+            .sent_wire_bytes
+            .saturating_sub(previous.counters.sent_wire_bytes),
+        sample_interval_ms,
+    );
+    let receive_rate_mbps = decimal_mbps(
+        counters
+            .received_wire_bytes
+            .saturating_sub(previous.counters.received_wire_bytes),
+        sample_interval_ms,
+    );
+    Some(TransportSample {
+        sample_interval_ms,
+        send_rate_mbps,
+        receive_rate_mbps,
+        ..counters
+    })
+}
+
+fn decimal_mbps(bytes: u64, interval_ms: u64) -> f64 {
+    if interval_ms == 0 {
+        return 0.0;
+    }
+    bytes as f64 * 8_000.0 / (interval_ms as f64 * 1_000_000.0)
 }
 
 /// A fully established OpenStream peer session.
@@ -951,18 +1070,196 @@ enum DataPath {
 /// service: role-scoped WebSocket, candidate exchange, ephemeral key exchange,
 /// and an authenticated UDP socket. Codec and OS-device policy remain above
 /// this type.
-#[derive(Debug)]
 pub struct PeerSession {
     signal: Endpoint,
-    transport: DataPath,
+    path: PathRuntime,
     cipher: CipherSession,
     stats: SessionStats,
+    path_baseline: Option<PathSampleBaseline>,
+    ice_counters: PathCounters,
     /// A peer can win the path probe and send its first capability message
     /// before the other side has left the probe loop. Preserve that
     /// authenticated packet instead of dropping it at the phase boundary.
     prefetched: Option<Packet>,
     /// Last direct-path keepalive sent by the owning event loop.
     last_keepalive: std::time::Instant,
+    migration_enabled: bool,
+    migration: MigrationController,
+    migration_config: MigrationConfig,
+    opening: Option<OpeningPath>,
+    draining: Option<DrainingPath>,
+    migration_inbox: std::collections::VecDeque<Packet>,
+}
+
+struct RelayTicket(String);
+
+impl fmt::Debug for RelayTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RelayTicket([redacted])")
+    }
+}
+
+#[derive(Debug)]
+struct MigrationConfig {
+    session_id: String,
+    role: Role,
+    local_candidates: Vec<Candidate>,
+    peer_candidates: Vec<Candidate>,
+    relay_address: Option<SocketAddr>,
+    relay_ticket: Option<RelayTicket>,
+}
+
+impl MigrationConfig {
+    fn new(
+        pairing: &Pairing,
+        role: Role,
+        local_candidates: Vec<Candidate>,
+        peer_candidates: Vec<Candidate>,
+    ) -> Self {
+        Self {
+            session_id: pairing.session_id.clone(),
+            role,
+            local_candidates: local_candidates
+                .into_iter()
+                .filter(|candidate| valid_local_candidate(candidate.address))
+                .take(MAX_REMOTE_CANDIDATES)
+                .collect(),
+            peer_candidates: peer_candidates
+                .into_iter()
+                .filter(|candidate| valid_local_candidate(candidate.address))
+                .take(MAX_REMOTE_CANDIDATES)
+                .collect(),
+            relay_address: pairing
+                .relay_address
+                .as_deref()
+                .and_then(|address| address.parse().ok())
+                .filter(|address: &SocketAddr| {
+                    address.port() != 0
+                        && !address.ip().is_unspecified()
+                        && !address.ip().is_multicast()
+                }),
+            relay_ticket: pairing
+                .relay_ticket(role)
+                .filter(|ticket| !ticket.is_empty())
+                .map(|ticket| RelayTicket(ticket.to_owned())),
+        }
+    }
+}
+
+struct OpeningPath {
+    generation: PathGeneration,
+    target: MigrationTarget,
+    token: MigrationToken,
+    advertised: bool,
+    remote: Option<SocketAddr>,
+    connected: bool,
+}
+
+struct ReceivedPacket {
+    packet: Packet,
+    ingress: PathSlot,
+    wire_bytes: Option<usize>,
+}
+
+async fn receive_backend(
+    backend: &PeerPathBackend,
+    datagram: &mut [u8; MAX_DATAGRAM],
+) -> Result<usize, Error> {
+    match backend {
+        PeerPathBackend::Direct { transport, .. } => {
+            tokio::time::timeout(DIRECT_IDLE_TIMEOUT, transport.recv_sealed(datagram))
+                .await
+                .map_err(|_| Error::Timeout("direct data path liveness"))?
+                .map_err(Error::from)
+        }
+        PeerPathBackend::Ice(path) => path
+            .conn
+            .recv(datagram)
+            .await
+            .map_err(|error| Error::Ice(error.to_string())),
+    }
+}
+
+struct DrainingPath {
+    incoming: mpsc::Receiver<(PathSlot, Vec<u8>)>,
+    cancel: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+impl DrainingPath {
+    fn new(old: PeerPath, deadline: Instant) -> Self {
+        let (outgoing, incoming) = mpsc::channel(32);
+        let (cancel, mut cancelled) = oneshot::channel();
+        let (generation, backend) = old.into_backend();
+        // This task owns the old socket and relay cleanup guard, so both the
+        // receive-only lifetime and remote registration cleanup remain finite
+        // even when the application's receive loop is idle or cancelled.
+        let task = tokio::spawn(async move {
+            let (transport, relay_registration) = match backend {
+                PeerPathBackend::Direct {
+                    transport,
+                    relay_registration,
+                    ..
+                } => (Some(transport), relay_registration),
+                PeerPathBackend::Ice(_) => (None, None),
+            };
+            if let Some(transport) = transport {
+                let mut datagram = [0; MAX_DATAGRAM];
+                loop {
+                    let result = tokio::select! {
+                        _ = &mut cancelled => break,
+                        result = tokio::time::timeout_at(
+                            TokioInstant::from_std(deadline),
+                            transport.recv_sealed(&mut datagram),
+                        ) => result,
+                    };
+                    let Ok(Ok(length)) = result else {
+                        break;
+                    };
+                    if outgoing
+                        .try_send((PathSlot(generation), datagram[..length].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            if let Some(relay_registration) = relay_registration {
+                let _ = relay_registration.unregister().await;
+            }
+        });
+        Self {
+            incoming,
+            cancel,
+            task,
+        }
+    }
+
+    async fn close(self) {
+        let _ = self.cancel.send(());
+        let _ = self.task.await;
+    }
+}
+
+async fn cleanup_peer_path(path: PeerPath) {
+    let (_generation, backend) = path.into_backend();
+    if let PeerPathBackend::Direct {
+        relay_registration: Some(relay_registration),
+        ..
+    } = backend
+    {
+        let _ = relay_registration.unregister().await;
+    }
+}
+
+impl fmt::Debug for PeerSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerSession")
+            .field("connection_path", &self.connection_path())
+            .field("path_generation", &self.path_generation())
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Bounded ordered control helper layered over a [`PeerSession`].
@@ -1077,6 +1374,413 @@ impl ReliableControl {
 }
 
 impl PeerSession {
+    /// Prepare and commit a fresh direct/opaque path as the authoritative host.
+    /// The peer's normal `recv` loop drives the responder. Cancellation keeps
+    /// the in-session attempt durable; later recv/liveness calls drive it on.
+    pub async fn migrate_to(&mut self, target: MigrationTarget) -> Result<MigrationReport, Error> {
+        if !self.migration_enabled {
+            return Err(PathMigrationError::CapabilityNotNegotiated.into());
+        }
+        let actions = self.migration.tick(Instant::now());
+        self.apply_migration_actions(actions).await?;
+        if self.migration.state == MigrationState::CommitUnconfirmed {
+            return Err(PathMigrationError::CommitUnconfirmed.into());
+        }
+        if self.migration.busy() {
+            return Err(PathMigrationError::MigrationAlreadyPending.into());
+        }
+        if self.migration.role != Role::Host {
+            return Err(PathMigrationError::HostMigrationRequired.into());
+        }
+        self.check_migration_target(target)?;
+        let previous = self.path.snapshot(Instant::now());
+        let actions = self
+            .migration
+            .start(target, MigrationToken::random()?, Instant::now())?;
+        self.apply_migration_actions(actions).await?;
+        loop {
+            if let Err(error) = self.drive_migration().await {
+                self.abort_preparation().await;
+                return Err(
+                    if self.migration.state == MigrationState::CommitUnconfirmed {
+                        PathMigrationError::CommitUnconfirmed.into()
+                    } else {
+                        error
+                    },
+                );
+            }
+            match self.migration.state {
+                MigrationState::Active => {
+                    let active = self.path.snapshot(Instant::now());
+                    return Ok(MigrationReport {
+                        previous_generation: previous.path_generation,
+                        active_generation: active.path_generation,
+                        previous_kind: previous.path,
+                        active_kind: active.path,
+                    });
+                }
+                MigrationState::CommitUnconfirmed => {
+                    return Err(PathMigrationError::CommitUnconfirmed.into());
+                }
+                MigrationState::Failed => return Err(PathMigrationError::PathUnavailable.into()),
+                _ => {}
+            }
+            match self.recv_step().await {
+                Ok(Some(packet)) if self.migration_inbox.len() < MAX_CONTROL_PENDING => {
+                    self.migration_inbox.push_back(packet)
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.abort_preparation().await;
+                    return Err(
+                        if self.migration.state == MigrationState::CommitUnconfirmed {
+                            PathMigrationError::CommitUnconfirmed.into()
+                        } else {
+                            error
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn migration_state(&self) -> MigrationState {
+        self.migration.state
+    }
+
+    pub fn path_snapshot(&mut self) -> PeerTransportSnapshot {
+        self.transport_snapshot(Instant::now())
+    }
+
+    fn check_migration_target(&self, target: MigrationTarget) -> Result<(), Error> {
+        if target == MigrationTarget::Ice
+            || matches!(self.path.active().backend(), PeerPathBackend::Ice(_))
+        {
+            return Err(PathMigrationError::UnsupportedIceRestart.into());
+        }
+        let config = &self.migration_config;
+        let available = match target {
+            MigrationTarget::DirectUdp => {
+                config
+                    .local_candidates
+                    .iter()
+                    .any(|c| c.kind == CandidateKind::Host)
+                    && config
+                        .peer_candidates
+                        .iter()
+                        .any(|c| c.kind != CandidateKind::Relay)
+            }
+            MigrationTarget::OpaqueRelay => {
+                config.relay_address.is_some() && config.relay_ticket.is_some()
+            }
+            MigrationTarget::Ice => false,
+        };
+        // Only cross-family migration is supported; re-registering an active
+        // relay role would replace its slot before the commit boundary.
+        let same_kind = matches!(
+            (target, self.connection_path()),
+            (
+                MigrationTarget::OpaqueRelay,
+                ConnectionPath::DirectUdp {
+                    candidate: CandidateKind::Relay
+                }
+            ) | (
+                MigrationTarget::DirectUdp,
+                ConnectionPath::DirectUdp {
+                    candidate: CandidateKind::Host
+                        | CandidateKind::Mapped
+                        | CandidateKind::ServerReflexive
+                }
+            )
+        );
+        if !available || same_kind {
+            return Err(PathMigrationError::PathUnavailable.into());
+        }
+        Ok(())
+    }
+
+    async fn abort_preparation(&mut self) {
+        let actions = self
+            .migration
+            .fail_preparation(openstream_protocol::path_control::AbortReason::ProbeFailed);
+        let _ = self.apply_migration_actions(actions).await;
+    }
+
+    async fn apply_migration_actions(
+        &mut self,
+        actions: Vec<MigrationAction>,
+    ) -> Result<(), Error> {
+        for action in actions {
+            match action {
+                MigrationAction::Send(slot, record) => {
+                    let bytes = record
+                        .encode()
+                        .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+                    if self
+                        .send_sealed_on(slot, Kind::Control, PATH_CONTROL_CHANNEL, 0, &bytes, false)
+                        .await
+                        .is_err()
+                        && slot == PathSlot(self.path_generation())
+                    {
+                        self.migration.old_path_failed();
+                    }
+                }
+                MigrationAction::Open {
+                    generation,
+                    target,
+                    token,
+                } => {
+                    self.opening = Some(OpeningPath {
+                        generation,
+                        target,
+                        token,
+                        advertised: false,
+                        remote: None,
+                        connected: false,
+                    });
+                }
+                MigrationAction::Activate { generation } => {
+                    // No await between the durable controller decision and
+                    // swapping all path-local state, or before ACK emission.
+                    assert_eq!(
+                        self.path.prepared.as_ref().map(PeerPath::generation),
+                        Some(generation)
+                    );
+                    self.path.mark_ready();
+                    self.path.mark_commit_pending();
+                    assert!(self.path.activate_prepared());
+                    self.path.active_mut().activate(Instant::now());
+                    self.path.begin_drain();
+                    let old = self.path.prepared.take().expect("old path retained");
+                    self.draining = Some(DrainingPath::new(
+                        old,
+                        self.migration.drain_deadline().expect("drain deadline"),
+                    ));
+                    self.opening = None;
+                    self.path_baseline = None;
+                    self.ice_counters = PathCounters::default();
+                    self.last_keepalive = Instant::now();
+                }
+                MigrationAction::Retire => {
+                    if let Some(draining) = self.draining.take() {
+                        draining.close().await;
+                    }
+                }
+                MigrationAction::Discard => {
+                    self.opening = None;
+                    if let Some(prepared) = self.path.prepared.take() {
+                        cleanup_peer_path(prepared).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn drive_migration(&mut self) -> Result<(), Error> {
+        if !self.migration_enabled {
+            return Ok(());
+        }
+        let actions = self.migration.tick(Instant::now());
+        self.apply_migration_actions(actions).await?;
+        if matches!(
+            self.migration.state,
+            MigrationState::Failed | MigrationState::CommitUnconfirmed
+        ) {
+            return Ok(());
+        }
+        // Reconstruct opening work if a caller cancelled between reservation
+        // and execution of an action. No second token or cipher is created.
+        if self.opening.is_none() {
+            if let Some(p) = &self.migration.pending {
+                self.opening = Some(OpeningPath {
+                    generation: p.generation,
+                    target: p.target,
+                    token: p.token,
+                    advertised: false,
+                    remote: None,
+                    connected: false,
+                });
+            }
+        }
+        let Some(opening) = &self.opening else {
+            return Ok(());
+        };
+        if opening.connected {
+            return Ok(());
+        }
+        let deadline = self
+            .migration
+            .pending
+            .as_ref()
+            .expect("opening has pending attempt")
+            .deadline;
+        let result =
+            tokio::time::timeout_at(TokioInstant::from_std(deadline), self.open_replacement())
+                .await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.abort_preparation().await;
+                Err(error)
+            }
+            Err(_) => {
+                self.abort_preparation().await;
+                Err(PathMigrationError::PathUnavailable.into())
+            }
+        }
+    }
+
+    async fn open_replacement(&mut self) -> Result<(), Error> {
+        let opening = self.opening.as_ref().expect("opening work");
+        let target = opening.target;
+        self.check_migration_target(target)?;
+        if self.path.prepared.is_none() {
+            let local = match self.path.active().backend() {
+                PeerPathBackend::Direct { transport, .. } => transport.local_addr()?,
+                PeerPathBackend::Ice(_) => {
+                    return Err(PathMigrationError::UnsupportedIceRestart.into());
+                }
+            };
+            let transport = UdpTransport::bind(SocketAddr::new(local.ip(), 0)).await?;
+            self.path.install(PeerPath::replacement(
+                PeerPathBackend::Direct {
+                    transport: Box::new(transport),
+                    candidate: if target == MigrationTarget::OpaqueRelay {
+                        CandidateKind::Relay
+                    } else {
+                        CandidateKind::Host
+                    },
+                    relay_registration: None,
+                },
+                opening.generation,
+                Instant::now(),
+            ));
+        }
+        let opening = self.opening.as_mut().expect("opening work");
+        let PeerPathBackend::Direct {
+            transport,
+            relay_registration,
+            ..
+        } = self
+            .path
+            .prepared
+            .as_mut()
+            .expect("replacement socket")
+            .backend_mut()
+        else {
+            unreachable!()
+        };
+        if target == MigrationTarget::DirectUdp {
+            if !opening.advertised {
+                let local = transport.local_addr()?;
+                let ip = if local.ip().is_unspecified() {
+                    self.migration_config
+                        .local_candidates
+                        .iter()
+                        .find(|candidate| {
+                            candidate.kind == CandidateKind::Host
+                                && candidate.address.is_ipv4() == local.is_ipv4()
+                        })
+                        .ok_or(PathMigrationError::PathUnavailable)?
+                        .address
+                        .ip()
+                } else {
+                    local.ip()
+                };
+                self.signal.send(&serde_json::json!({"type":"path_candidate", "generation":opening.generation, "token":hex::encode(opening.token.bytes()), "kind":"direct_udp", "ip":ip.to_string(), "port":local.port()}))?;
+                opening.advertised = true;
+            }
+            let Some(remote) = opening.remote else {
+                return Ok(());
+            };
+            transport.connect(remote).await?;
+        } else {
+            let config = &self.migration_config;
+            transport
+                .connect(
+                    config
+                        .relay_address
+                        .ok_or(PathMigrationError::PathUnavailable)?,
+                )
+                .await?;
+            let role = match config.role {
+                Role::Host => RelayRole::Host,
+                Role::Client => RelayRole::Client,
+            };
+            let ticket = &config
+                .relay_ticket
+                .as_ref()
+                .ok_or(PathMigrationError::PathUnavailable)?
+                .0;
+            let cleanup_guard = transport.relay_registration(&config.session_id, role, ticket)?;
+            let registration_result = transport
+                .register_relay(&config.session_id, role, ticket)
+                .await;
+            // Install the guard before propagating a registration error: the
+            // relay may have accepted the request even when its ACK was lost.
+            *relay_registration = Some(cleanup_guard);
+            registration_result?;
+        }
+        opening.connected = true;
+        let actions = self.migration.opened(Instant::now());
+        self.apply_migration_actions(actions).await
+    }
+
+    fn receive_path_candidate(&mut self, message: Value) -> Result<(), Error> {
+        let invalid = || Error::InvalidMessage("unexpected or invalid path candidate".into());
+        if message.to_string().len() > MAX_CANDIDATE_BYTES {
+            return Err(invalid());
+        }
+        let opening = self.opening.as_mut().ok_or_else(invalid)?;
+        if opening.target != MigrationTarget::DirectUdp || opening.remote.is_some() {
+            return Err(invalid());
+        }
+        let object = message.as_object().ok_or_else(invalid)?;
+        if object.len() != 6
+            || message.get("type").and_then(Value::as_str) != Some("path_candidate")
+            || message.get("kind").and_then(Value::as_str) != Some("direct_udp")
+            || message.get("generation").and_then(Value::as_u64) != Some(opening.generation)
+        {
+            return Err(invalid());
+        }
+        let raw_token = message
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?;
+        let mut token = [0; 16];
+        hex::decode_to_slice(raw_token, &mut token).map_err(|_| invalid())?;
+        if token == [0; 16] || token != opening.token.bytes() {
+            return Err(invalid());
+        }
+        let ip: IpAddr = message
+            .get("ip")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?
+            .parse()
+            .map_err(|_| invalid())?;
+        let port = message
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or_else(invalid)?;
+        let address = SocketAddr::new(ip, port);
+        let PeerPathBackend::Direct { transport, .. } =
+            self.path.prepared.as_ref().ok_or_else(invalid)?.backend()
+        else {
+            return Err(invalid());
+        };
+        let local = transport.local_addr()?;
+        if address == local
+            || address.is_ipv4() != local.is_ipv4()
+            || !valid_peer_candidate(address, local)
+        {
+            return Err(invalid());
+        }
+        opening.remote = Some(address);
+        Ok(())
+    }
+
     /// Establish the control and encrypted data paths for one pairing.
     pub async fn establish(
         server_origin: &str,
@@ -1324,16 +2028,28 @@ impl PeerSession {
         };
         candidate_forwarder.abort();
 
+        let now = Instant::now();
         Ok(Self {
             signal,
-            transport: DataPath::Ice(IcePath {
-                _agent: agent,
-                conn,
-            }),
+            path: PathRuntime::initial_active(
+                PeerPathBackend::Ice(IcePath {
+                    _agent: agent,
+                    conn,
+                }),
+                now,
+            ),
             cipher: CipherSession::new(keys.tx, keys.rx),
             stats: SessionStats::default(),
+            path_baseline: None,
+            ice_counters: PathCounters::default(),
             prefetched: None,
-            last_keepalive: std::time::Instant::now(),
+            last_keepalive: now,
+            migration_enabled: false,
+            migration: MigrationController::new(role),
+            migration_config: MigrationConfig::new(pairing, role, vec![], vec![]),
+            opening: None,
+            draining: None,
+            migration_inbox: Default::default(),
         })
     }
 
@@ -1510,7 +2226,7 @@ impl PeerSession {
         let mut transport = transport;
         let force_relay = std::env::var("OPENSTREAM_FORCE_RELAY").as_deref() == Ok("1");
         let candidate_deadline = TokioInstant::now() + PHASE_TIMEOUT;
-        for candidate in peer_candidates {
+        for candidate in peer_candidates.iter().copied() {
             if TokioInstant::now() >= candidate_deadline {
                 break;
             }
@@ -1520,7 +2236,7 @@ impl PeerSession {
             if transport.connect(candidate.address).await.is_err() {
                 continue;
             }
-            if candidate.kind == CandidateKind::Relay {
+            let relay_registration = if candidate.kind == CandidateKind::Relay {
                 let relay_role = match role {
                     Role::Host => RelayRole::Host,
                     Role::Client => RelayRole::Client,
@@ -1528,27 +2244,58 @@ impl PeerSession {
                 let Some(ticket) = pairing.relay_ticket(role) else {
                     continue;
                 };
-                transport
+                let cleanup_guard =
+                    transport.relay_registration(&pairing.session_id, relay_role, ticket)?;
+                let registration_result = transport
                     .register_relay(&pairing.session_id, relay_role, ticket)
-                    .await?;
-            }
+                    .await;
+                // On an error the guard drops on this scope and schedules an
+                // unregister for a registration whose ACK may have been lost.
+                registration_result?;
+                Some(cleanup_guard)
+            } else {
+                None
+            };
             // One cipher across all candidates: counters stay monotonic per
             // direction, so delayed probes from a failed candidate can never
             // collide with or pollute the winning path's counters.
-            if let ProbeResult::Established(prefetched) = probe_path(&transport, &mut cipher).await
-            {
+            let path = PeerPathBackend::Direct {
+                transport: Box::new(transport),
+                candidate: candidate.kind,
+                relay_registration,
+            };
+            if let ProbeResult::Established(prefetched) = path.probe(&mut cipher).await {
+                let now = Instant::now();
                 return Ok(Self {
                     signal,
-                    transport: DataPath::Direct {
-                        transport: Box::new(transport),
-                        candidate: candidate.kind,
-                    },
+                    path: PathRuntime::initial_active(path, now),
                     cipher,
                     stats: SessionStats::default(),
+                    path_baseline: None,
+                    ice_counters: PathCounters::default(),
                     prefetched,
-                    last_keepalive: std::time::Instant::now(),
+                    last_keepalive: now,
+                    migration_enabled: false,
+                    migration: MigrationController::new(role),
+                    migration_config: MigrationConfig::new(
+                        pairing,
+                        role,
+                        local_candidates,
+                        peer_candidates,
+                    ),
+                    opening: None,
+                    draining: None,
+                    migration_inbox: Default::default(),
                 });
             }
+            let PeerPathBackend::Direct {
+                transport: failed_transport,
+                ..
+            } = path
+            else {
+                unreachable!("direct candidate probe uses a direct backend");
+            };
+            transport = *failed_transport;
         }
         Err(Error::NoReachableCandidate)
     }
@@ -1563,12 +2310,28 @@ impl PeerSession {
     /// This reports only routing metadata. It never exposes bearer tokens,
     /// TURN credentials, session keys, or peer addresses.
     pub fn connection_path(&self) -> ConnectionPath {
-        match &self.transport {
-            DataPath::Direct { candidate, .. } => ConnectionPath::DirectUdp {
+        match self.path.active().backend() {
+            PeerPathBackend::Direct { candidate, .. } => ConnectionPath::DirectUdp {
                 candidate: *candidate,
             },
-            DataPath::Ice(_) => ConnectionPath::Ice,
+            PeerPathBackend::Ice(_) => ConnectionPath::Ice,
         }
+    }
+
+    /// Return the current path generation without exposing peer routing data.
+    pub fn path_generation(&self) -> PathGeneration {
+        self.path.active().generation()
+    }
+
+    /// Return an address- and credential-free snapshot of the selected path.
+    pub fn transport_snapshot(&mut self, now: Instant) -> PeerTransportSnapshot {
+        let counters = match self.path.active().backend() {
+            PeerPathBackend::Direct { transport, .. } => transport.telemetry_counters(),
+            PeerPathBackend::Ice(_) => self.ice_counters.sample(self.path_generation()),
+        };
+        let mut snapshot = self.path.snapshot(now);
+        snapshot.sample = sample_path_counters(counters, now, &mut self.path_baseline);
+        snapshot
     }
 
     /// Return a copy of the local transport counters for diagnostics.
@@ -1582,10 +2345,37 @@ impl PeerSession {
     /// process that is terminated without reaching this method relies on the
     /// bounded router lease to expire.
     pub async fn release_upnp(&mut self) -> Result<(), Error> {
-        match &mut self.transport {
-            DataPath::Direct { transport, .. } => transport.release_upnp().await?,
-            DataPath::Ice(_) => {}
+        match self.path.active_mut().backend_mut() {
+            PeerPathBackend::Direct { transport, .. } => transport.release_upnp().await?,
+            PeerPathBackend::Ice(_) => {}
         }
+        Ok(())
+    }
+
+    /// Stop this session and perform bounded relay cleanup for every path it
+    /// still owns. The transport guards also schedule best-effort cleanup when
+    /// the session is dropped without an explicit close, but callers that can
+    /// await shutdown should use this method so the relay slot is released
+    /// immediately rather than waiting for its idle lease.
+    pub async fn close(&mut self) -> Result<(), Error> {
+        self.opening = None;
+        self.migration_inbox.clear();
+        if let Some(prepared) = self.path.prepared.take() {
+            cleanup_peer_path(prepared).await;
+        }
+        let active_registration = match self.path.active_mut().backend_mut() {
+            PeerPathBackend::Direct {
+                relay_registration, ..
+            } => relay_registration.take(),
+            PeerPathBackend::Ice(_) => None,
+        };
+        if let Some(active_registration) = active_registration {
+            let _ = active_registration.unregister().await;
+        }
+        if let Some(draining) = self.draining.take() {
+            draining.close().await;
+        }
+        self.path.close_all();
         Ok(())
     }
 
@@ -1593,7 +2383,14 @@ impl PeerSession {
     /// caller's event loop reaches the keepalive interval. Full ICE already
     /// owns consent freshness, so this is intentionally a no-op there.
     pub async fn maintain_liveness(&mut self) -> Result<(), Error> {
-        if !matches!(&self.transport, DataPath::Direct { .. })
+        self.drive_migration().await?;
+        if matches!(
+            self.migration.state,
+            MigrationState::CommitPending | MigrationState::CommitUnconfirmed
+        ) {
+            return Ok(());
+        }
+        if !matches!(self.path.active().backend(), PeerPathBackend::Direct { .. })
             || self.last_keepalive.elapsed() < DIRECT_KEEPALIVE_INTERVAL
         {
             return Ok(());
@@ -1616,21 +2413,48 @@ impl PeerSession {
         flags: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
-        let sent = match &self.transport {
-            DataPath::Direct { transport, .. } => Ok(transport
-                .send(&mut self.cipher, kind, channel, flags, payload)
-                .await?),
-            DataPath::Ice(path) => {
-                let datagram = self
-                    .cipher
-                    .seal(kind, channel, flags, payload)
-                    .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-                path.conn
-                    .send(&datagram)
-                    .await
-                    .map_err(|error| Error::Ice(error.to_string()))
+        if self.path.active().state() == PathState::Closed {
+            return Err(PathMigrationError::PathUnavailable.into());
+        }
+        let slot = self.migration.application_slot()?;
+        self.send_sealed_on(slot, kind, channel, flags, payload, true)
+            .await
+    }
+
+    async fn send_sealed_on(
+        &mut self,
+        slot: PathSlot,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+        application: bool,
+    ) -> Result<usize, Error> {
+        let path = self
+            .path
+            .at(slot)
+            .ok_or(PathMigrationError::PathUnavailable)?;
+        let datagram = self
+            .cipher
+            .seal(kind, channel, flags, payload)
+            .map_err(|error| Error::Transport(openstream_transport::Error::Protocol(error)))?;
+        let ice_path = matches!(path.backend(), PeerPathBackend::Ice(_));
+        let sent = match path.backend() {
+            PeerPathBackend::Direct { transport, .. } => {
+                Ok(transport.send_sealed(&datagram, application).await?)
             }
+            PeerPathBackend::Ice(path) => path
+                .conn
+                .send(&datagram)
+                .await
+                .map_err(|error| Error::Ice(error.to_string())),
         }?;
+        if !application {
+            return Ok(sent);
+        }
+        if ice_path {
+            self.ice_counters.record_sent(sent);
+        }
         self.stats.sent_packets = self.stats.sent_packets.saturating_add(1);
         self.stats.sent_wire_bytes = self.stats.sent_wire_bytes.saturating_add(sent as u64);
         Ok(sent)
@@ -1638,51 +2462,140 @@ impl PeerSession {
 
     /// Receive and authenticate one encrypted data packet.
     pub async fn recv(&mut self) -> Result<Packet, Error> {
-        loop {
-            let packet = if let Some(packet) = self.prefetched.take() {
-                packet
-            } else {
-                match &self.transport {
-                    DataPath::Direct { transport, .. } => {
-                        tokio::time::timeout(DIRECT_IDLE_TIMEOUT, transport.recv(&mut self.cipher))
-                            .await
-                            .map_err(|_| Error::Timeout("direct data path liveness"))?
-                            .map_err(Error::from)?
-                    }
-                    DataPath::Ice(path) => {
-                        let mut datagram = [0_u8; MAX_DATAGRAM];
-                        let length = path
-                            .conn
-                            .recv(&mut datagram)
-                            .await
-                            .map_err(|error| Error::Ice(error.to_string()))?;
-                        self.cipher
-                            .open(&datagram[..length])
-                            .map_err(|error| Error::InvalidMessage(error.to_string()))?
-                    }
-                }
-            };
-            // Repeated path probes can still be in flight when the first
-            // capability message is delivered. They are authenticated
-            // handshake traffic, not application control messages; consume
-            // them here so they cannot be parsed as capabilities.
-            if is_path_probe_packet(&packet) {
-                continue;
-            }
-            if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE {
-                self.send(Kind::Control, 0, 0, PATH_KEEPALIVE_ACK).await?;
-                continue;
-            }
-            if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE_ACK {
-                continue;
-            }
-            self.stats.received_packets = self.stats.received_packets.saturating_add(1);
-            self.stats.received_payload_bytes = self
-                .stats
-                .received_payload_bytes
-                .saturating_add(packet.payload.len() as u64);
+        if let Some(packet) = self.migration_inbox.pop_front() {
             return Ok(packet);
         }
+        loop {
+            self.drive_migration().await?;
+            if self.migration.state == MigrationState::CommitUnconfirmed {
+                return Err(PathMigrationError::CommitUnconfirmed.into());
+            }
+            if let Some(packet) = self.recv_step().await? {
+                return Ok(packet);
+            }
+        }
+    }
+
+    async fn recv_step(&mut self) -> Result<Option<Packet>, Error> {
+        let Some(ReceivedPacket {
+            packet,
+            ingress,
+            wire_bytes,
+        }) = self.recv_ingress().await?
+        else {
+            return Ok(None);
+        };
+        if is_path_probe_packet(&packet) {
+            return Ok(None);
+        }
+        if self.migration_enabled
+            && packet.kind == Kind::Control
+            && packet.channel == PATH_CONTROL_CHANNEL
+        {
+            if packet.flags == 0 {
+                if let Ok(record) = PathControl::decode(&packet.payload) {
+                    let actions = self.migration.receive(ingress, record, Instant::now());
+                    self.apply_migration_actions(actions).await?;
+                }
+            }
+            return Ok(None);
+        }
+        if !self.migration.accepts_application(ingress, Instant::now()) {
+            return Ok(None);
+        }
+        if let Some(bytes) = wire_bytes {
+            if let Some(path) = self.path.at(ingress) {
+                match path.backend() {
+                    PeerPathBackend::Direct { transport, .. } => transport.record_received(bytes),
+                    PeerPathBackend::Ice(_) => self.ice_counters.record_received(bytes),
+                }
+            }
+        }
+        if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE {
+            // A draining socket is receive-only; reply on the selected path.
+            if self.migration.application_slot().is_ok() {
+                self.send(Kind::Control, 0, 0, PATH_KEEPALIVE_ACK).await?;
+            }
+            return Ok(None);
+        }
+        if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE_ACK {
+            return Ok(None);
+        }
+        self.stats.received_packets = self.stats.received_packets.saturating_add(1);
+        self.stats.received_payload_bytes = self
+            .stats
+            .received_payload_bytes
+            .saturating_add(packet.payload.len() as u64);
+        Ok(Some(packet))
+    }
+
+    async fn recv_ingress(&mut self) -> Result<Option<ReceivedPacket>, Error> {
+        if let Some(packet) = self.prefetched.take() {
+            return Ok(Some(ReceivedPacket {
+                packet,
+                ingress: PathSlot(self.path_generation()),
+                wire_bytes: None,
+            }));
+        }
+        let mut active_bytes = [0; MAX_DATAGRAM];
+        let mut prepared_bytes = [0; MAX_DATAGRAM];
+        let active_slot = PathSlot(self.path_generation());
+        let active = self.path.active().backend();
+        let active_is_ice = matches!(active, PeerPathBackend::Ice(_));
+        let prepared = self.path.prepared.as_ref().filter(|_| {
+            self.opening
+                .as_ref()
+                .is_some_and(|opening| opening.connected)
+        });
+        let migration_busy = self.migration.busy();
+        let event = tokio::select! {
+            result = receive_backend(active, &mut active_bytes) => match result {
+                Ok(length) => Some((active_slot, active_bytes[..length].to_vec())),
+                Err(error) => {
+                    if self.migration.state == MigrationState::CommitPending {
+                        self.migration.old_path_failed();
+                        None
+                    } else { return Err(error); }
+                }
+            },
+            result = async {
+                if let Some(path) = prepared { receive_backend(path.backend(), &mut prepared_bytes).await.map(|length| (PathSlot(path.generation()), length)) }
+                else { std::future::pending().await }
+            } => match result {
+                Ok((slot, length)) => Some((slot, prepared_bytes[..length].to_vec())),
+                Err(_) => None,
+            },
+            received = async {
+                if let Some(draining) = &mut self.draining { draining.incoming.recv().await }
+                else { std::future::pending().await }
+            } => received,
+            message = self.signal.recv(), if self.migration_enabled && self.opening.as_ref().is_some_and(|opening| opening.target == MigrationTarget::DirectUdp) => {
+                self.receive_path_candidate(message?)?;
+                None
+            },
+            _ = tokio::time::sleep(COMMIT_RETRY), if migration_busy => None,
+        };
+        let Some((ingress, bytes)) = event else {
+            return Ok(None);
+        };
+        let packet = match self.cipher.open(&bytes) {
+            Ok(packet) => packet,
+            // The multiplexer must survive delayed/replayed probes and relay
+            // registration ACKs without tearing down a migration.
+            Err(_) if self.migration_enabled => return Ok(None),
+            Err(error) => {
+                return Err(if active_is_ice {
+                    Error::InvalidMessage(error.to_string())
+                } else {
+                    Error::Transport(openstream_transport::Error::Protocol(error))
+                });
+            }
+        };
+        Ok(Some(ReceivedPacket {
+            packet,
+            ingress,
+            wire_bytes: Some(bytes.len()),
+        }))
     }
 
     /// Run the encrypted host-side capability exchange.
@@ -1721,8 +2634,10 @@ impl PeerSession {
                     "host expected a capability acknowledgement".into(),
                 ));
             };
-            return negotiate(&host, &capabilities)
-                .map_err(|error| Error::InvalidMessage(error.to_string()));
+            let negotiated = negotiate(&host, &capabilities)
+                .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+            self.migration_enabled = negotiated.path_migration;
+            return Ok(negotiated);
         }
     }
 
@@ -1785,7 +2700,10 @@ impl PeerSession {
                 )
                 .await?;
         }
-        negotiate(&host, &client).map_err(|error| Error::InvalidMessage(error.to_string()))
+        let negotiated =
+            negotiate(&host, &client).map_err(|error| Error::InvalidMessage(error.to_string()))?;
+        self.migration_enabled = negotiated.path_migration;
+        Ok(negotiated)
     }
 
     /// Receive one valid reliable-control frame during establishment. Raw
@@ -2042,7 +2960,7 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
         }
         if now >= next_probe {
             if transport
-                .send(cipher, Kind::Control, 0, 0, PATH_PROBE)
+                .send_untracked(cipher, Kind::Control, 0, 0, PATH_PROBE)
                 .await
                 .is_err()
             {
@@ -2056,16 +2974,17 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
         let remaining = deadline.saturating_duration_since(now);
         let until_retry = next_probe.saturating_duration_since(now);
         let wait = remaining.min(until_retry.max(Duration::from_millis(1)));
-        let packet = match tokio::time::timeout(wait, transport.recv(cipher)).await {
-            Ok(Ok(packet)) => packet,
-            Ok(Err(_)) => continue,
-            // The timeout normally means the retry interval elapsed. The
-            // top of the loop sends the next probe or ends at the deadline.
-            Err(_) => continue,
-        };
+        let (packet, wire_bytes) =
+            match tokio::time::timeout(wait, transport.recv_untracked(cipher)).await {
+                Ok(Ok(packet)) => packet,
+                Ok(Err(_)) => continue,
+                // The timeout normally means the retry interval elapsed. The
+                // top of the loop sends the next probe or ends at the deadline.
+                Err(_) => continue,
+            };
         if packet.kind == Kind::Control && packet.payload == PATH_PROBE {
             if transport
-                .send(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
+                .send_untracked(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
                 .await
                 .is_err()
             {
@@ -2078,7 +2997,7 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
             // receive an ACK can leave its counterpart waiting forever for
             // the response to its own probe.
             if transport
-                .send(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
+                .send_untracked(cipher, Kind::Control, 0, 0, PATH_PROBE_ACK)
                 .await
                 .is_err()
             {
@@ -2088,6 +3007,7 @@ async fn probe_path(transport: &UdpTransport, cipher: &mut CipherSession) -> Pro
         } else {
             // The authenticated peer may already have moved on to capability
             // negotiation. Keep its first packet for `PeerSession::recv`.
+            transport.record_received(wire_bytes);
             return ProbeResult::Established(Some(packet));
         }
     }
@@ -2143,9 +3063,453 @@ fn trusted_relay_candidate(candidate: Candidate, trusted_relay: Option<SocketAdd
         && !candidate.address.ip().is_multicast()
 }
 
+fn valid_local_candidate(address: SocketAddr) -> bool {
+    address.port() != 0 && !address.ip().is_unspecified() && !address.ip().is_multicast()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_KEY: [u8; 32] = [0x4d; 32];
+
+    fn test_endpoint() -> Endpoint {
+        let (outgoing, _outgoing_receiver) = mpsc::channel::<Message>(1);
+        let (_incoming_sender, incoming) = mpsc::channel::<Result<Value, Error>>(1);
+        Endpoint { outgoing, incoming }
+    }
+
+    fn direct_test_session(transport: UdpTransport) -> PeerSession {
+        let now = Instant::now();
+        PeerSession {
+            signal: test_endpoint(),
+            path: PathRuntime::initial_active(
+                PeerPathBackend::Direct {
+                    transport: Box::new(transport),
+                    candidate: CandidateKind::Host,
+                    relay_registration: None,
+                },
+                now,
+            ),
+            cipher: CipherSession::new(TEST_KEY, TEST_KEY),
+            stats: SessionStats::default(),
+            path_baseline: None,
+            ice_counters: PathCounters::default(),
+            prefetched: None,
+            last_keepalive: now,
+            migration_enabled: false,
+            migration: MigrationController::new(Role::Host),
+            migration_config: MigrationConfig::new(&pairing(), Role::Host, vec![], vec![]),
+            opening: None,
+            draining: None,
+            migration_inbox: Default::default(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_releases_draining_path_before_deadline() {
+        use openstream_protocol::relay;
+
+        let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay");
+        let relay_address = relay_socket.local_addr().expect("relay address");
+        let (unregisters, mut observed) = mpsc::channel(4);
+        let (ack_release, ack_gate) = oneshot::channel();
+        let relay_task = tokio::spawn(async move {
+            let mut ack_gate = Some(ack_gate);
+            let mut packet = [0; MAX_DATAGRAM];
+            let mut unregister_count = 0;
+            loop {
+                let (length, source) = relay_socket
+                    .recv_from(&mut packet)
+                    .await
+                    .expect("receive relay packet");
+                if let Ok(registration) = relay::decode_registration(&packet[..length]) {
+                    relay_socket
+                        .send_to(&relay::encode_ack(registration.role), source)
+                        .await
+                        .expect("ack registration");
+                } else if let Ok(unregister) = relay::decode_unregister(&packet[..length]) {
+                    unregister_count += 1;
+                    unregisters
+                        .send(unregister_count)
+                        .await
+                        .expect("observe unregister");
+                    if let Some(ack_gate) = ack_gate.take() {
+                        ack_gate.await.expect("release unregister ACK");
+                    }
+                    relay_socket
+                        .send_to(&relay::encode_unregister_ack(unregister.role), source)
+                        .await
+                        .expect("ack unregister");
+                }
+            }
+        });
+
+        let mut draining_transport = UdpTransport::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind draining transport");
+        draining_transport
+            .connect(relay_address)
+            .await
+            .expect("connect draining transport");
+        let registration = draining_transport
+            .relay_registration("session", RelayRole::Host, "ticket")
+            .expect("create relay registration");
+        draining_transport
+            .register_relay("session", RelayRole::Host, "ticket")
+            .await
+            .expect("register draining transport");
+
+        let active_transport = UdpTransport::bind("127.0.0.1:0".parse().expect("address"))
+            .await
+            .expect("bind active transport");
+        let mut session = direct_test_session(active_transport);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        session.draining = Some(DrainingPath::new(
+            PeerPath::replacement(
+                PeerPathBackend::Direct {
+                    transport: Box::new(draining_transport),
+                    candidate: CandidateKind::Relay,
+                    relay_registration: Some(registration),
+                },
+                2,
+                Instant::now(),
+            ),
+            deadline,
+        ));
+
+        {
+            let close = session.close();
+            tokio::pin!(close);
+            tokio::time::timeout(Duration::from_millis(500), async {
+                let first = tokio::select! {
+                    biased;
+                    result = &mut close => {
+                        result.expect("close session");
+                        panic!("close returned before relay cleanup was observed");
+                    }
+                    first = observed.recv() => first.expect("relay cleanup observation"),
+                };
+                assert_eq!(first, 1, "drain cleanup must unregister once");
+                ack_release.send(()).expect("release unregister ACK");
+                close.await.expect("close session");
+            })
+            .await
+            .expect("draining close was not prompt");
+        }
+        session.close().await.expect("close session again");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), observed.recv())
+                .await
+                .is_err(),
+            "repeated close sent a duplicate unregister"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "cleanup reached the drain deadline"
+        );
+
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn path_migration_api_gates_without_changing_the_active_socket() {
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut peer = direct_test_session(transport);
+        assert!(matches!(
+            peer.migrate_to(MigrationTarget::OpaqueRelay).await,
+            Err(Error::PathMigration(
+                PathMigrationError::CapabilityNotNegotiated
+            ))
+        ));
+        peer.migration_enabled = true;
+        assert!(matches!(
+            peer.migrate_to(MigrationTarget::Ice).await,
+            Err(Error::PathMigration(
+                PathMigrationError::UnsupportedIceRestart
+            ))
+        ));
+        assert!(matches!(
+            peer.migrate_to(MigrationTarget::OpaqueRelay).await,
+            Err(Error::PathMigration(PathMigrationError::PathUnavailable))
+        ));
+        peer.migration.role = Role::Client;
+        assert!(matches!(
+            peer.migrate_to(MigrationTarget::DirectUdp).await,
+            Err(Error::PathMigration(
+                PathMigrationError::HostMigrationRequired
+            ))
+        ));
+        assert_eq!(peer.path_generation(), 1);
+        assert_eq!(peer.migration_state(), MigrationState::Idle);
+    }
+
+    fn migration_endpoints() -> (Endpoint, Endpoint) {
+        let (host_out, mut host_messages) = mpsc::channel::<Message>(32);
+        let (client_out, mut client_messages) = mpsc::channel::<Message>(32);
+        let (host_in, host_recv) = mpsc::channel(32);
+        let (client_in, client_recv) = mpsc::channel(32);
+        tokio::spawn(async move {
+            while let Some(Message::Text(text)) = host_messages.recv().await {
+                if client_in
+                    .send(Ok(serde_json::from_str(&text).unwrap()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            while let Some(Message::Text(text)) = client_messages.recv().await {
+                if host_in
+                    .send(Ok(serde_json::from_str(&text).unwrap()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (
+            Endpoint {
+                outgoing: host_out,
+                incoming: host_recv,
+            },
+            Endpoint {
+                outgoing: client_out,
+                incoming: client_recv,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn path_migration_direct_relay_direct_preserves_cipher_and_resets_snapshot() {
+        use openstream_protocol::relay;
+        use openstream_transport::{PathMtuState, PathState, TransportPathKind};
+        let relay_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_socket.local_addr().unwrap();
+        let relay_task = tokio::spawn(async move {
+            let mut slots = [None, None];
+            let mut buffer = [0; MAX_DATAGRAM];
+            loop {
+                let (len, source) = relay_socket.recv_from(&mut buffer).await.unwrap();
+                if let Ok(reg) = relay::decode_registration(&buffer[..len]) {
+                    assert_eq!(reg.session_id, "session");
+                    let index = match reg.role {
+                        RelayRole::Host => 0,
+                        RelayRole::Client => 1,
+                    };
+                    assert_eq!(
+                        reg.token,
+                        if index == 0 {
+                            "host-ticket"
+                        } else {
+                            "client-ticket"
+                        }
+                    );
+                    slots[index] = Some(source);
+                    relay_socket
+                        .send_to(&relay::encode_ack(reg.role), source)
+                        .await
+                        .unwrap();
+                } else if let Some(index) = slots.iter().position(|slot| *slot == Some(source)) {
+                    if let Some(destination) = slots[1 - index] {
+                        relay_socket
+                            .send_to(&buffer[..len], destination)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        });
+        let mut ht = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut ct = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let ha = ht.local_addr().unwrap();
+        let ca = ct.local_addr().unwrap();
+        ht.connect(ca).await.unwrap();
+        ct.connect(ha).await.unwrap();
+        let mut host = direct_test_session(ht);
+        let mut client = direct_test_session(ct);
+        (host.signal, client.signal) = migration_endpoints();
+        let mut pairing = pairing();
+        pairing.session_id = "session".into();
+        pairing.relay_address = Some(relay_address.to_string());
+        pairing.relay_host_ticket = Some("host-ticket".into());
+        pairing.relay_client_ticket = Some("client-ticket".into());
+        host.migration_config = MigrationConfig::new(
+            &pairing,
+            Role::Host,
+            vec![Candidate {
+                kind: CandidateKind::Host,
+                address: ha,
+            }],
+            vec![Candidate {
+                kind: CandidateKind::Host,
+                address: ca,
+            }],
+        );
+        client.migration_config = MigrationConfig::new(
+            &pairing,
+            Role::Client,
+            vec![Candidate {
+                kind: CandidateKind::Host,
+                address: ca,
+            }],
+            vec![Candidate {
+                kind: CandidateKind::Host,
+                address: ha,
+            }],
+        );
+        client.migration = MigrationController::new(Role::Client);
+        let run = async {
+            let (h, c) = tokio::join!(
+                host.negotiate_host_with_capabilities(
+                    Capabilities::host_default().with_path_migration()
+                ),
+                client.negotiate_client_with_capabilities(
+                    Capabilities::client_default().with_path_migration()
+                )
+            );
+            assert!(h.unwrap().path_migration);
+            assert!(c.unwrap().path_migration);
+            let host_work = async {
+                for (target, generation, kind) in [
+                    (
+                        MigrationTarget::OpaqueRelay,
+                        2,
+                        TransportPathKind::OpaqueRelay,
+                    ),
+                    (MigrationTarget::DirectUdp, 3, TransportPathKind::DirectUdp),
+                ] {
+                    let report = host.migrate_to(target).await.unwrap();
+                    assert_eq!(report.previous_generation, generation - 1);
+                    assert_eq!(report.active_generation, generation);
+                    assert_eq!(report.active_kind, kind);
+                    let snapshot = host.path_snapshot();
+                    assert_eq!(snapshot.path_generation, generation);
+                    assert_eq!(snapshot.state, PathState::Active);
+                    assert_eq!(snapshot.datagram_size, Some(1200));
+                    assert_eq!(snapshot.path_mtu_state, PathMtuState::Unavailable);
+                    assert!(
+                        snapshot.sample.is_none(),
+                        "new generation starts a fresh baseline"
+                    );
+                    assert!(snapshot.path_age_ms < 250);
+                    host.send(Kind::Input, 1, 0, b"ping").await.unwrap();
+                    assert_eq!(host.recv().await.unwrap().payload, b"pong");
+                    tokio::time::sleep(Duration::from_millis(260)).await;
+                }
+            };
+            let client_work = async {
+                let mut counter = 0;
+                for generation in [2, 3] {
+                    let packet = client.recv().await.unwrap();
+                    assert_eq!(packet.payload, b"ping");
+                    assert!(
+                        packet.counter > counter,
+                        "one counter domain across generations"
+                    );
+                    counter = packet.counter;
+                    assert_eq!(client.path_generation(), generation);
+                    assert_eq!(client.migration_state(), MigrationState::Active);
+                    client.send(Kind::Input, 1, 0, b"pong").await.unwrap();
+                }
+            };
+            tokio::join!(host_work, client_work);
+        };
+        let result = tokio::time::timeout(Duration::from_secs(8), run).await;
+        relay_task.abort();
+        result.unwrap();
+        assert!(!format!("{:?}", host.migration_config).contains("host-ticket"));
+    }
+
+    #[tokio::test]
+    async fn delayed_setup_packets_do_not_pollute_application_counters() {
+        let mut sender = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut receiver = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let sender_addr = sender.local_addr().unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        sender.connect(receiver_addr).await.unwrap();
+        receiver.connect(sender_addr).await.unwrap();
+        let mut peer = direct_test_session(receiver);
+        let baseline_at = Instant::now();
+        assert!(peer.transport_snapshot(baseline_at).sample.is_none());
+
+        let mut cipher = CipherSession::new(TEST_KEY, TEST_KEY);
+        sender
+            .send(&mut cipher, Kind::Control, 0, 0, PATH_PROBE)
+            .await
+            .unwrap();
+        let sent_application = sender
+            .send(&mut cipher, Kind::Control, 0, 0, b"application")
+            .await
+            .unwrap();
+
+        let packet = peer.recv().await.unwrap();
+        assert_eq!(packet.payload, b"application");
+        let sample = peer
+            .transport_snapshot(baseline_at + Duration::from_secs(1))
+            .sample
+            .expect("application sample");
+        assert_eq!(sample.received_packets, 1);
+        assert_eq!(
+            sample.received_wire_bytes,
+            u64::try_from(sent_application).expect("wire length fits")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetched_application_io_is_preserved_across_probe_boundary() {
+        let mut probe_transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut peer_transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let probe_addr = probe_transport.local_addr().unwrap();
+        let peer_addr = peer_transport.local_addr().unwrap();
+        probe_transport.connect(peer_addr).await.unwrap();
+        peer_transport.connect(probe_addr).await.unwrap();
+
+        let peer = tokio::spawn(async move {
+            let mut cipher = CipherSession::new(TEST_KEY, TEST_KEY);
+            let probe = peer_transport.recv(&mut cipher).await.unwrap();
+            assert_eq!(probe.payload, PATH_PROBE);
+            peer_transport
+                .send(&mut cipher, Kind::Control, 0, 0, b"prefetched")
+                .await
+                .unwrap()
+        });
+        let mut cipher = CipherSession::new(TEST_KEY, TEST_KEY);
+        let result = probe_path(&probe_transport, &mut cipher).await;
+        let prefetched_wire_bytes = peer.await.unwrap();
+
+        let ProbeResult::Established(Some(packet)) = result else {
+            panic!("probe did not preserve the prefetched application packet");
+        };
+        assert_eq!(packet.payload, b"prefetched");
+        let counters = probe_transport.telemetry_counters();
+        assert_eq!(counters.sent_packets, 0);
+        assert_eq!(counters.received_packets, 1);
+        assert_eq!(
+            counters.received_wire_bytes,
+            u64::try_from(prefetched_wire_bytes).expect("wire length fits")
+        );
+    }
 
     fn pairing() -> Pairing {
         Pairing {
@@ -2387,6 +3751,7 @@ mod tests {
         assert!(!decoded.video_10_bit);
         assert!(!decoded.clipboard);
         assert!(!decoded.rumble);
+        assert!(!decoded.path_migration);
 
         let mut host = Capabilities::host_default();
         host.video_10_bit = true;
@@ -2412,6 +3777,37 @@ mod tests {
         assert!(negotiated.multi_monitor);
         assert!(negotiated.pen);
         assert!(!negotiated.rumble);
+    }
+
+    #[test]
+    fn path_migration_requires_explicit_opt_in_from_both_peers() {
+        let old_host = Capabilities::host_default();
+        let old_client = Capabilities::client_default();
+        assert!(!old_host.path_migration);
+        assert!(!old_client.path_migration);
+        assert!(
+            !negotiate(&old_host, &old_client)
+                .expect("legacy peers negotiate")
+                .path_migration
+        );
+
+        let migration_host = Capabilities::host_default().with_path_migration();
+        let migration_client = Capabilities::client_default().with_path_migration();
+        assert!(
+            !negotiate(&migration_host, &old_client)
+                .expect("old client declines migration")
+                .path_migration
+        );
+        assert!(
+            !negotiate(&old_host, &migration_client)
+                .expect("old host declines migration")
+                .path_migration
+        );
+        assert!(
+            negotiate(&migration_host, &migration_client)
+                .expect("both peers opt in")
+                .path_migration
+        );
     }
 
     #[test]
@@ -2503,5 +3899,38 @@ mod tests {
         assert_eq!(legacy_value.get("turn"), Some(&serde_json::Value::Null));
         let decoded: Pairing = serde_json::from_str(&legacy).expect("decode legacy pairing");
         assert_eq!(decoded.turn, None);
+    }
+
+    #[test]
+    fn generation_local_path_baseline_uses_decimal_mbps() {
+        let now = std::time::Instant::now();
+        let mut baseline = None;
+        let initial = openstream_transport::TransportSample {
+            path_generation: openstream_transport::FIRST_PATH_GENERATION,
+            sent_packets: 0,
+            sent_wire_bytes: 0,
+            received_packets: 0,
+            received_wire_bytes: 0,
+            sample_interval_ms: 0,
+            send_rate_mbps: 0.0,
+            receive_rate_mbps: 0.0,
+        };
+        assert_eq!(sample_path_counters(initial, now, &mut baseline), None);
+
+        let sampled = sample_path_counters(
+            openstream_transport::TransportSample {
+                sent_packets: 1,
+                sent_wire_bytes: 125_000,
+                received_packets: 2,
+                received_wire_bytes: 250_000,
+                ..initial
+            },
+            now + Duration::from_secs(1),
+            &mut baseline,
+        )
+        .expect("one-second sample");
+        assert_eq!(sampled.sample_interval_ms, 1_000);
+        assert!((sampled.send_rate_mbps - 1.0).abs() < f64::EPSILON);
+        assert!((sampled.receive_rate_mbps - 2.0).abs() < f64::EPSILON);
     }
 }

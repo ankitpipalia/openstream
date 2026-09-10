@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+pub mod path_control;
+
 /// Ordered control envelope carried inside an authenticated `Kind::Control`
 /// datagram. The outer AES-GCM counter still authenticates every packet; this
 /// inner sequence lets callers retransmit and deliver control messages in
@@ -365,6 +367,9 @@ pub mod relay {
     const MAGIC: [u8; 2] = *b"OR";
     const VERSION: u8 = 1;
     const REGISTER: u8 = 1;
+    const REGISTER_ACK: u8 = 2;
+    const UNREGISTER: u8 = 3;
+    const UNREGISTER_ACK: u8 = 4;
 
     /// Fixed bytes before the variable-length session and token fields.
     pub const HEADER_LEN: usize = 9;
@@ -428,7 +433,8 @@ pub mod relay {
     }
 
     /// Encode a role-token registration for the relay.
-    pub fn encode_registration(
+    fn encode_record(
+        record_type: u8,
         session_id: &str,
         role: Role,
         token: &str,
@@ -447,7 +453,7 @@ pub mod relay {
         let mut bytes = Vec::with_capacity(HEADER_LEN + session_id.len() + token.len());
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
-        bytes.push(REGISTER);
+        bytes.push(record_type);
         bytes.push(role as u8);
         bytes.extend_from_slice(&session_len.to_be_bytes());
         bytes.extend_from_slice(&token_len.to_be_bytes());
@@ -456,8 +462,26 @@ pub mod relay {
         Ok(bytes)
     }
 
-    /// Decode a relay registration without allocating attacker-controlled data.
-    pub fn decode_registration(bytes: &[u8]) -> Result<Registration<'_>, Error> {
+    /// Encode a role-token registration for the relay.
+    pub fn encode_registration(
+        session_id: &str,
+        role: Role,
+        token: &str,
+    ) -> Result<Vec<u8>, Error> {
+        encode_record(REGISTER, session_id, role, token)
+    }
+
+    /// Encode an idempotent request to remove one role's current relay slot.
+    /// The session, role, and ticket are repeated so the relay can reject a
+    /// stale request without disturbing a newer registration.
+    pub fn encode_unregister(session_id: &str, role: Role, token: &str) -> Result<Vec<u8>, Error> {
+        encode_record(UNREGISTER, session_id, role, token)
+    }
+
+    /// Decode one expected relay record without allocating attacker-controlled
+    /// data. Registration and unregister records intentionally share the same
+    /// bounded body but cannot be confused by their type byte.
+    fn decode_record(bytes: &[u8], expected_type: u8) -> Result<Registration<'_>, Error> {
         if bytes.len() < HEADER_LEN {
             return Err(Error::Short);
         }
@@ -467,7 +491,7 @@ pub mod relay {
         if bytes[2] != VERSION {
             return Err(Error::UnsupportedVersion);
         }
-        if bytes[3] != REGISTER {
+        if bytes[3] != expected_type {
             return Err(Error::InvalidType);
         }
         let role = Role::decode(bytes[4])?;
@@ -496,10 +520,21 @@ pub mod relay {
         })
     }
 
+    /// Decode a relay registration without allocating attacker-controlled data.
+    pub fn decode_registration(bytes: &[u8]) -> Result<Registration<'_>, Error> {
+        decode_record(bytes, REGISTER)
+    }
+
+    /// Decode an idempotent relay unregister request without allocating
+    /// attacker-controlled data.
+    pub fn decode_unregister(bytes: &[u8]) -> Result<Registration<'_>, Error> {
+        decode_record(bytes, UNREGISTER)
+    }
+
     /// Encode a small response so a peer can distinguish registration from
     /// encrypted traffic while probing the relay path.
     pub fn encode_ack(role: Role) -> [u8; 5] {
-        [MAGIC[0], MAGIC[1], VERSION, REGISTER + 1, role as u8]
+        [MAGIC[0], MAGIC[1], VERSION, REGISTER_ACK, role as u8]
     }
 
     /// Check the fixed-size acknowledgement for one role's registration.
@@ -510,6 +545,16 @@ pub mod relay {
     /// peers selected the same end-to-end session keys.
     pub fn is_ack(bytes: &[u8], role: Role) -> bool {
         bytes == encode_ack(role)
+    }
+
+    /// Encode the fixed-size acknowledgement for an unregister request.
+    pub fn encode_unregister_ack(role: Role) -> [u8; 5] {
+        [MAGIC[0], MAGIC[1], VERSION, UNREGISTER_ACK, role as u8]
+    }
+
+    /// Check the fixed-size acknowledgement for one role's unregister request.
+    pub fn is_unregister_ack(bytes: &[u8], role: Role) -> bool {
+        bytes == encode_unregister_ack(role)
     }
 
     #[cfg(test)]
@@ -543,6 +588,38 @@ pub mod relay {
             assert!(is_ack(&encode_ack(Role::Host), Role::Host));
             assert!(!is_ack(&encode_ack(Role::Host), Role::Client));
             assert!(!is_ack(b"OR\x01\x03\x01", Role::Host));
+        }
+
+        #[test]
+        fn unregister_round_trips_as_borrowed_fields() {
+            let encoded = encode_unregister("session-id", Role::Client, "client-token")
+                .expect("encode unregister");
+            assert_eq!(
+                decode_unregister(&encoded).expect("decode unregister"),
+                Registration {
+                    role: Role::Client,
+                    session_id: "session-id",
+                    token: "client-token",
+                }
+            );
+            assert_ne!(
+                encoded,
+                encode_registration("session-id", Role::Client, "client-token")
+                    .expect("encode registration")
+            );
+        }
+
+        #[test]
+        fn unregister_acknowledgement_is_role_specific() {
+            assert!(is_unregister_ack(
+                &encode_unregister_ack(Role::Host),
+                Role::Host
+            ));
+            assert!(!is_unregister_ack(
+                &encode_unregister_ack(Role::Host),
+                Role::Client
+            ));
+            assert!(!is_unregister_ack(&encode_ack(Role::Host), Role::Host));
         }
     }
 }
@@ -1059,8 +1136,196 @@ fn nonce(counter: u64) -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path_control::{
+        AbortReason, Error as PathControlError, MAX_PATH_CONTROL_BYTES, PATH_TOKEN_BYTES,
+        PathControl, PathKind,
+    };
 
     const KEY: [u8; 32] = [0x42; 32];
+
+    const TOKEN: [u8; PATH_TOKEN_BYTES] = [0xA5; PATH_TOKEN_BYTES];
+
+    fn path_control_records() -> Vec<PathControl> {
+        vec![
+            PathControl::Request {
+                request_id: 7,
+                kind: PathKind::DirectUdp,
+            },
+            PathControl::Prepare {
+                generation: 1,
+                kind: PathKind::OpaqueRelay,
+                token: TOKEN,
+            },
+            PathControl::Probe {
+                generation: 2,
+                token: TOKEN,
+            },
+            PathControl::ProbeAck {
+                generation: 3,
+                token: TOKEN,
+            },
+            PathControl::Ready {
+                generation: 4,
+                token: TOKEN,
+                datagram_size: 1200,
+            },
+            PathControl::Commit {
+                generation: 5,
+                token: TOKEN,
+            },
+            PathControl::CommitAck {
+                generation: 6,
+                token: TOKEN,
+            },
+        ]
+    }
+
+    #[test]
+    fn path_control_round_trips_every_record_and_abort_reason() {
+        let mut records = path_control_records();
+        records.extend(
+            [
+                AbortReason::Unsupported,
+                AbortReason::Timeout,
+                AbortReason::CandidateUnavailable,
+                AbortReason::ProbeFailed,
+                AbortReason::PmtuUnavailable,
+                AbortReason::ResourceLimit,
+                AbortReason::CommitUnconfirmed,
+            ]
+            .into_iter()
+            .map(|reason| PathControl::Abort {
+                generation: 7,
+                reason,
+            }),
+        );
+
+        for record in records {
+            let encoded = record.encode().expect("encode path control");
+            assert!(encoded.len() <= MAX_PATH_CONTROL_BYTES);
+            assert_eq!(PathControl::decode(&encoded), Ok(record));
+        }
+    }
+
+    #[test]
+    fn path_control_rejects_invalid_header_and_record_fields() {
+        let encoded = PathControl::Request {
+            request_id: 7,
+            kind: PathKind::DirectUdp,
+        }
+        .encode()
+        .expect("encode request");
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[0] = 0;
+        assert_eq!(
+            PathControl::decode(&unsupported_version),
+            Err(PathControlError::UnsupportedVersion(0))
+        );
+        unsupported_version[0] = 2;
+        assert_eq!(
+            PathControl::decode(&unsupported_version),
+            Err(PathControlError::UnsupportedVersion(2))
+        );
+
+        let mut unknown_type = encoded.clone();
+        unknown_type[1] = 0xFF;
+        assert_eq!(
+            PathControl::decode(&unknown_type),
+            Err(PathControlError::UnknownRecordType(0xFF))
+        );
+
+        let mut reserved_bits = encoded.clone();
+        reserved_bits[3] = 1;
+        assert_eq!(
+            PathControl::decode(&reserved_bits),
+            Err(PathControlError::ReservedBits(1))
+        );
+
+        let mut invalid_kind = encoded;
+        invalid_kind[2] = 0xFF;
+        assert_eq!(
+            PathControl::decode(&invalid_kind),
+            Err(PathControlError::InvalidPathKind(0xFF))
+        );
+    }
+
+    #[test]
+    fn path_control_rejects_invalid_generations_tokens_and_datagram_size() {
+        let mut zero_generation = PathControl::Probe {
+            generation: 1,
+            token: TOKEN,
+        }
+        .encode()
+        .expect("encode probe");
+        zero_generation[4..12].fill(0);
+        assert_eq!(
+            PathControl::decode(&zero_generation),
+            Err(PathControlError::ZeroGeneration)
+        );
+
+        let mut zero_token = PathControl::Probe {
+            generation: 1,
+            token: TOKEN,
+        }
+        .encode()
+        .expect("encode probe");
+        zero_token[12..28].fill(0);
+        assert_eq!(
+            PathControl::decode(&zero_token),
+            Err(PathControlError::ZeroToken)
+        );
+
+        let mut invalid_datagram_size = PathControl::Ready {
+            generation: 1,
+            token: TOKEN,
+            datagram_size: 1200,
+        }
+        .encode()
+        .expect("encode ready");
+        invalid_datagram_size[28..30].fill(0);
+        assert_eq!(
+            PathControl::decode(&invalid_datagram_size),
+            Err(PathControlError::InvalidDatagramSize(0))
+        );
+    }
+
+    #[test]
+    fn path_control_rejects_truncated_and_oversized_payloads() {
+        let encoded = PathControl::Prepare {
+            generation: 1,
+            kind: PathKind::Ice,
+            token: TOKEN,
+        }
+        .encode()
+        .expect("encode prepare");
+        for length in 0..encoded.len() {
+            assert!(matches!(
+                PathControl::decode(&encoded[..length]),
+                Err(PathControlError::Truncated { .. })
+            ));
+        }
+        let oversized = vec![0_u8; MAX_PATH_CONTROL_BYTES + 1];
+        assert_eq!(
+            PathControl::decode(&oversized),
+            Err(PathControlError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn path_control_duplicate_encodings_decode_to_equal_records() {
+        let record = PathControl::Commit {
+            generation: 9,
+            token: TOKEN,
+        };
+        let first = record.encode().expect("encode first duplicate");
+        let second = record.encode().expect("encode second duplicate");
+        assert_eq!(first, second);
+        assert_eq!(
+            PathControl::decode(&first).expect("decode first"),
+            PathControl::decode(&second).expect("decode second")
+        );
+    }
 
     #[test]
     fn encrypted_packet_round_trips() {

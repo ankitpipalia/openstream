@@ -44,7 +44,7 @@ mod linux {
     use lowlat_core::envelope::Envelope;
     use lowlat_core::pmtu::{PathConfig, PathMtuState};
     use lowlat_core::send::{SendRing, SendSlot};
-    use lowlat_core::session::Session;
+    use lowlat_core::session::{Health, Session};
     use lowlat_net::{Shell, Socket, Wake};
 
     /// How long to keep running after a path is found.
@@ -65,7 +65,14 @@ mod linux {
     const ACTIVE_BODY: usize = lowlat_core::DEFAULT_DATAGRAM
         - lowlat_core::envelope::ENVELOPE_LEN
         - lowlat_core::packet::HEADER_LEN;
-    const SLOTS: usize = 64;
+    // The sender's outstanding cap is 64 fragments, and recovery can advance
+    // its sequence space by that whole amount when it abandons a black-holed
+    // video burst. The receive ring must therefore use the protocol window,
+    // not the sender cap: otherwise every fresh fragment after recovery is
+    // rejected as out of window before the media-resynchronisation policy can
+    // skip the abandoned gap.
+    const SEND_SLOTS: usize = 64;
+    const RECV_SLOTS: usize = lowlat_core::channel::RING_SLOTS;
     const CHANNEL: u8 = 1;
     const KEY: [u8; 32] = [0x77u8; 32];
 
@@ -101,6 +108,18 @@ mod linux {
             .map_err(|error| format!("flush milestone: {error}"))
     }
 
+    fn watchdog_recovery_due(health: Health, already_recovered: bool) -> bool {
+        health == Health::Undeliverable && !already_recovered
+    }
+
+    #[test]
+    fn watchdog_recovery_requires_undeliverable_and_is_one_shot() {
+        assert!(!watchdog_recovery_due(Health::Alive, false));
+        assert!(!watchdog_recovery_due(Health::Stalled, false));
+        assert!(watchdog_recovery_due(Health::Undeliverable, false));
+        assert!(!watchdog_recovery_due(Health::Undeliverable, true));
+    }
+
     fn peer(args: &[String]) -> Result<(), String> {
         // Only the port is taken from the bind address. Every fixture namespace
         // holds exactly one host address, and the socket is dual stack and bound to
@@ -115,6 +134,7 @@ mod linux {
         let pmtu_recover = flag(args, "--pmtu-recover").map(PathBuf::from);
         let pmtu_raise = flag(args, "--pmtu-raise").map(PathBuf::from);
         let pmtu_ready_again = flag(args, "--pmtu-ready-again").map(PathBuf::from);
+        let pmtu_watchdog = args.iter().any(|arg| arg == "--pmtu-watchdog");
         let stream = args.iter().any(|arg| arg == "--stream");
         let timeout_ms: f64 = required(args, "--timeout-ms")?
             .parse()
@@ -131,10 +151,10 @@ mod linux {
             remote_pwd: required(args, "--remote-pwd")?,
         };
 
-        let mut recv_bodies = vec![0u8; STORAGE_BODY * SLOTS];
-        let mut recv_meta = vec![SlotMeta::default(); SLOTS];
-        let mut send_bodies = vec![0u8; STORAGE_BODY * SLOTS];
-        let mut send_meta = vec![SendSlot::default(); SLOTS];
+        let mut recv_bodies = vec![0u8; STORAGE_BODY * RECV_SLOTS];
+        let mut recv_meta = vec![SlotMeta::default(); RECV_SLOTS];
+        let mut send_bodies = vec![0u8; STORAGE_BODY * SEND_SLOTS];
+        let mut send_meta = vec![SendSlot::default(); SEND_SLOTS];
 
         let conn = Conn::new(credentials, [seed_byte; 16], 0.0);
         let envelope = Envelope::from_key(&KEY).map_err(|e| format!("key: {e}"))?;
@@ -192,14 +212,14 @@ mod linux {
             let notify = shell.wake_handle().map_err(|e| format!("handle: {e}"))?;
             thread::spawn(move || {
                 loop {
-                    if let Ok(text) = fs::read_to_string(&path)
-                        && let Ok(addr) = text.trim().parse::<SocketAddr>()
-                    {
-                        if candidates.send(addr).is_err() {
+                    if let Ok(text) = fs::read_to_string(&path) {
+                        if let Ok(addr) = text.trim().parse::<SocketAddr>() {
+                            if candidates.send(addr).is_err() {
+                                return;
+                            }
+                            let _ = notify.notify();
                             return;
                         }
-                        let _ = notify.notify();
-                        return;
                     }
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -228,6 +248,7 @@ mod linux {
         let mut stream_received_after_recovery = 0u64;
         let mut pmtu_round = 0u8;
         let mut pmtu_recovered_at = None;
+        let mut watchdog_recovered = false;
         let mut pmtu_raise_requested = false;
         let mut pmtu_ready_again_written = false;
         let mut transition_complete_at = None;
@@ -244,21 +265,21 @@ mod linux {
                 println!("timeout");
                 return Ok(());
             }
-            let settle_from = if pmtu_recover.is_some() || pmtu_raise.is_some() {
+            let settle_from = if pmtu_recover.is_some() || pmtu_watchdog || pmtu_raise.is_some() {
                 transition_complete_at
             } else {
                 settled_at
             };
-            if let Some(at) = settle_from
-                && now_ms > at + SETTLE_MS
-            {
-                if stream {
-                    println!(
-                        "stream sent={stream_sent} sent_after_recovery={stream_sent_after_recovery} \
-                         received={stream_received} after_recovery={stream_received_after_recovery}"
-                    );
+            if let Some(at) = settle_from {
+                if now_ms > at + SETTLE_MS {
+                    if stream {
+                        println!(
+                            "stream sent={stream_sent} sent_after_recovery={stream_sent_after_recovery} \
+                             received={stream_received} after_recovery={stream_received_after_recovery}"
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
 
             // Whatever signaling delivered, injected where the application's work is
@@ -303,6 +324,35 @@ mod linux {
                 );
             }
 
+            if pmtu_watchdog
+                && watchdog_recovery_due(shell.endpoint().health(now_ms), watchdog_recovered)
+            {
+                match shell.recover_path_black_hole(now_ms) {
+                    PathMtuRecovery::Recovered {
+                        previous_datagram_size,
+                        datagram_size,
+                        dropped_video_fragments,
+                    } => {
+                        watchdog_recovered = true;
+                        println!(
+                            "pmtu-watchdog-recovered old={} new={} dropped={}",
+                            previous_datagram_size, datagram_size, dropped_video_fragments
+                        );
+                        flush_milestone()?;
+                        pmtu_recovered_at = Some(now_ms);
+                        if pmtu_raise.is_none() {
+                            transition_complete_at = Some(now_ms);
+                        }
+                    }
+                    PathMtuRecovery::Blocked => {
+                        return Err("pmtu recovery blocked by queued reliable data".to_string());
+                    }
+                    PathMtuRecovery::NotConfigured | PathMtuRecovery::Unusable => {
+                        return Err("pmtu recovery found no usable configured path".to_string());
+                    }
+                }
+            }
+
             if stream {
                 let mut inbound = [0u8; STORAGE_BODY * 2];
                 loop {
@@ -332,12 +382,14 @@ mod linux {
                 }
             }
 
-            if !published && let Some(mapped) = shell.endpoint().conn().reflexive().next() {
-                if let Some(path) = publish.as_ref() {
-                    fs::write(path, mapped.to_string()).map_err(|e| format!("publish: {e}"))?;
+            if !published {
+                if let Some(mapped) = shell.endpoint().conn().reflexive().next() {
+                    if let Some(path) = publish.as_ref() {
+                        fs::write(path, mapped.to_string()).map_err(|e| format!("publish: {e}"))?;
+                    }
+                    published = true;
+                    println!("reflexive {mapped}");
                 }
-                published = true;
-                println!("reflexive {mapped}");
             }
 
             match shell.endpoint().conn().state() {
@@ -387,47 +439,53 @@ mod linux {
                 flush_milestone()?;
             }
 
-            if let Some(path) = pmtu_recover.as_ref()
-                && pmtu_recovered_at.is_none()
-                && path.exists()
-            {
-                match shell.recover_path_black_hole(now_ms) {
-                    PathMtuRecovery::Recovered {
-                        previous_datagram_size,
-                        datagram_size,
-                        dropped_video_fragments,
-                    } => {
-                        println!(
-                            "pmtu-recovered old={} new={} dropped={}",
-                            previous_datagram_size, datagram_size, dropped_video_fragments
-                        );
-                        flush_milestone()?;
-                        pmtu_recovered_at = Some(now_ms);
-                        if pmtu_raise.is_none() {
-                            transition_complete_at = Some(now_ms);
+            if !pmtu_watchdog {
+                if let Some(path) = pmtu_recover.as_ref() {
+                    if pmtu_recovered_at.is_none() && path.exists() {
+                        match shell.recover_path_black_hole(now_ms) {
+                            PathMtuRecovery::Recovered {
+                                previous_datagram_size,
+                                datagram_size,
+                                dropped_video_fragments,
+                            } => {
+                                println!(
+                                    "pmtu-recovered old={} new={} dropped={}",
+                                    previous_datagram_size, datagram_size, dropped_video_fragments
+                                );
+                                flush_milestone()?;
+                                pmtu_recovered_at = Some(now_ms);
+                                if pmtu_raise.is_none() {
+                                    transition_complete_at = Some(now_ms);
+                                }
+                            }
+                            PathMtuRecovery::Blocked => {
+                                return Err(
+                                    "pmtu recovery blocked by queued reliable data".to_string()
+                                );
+                            }
+                            PathMtuRecovery::NotConfigured | PathMtuRecovery::Unusable => {
+                                return Err(
+                                    "pmtu recovery found no usable configured path".to_string()
+                                );
+                            }
                         }
-                    }
-                    PathMtuRecovery::Blocked => {
-                        return Err("pmtu recovery blocked by queued reliable data".to_string());
-                    }
-                    PathMtuRecovery::NotConfigured | PathMtuRecovery::Unusable => {
-                        return Err("pmtu recovery found no usable configured path".to_string());
                     }
                 }
             }
 
-            if let Some(path) = pmtu_raise.as_ref()
-                && !pmtu_raise_requested
-                && (pmtu_recover.is_none() || pmtu_recovered_at.is_some())
-                && path.exists()
-            {
-                if !shell.configure_path_mtu(PathConfig::direct_v4(1500), now_ms) {
-                    return Err("pmtu raise could not reset the direct path".to_string());
+            if let Some(path) = pmtu_raise.as_ref() {
+                if !pmtu_raise_requested
+                    && (pmtu_recover.is_none() || pmtu_recovered_at.is_some())
+                    && path.exists()
+                {
+                    if !shell.configure_path_mtu(PathConfig::direct_v4(1500), now_ms) {
+                        return Err("pmtu raise could not reset the direct path".to_string());
+                    }
+                    pmtu_raise_requested = true;
+                    pmtu_ready_again_written = false;
+                    println!("pmtu-raise-requested");
+                    flush_milestone()?;
                 }
-                pmtu_raise_requested = true;
-                pmtu_ready_again_written = false;
-                println!("pmtu-raise-requested");
-                flush_milestone()?;
             }
         }
     }

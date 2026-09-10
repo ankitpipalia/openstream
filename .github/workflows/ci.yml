@@ -44,6 +44,9 @@ jobs:
       - name: Shell fixture syntax
         run: bash -n scripts/netns-fixtures.sh
 
+      - name: Alpine/musl helper syntax
+        run: sh -n scripts/alpine-musl-ci.sh
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -325,6 +328,25 @@ jobs:
           RUSTFLAGS: -Z sanitizer=address
           RUSTDOCFLAGS: -Z sanitizer=address
 
+  alpine-musl:
+    name: Alpine/musl validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Alpine/musl helper executable
+        run: |
+          cd engine/lowlat
+          test -x scripts/alpine-musl-ci.sh
+        working-directory: .
+      - name: Run pinned Alpine/musl validation
+        run: >-
+          docker run --rm --platform linux/amd64
+          --mount type=bind,src="$PWD",dst=/workspace
+          -w /workspace/engine/lowlat
+          docker.io/library/rust:1.85.0-alpine3.21@sha256:715f7a1b6b3a538f7b55c0be7db7e5bb0461fe9ea1d0004a481ab0c5d59542ad
+          /workspace/engine/lowlat/scripts/alpine-musl-ci.sh
+        working-directory: .
+
   ci-gate:
     name: CI gate
     if: ${{ always() }}
@@ -337,6 +359,7 @@ jobs:
       - deny
       - smoke
       - sanitizers
+      - alpine-musl
     runs-on: ubuntu-latest
     steps:
       - name: Require every CI job to pass
@@ -349,9 +372,10 @@ jobs:
           DENY: ${{ needs.deny.result }}
           SMOKE: ${{ needs.smoke.result }}
           SANITIZERS: ${{ needs.sanitizers.result }}
+          ALPINE_MUSL: ${{ needs.alpine-musl.result }}
         run: |
           for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
-              "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS"; do
+              "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS" "$ALPINE_MUSL"; do
             if [ "$result" != success ]; then
               echo "CI job result was $result" >&2
               exit 1

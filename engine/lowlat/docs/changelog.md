@@ -3,6 +3,44 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## One encrypted session can change its OpenStream path
+
+The portable `PeerSession` now exposes generation-scoped `PeerTransportSnapshot`
+telemetry and routes end-to-end frame feedback through one bounded
+`PeerTelemetryAdapter`. Local packet rates and path pressure remain diagnostic;
+they are not fabricated delivery acknowledgements and cannot independently
+change the portable encoder policy.
+
+The host-authoritative path controller can prepare, authenticate, prove,
+commit, drain, and retire an OpenStream-owned direct or opaque-relay path
+without creating a second cipher session. `PATH_COMMIT` remains old-path
+traffic, `PATH_COMMIT_ACK` proves the replacement path, duplicates are
+idempotent, and the old path becomes receive-only for a bounded grace period.
+Reliable logical control keeps its inner ordering and retransmits with fresh
+outer counters, while late best-effort media may be rejected by the shared
+replay window. Relay registration guards unregister on cleanup and do not
+expose tickets in diagnostics.
+
+The live acceptance is deliberately split into two truthful checks:
+
+- `scripts/path-migration-smoke.sh` proves direct -> opaque relay -> direct,
+  three committed generations, frame-ACK continuity, and one cipher/session.
+- `scripts/ice-migration-capability.sh` proves that the current
+  `webrtc-ice 0.17.2` boundary returns `UnsupportedIceRestart` without
+  reconnecting; it is not a TURN migration claim.
+
+The automatic PMTU watchdog fixture and pinned Alpine/musl ABI job are now
+part of the implementation gate. The watchdog changes a real Linux namespace
+path when privileges exist and invokes production `Health::Undeliverable`
+recovery rather than reading a test marker. The Alpine job uses the immutable
+`rust:1.85.0-alpine3.21` image digest and compiles both C11 and C++17 ABI
+consumers. Apple `container machine` instructions and CI/local evidence
+boundaries are recorded in the repository-root build and NAT documentation.
+
+This phase does not claim external coturn/public-NAT acceptance, native
+ScreenCaptureKit/VideoToolbox or Windows zero-copy media, mobile-device
+validation, virtual OS devices, or stock Parsec interoperability.
+
 ## The path now proves how large each datagram may be
 
 **The direct lowlat shell now owns path-aware DPLPMTUD instead of assuming the
@@ -33,8 +71,10 @@ explicitly, while the protocol ceiling remains 2000 bytes.
 
 The production boundary is deliberate: automatic configuration is complete for
 the native direct lowlat shell. A relay shell can provide its framing-aware
-`PathConfig`, but full direct-to-TURN migration acceptance and the portable
-`PeerSession`/FFmpeg telemetry adapter remain separate open work.
+`PathConfig`, but full direct-to-TURN migration acceptance remains separate
+open work. The portable `PeerSession`/FFmpeg path now has its common
+generation-scoped telemetry and frame-feedback adapter; it intentionally does
+not fabricate lowlat-only cumulative ACK, retransmission, or send-ring data.
 
 **The integration gate now changes a live Linux route.** Two real encrypted
 endpoints run in network namespaces over a veth pair, discover a 1472-byte IPv4

@@ -29,6 +29,10 @@ deployed with infrastructure that you control.
   VideoToolbox/AudioEngine integration sources.
 - Bounded queues, fuzz targets, CI checks, deployment templates, and detailed
   architecture/protocol documentation.
+- Generation-scoped transport telemetry, a shared frame-feedback adapter, and
+  host-authoritative direct ↔ opaque-relay ↔ direct migration over one
+  encrypted session. ICE migration reports the typed unsupported result on the
+  current `webrtc-ice` boundary.
 
 ## Repository layout
 
@@ -94,6 +98,18 @@ OPENSTREAM_RELAY_ENDPOINT=127.0.0.1:18100 \
 OPENSTREAM_DEMO_PORT=18101 \
 ./scripts/run-local-demo.sh
 ```
+
+Run the one-session, three-generation migration acceptance:
+
+```sh
+./scripts/path-migration-smoke.sh
+./scripts/ice-migration-capability.sh
+```
+
+The first command proves direct → application-owned opaque relay → direct;
+the second reports `UnsupportedIceRestart` for the current
+`webrtc-ice 0.17.2` boundary. Neither command claims external coturn,
+public-NAT, native zero-copy media, or stock Parsec compatibility.
 
 ## Build and test
 

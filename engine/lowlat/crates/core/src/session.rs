@@ -849,15 +849,16 @@ impl<'a> Session<'a> {
         // snapshot remains useful for diagnostics, but feeding control or
         // audio pressure into it makes a busy side channel look like video
         // congestion and was the ambiguity the per-channel telemetry fixed.
-        if let Some(video) = self.channel_stats.get(VIDEO_CHANNEL as usize)
-            && self
+        if let Some(video) = self.channel_stats.get(VIDEO_CHANNEL as usize) {
+            if self
                 .send
                 .get(VIDEO_CHANNEL as usize)
                 .and_then(Option::as_ref)
                 .is_some()
-        {
-            self.controller
-                .tick(video.in_flight, video.stale, video.delivery_rate_mbps);
+            {
+                self.controller
+                    .tick(video.in_flight, video.stale, video.delivery_rate_mbps);
+            }
         }
     }
 
@@ -929,21 +930,22 @@ impl<'a> Session<'a> {
             .send
             .get(VIDEO_CHANNEL as usize)
             .and_then(Option::as_ref)
-            && let Some(cleartext_len) = video.next_due_len(now_ms, self.srtt_ms, self.level)
         {
-            let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
-            let wait = if self.pacer.enabled() {
-                self.pacer.wait_ms(now_ms, wire_len)
-            } else {
-                0.0
-            };
-            next = next.min(wait);
-            // When video is waiting for credit, do not turn a control backlog
-            // into a one-millisecond busy loop. The next wake is the precise
-            // refill event, where the bounded priority quantum is followed by
-            // the video packet.
-            if self.pacer.enabled() && wait.is_finite() && wait > 0.0 {
-                return next;
+            if let Some(cleartext_len) = video.next_due_len(now_ms, self.srtt_ms, self.level) {
+                let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
+                let wait = if self.pacer.enabled() {
+                    self.pacer.wait_ms(now_ms, wire_len)
+                } else {
+                    0.0
+                };
+                next = next.min(wait);
+                // When video is waiting for credit, do not turn a control backlog
+                // into a one-millisecond busy loop. The next wake is the precise
+                // refill event, where the bounded priority quantum is followed by
+                // the video packet.
+                if self.pacer.enabled() && wait.is_finite() && wait > 0.0 {
+                    return next;
+                }
             }
         }
         if self.has_due_priority(now_ms) {
@@ -1011,17 +1013,18 @@ impl<'a> Session<'a> {
             };
             let wire_len = ENVELOPE_LEN.saturating_add(cleartext_len);
             let priority_bytes = self.drain_bytes.get(index).copied().unwrap_or_default();
-            if let Some(quantum) = Self::priority_quantum(index)
-                && priority_bytes > 0
-                && priority_bytes.saturating_add(wire_len) > quantum
-                && self.has_due_after(self.drain_channel, now_ms)
-            {
-                // Channel 0 combines input and bulk control in one ordered
-                // sequence space, so this yields at a fragment boundary. It
-                // prevents a large control transfer from monopolising the
-                // socket while retaining the ordering the peer relies on.
-                self.drain_channel += 1;
-                continue;
+            if let Some(quantum) = Self::priority_quantum(index) {
+                if priority_bytes > 0
+                    && priority_bytes.saturating_add(wire_len) > quantum
+                    && self.has_due_after(self.drain_channel, now_ms)
+                {
+                    // Channel 0 combines input and bulk control in one ordered
+                    // sequence space, so this yields at a fragment boundary. It
+                    // prevents a large control transfer from monopolising the
+                    // socket while retaining the ordering the peer relies on.
+                    self.drain_channel += 1;
+                    continue;
+                }
             }
             let Some(ring) = self.send.get_mut(index).and_then(Option::as_mut) else {
                 self.drain_channel += 1;

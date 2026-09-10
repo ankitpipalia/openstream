@@ -152,6 +152,101 @@ endpoints to discover `1472`, recover to the 1229-byte floor, deliver new
 messages after the downgrade, and discover `1472` again. It is skipped when
 Linux namespaces or root privileges are unavailable.
 
+The fast `mtu-transition` case uses an explicit recovery trigger. The slow
+watchdog case exercises the production decision instead: it waits for real
+`Health::Undeliverable`, invokes recovery once, drops only oversized video,
+retains reliable control, requests a fresh IDR, and proves traffic after the
+recovery. On macOS, Apple's persistent Linux environment is the supported
+way to run it:
+
+```sh
+# Run from the repository root. The machine must have the repository home
+# mount and the Linux tools/capabilities required by the fixture. Keeping the
+# build and fixture as direct machine commands avoids depending on a shell
+# quoting convention inside the VM.
+container machine list
+container machine run -n openstream-linux-ci --root \
+  --cwd "$PWD/engine/lowlat" \
+  -e CARGO_TARGET_DIR=/tmp/openstream-lowlat-target \
+  cargo build --locked --release \
+    -p lowlat-sim --bin punch --bin shell-punch
+container machine run -n openstream-linux-ci --root \
+  --cwd "$PWD/engine/lowlat" \
+  -e PUNCH=/tmp/openstream-lowlat-target/release/punch \
+  -e PEER=/tmp/openstream-lowlat-target/release/shell-punch \
+  "$PWD/engine/lowlat/scripts/netns-fixtures.sh" mtu-watchdog
+```
+
+To run the full namespace matrix, append the other explicit topologies to the
+last `container machine run` command:
+
+```sh
+container machine run -n openstream-linux-ci --root \
+  --cwd "$PWD/engine/lowlat" \
+  -e PUNCH=/tmp/openstream-lowlat-target/release/punch \
+  -e PEER=/tmp/openstream-lowlat-target/release/shell-punch \
+  "$PWD/engine/lowlat/scripts/netns-fixtures.sh" \
+  port-restricted full-cone restricted-cone symmetric carrier-grade hairpin \
+  mtu-transition mtu-watchdog
+```
+
+The fixture prints `skipped:` with the missing capability when the machine
+cannot create namespaces, veth pairs, or nft rules. A skip is environmental
+evidence, not a passing networking result. A successful watchdog run prints
+`PASS mtu-watchdog`, `netns fixtures: 1 passed, 0 failed`, and exactly one
+`pmtu-watchdog-recovered` line per endpoint.
+
+The required libc/ABI check runs in a pinned Alpine image on GitHub and can be
+reproduced from the repository root with Docker:
+
+```sh
+docker run --rm --platform linux/amd64 \
+  --mount type=bind,src="$PWD",dst=/workspace \
+  -w /workspace/engine/lowlat \
+  docker.io/library/rust:1.85.0-alpine3.21@sha256:715f7a1b6b3a538f7b55c0be7db7e5bb0461fe9ea1d0004a481ab0c5d59542ad \
+  /workspace/engine/lowlat/scripts/alpine-musl-ci.sh
+```
+
+The helper pins Rust 1.85.0, runs the lowlat common/core/net tests under
+musl, and compiles both the C11 and C++17 ABI consumers. The `alpine-musl`
+job is a required input to `CI gate`; a skipped or failed result fails the
+gate.
+
+## Shared path-controller acceptance
+
+The portable client now has one generation-aware telemetry boundary and one
+`PeerSession` cipher/replay state across the OpenStream-owned direct/opaque
+relay migration. Run the live acceptance from the repository root:
+
+```sh
+./scripts/path-migration-smoke.sh
+```
+
+The harness uses one pairing and one host/client process per role. It requires
+the following milestones from the same encrypted session:
+
+```text
+migration committed generation=2 path=opaque_relay
+migration committed generation=3 path=direct_udp
+migration acceptance passed: one cipher session, three committed generations
+```
+
+It also checks frame acknowledgements at generations 1, 2, and 3, redacted
+identity logging, relay unregister cleanup, and the absence of a second key
+exchange or second session. This is an OpenStream-owned opaque-relay test; it
+does not claim interoperability with TURN or stock Parsec clients.
+
+The current `webrtc-ice = 0.17.2` boundary is tested separately:
+
+```sh
+./scripts/ice-migration-capability.sh
+```
+
+That smoke must report the typed `UnsupportedIceRestart` result without
+changing the active path, generation, cipher, or session. It is not a
+successful ICE/TURN migration test. External coturn migration remains open
+until a real service and NAT run is recorded.
+
 The application-owned relay was then exercised with
 `OPENSTREAM_FORCE_RELAY=1`. The pairing response advertised the relay,
 invalid role tokens returned `401`, and the reference host/client completed

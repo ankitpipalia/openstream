@@ -166,32 +166,70 @@ mod tests {
     use super::*;
 
     /// The system C/runtime library differs in both name and loader behavior
-    /// across the supported targets. Use a concrete image on each platform so
-    /// the loader contract is tested rather than assuming glibc on Apple or
-    /// Windows.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    const LIBC: &CStr = c"libc.so.6";
+    /// across the supported targets. Use a small, loadable runtime library on
+    /// each platform rather than assuming glibc's `libc.so.6` exists on musl.
+    #[cfg(all(unix, not(target_os = "macos"), target_arch = "x86_64"))]
+    const RUNTIME_NAMES: &[&CStr] = &[c"libatomic.so.1", c"/usr/lib/libatomic.so.1"];
+    #[cfg(all(unix, not(target_os = "macos"), target_arch = "aarch64"))]
+    const RUNTIME_NAMES: &[&CStr] = &[c"libatomic.so.1", c"/usr/lib/libatomic.so.1"];
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_arch = "x86_64"),
+        not(target_arch = "aarch64")
+    ))]
+    const RUNTIME_NAMES: &[&CStr] = &[c"libatomic.so.1", c"/usr/lib/libatomic.so.1"];
     #[cfg(target_os = "macos")]
-    const LIBC: &CStr = c"/usr/lib/libSystem.B.dylib";
+    const RUNTIME_NAMES: &[&CStr] = &[c"/usr/lib/libSystem.B.dylib"];
     #[cfg(windows)]
-    const LIBC: &CStr = c"ucrtbase.dll";
+    const RUNTIME_NAMES: &[&CStr] = &[c"ucrtbase.dll"];
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    const SYMBOL_NAME: &CStr = c"__atomic_add_fetch_8";
+    #[cfg(any(target_os = "macos", windows))]
+    const SYMBOL_NAME: &CStr = c"malloc";
+
+    fn open_runtime() -> Library {
+        Library::open_first(RUNTIME_NAMES).expect("runtime library did not open")
+    }
+
+    fn open_first_names() -> std::vec::Vec<&'static CStr> {
+        let mut names = std::vec::Vec::with_capacity(RUNTIME_NAMES.len() + 1);
+        #[cfg(unix)]
+        names.push(c"liblowlat-absent.so.999");
+        #[cfg(windows)]
+        names.push(c"lowlat-absent.dll");
+        names.extend_from_slice(RUNTIME_NAMES);
+        names
+    }
 
     #[test]
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "the Rust musl test binary is static and cannot dlopen a shared object"
+    )]
     fn opens_a_library_and_resolves_a_symbol() {
-        let library = Library::open(LIBC).expect("libc did not open");
+        let library = open_runtime();
         // SAFETY: the signature is not called, only resolved, and the test
         // asserts resolution rather than invocation.
         let symbol: Option<unsafe extern "C" fn(usize) -> *mut c_void> =
-            unsafe { library.symbol(c"malloc") };
-        assert!(symbol.is_some(), "a symbol libc certainly exports");
+            unsafe { library.symbol(SYMBOL_NAME) };
+        assert!(
+            symbol.is_some(),
+            "the selected runtime exports its test symbol"
+        );
     }
 
     /// The counterpart that proves the test above is not vacuous: the same
     /// call against a name no library exports must report absence rather than
     /// hand back something.
     #[test]
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "the Rust musl test binary is static and cannot dlopen a shared object"
+    )]
     fn an_absent_symbol_reports_none() {
-        let library = Library::open(LIBC).expect("libc did not open");
+        let library = open_runtime();
         // SAFETY: as above; resolution only.
         let symbol: Option<unsafe extern "C" fn()> =
             unsafe { library.symbol(c"lowlat_no_such_symbol_exists") };
@@ -207,16 +245,25 @@ mod tests {
     /// that exists on a machine without the development package. The first
     /// entry failing must not abandon the search.
     #[test]
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "the Rust musl test binary is static and cannot dlopen a shared object"
+    )]
     fn open_first_skips_names_that_do_not_load() {
-        let library = Library::open_first(&[c"liblowlat-absent.so.999", LIBC]);
+        let names = open_first_names();
+        let library = Library::open_first(&names);
         assert!(library.is_some(), "the fallback name was never tried");
-        assert!(Library::open_first(&[c"liblowlat-absent.so.999"]).is_none());
+        assert!(Library::open_first(&names[..1]).is_none());
         assert!(Library::open_first(&[]).is_none());
     }
 
     #[test]
+    #[cfg_attr(
+        target_env = "musl",
+        ignore = "the Rust musl test binary is static and cannot dlopen a shared object"
+    )]
     fn a_handle_crosses_threads() {
-        let library = Library::open(LIBC).expect("libc did not open");
+        let library = open_runtime();
         std::thread::spawn(move || drop(library))
             .join()
             .expect("the handle did not survive the move");

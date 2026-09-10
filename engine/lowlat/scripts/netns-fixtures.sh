@@ -25,6 +25,13 @@ PUNCH=${PUNCH:-/tmp/lowlat-target/release/punch}
 PEER=${PEER:-/tmp/lowlat-target/release/shell-punch}
 RUN=${RUN:-/tmp/lowlat-netns}
 TIMEOUT_MS=12000
+# The delivery watchdog fires after 15 seconds. Give the automatic-recovery
+# topology another 15 seconds to recover and settle, while leaving the ordinary
+# fixture's 12-second wait and endpoint timeout unchanged.
+WATCHDOG_DELIVERY_DEADLINE_MS=15000
+WATCHDOG_SETTLE_MS=15000
+WATCHDOG_WAIT_ATTEMPTS=$(((WATCHDOG_DELIVERY_DEADLINE_MS + WATCHDOG_SETTLE_MS) / 10))
+WATCHDOG_TIMEOUT_MS=$((WATCHDOG_DELIVERY_DEADLINE_MS + (2 * WATCHDOG_SETTLE_MS) + TIMEOUT_MS))
 VERBOSE=${VERBOSE:-}
 
 # One namespace per role. Named so a leaked one is obvious in `ip netns list`.
@@ -46,6 +53,44 @@ pass=0
 fail=0
 
 log() { printf '%s\n' "$*"; }
+
+# Verify the kernel operations every topology needs before entering the matrix.
+# A process can have EUID 0 while a container runtime has withheld CAP_SYS_ADMIN
+# or CAP_NET_ADMIN; treating that environmental limit as a topology failure
+# would make a skipped fixture indistinguishable from a regression.
+namespace_prerequisites() {
+    local tool namespace link
+    for tool in ip nft sysctl; do
+        if ! command -v "$tool" >/dev/null; then
+            log "skipped: network namespace fixtures need $tool"
+            return 1
+        fi
+    done
+
+    namespace="llpf$$"
+    link="llpv$$"
+    if ! ip netns add "$namespace" >/dev/null 2>&1; then
+        log "skipped: network namespace fixtures cannot create network namespaces"
+        return 1
+    fi
+    if ! ip netns exec "$namespace" sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+        ip netns del "$namespace" 2>/dev/null
+        log "skipped: network namespace fixtures cannot configure network namespaces"
+        return 1
+    fi
+    if ! ip netns exec "$namespace" nft list tables >/dev/null 2>&1; then
+        ip netns del "$namespace" 2>/dev/null
+        log "skipped: network namespace fixtures cannot use nft in network namespaces"
+        return 1
+    fi
+    if ! ip link add "$link" type veth peer name "${link}p" >/dev/null 2>&1; then
+        ip netns del "$namespace" 2>/dev/null
+        log "skipped: network namespace fixtures cannot create veth pairs"
+        return 1
+    fi
+    ip link del "$link"
+    ip netns del "$namespace"
+}
 
 cleanup() {
     for ns in $NAMESPACES; do
@@ -192,8 +237,9 @@ run_pair() {
 # file -> wait for a fixture process to publish a milestone.
 wait_for_file() {
     local file=$1
+    local attempts=${2:-1200}
     local tries=0
-    while [[ ! -e $file && $tries -lt 1200 ]]; do
+    while [[ ! -e $file && $tries -lt $attempts ]]; do
         sleep 0.01
         tries=$((tries + 1))
     done
@@ -203,8 +249,9 @@ wait_for_file() {
 # file pattern -> wait until a process has written a milestone line.
 wait_for_line() {
     local file=$1 pattern=$2
+    local attempts=${3:-1200}
     local tries=0
-    while [[ $tries -lt 1200 ]]; do
+    while [[ $tries -lt $attempts ]]; do
         if [[ -f $file ]] && grep -Eq "$pattern" "$file"; then
             return 0
         fi
@@ -229,20 +276,27 @@ stop_processes() {
 }
 
 # ns bind_addr candidate ready recover raise ready_again ufrag pwd peer_ufrag
-# peer_pwd seed session_role out
+# peer_pwd seed session_role out [watchdog]
 start_mtu_peer() {
+    local -a recovery_args=(--pmtu-recover "$5")
+    local timeout_ms=$TIMEOUT_MS
+    if [[ ${15:-} == watchdog ]]; then
+        recovery_args=(--pmtu-watchdog)
+        timeout_ms=$WATCHDOG_TIMEOUT_MS
+    fi
+
     ip netns exec "$1" "$PEER" peer \
         --bind "$2" \
         --candidate "$3" \
         --pmtu-ready "$4" \
-        --pmtu-recover "$5" \
+        "${recovery_args[@]}" \
         --pmtu-raise "$6" \
         --pmtu-ready-again "$7" \
         --stream \
         --local-ufrag "$8" --local-pwd "$9" \
         --remote-ufrag "${10}" --remote-pwd "${11}" \
         --seed "${12}" --session-role "${13}" \
-        --timeout-ms "$TIMEOUT_MS" $VERBOSE \
+        --timeout-ms "$timeout_ms" $VERBOSE \
         >"${14}" 2>&1 &
 }
 
@@ -323,6 +377,73 @@ topology_mtu_transition() {
 
     pass=$((pass + 1))
     log "  PASS mtu-transition: live 1500 -> 1300 -> 1500 survived on both endpoints"
+}
+
+# The same link transition as mtu-transition, except recovery is driven by the
+# endpoint's delivery watchdog. No recovery marker is given to either peer.
+topology_mtu_watchdog() {
+    mkns llha llhb || return 1
+    wire llha inta 192.168.30.1/30 llhb intb 192.168.30.2/30 || return 1
+    ip -n llha link set inta mtu 1500 || return 1
+    ip -n llhb link set intb mtu 1500 || return 1
+
+    start_mtu_peer llha 192.168.30.1:$LEFT_PORT 192.168.30.2:$RIGHT_PORT \
+        "$RUN/a.ready" '' "$RUN/a.raise" "$RUN/a.ready-again" \
+        "$LEFT_UFRAG" "$LEFT_PWD" "$RIGHT_UFRAG" "$RIGHT_PWD" 161 host "$RUN/a.out" watchdog
+    local a=$!
+    start_mtu_peer llhb 192.168.30.2:$RIGHT_PORT 192.168.30.1:$LEFT_PORT \
+        "$RUN/b.ready" '' "$RUN/b.raise" "$RUN/b.ready-again" \
+        "$RIGHT_UFRAG" "$RIGHT_PWD" "$LEFT_UFRAG" "$LEFT_PWD" 178 guest "$RUN/b.out" watchdog
+    local b=$!
+
+    if ! wait_for_line "$RUN/a.out" '^pmtu-ready datagram=1472' \
+        || ! wait_for_line "$RUN/b.out" '^pmtu-ready datagram=1472'; then
+        log "  FAIL mtu-watchdog: initial PMTU search did not complete"
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    if ! ip -n llha link set inta mtu 1300 || ! ip -n llhb link set intb mtu 1300; then
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    if ! wait_for_line "$RUN/a.out" '^pmtu-watchdog-recovered ' "$WATCHDOG_WAIT_ATTEMPTS" \
+        || ! wait_for_line "$RUN/b.out" '^pmtu-watchdog-recovered ' "$WATCHDOG_WAIT_ATTEMPTS"; then
+        log "  FAIL mtu-watchdog: automatic black-hole recovery did not complete"
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    if ! ip -n llha link set inta mtu 1500 || ! ip -n llhb link set intb mtu 1500; then
+        stop_processes "$a" "$b"
+        return 1
+    fi
+    touch "$RUN/a.raise" "$RUN/b.raise"
+
+    if ! wait_for_line "$RUN/a.out" '^pmtu-ready-again datagram=1472' "$WATCHDOG_WAIT_ATTEMPTS" \
+        || ! wait_for_line "$RUN/b.out" '^pmtu-ready-again datagram=1472' "$WATCHDOG_WAIT_ATTEMPTS"; then
+        log "  FAIL mtu-watchdog: upward re-probe did not complete"
+        stop_processes "$a" "$b"
+        return 1
+    fi
+
+    local a_status=0 b_status=0
+    wait "$a" || a_status=$?
+    wait "$b" || b_status=$?
+    if [[ $a_status -ne 0 || $b_status -ne 0 ]] \
+        || [[ $(grep -Ec '^pmtu-watchdog-recovered old=1472 new=1229 ' "$RUN/a.out") -ne 1 ]] \
+        || [[ $(grep -Ec '^pmtu-watchdog-recovered old=1472 new=1229 ' "$RUN/b.out") -ne 1 ]] \
+        || ! grep -Eq '^stream sent=[1-9][0-9]* sent_after_recovery=[1-9][0-9]* received=[1-9][0-9]* after_recovery=[1-9][0-9]*' "$RUN/a.out" \
+        || ! grep -Eq '^stream sent=[1-9][0-9]* sent_after_recovery=[1-9][0-9]* received=[1-9][0-9]* after_recovery=[1-9][0-9]*' "$RUN/b.out"; then
+        log "  FAIL mtu-watchdog: endpoint output did not prove automatic recovery"
+        log "    left:  $(grep -E '^(established|pmtu-|stream )' "$RUN/a.out" | tr '\n' ' ')"
+        log "    right: $(grep -E '^(established|pmtu-|stream )' "$RUN/b.out" | tr '\n' ' ')"
+        return 1
+    fi
+
+    pass=$((pass + 1))
+    log "  PASS mtu-watchdog: automatic 1500 -> 1300 -> 1500 recovery survived on both endpoints"
 }
 
 # name expected -> compare both outcomes against "established" or "failed"
@@ -528,6 +649,9 @@ if [[ ! -x $PUNCH ]]; then
 fi
 if [[ ! -x $PEER ]]; then
     log "skipped: no endpoint at $PEER; build it first"
+    exit 0
+fi
+if ! namespace_prerequisites; then
     exit 0
 fi
 
