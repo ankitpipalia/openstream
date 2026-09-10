@@ -2,6 +2,13 @@
 
 use core::fmt;
 
+pub mod delivery;
+pub use delivery::{
+    AckOutcome, DELIVERY_HISTORY_CAPACITY, DeliveryClassSnapshot, DeliveryError, DeliveryEstimator,
+    DeliverySnapshot, MAX_ACK_DELAY_US, MIN_DELIVERY_SAMPLE_INTERVAL_MS, STALE_AFTER_MS,
+    SendOutcome, SentPacket, TrafficClass,
+};
+
 /// Packet-count ceiling for a pacer's stored burst credit.
 pub const MAX_BURST_DATAGRAMS: usize = 4;
 
