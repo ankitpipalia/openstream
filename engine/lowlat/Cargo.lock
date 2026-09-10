@@ -1438,6 +1438,7 @@ dependencies = [
  "aes-gcm",
  "hmac",
  "lowlat-common",
+ "openstream-transport-policy",
  "sha1",
 ]
 
@@ -1951,6 +1952,10 @@ dependencies = [
  "tokio",
  "url",
 ]
+
+[[package]]
+name = "openstream-transport-policy"
+version = "0.0.0"
 
 [[package]]
 name = "opus-rs"

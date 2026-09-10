@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/common",
     "crates/core",
+    "crates/transport-policy",
     "crates/crypto",
     "crates/net",
     "crates/sim",
@@ -48,6 +49,7 @@ lowlat-encode = { path = "crates/encode" }
 lowlat-inject = { path = "crates/inject" }
 lowlat-host = { path = "crates/host" }
 lowlat-kessel = { path = "crates/kessel" }
+openstream-transport-policy = { path = "crates/transport-policy" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 base64 = "0.22"
