@@ -99,6 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut waiting_for_keyframe = false;
     let mut control_tick = tokio::time::interval(Duration::from_millis(100));
     while tokio::time::Instant::now() < deadline {
+        session.flush_outbound().await?;
+        let outbound_wake = session.next_outbound_wake();
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let packet = tokio::select! {
             packet = tokio::time::timeout(remaining, session.recv()) => {
@@ -109,7 +111,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
+                session.flush_outbound().await?;
                 session.maintain_liveness().await?;
+                continue;
+            }
+            _ = wait_for_outbound_wake(outbound_wake) => {
+                session.flush_outbound().await?;
                 continue;
             }
         };
@@ -234,6 +241,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("OpenStream client wrote {frames} decoded access units to {output}");
     eprintln!("OpenStream transport stats: {:?}", session.stats());
     Ok(())
+}
+
+async fn wait_for_outbound_wake(wake: Option<Duration>) {
+    match wake {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending::<()>().await,
+    }
 }
 
 fn codec_suffix(codec: VideoCodec) -> &'static str {

@@ -13,7 +13,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
-    Capabilities, Pairing, PeerSession, ReliableControl, Role, VideoCodec, parse_stun_servers,
+    Capabilities, Pairing, PeerSession, QueueOutcome, ReliableControl, Role, VideoCodec,
+    parse_stun_servers,
 };
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
@@ -268,6 +269,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut peer_ended = false;
     'stream: while Instant::now() < deadline {
+        session.flush_outbound().await?;
+        let outbound_wake = session.next_outbound_wake();
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::select! {
             result = tokio::time::timeout(remaining, session.recv()) => {
@@ -422,7 +425,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         payload: encoded.to_vec(),
                     }
                     .encode()?;
-                    session.send(Kind::Audio, 0, 0, &payload).await?;
+                    queue_stream_packet(&mut session, Kind::Audio, &payload)?;
                     audio_sequence = audio_sequence.wrapping_add(1);
                 }
             }
@@ -432,6 +435,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     reliable_control.send(&mut session, &rumble.encode()).await?;
                 }
                 reliable_control.retry(&mut session).await?;
+                session.flush_outbound().await?;
                 session.maintain_liveness().await?;
                 let now = Instant::now();
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -579,6 +583,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     clipboard_value = Some(current);
                 }
             }
+            _ = wait_for_outbound_wake(outbound_wake) => {
+                session.flush_outbound().await?;
+            }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 break;
             }
@@ -613,6 +620,27 @@ async fn read_optional(reader: &mut Option<ChildStdout>, buffer: &mut [u8]) -> i
         Some(reader) => reader.read(buffer).await,
         None => std::future::pending::<io::Result<usize>>().await,
     }
+}
+
+async fn wait_for_outbound_wake(wake: Option<Duration>) {
+    match wake {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn queue_stream_packet(
+    session: &mut PeerSession,
+    kind: Kind,
+    payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(
+        session.queue(kind, 0, 0, payload)?,
+        QueueOutcome::DroppedOldest
+    ) {
+        eprintln!("OpenStream dropped oldest queued {kind:?} packet");
+    }
+    Ok(())
 }
 
 /// Own an external encoder process and make early-return cleanup reliable.
@@ -1170,7 +1198,7 @@ async fn send_access_unit(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let keyframe = contains_idr(payload, codec);
     for fragment in fragment_frame(frame_id, presentation_time_us, keyframe, payload)? {
-        session.send(Kind::Video, 0, 0, &fragment).await?;
+        queue_stream_packet(session, Kind::Video, &fragment)?;
     }
     Ok(())
 }

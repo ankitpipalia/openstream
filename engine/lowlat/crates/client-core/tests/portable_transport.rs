@@ -1,4 +1,6 @@
+use std::fs;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -152,6 +154,112 @@ async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>,
         bridge,
         loopback,
     )
+}
+
+#[test]
+fn no_immediate_media_bypass_source_check() {
+    let client_core_manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let portable_source_roots = [
+        (
+            "ffmpeg-host",
+            client_core_manifest.join("../ffmpeg-host/src"),
+        ),
+        (
+            "reference-peer",
+            client_core_manifest.join("../reference-peer/src"),
+        ),
+        ("client", client_core_manifest.join("../client/src")),
+        (
+            "desktop-client",
+            client_core_manifest.join("../desktop-client/src"),
+        ),
+    ];
+    let forbidden = [
+        ("private immediate send", "send_immediate_on("),
+        ("raw sealed write", "write_sealed_on("),
+        ("raw sealed send", "send_sealed_on("),
+        ("raw datagram send", "send_datagram("),
+        ("direct high-rate video send", "session.send(Kind::Video"),
+        ("direct high-rate audio send", "session.send(Kind::Audio"),
+    ];
+    let mut violations = Vec::new();
+
+    for (crate_name, root) in portable_source_roots {
+        for path in rust_source_paths(&root) {
+            let source = fs::read_to_string(&path).expect("read portable consumer source");
+            let compact_source: String = source
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            let relative_path = path
+                .strip_prefix(client_core_manifest)
+                .unwrap_or(&path)
+                .display();
+            for (label, needle) in forbidden {
+                if compact_source.contains(needle) {
+                    let location = source.lines().enumerate().find_map(|(line_number, line)| {
+                        line.contains(needle).then_some(line_number + 1)
+                    });
+                    match location {
+                        Some(line_number) => violations.push(format!(
+                            "{crate_name}:{relative_path}:{line_number}: {label}"
+                        )),
+                        None => violations.push(format!("{crate_name}:{relative_path}: {label}")),
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "portable outbound paths bypass the packet scheduler: {}",
+        violations.join(", ")
+    );
+}
+
+fn rust_source_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(root).expect("read portable consumer source directory") {
+        let entry = entry.expect("read portable consumer source entry");
+        let path = entry.path();
+        if path.is_dir() {
+            paths.extend(rust_source_paths(&path));
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_immediate_media_bypass_behavior() {
+    let (mut sender, mut receiver, bridge, _loopback) = connected_test_sessions().await;
+    let frame = vec![0; MAX_PLAINTEXT];
+
+    sender.set_wire_pacing_rate(1.0).unwrap();
+    for _ in 0..5 {
+        sender.queue(Kind::Video, 0, 0, &frame).unwrap();
+    }
+
+    assert_eq!(sender.stats().sent_packets, 0);
+    assert_eq!(sender.outbound_pending(), 5);
+    assert!(sender.next_outbound_wake().is_some());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), receiver.recv())
+            .await
+            .is_err()
+    );
+
+    let report = sender.flush_outbound().await.unwrap();
+    assert_eq!(report.sent_packets, 1);
+    assert_eq!(report.pending_packets, 4);
+    assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
+
+    sender.close().await.unwrap();
+    receiver.close().await.unwrap();
+    bridge.abort();
 }
 
 #[test]

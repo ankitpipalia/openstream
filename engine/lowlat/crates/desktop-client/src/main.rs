@@ -987,6 +987,7 @@ async fn network_loop(
     let mut control_tick = tokio::time::interval(Duration::from_millis(100));
     let mut clipboard_tick = tokio::time::interval(Duration::from_millis(500));
     loop {
+        session.flush_outbound().await?;
         while let Ok(input) = input_rx.try_recv() {
             match input {
                 UiInput::Event(event) => {
@@ -1012,6 +1013,7 @@ async fn network_loop(
                 }
             }
         }
+        let outbound_wake = session.next_outbound_wake();
         tokio::select! {
             packet = session.recv() => {
                 let packet = packet?;
@@ -1187,7 +1189,11 @@ async fn network_loop(
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
+                session.flush_outbound().await?;
                 session.maintain_liveness().await?;
+            }
+            _ = wait_for_outbound_wake(outbound_wake) => {
+                session.flush_outbound().await?;
             }
             _ = metrics_tick.tick() => {
                 let _ = ui_tx.send(UiMessage::Metrics(metrics.snapshot().overlay_line()));
@@ -1230,6 +1236,13 @@ async fn network_loop(
                 }
             }
         }
+    }
+}
+
+async fn wait_for_outbound_wake(wake: Option<Duration>) {
+    match wake {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending::<()>().await,
     }
 }
 
