@@ -23,7 +23,8 @@ use openstream_transport::{
     UdpTransport,
 };
 use openstream_transport_policy::{
-    DeliveryError, DeliveryEstimator, DeliverySnapshot, SentPacket, TrafficClass,
+    DeliveryClassSnapshot as PolicyDeliveryClassSnapshot, DeliveryError, DeliveryEstimator,
+    DeliverySnapshot as PolicyDeliverySnapshot, DeliverySnapshotView, SentPacket, TrafficClass,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,8 +59,101 @@ pub use transport_ack::{
     TransportAckConfig, TransportAckConfigError, TransportAckWindow, TransportAckWindowError,
 };
 
-/// Delivery telemetry for the active portable path generation.
-pub type PeerDeliverySnapshot = DeliverySnapshot;
+/// Delivery counters for one traffic class on the active portable path.
+///
+/// These are authenticated peer-delivery observations. They deliberately do
+/// not contain addresses, credentials, payloads, or local socket counters.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryClassSnapshot {
+    pub sent_packets: u64,
+    pub sent_bytes: u64,
+    pub acknowledged_packets: u64,
+    pub acknowledged_bytes: u64,
+    pub delivery_rate_mbps: Option<f64>,
+    pub in_flight: u32,
+    pub stale: u64,
+    pub logical_reliable_retries: u64,
+    pub outer_retransmissions: u64,
+}
+
+impl From<PolicyDeliveryClassSnapshot> for DeliveryClassSnapshot {
+    fn from(snapshot: PolicyDeliveryClassSnapshot) -> Self {
+        Self {
+            sent_packets: snapshot.sent_packets,
+            sent_bytes: snapshot.sent_bytes,
+            acknowledged_packets: snapshot.acknowledged_packets,
+            acknowledged_bytes: snapshot.acknowledged_bytes,
+            delivery_rate_mbps: snapshot.delivery_rate_mbps,
+            in_flight: snapshot.in_flight,
+            stale: snapshot.stale,
+            logical_reliable_retries: snapshot.logical_reliable_retries,
+            outer_retransmissions: snapshot.outer_retransmissions,
+        }
+    }
+}
+
+impl From<DeliveryClassSnapshot> for PolicyDeliveryClassSnapshot {
+    fn from(snapshot: DeliveryClassSnapshot) -> Self {
+        Self {
+            sent_packets: snapshot.sent_packets,
+            sent_bytes: snapshot.sent_bytes,
+            acknowledged_packets: snapshot.acknowledged_packets,
+            acknowledged_bytes: snapshot.acknowledged_bytes,
+            delivery_rate_mbps: snapshot.delivery_rate_mbps,
+            in_flight: snapshot.in_flight,
+            stale: snapshot.stale,
+            logical_reliable_retries: snapshot.logical_reliable_retries,
+            outer_retransmissions: snapshot.outer_retransmissions,
+        }
+    }
+}
+
+/// Address- and credential-free authenticated delivery telemetry for one
+/// active portable path generation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PeerDeliverySnapshot {
+    pub path_generation: PathGeneration,
+    pub sample_interval_ms: f64,
+    pub srtt_ms: Option<f64>,
+    pub aggregate: DeliveryClassSnapshot,
+    pub video: DeliveryClassSnapshot,
+    pub audio: DeliveryClassSnapshot,
+    pub critical: DeliveryClassSnapshot,
+}
+
+impl From<PolicyDeliverySnapshot> for PeerDeliverySnapshot {
+    fn from(snapshot: PolicyDeliverySnapshot) -> Self {
+        Self {
+            path_generation: snapshot.path_generation,
+            sample_interval_ms: snapshot.sample_interval_ms,
+            srtt_ms: snapshot.srtt_ms,
+            aggregate: snapshot.aggregate.into(),
+            video: snapshot.video.into(),
+            audio: snapshot.audio.into(),
+            critical: snapshot.critical.into(),
+        }
+    }
+}
+
+impl From<PeerDeliverySnapshot> for PolicyDeliverySnapshot {
+    fn from(snapshot: PeerDeliverySnapshot) -> Self {
+        Self {
+            path_generation: snapshot.path_generation,
+            sample_interval_ms: snapshot.sample_interval_ms,
+            srtt_ms: snapshot.srtt_ms,
+            aggregate: snapshot.aggregate.into(),
+            video: snapshot.video.into(),
+            audio: snapshot.audio.into(),
+            critical: snapshot.critical.into(),
+        }
+    }
+}
+
+impl DeliverySnapshotView for PeerDeliverySnapshot {
+    fn delivery_snapshot(&self) -> PolicyDeliverySnapshot {
+        (*self).into()
+    }
+}
 
 use scheduler::{OutboundScheduler, SchedulerError};
 
@@ -2613,7 +2707,7 @@ impl PeerSession {
 
     /// Return authenticated delivery telemetry for the active path generation.
     pub fn transport_delivery_snapshot(&mut self, now: Instant) -> PeerDeliverySnapshot {
-        self.delivery.snapshot(self.policy_now_ms(now))
+        self.delivery.snapshot(self.policy_now_ms(now)).into()
     }
 
     /// Send one encrypted application packet through the bounded scheduler.

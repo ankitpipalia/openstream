@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use openstream_client_core::{Pairing, PeerSession, Role};
+use openstream_client_core::{
+    DeliveryClassSnapshot, Pairing, PeerDeliverySnapshot, PeerSession, Role,
+};
+use openstream_media::{AdaptiveBitrate, PeerTelemetryAdapter};
 use openstream_protocol::{Kind, MAX_PLAINTEXT, Session as CipherSession};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -97,6 +100,32 @@ fn pairing() -> Pairing {
     }
 }
 
+fn delivery_class() -> DeliveryClassSnapshot {
+    DeliveryClassSnapshot {
+        sent_packets: 0,
+        sent_bytes: 0,
+        acknowledged_packets: 0,
+        acknowledged_bytes: 0,
+        delivery_rate_mbps: None,
+        in_flight: 0,
+        stale: 0,
+        logical_reliable_retries: 0,
+        outer_retransmissions: 0,
+    }
+}
+
+fn delivery_snapshot(generation: u64) -> PeerDeliverySnapshot {
+    PeerDeliverySnapshot {
+        path_generation: generation,
+        sample_interval_ms: 0.0,
+        srtt_ms: None,
+        aggregate: delivery_class(),
+        video: delivery_class(),
+        audio: delivery_class(),
+        critical: delivery_class(),
+    }
+}
+
 async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>, LoopbackIceEnv) {
     let loopback = LoopbackIceEnv::enable();
     let (origin, bridge) = websocket_bridge().await;
@@ -123,6 +152,91 @@ async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>,
         bridge,
         loopback,
     )
+}
+
+#[test]
+fn public_delivery_snapshot_is_serde_safe_and_has_no_socket_metadata() {
+    let snapshot = delivery_snapshot(7);
+    let encoded = serde_json::to_string(&snapshot).expect("serialize delivery snapshot");
+
+    assert!(encoded.contains("\"path_generation\":7"));
+    assert!(!encoded.contains("127.0.0.1"));
+    assert!(!encoded.contains("credential"));
+    assert_eq!(snapshot.video.delivery_rate_mbps, None);
+}
+
+#[test]
+fn packet_delivery_observation_is_diagnostics_only_for_adaptive_bitrate() {
+    let mut with_delivery = PeerTelemetryAdapter::new(AdaptiveBitrate::new(10.0, 1.0, 20.0), 1, 0);
+    let mut without_delivery =
+        PeerTelemetryAdapter::new(AdaptiveBitrate::new(10.0, 1.0, 20.0), 1, 0);
+    for frame_id in 0..8 {
+        with_delivery.frame_sent(frame_id, 1_024, 0);
+        without_delivery.frame_sent(frame_id, 1_024, 0);
+    }
+
+    let delivery = delivery_snapshot(1);
+    with_delivery.observe_delivery(&delivery);
+
+    assert_eq!(
+        with_delivery
+            .latest_delivery_snapshot()
+            .map(|snapshot| snapshot.path_generation),
+        Some(delivery.path_generation)
+    );
+    assert_eq!(with_delivery.tick(500), without_delivery.tick(500));
+    assert_eq!(
+        with_delivery.bitrate_mbps().to_bits(),
+        without_delivery.bitrate_mbps().to_bits()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_snapshot_keeps_aggregate_and_class_evidence_distinct() {
+    let (mut sender, mut receiver, bridge, _loopback) = connected_test_sessions().await;
+
+    sender.set_wire_pacing_rate(0.0).unwrap();
+    sender.queue(Kind::Video, 0, 0, b"video").unwrap();
+    sender.queue(Kind::Audio, 0, 0, b"audio").unwrap();
+    sender.flush_outbound().await.unwrap();
+    receiver.recv().await.unwrap();
+    receiver.recv().await.unwrap();
+    sender.recv_step().await.unwrap();
+
+    let snapshot = sender.transport_delivery_snapshot(std::time::Instant::now());
+    assert_eq!(snapshot.aggregate.acknowledged_packets, 2);
+    assert_eq!(snapshot.video.acknowledged_packets, 1);
+    assert_eq!(snapshot.audio.acknowledged_packets, 1);
+    assert_eq!(snapshot.critical.acknowledged_packets, 0);
+    assert_eq!(
+        snapshot.aggregate.acknowledged_bytes,
+        snapshot.video.acknowledged_bytes + snapshot.audio.acknowledged_bytes
+    );
+
+    sender.close().await.unwrap();
+    receiver.close().await.unwrap();
+    bridge.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_snapshot_does_not_fabricate_acknowledgement_from_local_writes() {
+    let (mut sender, mut receiver, bridge, _loopback) = connected_test_sessions().await;
+
+    sender.set_wire_pacing_rate(0.0).unwrap();
+    sender
+        .send(Kind::Video, 0, 0, b"locally-written")
+        .await
+        .unwrap();
+
+    let snapshot = sender.transport_delivery_snapshot(std::time::Instant::now());
+    assert_eq!(snapshot.aggregate.acknowledged_packets, 0);
+    assert_eq!(snapshot.aggregate.delivery_rate_mbps, None);
+    assert_eq!(snapshot.video.delivery_rate_mbps, None);
+    assert!(snapshot.aggregate.sent_packets > 0);
+
+    sender.close().await.unwrap();
+    receiver.close().await.unwrap();
+    bridge.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

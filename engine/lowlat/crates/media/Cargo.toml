@@ -12,6 +12,7 @@ lowlat-audio.workspace = true
 lowlat-core.workspace = true
 openstream-protocol = { path = "../protocol" }
 openstream-transport = { path = "../transport" }
+openstream-transport-policy.workspace = true
 
 [lints]
 workspace = true

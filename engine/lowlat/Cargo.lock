@@ -1884,6 +1884,7 @@ dependencies = [
  "lowlat-core",
  "openstream-protocol",
  "openstream-transport",
+ "openstream-transport-policy",
 ]
 
 [[package]]

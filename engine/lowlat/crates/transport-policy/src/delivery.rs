@@ -174,6 +174,21 @@ pub struct DeliverySnapshot {
     pub critical: DeliveryClassSnapshot,
 }
 
+/// A small conversion boundary for client-facing diagnostics.
+///
+/// The policy crate owns the dependency-free snapshot shape. Higher-level
+/// clients can expose an address-free representation without making the
+/// media crate depend on a concrete session implementation.
+pub trait DeliverySnapshotView {
+    fn delivery_snapshot(&self) -> DeliverySnapshot;
+}
+
+impl DeliverySnapshotView for DeliverySnapshot {
+    fn delivery_snapshot(&self) -> DeliverySnapshot {
+        *self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ClassState {
     sent_packets: u64,
