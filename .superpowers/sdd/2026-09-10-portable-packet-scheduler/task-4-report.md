@@ -1,5 +1,22 @@
 # Task 4 implementation report — portable ACK policy and PeerSession integration
 
+## Prior partial-state audit
+
+- The handoff described the Task 4 implementation as uncommitted. At the
+  start of this finisher audit, `git status --short --branch` was clean on
+  `codex/portable-scheduler`; `HEAD` was already the implementation commit
+  `747ddc9077d99822f5639ed76ab28404158a8137` with the requested subject.
+- `git diff HEAD^ HEAD` contained only this report and the four Task 4
+  implementation/test files listed below. No implementation redesign or
+  unrelated change was necessary.
+- The prior partial-state failure was a generation mismatch at path
+  activation: the active `PeerPath` advanced while the newly added scheduler,
+  delivery estimator, and ACK window remained at generation 1. That caused
+  the first post-migration application send to return `OutboundHistoryFull`.
+  The activation boundary now resets those path-local states while preserving
+  the cipher, outer-counter domain, reliable-control sequence space, and frame
+  state.
+
 ## Changed files
 
 - `engine/lowlat/crates/client-core/src/lib.rs` — scheduler-backed
@@ -12,16 +29,10 @@
 - `engine/lowlat/crates/client-core/tests/portable_transport.rs` — authenticated
   loopback coverage for queueing, pacing, ACK interception/suppression, delayed
   ACKs, and delivery snapshots.
+- `.superpowers/sdd/2026-09-10-portable-packet-scheduler/task-4-report.md` —
+  finisher audit, verification outcomes, concerns, and commit identity.
 
 ## Root cause and fixes
-
-The initial full client-core regression exposed one compatibility failure:
-path migration advanced the active `PeerPath` generation but left the new
-scheduler, delivery estimator, and ACK window at generation 1. The first
-application send after activation consequently failed as `OutboundHistoryFull`.
-The existing activation boundary now resets those three path-local states
-synchronously while retaining the single cipher, outer counter domain,
-reliable-control sequence space, and frame state.
 
 Warnings-denied Clippy also found one test assertion using redundant pattern
 matching; it now uses `.is_none()`.
@@ -84,6 +95,30 @@ All Rust commands below were run from
     pattern; rerun after the lint fix passed.
 12. `cargo check -p openstream-client-core --all-features --locked` — passed.
 
+## Fresh finisher verification
+
+- `cargo test -p openstream-client-core --all-features --locked --
+  --test-threads=1` — 61 unit tests, 1 ICE integration test, 3
+  path-migration integration tests, 6 portable integration tests, 11
+  scheduler tests, and doc-test target completion; 0 failed.
+- `cargo fmt --all -- --check` — exit 0.
+- `cargo clippy -p openstream-client-core --all-targets --all-features
+  --locked -- -D warnings` — exit 0.
+- `cargo test --all-features --locked -- --test-threads=1` — workspace
+  regression passed; all listed tests and doc-tests passed, with only
+  environment-dependent tests ignored.
+- `git diff --check origin/main...HEAD` — passed.
+
+## Concerns
+
+- No known Task 4 functional concerns remain after the fresh locked test,
+  format, and warnings-denied Clippy checks.
+- Verification is limited to the repository's unit/integration and loopback
+  coverage; it is not a WAN, hardware, or full-ICE performance validation.
+- The Cargo workspace is rooted at `engine/lowlat`, so the Rust commands above
+  were run from that directory. No Task 5 or Task 6 call-site migration was
+  performed.
+
 An initial test invocation from the worktree root failed before compilation
 because this repository's Cargo workspace is rooted at `engine/lowlat`; no code
 was changed by that invocation.
@@ -93,5 +128,11 @@ was changed by that invocation.
 No Task 5 or Task 6 call-site migration was performed. The branch was not
 rebased and nothing was pushed.
 
-The commit uses the plan-specified message: `feat: integrate portable packet
-delivery telemetry`.
+## Commit
+
+The Task 4 implementation commit already present at the start of the finisher
+audit is:
+
+`747ddc9077d99822f5639ed76ab28404158a8137` — `feat: integrate portable packet delivery telemetry`
+
+No rebase or push was performed.
