@@ -66,6 +66,7 @@ impl PeerTelemetryAdapter {
         if snapshot.path_generation > self.generation {
             self.generation = snapshot.path_generation;
             self.path_sample_baseline = None;
+            self.delivery = None;
             self.adaptive.suppress_ramp_until(now_ms);
         } else {
             self.path_sample_baseline = snapshot.sample;
@@ -132,13 +133,19 @@ impl PeerTelemetryAdapter {
         self.pending.len()
     }
 
-    /// Record authenticated packet-delivery evidence for diagnostics only.
+    /// Record current-generation packet-delivery evidence for diagnostics only.
     ///
     /// The small policy conversion boundary lets this adapter consume the
     /// portable client's address-free snapshot without depending on the
-    /// session implementation. It never updates [`AdaptiveBitrate`].
+    /// session implementation. Stale and future generations are ignored;
+    /// future evidence can be submitted again after the adapter advances. It
+    /// never updates [`AdaptiveBitrate`].
     pub fn observe_delivery<S: DeliverySnapshotView>(&mut self, snapshot: &S) {
-        self.delivery = Some(snapshot.delivery_snapshot());
+        let delivery = snapshot.delivery_snapshot();
+        if delivery.path_generation != self.generation {
+            return;
+        }
+        self.delivery = Some(delivery);
     }
 
     /// Return the latest packet-delivery observation, if one was provided.
