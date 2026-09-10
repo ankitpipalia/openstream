@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub mod path_control;
+pub mod transport_meta;
 
 /// Ordered control envelope carried inside an authenticated `Kind::Control`
 /// datagram. The outer AES-GCM counter still authenticates every packet; this
@@ -1019,6 +1020,33 @@ impl Session {
         flags: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
+        self.seal_inner(kind, channel, flags, payload)
+            .map(|(_, datagram)| datagram)
+    }
+
+    /// Return the next transmit counter without reserving or advancing it.
+    pub fn next_tx_counter(&self) -> u64 {
+        self.next_tx
+    }
+
+    /// Seal one packet and return both its assigned counter and datagram.
+    pub fn seal_with_counter(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(u64, Vec<u8>), Error> {
+        self.seal_inner(kind, channel, flags, payload)
+    }
+
+    fn seal_inner(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<(u64, Vec<u8>), Error> {
         if payload.len() > MAX_PLAINTEXT {
             return Err(Error::TooLarge);
         }
@@ -1044,7 +1072,7 @@ impl Session {
             .encrypt_in_place_detached(Nonce::from_slice(&nonce_bytes), header, ciphertext)
             .map_err(|_| Error::AuthenticationFailed)?;
         tag_bytes.copy_from_slice(&tag);
-        Ok(out)
+        Ok((counter, out))
     }
 
     /// Open one datagram, accepting bounded reordering and rejecting replays.
@@ -1476,6 +1504,36 @@ mod tests {
             .expect("derive");
         assert_eq!(bound.tx, right_bound.rx);
         assert_eq!(bound.rx, right_bound.tx);
+    }
+
+    #[test]
+    fn session_seal_with_counter_next_tx_counter_is_non_mutating() {
+        let session = Session::new_loopback(KEY);
+        assert_eq!(session.next_tx_counter(), 0);
+        assert_eq!(session.next_tx_counter(), 0);
+    }
+
+    #[test]
+    fn session_seal_with_counter_returns_counter_zero_then_one() {
+        let mut session = Session::new_loopback(KEY);
+        let (first_counter, first_datagram) = session
+            .seal_with_counter(Kind::Control, 0, 0, b"first")
+            .expect("seal first");
+        let (second_counter, second_datagram) = session
+            .seal_with_counter(Kind::Control, 0, 0, b"second")
+            .expect("seal second");
+
+        assert_eq!(first_counter, 0);
+        assert_eq!(second_counter, 1);
+        assert_eq!(
+            u64::from_be_bytes(first_datagram[6..14].try_into().unwrap()),
+            0
+        );
+        assert_eq!(
+            u64::from_be_bytes(second_datagram[6..14].try_into().unwrap()),
+            1
+        );
+        assert_eq!(session.next_tx_counter(), 2);
     }
 
     #[test]
