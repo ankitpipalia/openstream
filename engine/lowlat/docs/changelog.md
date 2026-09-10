@@ -71,8 +71,10 @@ explicitly, while the protocol ceiling remains 2000 bytes.
 
 The production boundary is deliberate: automatic configuration is complete for
 the native direct lowlat shell. A relay shell can provide its framing-aware
-`PathConfig`, but full direct-to-TURN migration acceptance and the portable
-`PeerSession`/FFmpeg telemetry adapter remain separate open work.
+`PathConfig`, but full direct-to-TURN migration acceptance remains separate
+open work. The portable `PeerSession`/FFmpeg path now has its common
+generation-scoped telemetry and frame-feedback adapter; it intentionally does
+not fabricate lowlat-only cumulative ACK, retransmission, or send-ring data.
 
 **The integration gate now changes a live Linux route.** Two real encrypted
 endpoints run in network namespaces over a veth pair, discover a 1472-byte IPv4

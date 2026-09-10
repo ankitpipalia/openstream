@@ -85,9 +85,12 @@ The current prototype is `openstream-protocol` in
 monotonic counters, a 1200-byte initial UDP payload limit, and replay checks.
 `openstream-media` adds bounded encoded-video fragmentation/reassembly. The
 Linux host and headless client exercise fragmented access units and frame
-ACKs. The native Linux path also has a bounded ACK-age/gap bitrate controller;
-the external FFmpeg process path remains fixed-rate because it has no portable
-live encoder-control ABI. The prototype is not a claim of BUD compatibility.
+ACKs. Both host paths use the shared ACK-age/gap bitrate policy; native Linux
+applies decisions through its live encoder control, while the external FFmpeg
+path can opt into a hysteresis- and cooldown-gated rolling encoder restart
+with `OPENSTREAM_FFMPEG_RECONFIGURE=restart`. Fixed-rate remains the explicit
+portable default because an external FFmpeg process has no live encoder-control
+ABI. The prototype is not a claim of BUD compatibility.
 Direct authenticated nomination remains the default. When `OPENSTREAM_UPNP=1`
 is set, the direct path also advertises the mapped address from the same UDP
 socket after a bounded SSDP/SOAP IGD mapping attempt. When `OPENSTREAM_ICE=1` or `OPENSTREAM_ICE_URLS` is configured,
@@ -143,8 +146,11 @@ ACKs only a fully assembled/accepted frame, so pending-frame count, ACK age,
 and explicit client-reported gaps are useful congestion signals without
 trusting a peer clock.
 The native Linux host uses those signals to lower or slowly raise the lowlat
-encoder ceiling; a portable external FFmpeg host reports the limitation and
-does not pretend that a bitrate change was applied.
+encoder ceiling. The portable external FFmpeg host routes the same frame
+feedback through `PeerTelemetryAdapter`; when explicitly configured for
+rolling reconfiguration, it applies a bounded restart with a fresh IDR.
+Without that opt-in, it remains fixed-rate and reports the encoder-control
+limitation rather than pretending a bitrate change was applied.
 
 The imported sans-IO lowlat session also records packet-level local telemetry:
 cumulative payload sent and cumulatively acknowledged, bounded-sample send and
@@ -159,11 +165,13 @@ The lowlat session now has a path-aware DPLPMTUD controller with exact authentic
 probes, three-attempt loss tolerance, IPv4/IPv6/relay-derived ceilings, maintenance reprobes,
 and black-hole fallback. A confirmed size is applied atomically to ceiling-sized send-ring
 storage, active packetization, and pacing; lowering is refused while an attached ring still
-contains larger fragments. The portable `PeerSession` telemetry adapter remains open.
+contains larger fragments. The portable `PeerSession` exposes generation-scoped snapshots,
+and `PeerTelemetryAdapter` consumes those snapshots alongside end-to-end frame feedback.
 The rate controller consumes measured delivery rate during clean-path ramp-up;
 these counters are local diagnostics and do not add a congestion-feedback wire
-message. The OpenStream `PeerSession`/FFmpeg path still uses its separate
-frame-ACK controller until a common telemetry adapter is added.
+message. The portable FFmpeg path uses the common frame-feedback adapter; its
+encoder decisions remain grounded in `FrameAck` evidence, while local packet
+rates remain diagnostic only.
 
 ## OS boundaries
 
