@@ -58,11 +58,11 @@
 - Produces `AppState`, `AppCommand`, `AppEvent`, `DeviceSummary`, `ConnectionRequest`, `PermissionSet`, `HostStatus`, `DiagnosticSnapshot`, and typed `AppErrorCode`.
 - Consumes `openstream-settings`; it does not perform I/O, REST, WebSocket, FFmpeg, or UI work.
 
-- [ ] Step 1: Add failing transition tests for local ready, connect/approval expiry, connect success, reconnect, disconnect, host enable/disable, invalid permission escalation, and typed retryable/fatal errors.
-- [ ] Step 2: Run `cargo test -p openstream-app-core --locked`; verify the transition API is absent/failing.
-- [ ] Step 3: Implement the bounded state machine and command/event types with serde-safe data that excludes credentials and user content.
-- [ ] Step 4: Implement permission intersection so requested grants can only reduce to host policy/capability, never escalate; reject expired or duplicate request IDs.
-- [ ] Step 5: Run focused tests, Clippy, and a serde round-trip test suite.
+- [x] Step 1: Add failing transition tests for local ready, connect/approval expiry, connect success, reconnect, disconnect, host enable/disable, invalid permission escalation, and typed retryable/fatal errors.
+- [x] Step 2: Run `cargo test -p openstream-app-core --locked`; verify the transition API is absent/failing.
+- [x] Step 3: Implement the bounded state machine and command/event types with serde-safe data that excludes credentials and user content.
+- [x] Step 4: Implement permission intersection so requested grants can only reduce to host policy/capability, never escalate; reject expired or duplicate request IDs.
+- [x] Step 5: Run focused tests, Clippy, and a serde round-trip test suite.
 - [ ] Step 6: Commit `feat: add OpenStream application domain state`.
 
 **Expected result:** UI, agent, and future control-server adapters can share one state model without embedding transport logic in the frontend.
