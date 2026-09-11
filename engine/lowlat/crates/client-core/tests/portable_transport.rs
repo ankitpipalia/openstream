@@ -558,10 +558,7 @@ async fn drain_quiescent_datagrams(
     stats: &Arc<Mutex<RelayStats>>,
     buffer: &mut [u8; MAX_DATAGRAM + 256],
 ) {
-    loop {
-        let Ok((length, source)) = socket.try_recv_from(buffer) else {
-            break;
-        };
+    while let Ok((length, source)) = socket.try_recv_from(buffer) {
         let bytes = buffer[..length].to_vec();
         if let Ok(registration) = relay::decode_registration(&bytes) {
             handle_registration(socket, slots, source, registration).await;
@@ -705,7 +702,7 @@ async fn apply_relay_action(
             stats.lock().expect("relay stats lock").held += 1;
             state.held = Some(datagram);
         }
-        RelayAction::ReorderVideo { following } if following == 0 => {
+        RelayAction::ReorderVideo { following: 0 } => {
             forward_datagram(socket, stats, direction, datagram).await;
         }
         RelayAction::ReorderVideo { following } => {
@@ -1390,7 +1387,7 @@ async fn authenticated_relay_drops_first_ack_and_delays_timer_recovery() {
     let stats = relay
         .wait_for("delayed recovery ACK", |stats| {
             stats.delayed >= 1
-                && stats.transport_ack_client_to_host >= baseline.transport_ack_client_to_host + 1
+                && stats.transport_ack_client_to_host > baseline.transport_ack_client_to_host
         })
         .await;
     assert_eq!(stats.dropped - baseline.dropped, 1);
