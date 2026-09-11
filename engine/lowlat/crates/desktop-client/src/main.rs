@@ -885,27 +885,7 @@ async fn network_loop(
     };
     let mut decoder =
         Command::new(env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()))
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                format,
-                "-i",
-                "pipe:0",
-                "-an",
-                "-sn",
-                "-dn",
-                "-f",
-                "rawvideo",
-                "-vf",
-                &format!("scale={width}:{height}:flags=fast_bilinear"),
-                "-pix_fmt",
-                "bgra",
-                "-vsync",
-                "0",
-                "pipe:1",
-            ])
+            .args(decoder_args(format, width, height))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1313,6 +1293,30 @@ fn spawn_audio_player() -> Result<Option<Child>, Box<dyn std::error::Error + Sen
     Ok(Some(child))
 }
 
+fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
+    vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-f".into(),
+        format.into(),
+        "-i".into(),
+        "pipe:0".into(),
+        "-an".into(),
+        "-sn".into(),
+        "-dn".into(),
+        "-f".into(),
+        "rawvideo".into(),
+        "-vf".into(),
+        format!("scale={width}:{height}:flags=fast_bilinear"),
+        "-pix_fmt".into(),
+        "bgra".into(),
+        "-fps_mode".into(),
+        "passthrough".into(),
+        "pipe:1".into(),
+    ]
+}
+
 fn monotonic_us() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
@@ -1331,8 +1335,8 @@ impl From<io::Error> for UiMessage {
 mod tests {
     use super::{
         CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, InputReceiver, InputSender,
-        UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display, gamepad_axis_index,
-        gamepad_button_index, keyboard_usages, selected_display_index,
+        UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display, decoder_args,
+        gamepad_axis_index, gamepad_button_index, keyboard_usages, selected_display_index,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -1444,5 +1448,15 @@ mod tests {
         );
         assert!(sender.send(UiMessage::End).is_ok());
         assert!(matches!(receiver.try_recv(), Ok(UiMessage::End)));
+    }
+
+    #[test]
+    fn decoder_args_use_fps_mode_for_current_ffmpeg() {
+        let args = decoder_args("h264", 1920, 1080);
+        assert!(
+            args.windows(2)
+                .any(|window| { window[0] == "-fps_mode" && window[1] == "passthrough" })
+        );
+        assert!(!args.iter().any(|arg| arg == "-vsync"));
     }
 }
