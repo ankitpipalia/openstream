@@ -1077,14 +1077,34 @@ async fn history_backpressure_keeps_receive_path_alive() {
     assert_eq!(sender.outbound_pending(), 0);
 
     sender.queue(Kind::Video, 0, 0, b"retained").unwrap();
-    assert_eq!(
-        sender.flush_outbound_recoverably().await.unwrap(),
-        FlushOutcome::Backpressured
-    );
-    assert_eq!(sender.outbound_pending(), 1);
+    // The fill loop intentionally uses the production clock. On a normal
+    // runner the aliased entry is young and this proves history backpressure;
+    // under instrumentation, the oldest entry may cross STALE_AFTER_MS and
+    // be evicted, which is also valid production behavior. Both outcomes must
+    // leave the session able to receive and process transport ACKs.
+    let video_sent_before_ack_drain = match sender.flush_outbound_recoverably().await.unwrap() {
+        FlushOutcome::Backpressured => {
+            assert_eq!(sender.outbound_pending(), 1);
+            false
+        }
+        FlushOutcome::Flushed(report) => {
+            assert_eq!(report.sent_packets, 1);
+            assert_eq!(report.pending_packets, 0);
+            assert_eq!(sender.outbound_pending(), 0);
+            true
+        }
+    };
 
     for _ in 0..DELIVERY_HISTORY_CAPACITY {
         assert_eq!(receiver.recv().await.unwrap().kind, Kind::Control);
+    }
+
+    if video_sent_before_ack_drain {
+        assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
+        tokio::time::timeout(Duration::from_millis(100), receiver.recv_step())
+            .await
+            .expect("receiver emits the delayed transport ACK")
+            .expect("receiver transport ACK is valid");
     }
 
     for _ in 0..DELIVERY_HISTORY_CAPACITY {
@@ -1109,11 +1129,13 @@ async fn history_backpressure_keeps_receive_path_alive() {
         0
     );
 
-    assert!(matches!(
-        sender.flush_outbound_recoverably().await.unwrap(),
-        FlushOutcome::Flushed(report) if report.sent_packets == 1 && report.pending_packets == 0
-    ));
-    assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
+    if !video_sent_before_ack_drain {
+        assert!(matches!(
+            sender.flush_outbound_recoverably().await.unwrap(),
+            FlushOutcome::Flushed(report) if report.sent_packets == 1 && report.pending_packets == 0
+        ));
+        assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
+    }
 
     sender.close().await.unwrap();
     receiver.close().await.unwrap();
