@@ -26,6 +26,7 @@ use openstream_transport_policy::{
     DeliveryClassSnapshot as PolicyDeliveryClassSnapshot, DeliveryError, DeliveryEstimator,
     DeliverySnapshot as PolicyDeliverySnapshot, DeliverySnapshotView, SentPacket, TrafficClass,
 };
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -2366,91 +2367,89 @@ impl PeerSession {
                 local_candidates.push(relay_candidate);
             }
         }
-        for candidate in &local_candidates {
-            signal.send(&serde_json::json!({
-                "type": "candidate",
-                "kind": candidate.kind,
-                "ip": candidate.address.ip().to_string(),
-                "port": candidate.address.port(),
-            }))?;
-        }
-        signal.send(&serde_json::json!({
-            "type": "candidate_done",
-            "count": local_candidates.len(),
-        }))?;
-
-        let mut peer_candidates = Vec::new();
         let trusted_relay = pairing
             .relay_address
             .as_deref()
             .map(str::parse::<SocketAddr>)
             .transpose()?;
-        let candidate_deadline = TokioInstant::now() + PHASE_TIMEOUT;
-        loop {
-            let message = signal
-                .recv_until(candidate_deadline, "candidate exchange")
-                .await?;
-            match message.get("type").and_then(Value::as_str) {
-                Some("candidate") => {
-                    if peer_candidates.len() >= MAX_REMOTE_CANDIDATES {
-                        return Err(Error::TooManyCandidates);
-                    }
-                    let ip = message
-                        .get("ip")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| Error::InvalidMessage("candidate.ip is missing".into()))?
-                        .parse::<IpAddr>()?;
-                    let port = message
-                        .get("port")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| Error::InvalidMessage("candidate.port is missing".into()))?;
-                    let port = u16::try_from(port).map_err(|_| {
-                        Error::InvalidMessage("candidate.port is out of range".into())
-                    })?;
-                    let kind = message
-                        .get("kind")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .map_err(|error| Error::InvalidMessage(error.to_string()))?
-                        .unwrap_or(CandidateKind::Host);
-                    let candidate = Candidate {
-                        kind,
-                        address: SocketAddr::new(ip, port),
-                    };
-                    // Reject self, duplicates, and unroutable/unsanctioned
-                    // addresses a malicious peer could use for scanning.
-                    if candidate.address != local
-                        && !peer_candidates.contains(&candidate)
-                        && (valid_peer_candidate(candidate.address, local)
-                            || trusted_relay_candidate(candidate, trusted_relay))
-                    {
-                        peer_candidates.push(candidate);
-                    }
+        let mut direct = DirectHandshake::with_candidate_policy(Some(local), trusted_relay);
+        let mut local_key_exchange = None;
+        let (mut peer_candidates, _peer_public, keys) = loop {
+            let message = match direct.deadline() {
+                Some(deadline) => {
+                    let phase = direct
+                        .deadline_phase()
+                        .expect("a direct phase deadline has a phase");
+                    signal.recv_until(deadline, phase).await?
                 }
-                Some("candidate_done") => break,
-                _ => {}
-            }
-        }
-        let key_exchange = KeyExchange::generate()?;
-        let identity = local_identity()?;
-        signal.send(&encode_key_message(
-            &key_exchange,
-            &identity,
-            &pairing.session_id,
-            role,
-        )?)?;
-        let key_deadline = TokioInstant::now() + PHASE_TIMEOUT;
-        let peer_public = loop {
-            let message = signal.recv_until(key_deadline, "key exchange").await?;
-            if let Some(key) = decode_peer_key(&message)? {
-                break key;
+                None => signal.recv().await?,
+            };
+            let outcome = direct.handle(&message, TokioInstant::now())?;
+            match outcome {
+                DirectMessageOutcome::Ready => {
+                    let generation = direct.generation();
+                    for candidate in &local_candidates {
+                        signal.send(&serde_json::json!({
+                            "type": "direct_candidate",
+                            "establishment_generation": generation,
+                            "kind": candidate.kind,
+                            "ip": candidate.address.ip().to_string(),
+                            "port": candidate.address.port(),
+                        }))?;
+                    }
+                    signal.send(&serde_json::json!({
+                        "type": "direct_candidate_done",
+                        "establishment_generation": generation,
+                        "count": local_candidates.len(),
+                    }))?;
+                    local_key_exchange = None;
+                }
+                DirectMessageOutcome::Reset => {
+                    // A reset invalidates every epoch-local candidate and key.
+                    // The next readiness message causes a fresh key exchange.
+                    local_key_exchange = None;
+                }
+                DirectMessageOutcome::CandidateDone => {
+                    let key_exchange = KeyExchange::generate()?;
+                    let identity = local_identity()?;
+                    signal.send(&encode_direct_key_message(
+                        &key_exchange,
+                        &identity,
+                        &pairing.session_id,
+                        direct.generation(),
+                        role,
+                    )?)?;
+                    local_key_exchange = Some(key_exchange);
+                }
+                DirectMessageOutcome::KeyAccepted => {
+                    let peer_public = direct.peer_key().copied().ok_or_else(|| {
+                        Error::InvalidMessage("direct key was not retained".into())
+                    })?;
+                    let key_exchange = local_key_exchange.take().ok_or_else(|| {
+                        Error::InvalidMessage("direct key arrived before local key".into())
+                    })?;
+                    authenticate_direct_peer(
+                        server_origin,
+                        pairing,
+                        role,
+                        direct.generation(),
+                        &peer_public,
+                    )?;
+                    let keys = key_exchange
+                        .derive_session_keys(peer_public.ephemeral, &pairing.session_id)
+                        .map_err(|_| Error::PeerKeyRejected)?;
+                    break (direct.remote_candidates().to_vec(), peer_public, keys);
+                }
+                DirectMessageOutcome::ReadyDuplicate
+                | DirectMessageOutcome::Ignored
+                | DirectMessageOutcome::IgnoredStale
+                | DirectMessageOutcome::CandidateAccepted
+                | DirectMessageOutcome::CandidateDuplicate
+                | DirectMessageOutcome::CandidateIgnored
+                | DirectMessageOutcome::CandidateDoneDuplicate
+                | DirectMessageOutcome::KeyDuplicate => {}
             }
         };
-        authenticate_peer(server_origin, pairing, role, &peer_public)?;
-        let keys = key_exchange
-            .derive_session_keys(peer_public.ephemeral, &pairing.session_id)
-            .map_err(|_| Error::PeerKeyRejected)?;
 
         peer_candidates.sort_by_key(|candidate| {
             (
@@ -3286,12 +3285,491 @@ const PATH_PROBE: &[u8] = b"openstream/path-probe/v1";
 const PATH_PROBE_ACK: &[u8] = b"openstream/path-probe-ack/v1";
 const PATH_KEEPALIVE: &[u8] = b"openstream/path-keepalive/v1";
 const PATH_KEEPALIVE_ACK: &[u8] = b"openstream/path-keepalive-ack/v1";
+const DIRECT_KEY_TRANSCRIPT_DOMAIN: &[u8] = b"OpenStream direct key v2";
+const MAX_DIRECT_RESET_REASON_BYTES: usize = 64;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPhase {
+    WaitingForPeer,
+    Candidates,
+    KeyExchange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectMessageOutcome {
+    Ignored,
+    IgnoredStale,
+    Ready,
+    ReadyDuplicate,
+    Reset,
+    CandidateAccepted,
+    CandidateDuplicate,
+    CandidateIgnored,
+    CandidateDone,
+    CandidateDoneDuplicate,
+    KeyAccepted,
+    KeyDuplicate,
+}
+
+/// State for one server-authoritative direct-establishment epoch.
+///
+/// The state is deliberately independent from UDP path generations and from
+/// `CipherSession`. It exists only until the authenticated direct path is
+/// returned, and it can be reset without reusing any candidate or key state.
+#[derive(Debug)]
+struct DirectHandshake {
+    generation: u64,
+    phase: DirectPhase,
+    deadline: Option<TokioInstant>,
+    local: Option<SocketAddr>,
+    trusted_relay: Option<SocketAddr>,
+    remote_candidates: Vec<Candidate>,
+    remote_candidate_count: Option<usize>,
+    peer_key: Option<PeerKey>,
+}
+
+impl DirectHandshake {
+    #[cfg(test)]
+    fn new(_role: Role) -> Self {
+        Self::with_candidate_policy(None, None)
+    }
+
+    fn with_candidate_policy(local: Option<SocketAddr>, trusted_relay: Option<SocketAddr>) -> Self {
+        Self {
+            generation: 0,
+            phase: DirectPhase::WaitingForPeer,
+            deadline: None,
+            local,
+            trusted_relay,
+            remote_candidates: Vec::new(),
+            remote_candidate_count: None,
+            peer_key: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn phase(&self) -> DirectPhase {
+        self.phase
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn deadline(&self) -> Option<TokioInstant> {
+        self.deadline
+    }
+
+    fn deadline_phase(&self) -> Option<&'static str> {
+        match self.phase {
+            DirectPhase::WaitingForPeer => None,
+            DirectPhase::Candidates => Some("candidate exchange"),
+            DirectPhase::KeyExchange => Some("key exchange"),
+        }
+    }
+
+    #[cfg(test)]
+    fn check_deadline(&self, now: TokioInstant) -> Option<&'static str> {
+        self.deadline
+            .filter(|deadline| now >= *deadline)
+            .and(self.deadline_phase())
+    }
+
+    fn remote_candidates(&self) -> &[Candidate] {
+        &self.remote_candidates
+    }
+
+    fn peer_key(&self) -> Option<&PeerKey> {
+        self.peer_key.as_ref()
+    }
+
+    fn handle(
+        &mut self,
+        message: &Value,
+        now: TokioInstant,
+    ) -> Result<DirectMessageOutcome, Error> {
+        match message.get("type").and_then(Value::as_str) {
+            Some("peer_ready") => self.handle_ready(message, now),
+            Some("peer_reset") => self.handle_reset(message),
+            Some("direct_candidate") => self.handle_candidate(message),
+            Some("direct_candidate_done") => self.handle_candidate_done(message, now),
+            Some("direct_key") => self.handle_key(message),
+            // These records belong to the independent ICE choreography or to
+            // server-side relay setup. Never reinterpret them as direct v2.
+            Some(
+                "relay_ticket_proof" | "ice_credentials" | "ice_candidate" | "ice_candidate_done"
+                | "key",
+            )
+            | None => Ok(DirectMessageOutcome::Ignored),
+            Some(_) => Ok(DirectMessageOutcome::Ignored),
+        }
+    }
+
+    fn handle_ready(
+        &mut self,
+        message: &Value,
+        now: TokioInstant,
+    ) -> Result<DirectMessageOutcome, Error> {
+        let generation = direct_message_generation(message, "peer_ready")?;
+        if generation < self.generation {
+            return Ok(DirectMessageOutcome::IgnoredStale);
+        }
+        if self.phase != DirectPhase::WaitingForPeer {
+            if generation == self.generation {
+                return Ok(DirectMessageOutcome::ReadyDuplicate);
+            }
+            return Err(Error::InvalidMessage(
+                "peer_ready generation is future".into(),
+            ));
+        }
+        if self.generation != 0 {
+            let expected = self.generation.checked_add(1).ok_or_else(|| {
+                Error::InvalidMessage("peer_ready generation cannot advance".into())
+            })?;
+            if generation != expected {
+                return Err(Error::InvalidMessage(
+                    if generation > expected {
+                        "peer_ready generation is future"
+                    } else {
+                        "peer_ready generation is not the next epoch"
+                    }
+                    .into(),
+                ));
+            }
+        }
+        self.generation = generation;
+        self.clear_epoch_state();
+        self.phase = DirectPhase::Candidates;
+        self.deadline = Some(now + PHASE_TIMEOUT);
+        Ok(DirectMessageOutcome::Ready)
+    }
+
+    fn handle_reset(&mut self, message: &Value) -> Result<DirectMessageOutcome, Error> {
+        let generation = direct_message_generation(message, "peer_reset")?;
+        if generation < self.generation {
+            return Ok(DirectMessageOutcome::IgnoredStale);
+        }
+        let reason = message
+            .get("reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidMessage("peer_reset.reason is missing".into()))?;
+        if reason.is_empty()
+            || reason.len() > MAX_DIRECT_RESET_REASON_BYTES
+            || reason
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+        {
+            return Err(Error::InvalidMessage("peer_reset.reason is invalid".into()));
+        }
+        self.generation = self.generation.max(generation);
+        self.clear_epoch_state();
+        self.phase = DirectPhase::WaitingForPeer;
+        Ok(DirectMessageOutcome::Reset)
+    }
+
+    fn check_direct_generation(&self, message: &Value, message_type: &str) -> Result<u64, Error> {
+        let generation = direct_message_generation(message, message_type)?;
+        if generation < self.generation {
+            return Ok(generation);
+        }
+        if self.phase == DirectPhase::WaitingForPeer {
+            return Err(Error::InvalidMessage(format!(
+                "{message_type} received before peer_ready"
+            )));
+        }
+        if generation > self.generation {
+            return Err(Error::InvalidMessage(format!(
+                "{message_type} generation is future"
+            )));
+        }
+        Ok(generation)
+    }
+
+    fn handle_candidate(&mut self, message: &Value) -> Result<DirectMessageOutcome, Error> {
+        let generation = self.check_direct_generation(message, "direct_candidate")?;
+        if generation < self.generation {
+            return Ok(DirectMessageOutcome::IgnoredStale);
+        }
+        if self.phase != DirectPhase::Candidates {
+            return Err(Error::InvalidMessage(
+                "direct_candidate received after candidate_done".into(),
+            ));
+        }
+        let candidate = decode_direct_candidate(message)?;
+        if let Some(local) = self.local {
+            let usable = candidate.address != local
+                && (valid_peer_candidate(candidate.address, local)
+                    || trusted_relay_candidate(candidate, self.trusted_relay));
+            if !usable {
+                return Ok(DirectMessageOutcome::CandidateIgnored);
+            }
+        }
+        if self.remote_candidates.contains(&candidate) {
+            return Ok(DirectMessageOutcome::CandidateDuplicate);
+        }
+        if self.remote_candidates.len() >= MAX_REMOTE_CANDIDATES {
+            return Err(Error::TooManyCandidates);
+        }
+        self.remote_candidates.push(candidate);
+        Ok(DirectMessageOutcome::CandidateAccepted)
+    }
+
+    fn handle_candidate_done(
+        &mut self,
+        message: &Value,
+        now: TokioInstant,
+    ) -> Result<DirectMessageOutcome, Error> {
+        let generation = self.check_direct_generation(message, "direct_candidate_done")?;
+        if generation < self.generation {
+            return Ok(DirectMessageOutcome::IgnoredStale);
+        }
+        if self.phase == DirectPhase::KeyExchange {
+            let count = direct_candidate_count(message)?;
+            return if self.remote_candidate_count == Some(count) {
+                Ok(DirectMessageOutcome::CandidateDoneDuplicate)
+            } else {
+                Err(Error::InvalidMessage(
+                    "conflicting direct_candidate_done".into(),
+                ))
+            };
+        }
+        if self.phase != DirectPhase::Candidates {
+            return Err(Error::InvalidMessage(
+                "direct_candidate_done received out of order".into(),
+            ));
+        }
+        let count = direct_candidate_count(message)?;
+        self.remote_candidate_count = Some(count);
+        self.phase = DirectPhase::KeyExchange;
+        self.deadline = Some(now + PHASE_TIMEOUT);
+        Ok(DirectMessageOutcome::CandidateDone)
+    }
+
+    fn handle_key(&mut self, message: &Value) -> Result<DirectMessageOutcome, Error> {
+        let generation = self.check_direct_generation(message, "direct_key")?;
+        if generation < self.generation {
+            return Ok(DirectMessageOutcome::IgnoredStale);
+        }
+        if self.phase != DirectPhase::KeyExchange {
+            return Err(Error::InvalidMessage(
+                "direct_key received before candidate_done".into(),
+            ));
+        }
+        let key = decode_direct_peer_key(message, self.generation)?;
+        if let Some(existing) = self.peer_key {
+            return if existing == key {
+                Ok(DirectMessageOutcome::KeyDuplicate)
+            } else {
+                Err(Error::InvalidMessage("conflicting direct_key".into()))
+            };
+        }
+        self.peer_key = Some(key);
+        Ok(DirectMessageOutcome::KeyAccepted)
+    }
+
+    fn clear_epoch_state(&mut self) {
+        self.remote_candidates.clear();
+        self.remote_candidate_count = None;
+        self.peer_key = None;
+        self.deadline = None;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerKey {
     ephemeral: [u8; 32],
     identity: [u8; 32],
     signature: [u8; 64],
+}
+
+fn direct_message_generation(message: &Value, message_type: &str) -> Result<u64, Error> {
+    if message.get("type").and_then(Value::as_str) != Some(message_type) {
+        return Err(Error::InvalidMessage(format!(
+            "expected {message_type} message"
+        )));
+    }
+    let generation = message
+        .get("establishment_generation")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            Error::InvalidMessage(format!(
+                "{message_type}.establishment_generation is missing"
+            ))
+        })?;
+    if generation == 0 {
+        return Err(Error::InvalidMessage(format!(
+            "{message_type}.establishment_generation must be positive"
+        )));
+    }
+    Ok(generation)
+}
+
+fn decode_direct_candidate(message: &Value) -> Result<Candidate, Error> {
+    let object = message
+        .as_object()
+        .ok_or_else(|| Error::InvalidMessage("direct_candidate must be an object".into()))?;
+    if object.len() != 5 {
+        return Err(Error::InvalidMessage(
+            "direct_candidate has unexpected fields".into(),
+        ));
+    }
+    let kind = serde_json::from_value(
+        object
+            .get("kind")
+            .cloned()
+            .ok_or_else(|| Error::InvalidMessage("direct_candidate.kind is missing".into()))?,
+    )
+    .map_err(|error| Error::InvalidMessage(format!("direct_candidate.kind is invalid: {error}")))?;
+    let ip = object
+        .get("ip")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidMessage("direct_candidate.ip is missing".into()))?
+        .parse::<IpAddr>()?;
+    let port = object
+        .get("port")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| Error::InvalidMessage("direct_candidate.port is missing".into()))?;
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| Error::InvalidMessage("direct_candidate.port is invalid".into()))?;
+    Ok(Candidate {
+        kind,
+        address: SocketAddr::new(ip, port),
+    })
+}
+
+fn direct_candidate_count(message: &Value) -> Result<usize, Error> {
+    let object = message
+        .as_object()
+        .ok_or_else(|| Error::InvalidMessage("direct_candidate_done must be an object".into()))?;
+    if object.len() != 3 {
+        return Err(Error::InvalidMessage(
+            "direct_candidate_done has unexpected fields".into(),
+        ));
+    }
+    let count = object
+        .get("count")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| Error::InvalidMessage("direct_candidate_done.count is invalid".into()))?;
+    if !(1..=MAX_REMOTE_CANDIDATES).contains(&count) {
+        return Err(Error::InvalidMessage(
+            "direct_candidate_done.count is outside the supported range".into(),
+        ));
+    }
+    Ok(count)
+}
+
+fn direct_key_transcript(
+    session_id: &str,
+    generation: u64,
+    role: Role,
+    ephemeral: [u8; 32],
+) -> Result<Vec<u8>, Error> {
+    if generation == 0 {
+        return Err(Error::InvalidMessage(
+            "direct_key generation must be positive".into(),
+        ));
+    }
+    let session_length = u32::try_from(session_id.len()).map_err(|_| {
+        Error::InvalidMessage("session_id is too long for direct key transcript".into())
+    })?;
+    let mut transcript =
+        Vec::with_capacity(DIRECT_KEY_TRANSCRIPT_DOMAIN.len() + 4 + session_id.len() + 8 + 1 + 32);
+    transcript.extend_from_slice(DIRECT_KEY_TRANSCRIPT_DOMAIN);
+    transcript.extend_from_slice(&session_length.to_be_bytes());
+    transcript.extend_from_slice(session_id.as_bytes());
+    transcript.extend_from_slice(&generation.to_be_bytes());
+    transcript.push(identity_role(role));
+    transcript.extend_from_slice(&ephemeral);
+    Ok(transcript)
+}
+
+fn encode_direct_key_message(
+    key_exchange: &KeyExchange,
+    identity: &IdentityKey,
+    session_id: &str,
+    generation: u64,
+    role: Role,
+) -> Result<Value, Error> {
+    let ephemeral = key_exchange.public_key();
+    let transcript = direct_key_transcript(session_id, generation, role, ephemeral)?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(identity.pkcs8())
+        .map_err(|_| Error::Identity(IdentityError::InvalidKeyMaterial))?;
+    let signature = key_pair.sign(&transcript);
+    let signature = <[u8; 64]>::try_from(signature.as_ref())
+        .map_err(|_| Error::Identity(IdentityError::SigningFailed))?;
+    Ok(serde_json::json!({
+        "type": "direct_key",
+        "establishment_generation": generation,
+        "public_key": hex::encode(ephemeral),
+        "identity_public_key": hex::encode(identity.public_key()),
+        "signature": hex::encode(signature),
+    }))
+}
+
+fn decode_direct_peer_key(message: &Value, generation: u64) -> Result<PeerKey, Error> {
+    let object = message
+        .as_object()
+        .ok_or_else(|| Error::InvalidMessage("direct_key must be an object".into()))?;
+    if object.len() != 5 {
+        return Err(Error::InvalidMessage(
+            "direct_key has unexpected fields".into(),
+        ));
+    }
+    let message_generation = direct_message_generation(message, "direct_key")?;
+    if message_generation != generation {
+        return Err(Error::InvalidMessage(
+            "direct_key generation does not match the active epoch".into(),
+        ));
+    }
+    let ephemeral = fixed_hex::<32>(
+        object
+            .get("public_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidMessage("direct_key.public_key is missing".into()))?,
+        "direct_key.public_key",
+    )?;
+    if ephemeral == [0; 32] {
+        return Err(Error::PeerKeyRejected);
+    }
+    let identity = fixed_hex::<32>(
+        object
+            .get("identity_public_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::InvalidMessage("direct_key.identity_public_key is missing".into())
+            })?,
+        "direct_key.identity_public_key",
+    )?;
+    let signature = fixed_hex::<64>(
+        object
+            .get("signature")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidMessage("direct_key.signature is missing".into()))?,
+        "direct_key.signature",
+    )?;
+    Ok(PeerKey {
+        ephemeral,
+        identity,
+        signature,
+    })
+}
+
+fn verify_direct_key_signature(
+    peer: &PeerKey,
+    session_id: &str,
+    generation: u64,
+    sender_role: Role,
+) -> bool {
+    let Ok(transcript) = direct_key_transcript(session_id, generation, sender_role, peer.ephemeral)
+    else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ED25519, peer.identity)
+        .verify(&transcript, &peer.signature)
+        .is_ok()
 }
 
 /// Decode a peer's signed ephemeral-key message. Bare public keys from the
@@ -3359,6 +3837,13 @@ fn identity_role(role: Role) -> u8 {
     match role {
         Role::Host => 1,
         Role::Client => 2,
+    }
+}
+
+fn opposite_role(role: Role) -> Role {
+    match role {
+        Role::Host => Role::Client,
+        Role::Client => Role::Host,
     }
 }
 
@@ -3432,10 +3917,7 @@ fn authenticate_peer(
     local_role: Role,
     peer: &PeerKey,
 ) -> Result<(), Error> {
-    let peer_role = match local_role {
-        Role::Host => Role::Client,
-        Role::Client => Role::Host,
-    };
+    let peer_role = opposite_role(local_role);
     if !IdentityKey::verify_key_exchange(
         peer.identity,
         peer.signature,
@@ -3445,6 +3927,24 @@ fn authenticate_peer(
     ) {
         return Err(Error::PeerIdentityRejected);
     }
+    enforce_peer_identity_policy(server_origin, peer)
+}
+
+fn authenticate_direct_peer(
+    server_origin: &str,
+    pairing: &Pairing,
+    local_role: Role,
+    generation: u64,
+    peer: &PeerKey,
+) -> Result<(), Error> {
+    let peer_role = opposite_role(local_role);
+    if !verify_direct_key_signature(peer, &pairing.session_id, generation, peer_role) {
+        return Err(Error::PeerIdentityRejected);
+    }
+    enforce_peer_identity_policy(server_origin, peer)
+}
+
+fn enforce_peer_identity_policy(server_origin: &str, peer: &PeerKey) -> Result<(), Error> {
     let expected = std::env::var("OPENSTREAM_EXPECT_PEER_IDENTITY")
         .unwrap_or_default()
         .trim()
@@ -3623,6 +4123,329 @@ mod tests {
         let (outgoing, _outgoing_receiver) = mpsc::channel::<Message>(1);
         let (_incoming_sender, incoming) = mpsc::channel::<Result<Value, Error>>(1);
         Endpoint { outgoing, incoming }
+    }
+
+    #[test]
+    fn direct_v2_waits_for_readiness_without_consuming_phase_timeout() {
+        let started = TokioInstant::now();
+        let mut handshake = DirectHandshake::new(Role::Host);
+
+        assert_eq!(handshake.phase(), DirectPhase::WaitingForPeer);
+        assert_eq!(handshake.deadline(), None);
+        assert_eq!(handshake.check_deadline(started + PHASE_TIMEOUT * 2), None);
+
+        assert_eq!(
+            handshake
+                .handle(
+                    &serde_json::json!({
+                        "type": "peer_ready",
+                        "establishment_generation": 7,
+                    }),
+                    started,
+                )
+                .expect("current readiness"),
+            DirectMessageOutcome::Ready
+        );
+        assert_eq!(handshake.generation(), 7);
+        assert_eq!(handshake.phase(), DirectPhase::Candidates);
+        assert_eq!(handshake.deadline(), Some(started + PHASE_TIMEOUT));
+    }
+
+    #[test]
+    fn direct_v2_rejects_future_and_pre_ready_records_but_drops_stale_records() {
+        let now = TokioInstant::now();
+        let mut waiting = DirectHandshake::new(Role::Client);
+        assert!(matches!(
+            waiting.handle(
+                &serde_json::json!({
+                    "type": "direct_candidate",
+                    "establishment_generation": 1,
+                    "kind": "host",
+                    "ip": "192.0.2.10",
+                    "port": 40001,
+                }),
+                now,
+            ),
+            Err(Error::InvalidMessage(reason)) if reason.contains("before peer_ready")
+        ));
+
+        let mut handshake = DirectHandshake::new(Role::Client);
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 7,
+                }),
+                now,
+            )
+            .expect("readiness");
+        assert_eq!(
+            handshake
+                .handle(
+                    &serde_json::json!({
+                        "type": "peer_ready",
+                        "establishment_generation": 6,
+                    }),
+                    now,
+                )
+                .expect("stale readiness"),
+            DirectMessageOutcome::IgnoredStale
+        );
+        assert_eq!(
+            handshake
+                .handle(
+                    &serde_json::json!({
+                        "type": "peer_reset",
+                        "establishment_generation": 6,
+                        "reason": "role_replaced",
+                    }),
+                    now,
+                )
+                .expect("stale reset"),
+            DirectMessageOutcome::IgnoredStale
+        );
+        assert!(matches!(
+            handshake.handle(
+                &serde_json::json!({
+                    "type": "direct_candidate",
+                    "establishment_generation": 8,
+                    "kind": "host",
+                    "ip": "192.0.2.11",
+                    "port": 40002,
+                }),
+                now,
+            ),
+            Err(Error::InvalidMessage(reason)) if reason.contains("future")
+        ));
+    }
+
+    #[test]
+    fn direct_v2_reset_clears_epoch_state_and_allows_the_next_epoch() {
+        let now = TokioInstant::now();
+        let mut handshake = DirectHandshake::new(Role::Host);
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 3,
+                }),
+                now,
+            )
+            .expect("readiness");
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "direct_candidate",
+                    "establishment_generation": 3,
+                    "kind": "host",
+                    "ip": "192.0.2.10",
+                    "port": 40001,
+                }),
+                now,
+            )
+            .expect("candidate");
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "direct_candidate_done",
+                    "establishment_generation": 3,
+                    "count": 1,
+                }),
+                now,
+            )
+            .expect("candidate done");
+        assert_eq!(handshake.phase(), DirectPhase::KeyExchange);
+
+        assert_eq!(
+            handshake
+                .handle(
+                    &serde_json::json!({
+                        "type": "peer_reset",
+                        "establishment_generation": 3,
+                        "reason": "role_replaced",
+                    }),
+                    now,
+                )
+                .expect("reset"),
+            DirectMessageOutcome::Reset
+        );
+        assert_eq!(handshake.phase(), DirectPhase::WaitingForPeer);
+        assert_eq!(handshake.generation(), 3);
+        assert!(handshake.remote_candidates().is_empty());
+        assert_eq!(handshake.deadline(), None);
+
+        assert!(matches!(
+            handshake.handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 6,
+                }),
+                now,
+            ),
+            Err(Error::InvalidMessage(reason)) if reason.contains("future")
+        ));
+
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 4,
+                }),
+                now,
+            )
+            .expect("next readiness");
+        assert_eq!(handshake.generation(), 4);
+        assert_eq!(handshake.phase(), DirectPhase::Candidates);
+        assert!(handshake.remote_candidates().is_empty());
+    }
+
+    #[test]
+    fn direct_v2_transcript_is_exact_and_binds_session_epoch_role_and_key() {
+        let ephemeral = [0x11; 32];
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"OpenStream direct key v2");
+        expected.extend_from_slice(&7_u32.to_be_bytes());
+        expected.extend_from_slice(b"session");
+        expected.extend_from_slice(&9_u64.to_be_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&ephemeral);
+        assert_eq!(
+            direct_key_transcript("session", 9, Role::Host, ephemeral).expect("transcript"),
+            expected
+        );
+
+        let identity = IdentityKey::generate().expect("identity");
+        let key = KeyExchange::generate().expect("ephemeral key");
+        let message = encode_direct_key_message(&key, &identity, "session", 9, Role::Host)
+            .expect("direct key");
+        let peer = decode_direct_peer_key(&message, 9).expect("decode direct key");
+        assert!(verify_direct_key_signature(&peer, "session", 9, Role::Host,));
+        assert!(!verify_direct_key_signature(
+            &peer,
+            "session",
+            9,
+            Role::Client,
+        ));
+        assert!(!verify_direct_key_signature(
+            &peer,
+            "other-session",
+            9,
+            Role::Host,
+        ));
+        assert!(!verify_direct_key_signature(
+            &peer,
+            "session",
+            10,
+            Role::Host,
+        ));
+        let changed_key = KeyExchange::generate().expect("changed ephemeral key");
+        let changed_transcript =
+            direct_key_transcript("session", 9, Role::Host, changed_key.public_key())
+                .expect("changed transcript");
+        assert_ne!(
+            changed_transcript,
+            direct_key_transcript("session", 9, Role::Host, peer.ephemeral)
+                .expect("original transcript")
+        );
+    }
+
+    #[test]
+    fn direct_v2_duplicate_candidates_done_and_keys_are_idempotent_but_conflicts_fail() {
+        let now = TokioInstant::now();
+        let mut handshake = DirectHandshake::new(Role::Client);
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 1,
+                }),
+                now,
+            )
+            .expect("readiness");
+        let candidate = serde_json::json!({
+            "type": "direct_candidate",
+            "establishment_generation": 1,
+            "kind": "host",
+            "ip": "192.0.2.10",
+            "port": 40001,
+        });
+        assert_eq!(
+            handshake.handle(&candidate, now).expect("candidate"),
+            DirectMessageOutcome::CandidateAccepted
+        );
+        assert_eq!(
+            handshake
+                .handle(&candidate, now)
+                .expect("duplicate candidate"),
+            DirectMessageOutcome::CandidateDuplicate
+        );
+        let done = serde_json::json!({
+            "type": "direct_candidate_done",
+            "establishment_generation": 1,
+            "count": 1,
+        });
+        assert_eq!(
+            handshake.handle(&done, now).expect("done"),
+            DirectMessageOutcome::CandidateDone
+        );
+        assert_eq!(
+            handshake.handle(&done, now).expect("duplicate done"),
+            DirectMessageOutcome::CandidateDoneDuplicate
+        );
+        assert!(matches!(
+            handshake.handle(
+                &serde_json::json!({
+                    "type": "direct_candidate_done",
+                    "establishment_generation": 1,
+                    "count": 2,
+                }),
+                now,
+            ),
+            Err(Error::InvalidMessage(reason)) if reason.contains("conflicting")
+        ));
+
+        let identity = IdentityKey::generate().expect("identity");
+        let key = KeyExchange::generate().expect("key");
+        let message = encode_direct_key_message(&key, &identity, "session", 1, Role::Host)
+            .expect("key message");
+        assert_eq!(
+            handshake.handle(&message, now).expect("key"),
+            DirectMessageOutcome::KeyAccepted
+        );
+        assert_eq!(
+            handshake.handle(&message, now).expect("duplicate key"),
+            DirectMessageOutcome::KeyDuplicate
+        );
+        let other_identity = IdentityKey::generate().expect("other identity");
+        let other_key = KeyExchange::generate().expect("other key");
+        let conflicting =
+            encode_direct_key_message(&other_key, &other_identity, "session", 1, Role::Host)
+                .expect("conflicting key");
+        assert!(matches!(
+            handshake.handle(&conflicting, now),
+            Err(Error::InvalidMessage(reason)) if reason.contains("conflicting")
+        ));
+    }
+
+    #[test]
+    fn direct_v2_does_not_consume_ice_vocabulary_or_server_proof_as_direct_handshake() {
+        let now = TokioInstant::now();
+        let mut handshake = DirectHandshake::new(Role::Host);
+        for message in [
+            serde_json::json!({"type":"relay_ticket_proof","socket_generation":1,"proof":"redacted"}),
+            serde_json::json!({"type":"ice_candidate","candidate":"candidate"}),
+            serde_json::json!({"type":"ice_candidate_done"}),
+            serde_json::json!({"type":"key","public_key":"00"}),
+        ] {
+            assert_eq!(
+                handshake
+                    .handle(&message, now)
+                    .expect("unrelated signaling"),
+                DirectMessageOutcome::Ignored
+            );
+        }
+        assert_eq!(handshake.phase(), DirectPhase::WaitingForPeer);
+        assert!(handshake.peer_key().is_none());
     }
 
     fn direct_test_session(transport: UdpTransport) -> PeerSession {

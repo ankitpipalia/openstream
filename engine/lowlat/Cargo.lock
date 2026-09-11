@@ -1813,6 +1813,7 @@ dependencies = [
  "openstream-protocol",
  "openstream-transport",
  "openstream-transport-policy",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

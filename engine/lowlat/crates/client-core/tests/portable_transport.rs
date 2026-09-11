@@ -42,6 +42,16 @@ impl Drop for LoopbackIceEnv {
 }
 
 async fn websocket_bridge() -> (String, JoinHandle<()>) {
+    websocket_bridge_with_direct_readiness(false).await
+}
+
+async fn direct_websocket_bridge() -> (String, JoinHandle<()>) {
+    websocket_bridge_with_direct_readiness(true).await
+}
+
+async fn websocket_bridge_with_direct_readiness(
+    publish_direct_readiness: bool,
+) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback signaling bridge");
@@ -56,6 +66,24 @@ async fn websocket_bridge() -> (String, JoinHandle<()>) {
         let (mut second_sink, mut second_source) = second.split();
         let (to_first, mut first_queue) = mpsc::channel::<Message>(128);
         let (to_second, mut second_queue) = mpsc::channel::<Message>(128);
+
+        if publish_direct_readiness {
+            let readiness = Message::Text(
+                serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 1,
+                })
+                .to_string(),
+            );
+            to_first
+                .send(readiness.clone())
+                .await
+                .expect("queue direct readiness for first peer");
+            to_second
+                .send(readiness)
+                .await
+                .expect("queue direct readiness for second peer");
+        }
 
         let first_writer = tokio::spawn(async move {
             while let Some(message) = first_queue.recv().await {
@@ -385,7 +413,7 @@ async fn connected_relay_test_sessions()
 -> (PeerSession, PeerSession, ControllableRelay, JoinHandle<()>) {
     let relay = ControllableRelay::new().await;
     let force_relay = ForceRelayEnv::enable().await;
-    let (origin, bridge) = websocket_bridge().await;
+    let (origin, bridge) = direct_websocket_bridge().await;
     let pairing = Arc::new(relay.pairing());
     let (sender_result, receiver_result) = tokio::join!(
         PeerSession::establish_with_stun(

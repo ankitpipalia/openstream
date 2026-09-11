@@ -15,6 +15,7 @@ if-addrs.workspace = true
 openstream-protocol = { path = "../protocol" }
 openstream-transport-policy.workspace = true
 openstream-transport = { path = "../transport" }
+ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
