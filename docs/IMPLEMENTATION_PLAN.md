@@ -310,12 +310,13 @@ without changing the default OpenStream wire format.
   `CongestionObservation` into `openstream-transport-policy`. The shared crate
   remains policy-only and does not own sockets, packet encoding, retransmission
   rings, PMTU probes, or session orchestration.
-- [ ] Add a shared outbound packet scheduler and packet delivery estimator to
-  portable `PeerSession` and the FFmpeg path. The portable path still relies
-  on end-to-end `FrameAck` feedback for encoder decisions.
-- [ ] Share packet-level telemetry and scheduler integration across lowlat and
-  portable backends without fabricating delivery, ACK, retransmission, or
-  send-ring metrics where a backend cannot provide them.
+- [x] Add a shared outbound packet scheduler and fixed-size packet delivery
+  estimator to portable `PeerSession` and the FFmpeg path. The bounded
+  scheduler uses class-specific queues and wire-rate pacing; the portable
+  encoder still relies on end-to-end `FrameAck` feedback for encoder decisions.
+- [x] Share the packet-level telemetry contract and scheduler integration
+  across lowlat and portable backends without fabricating delivery, ACK,
+  retransmission, or send-ring metrics where a backend cannot provide them.
 
 - [x] Low-level `lowlat-core` transport telemetry: cumulative sent and
   cumulatively acknowledged payload bytes, delivered/send rate over a bounded
@@ -349,7 +350,8 @@ without changing the default OpenStream wire format.
   `PeerSession` / FFmpeg path: generation-scoped `PeerTransportSnapshot`
   values feed a reusable `PeerTelemetryAdapter`, while local packet rates
   remain diagnostic and encoder decisions remain grounded in end-to-end
-  `FrameAck` evidence. This is not a packet delivery estimator.
+  `FrameAck` evidence. The adapter remains separate from the packet delivery
+  estimator and does not turn local packet metrics into encoder evidence.
 - [x] Add the host-authoritative direct↔opaque-relay↔direct path migration
   choreography, versioned path-control messages, idempotent commit/ACK
   handling, replay-window/reliable-control recovery tests, and the live
@@ -358,6 +360,11 @@ without changing the default OpenStream wire format.
 - [x] Add the automatic `Health::Undeliverable` PMTU-watchdog fixture and make
   the pinned Alpine/musl ABI validation a required `CI gate` input. The
   privileged Apple Linux run is documented separately from host-only CI.
+- [x] Add portable authenticated transport acceptance: ACK loss/delay,
+  duplicate ACK and ACK-of-ACK suppression, 64-counter reordering/replay
+  behavior, generation-isolated late ACKs, bounded queue/backpressure, and
+  end-to-end `FrameAck` continuity over a real loopback opaque relay. The
+  suite is synthetic/loopback evidence, not external WAN or TURN acceptance.
 - [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →
   VideoToolbox capture/encode, with live VideoToolbox bitrate updates.
 - [ ] Add native Windows capture/encode and decoder-surface presentation;
@@ -365,12 +372,12 @@ without changing the default OpenStream wire format.
 - [ ] Add capability-detected Android HEVC decode and benchmark NDK
   MediaCodec/AAudio against the current Kotlin MediaCodec/AudioTrack path.
 
-Gate: packet-level telemetry is visible in a bounded diagnostic snapshot;
-synthetic loss, delay, reordering, and rate changes remain deterministic; and
-each native media backend has a measured capture-to-present latency report
-before it is enabled by default. This gate does not close the open portable
-packet scheduler, cross-backend packet telemetry, native media, or external
-coturn/public-NAT acceptance work.
+Gate: packet-level telemetry is visible in a bounded diagnostic snapshot and
+the portable scheduler/ACK path has deterministic synthetic loss, delay,
+reordering, queue-pressure, migration, and rate-policy evidence. Each native
+media backend still needs a measured capture-to-present latency report before
+it is enabled by default. This gate does not close native media, portable
+DPLPMTUD, external coturn/public-NAT acceptance, or platform integration work.
 
 ## Compatibility backend
 

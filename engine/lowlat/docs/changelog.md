@@ -3,6 +3,46 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Harden portable packet delivery accounting
+
+Portable RTT sampling now uses receiver ACK delay only when the ACK newly
+acknowledges its `largest_counter`; a later bitmap that retires an older
+packet cannot apply the newer packet's delay to the wrong RTT sample. The
+authenticated transport-ACK codec now requires bit 0 of `received_mask` to be
+set, matching the documented bitmap meaning.
+
+The bounded delivery-history ring is now 2,048 entries, covering the
+documented 100 Mbps / 100 ms portable bandwidth-delay envelope at the
+1,200-byte wire ceiling without making the estimator dynamically allocated.
+The regression suite exercises that high-BDP case and the two-ACK RTT-delay
+case. This remains a bounded transport-policy change; it does not claim
+external-WAN acceptance or change the portable wire format.
+
+## Portable sends now use bounded packet scheduling
+
+`PeerSession` now routes established video, audio, input, and application
+control through a bounded class-aware outbound scheduler. ACK and path/setup
+metadata retain typed immediate handling; transport ACKs are channel-254
+records, coalesced, non-ack-eliciting, and intercepted before reliable
+control.
+
+The portable path records authenticated sent-packet evidence in a fixed
+delivery-history ring and reports aggregate plus traffic-class delivery
+snapshots, SRTT, in-flight/stale pressure, and logical retry counts. These are
+local path diagnostics only. They do not fabricate peer delivery or lowlat
+send-ring metrics, and they do not replace end-to-end `FrameAck` evidence for
+portable encoder decisions. Path-local samples reset on generation changes
+while the single cipher/replay and reliable-control domains remain intact.
+
+The FFmpeg host, reference peer, client, and desktop client now use the
+queue/flush/wake APIs. A real two-session authenticated loopback relay fixture
+covers dropped/delayed feedback, duplicate ACKs and ACK-of-ACK suppression,
+64-counter reordering, late old-generation ACKs, bounded backpressure, and
+post-migration `FrameAck` continuity. Run it with
+`./scripts/portable-transport-smoke.sh`. This is synthetic loopback evidence;
+it does not claim portable DPLPMTUD, external coturn/public-NAT reachability,
+native zero-copy media, hardware acceptance, or Parsec/BUD compatibility.
+
 ## Pure transport policy is now shareable
 
 Pure pacing and packet-congestion policy now live in the dependency-free
@@ -13,11 +53,12 @@ encoding, retransmission rings, PMTU probes, and session orchestration.
 The extraction does not change the wire format, socket behavior, or lowlat
 packet scheduling.
 
-Portable `PeerSession` still has no outbound packet scheduler or packet
-delivery estimator. Its `PeerTelemetryAdapter` remains an end-to-end
-frame-feedback and generation-scoped local-diagnostics boundary; it does not
-fabricate lowlat packet delivery, ACK, retransmission, or send-ring metrics.
-Cross-backend packet telemetry and scheduler integration remain open.
+At the time of this entry, portable `PeerSession` still had no outbound
+packet scheduler or packet delivery estimator. Its `PeerTelemetryAdapter`
+was an end-to-end frame-feedback and generation-scoped local-diagnostics
+boundary; it did not fabricate lowlat packet delivery, ACK, retransmission,
+or send-ring metrics. The later portable scheduler entry above records the
+completion of that work.
 
 This entry records a policy extraction, not portable transport parity and not
 Parsec or BUD compatibility. Native media pipelines, physical mobile-device

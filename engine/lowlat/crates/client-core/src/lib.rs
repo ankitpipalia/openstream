@@ -14,11 +14,17 @@ use futures_util::{SinkExt, StreamExt};
 use openstream_protocol::control::{Channel as ControlChannel, Frame as ControlFrame};
 use openstream_protocol::path_control::{PATH_CONTROL_CHANNEL, PathControl};
 use openstream_protocol::relay::Role as RelayRole;
+use openstream_protocol::transport_meta::{TRANSPORT_META_CHANNEL, TransportAck};
 use openstream_protocol::{
     IdentityError, IdentityKey, KeyExchange, Kind, MAX_DATAGRAM, Packet, Session as CipherSession,
 };
 use openstream_transport::{
-    PathGeneration, PathState, PeerTransportSnapshot, TransportSample, UdpTransport,
+    FIRST_PATH_GENERATION, PathGeneration, PathState, PeerTransportSnapshot, TransportSample,
+    UdpTransport,
+};
+use openstream_transport_policy::{
+    DeliveryClassSnapshot as PolicyDeliveryClassSnapshot, DeliveryError, DeliveryEstimator,
+    DeliverySnapshot as PolicyDeliverySnapshot, DeliverySnapshotView, SentPacket, TrafficClass,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +44,8 @@ use webrtc_ice::url::Url as IceUrl;
 use webrtc_util::conn::Conn as IceConn;
 
 mod path;
+pub mod scheduler;
+pub mod transport_ack;
 
 use path::{
     COMMIT_RETRY, MigrationAction, MigrationController, PathRuntime, PathSlot, PeerPath,
@@ -46,6 +54,108 @@ use path::{
 pub use path::{
     MigrationReport, MigrationState, MigrationTarget, MigrationToken, PathMigrationError,
 };
+pub use scheduler::{OutboundClass, QueueOutcome};
+pub use transport_ack::{
+    TransportAckConfig, TransportAckConfigError, TransportAckWindow, TransportAckWindowError,
+};
+
+/// Delivery counters for one traffic class on the active portable path.
+///
+/// These are authenticated peer-delivery observations. They deliberately do
+/// not contain addresses, credentials, payloads, or local socket counters.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryClassSnapshot {
+    pub sent_packets: u64,
+    pub sent_bytes: u64,
+    pub acknowledged_packets: u64,
+    pub acknowledged_bytes: u64,
+    pub delivery_rate_mbps: Option<f64>,
+    pub in_flight: u32,
+    pub stale: u64,
+    pub logical_reliable_retries: u64,
+    pub outer_retransmissions: u64,
+}
+
+impl From<PolicyDeliveryClassSnapshot> for DeliveryClassSnapshot {
+    fn from(snapshot: PolicyDeliveryClassSnapshot) -> Self {
+        Self {
+            sent_packets: snapshot.sent_packets,
+            sent_bytes: snapshot.sent_bytes,
+            acknowledged_packets: snapshot.acknowledged_packets,
+            acknowledged_bytes: snapshot.acknowledged_bytes,
+            delivery_rate_mbps: snapshot.delivery_rate_mbps,
+            in_flight: snapshot.in_flight,
+            stale: snapshot.stale,
+            logical_reliable_retries: snapshot.logical_reliable_retries,
+            outer_retransmissions: snapshot.outer_retransmissions,
+        }
+    }
+}
+
+impl From<DeliveryClassSnapshot> for PolicyDeliveryClassSnapshot {
+    fn from(snapshot: DeliveryClassSnapshot) -> Self {
+        Self {
+            sent_packets: snapshot.sent_packets,
+            sent_bytes: snapshot.sent_bytes,
+            acknowledged_packets: snapshot.acknowledged_packets,
+            acknowledged_bytes: snapshot.acknowledged_bytes,
+            delivery_rate_mbps: snapshot.delivery_rate_mbps,
+            in_flight: snapshot.in_flight,
+            stale: snapshot.stale,
+            logical_reliable_retries: snapshot.logical_reliable_retries,
+            outer_retransmissions: snapshot.outer_retransmissions,
+        }
+    }
+}
+
+/// Address- and credential-free authenticated delivery telemetry for one
+/// active portable path generation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PeerDeliverySnapshot {
+    pub path_generation: PathGeneration,
+    pub sample_interval_ms: f64,
+    pub srtt_ms: Option<f64>,
+    pub aggregate: DeliveryClassSnapshot,
+    pub video: DeliveryClassSnapshot,
+    pub audio: DeliveryClassSnapshot,
+    pub critical: DeliveryClassSnapshot,
+}
+
+impl From<PolicyDeliverySnapshot> for PeerDeliverySnapshot {
+    fn from(snapshot: PolicyDeliverySnapshot) -> Self {
+        Self {
+            path_generation: snapshot.path_generation,
+            sample_interval_ms: snapshot.sample_interval_ms,
+            srtt_ms: snapshot.srtt_ms,
+            aggregate: snapshot.aggregate.into(),
+            video: snapshot.video.into(),
+            audio: snapshot.audio.into(),
+            critical: snapshot.critical.into(),
+        }
+    }
+}
+
+impl From<PeerDeliverySnapshot> for PolicyDeliverySnapshot {
+    fn from(snapshot: PeerDeliverySnapshot) -> Self {
+        Self {
+            path_generation: snapshot.path_generation,
+            sample_interval_ms: snapshot.sample_interval_ms,
+            srtt_ms: snapshot.srtt_ms,
+            aggregate: snapshot.aggregate.into(),
+            video: snapshot.video.into(),
+            audio: snapshot.audio.into(),
+            critical: snapshot.critical.into(),
+        }
+    }
+}
+
+impl DeliverySnapshotView for PeerDeliverySnapshot {
+    fn delivery_snapshot(&self) -> PolicyDeliverySnapshot {
+        (*self).into()
+    }
+}
+
+use scheduler::{OutboundScheduler, SchedulerError};
 
 /// Wire-level capability protocol version.
 pub const CAPABILITY_VERSION: u8 = 1;
@@ -420,6 +530,38 @@ pub struct SessionStats {
     pub received_payload_bytes: u64,
 }
 
+/// Result of one non-blocking outbound scheduler flush.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushReport {
+    pub sent_packets: usize,
+    pub sent_wire_bytes: usize,
+    pub pending_packets: usize,
+    pub stale_evictions: u64,
+    pub logical_reliable_retries: u64,
+    pub outer_retransmissions: u64,
+}
+
+/// Outcome of a flush when delivery history applies bounded backpressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// The scheduler flush completed without delivery-history backpressure.
+    Flushed(FlushReport),
+    /// Queued application work remains until a transport ACK frees history.
+    Backpressured,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmittedPacket {
+    queue_id: u64,
+    wire_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct FlushWork {
+    report: FlushReport,
+    emitted: Vec<EmittedPacket>,
+}
+
 /// One address that a peer may try for the UDP data path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
@@ -746,6 +888,16 @@ pub enum Error {
     PeerIdentityRejected,
     /// The peer sent more candidates than `MAX_REMOTE_CANDIDATES`.
     TooManyCandidates,
+    /// The bounded critical outbound queue cannot accept another packet.
+    OutboundBackpressure {
+        class: OutboundClass,
+    },
+    /// The outbound packet cannot fit the portable sealed datagram bound.
+    InvalidOutboundPacket,
+    /// The delivery-history slot required for the next packet is unavailable.
+    OutboundHistoryFull,
+    /// The requested portable wire-rate value is not a finite non-negative rate.
+    InvalidWirePacingRate,
 }
 
 impl fmt::Display for Error {
@@ -788,6 +940,16 @@ impl fmt::Display for Error {
             }
             Self::TooManyCandidates => {
                 write!(f, "peer sent more than {MAX_REMOTE_CANDIDATES} candidates")
+            }
+            Self::OutboundBackpressure { class } => {
+                write!(f, "{class:?} outbound queue is full")
+            }
+            Self::InvalidOutboundPacket => {
+                f.write_str("outbound packet is invalid or exceeds the portable wire limit")
+            }
+            Self::OutboundHistoryFull => f.write_str("delivery history is full"),
+            Self::InvalidWirePacingRate => {
+                f.write_str("wire pacing rate must be finite and non-negative")
             }
         }
     }
@@ -1075,6 +1237,14 @@ pub struct PeerSession {
     path: PathRuntime,
     cipher: CipherSession,
     stats: SessionStats,
+    scheduler: OutboundScheduler,
+    // The policy ring is intentionally fixed-size and allocation-free, but
+    // its portable session owner keeps it off async/task stacks. This avoids
+    // making a 100 Mbps / 100 ms delivery window depend on the executor's
+    // thread-stack size.
+    delivery: Box<DeliveryEstimator>,
+    transport_ack: TransportAckWindow,
+    policy_clock_origin: Instant,
     path_baseline: Option<PathSampleBaseline>,
     ice_counters: PathCounters,
     /// A peer can win the path probe and send its first capability message
@@ -1159,6 +1329,63 @@ struct ReceivedPacket {
     packet: Packet,
     ingress: PathSlot,
     wire_bytes: Option<usize>,
+}
+
+fn new_transport_state(
+    now: Instant,
+    generation: PathGeneration,
+) -> (
+    OutboundScheduler,
+    Box<DeliveryEstimator>,
+    TransportAckWindow,
+    Instant,
+) {
+    (
+        OutboundScheduler::new(0.0),
+        Box::new(DeliveryEstimator::new(generation)),
+        TransportAckWindow::new(generation, TransportAckConfig::default()),
+        now,
+    )
+}
+
+fn outbound_class(kind: Kind) -> OutboundClass {
+    match kind {
+        Kind::Control | Kind::Input => OutboundClass::Critical,
+        Kind::Audio => OutboundClass::Audio,
+        Kind::Video => OutboundClass::Video,
+    }
+}
+
+fn queue_error(kind: Kind, error: SchedulerError) -> Error {
+    match error {
+        SchedulerError::QueueFull => Error::OutboundBackpressure {
+            class: outbound_class(kind),
+        },
+        SchedulerError::InvalidPacket => Error::InvalidOutboundPacket,
+        SchedulerError::HistoryFull => Error::OutboundHistoryFull,
+    }
+}
+
+fn flush_error(error: SchedulerError) -> Error {
+    match error {
+        SchedulerError::HistoryFull => Error::OutboundHistoryFull,
+        SchedulerError::QueueFull => Error::OutboundBackpressure {
+            class: OutboundClass::Critical,
+        },
+        SchedulerError::InvalidPacket => Error::InvalidOutboundPacket,
+    }
+}
+
+fn delivery_error(error: DeliveryError) -> Error {
+    Error::InvalidMessage(error.to_string())
+}
+
+fn traffic_class(kind: Kind) -> TrafficClass {
+    match kind {
+        Kind::Control | Kind::Input => TrafficClass::Critical,
+        Kind::Audio => TrafficClass::Audio,
+        Kind::Video => TrafficClass::Video,
+    }
 }
 
 async fn receive_backend(
@@ -1316,7 +1543,7 @@ impl ReliableControl {
     /// a timer because the host/client event loop already has the correct
     /// lifecycle and latency budget.
     pub async fn retry(&mut self, session: &mut PeerSession) -> Result<(), Error> {
-        self.flush(session).await
+        self.flush_retry(session).await
     }
 
     /// Consume one packet. `None` means it was ordinary/raw control data and
@@ -1341,7 +1568,7 @@ impl ReliableControl {
         let received = self.inbound.receive(frame);
         if !ack_only {
             if let Some(acknowledgement) = self.inbound.acknowledgement_frame() {
-                self.send_frame(session, &acknowledgement).await?;
+                self.send_frame(session, &acknowledgement, false).await?;
             }
         }
         self.flush(session).await?;
@@ -1355,7 +1582,14 @@ impl ReliableControl {
 
     async fn flush(&mut self, session: &mut PeerSession) -> Result<(), Error> {
         if let Some(frame) = self.outbound.next_frame() {
-            self.send_frame(session, &frame).await?;
+            self.send_frame(session, &frame, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_retry(&mut self, session: &mut PeerSession) -> Result<(), Error> {
+        if let Some(frame) = self.outbound.next_frame() {
+            self.send_frame(session, &frame, true).await?;
         }
         Ok(())
     }
@@ -1364,11 +1598,14 @@ impl ReliableControl {
         &mut self,
         session: &mut PeerSession,
         frame: &ControlFrame,
+        logical_retransmission: bool,
     ) -> Result<(), Error> {
         let payload = frame
             .encode()
             .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        session.send(Kind::Control, 0, 0, &payload).await?;
+        session
+            .send_application_with_flag(Kind::Control, 0, 0, &payload, logical_retransmission)
+            .await?;
         Ok(())
     }
 }
@@ -1517,7 +1754,7 @@ impl PeerSession {
                         .encode()
                         .map_err(|error| Error::InvalidMessage(error.to_string()))?;
                     if self
-                        .send_sealed_on(slot, Kind::Control, PATH_CONTROL_CHANNEL, 0, &bytes, false)
+                        .send_path_control(slot, PATH_CONTROL_CHANNEL, &bytes)
                         .await
                         .is_err()
                         && slot == PathSlot(self.path_generation())
@@ -1549,7 +1786,8 @@ impl PeerSession {
                     self.path.mark_ready();
                     self.path.mark_commit_pending();
                     assert!(self.path.activate_prepared());
-                    self.path.active_mut().activate(Instant::now());
+                    let now = Instant::now();
+                    self.path.active_mut().activate(now);
                     self.path.begin_drain();
                     let old = self.path.prepared.take().expect("old path retained");
                     self.draining = Some(DrainingPath::new(
@@ -1559,7 +1797,11 @@ impl PeerSession {
                     self.opening = None;
                     self.path_baseline = None;
                     self.ice_counters = PathCounters::default();
-                    self.last_keepalive = Instant::now();
+                    let policy_now_ms = self.policy_now_ms(now);
+                    self.scheduler.reset_generation(policy_now_ms, generation);
+                    self.delivery.reset_generation(generation);
+                    self.transport_ack.reset(generation);
+                    self.last_keepalive = now;
                 }
                 MigrationAction::Retire => {
                     if let Some(draining) = self.draining.take() {
@@ -2029,6 +2271,8 @@ impl PeerSession {
         candidate_forwarder.abort();
 
         let now = Instant::now();
+        let (scheduler, delivery, transport_ack, policy_clock_origin) =
+            new_transport_state(now, FIRST_PATH_GENERATION);
         Ok(Self {
             signal,
             path: PathRuntime::initial_active(
@@ -2040,6 +2284,10 @@ impl PeerSession {
             ),
             cipher: CipherSession::new(keys.tx, keys.rx),
             stats: SessionStats::default(),
+            scheduler,
+            delivery,
+            transport_ack,
+            policy_clock_origin,
             path_baseline: None,
             ice_counters: PathCounters::default(),
             prefetched: None,
@@ -2266,11 +2514,17 @@ impl PeerSession {
             };
             if let ProbeResult::Established(prefetched) = path.probe(&mut cipher).await {
                 let now = Instant::now();
+                let (scheduler, delivery, transport_ack, policy_clock_origin) =
+                    new_transport_state(now, FIRST_PATH_GENERATION);
                 return Ok(Self {
                     signal,
                     path: PathRuntime::initial_active(path, now),
                     cipher,
                     stats: SessionStats::default(),
+                    scheduler,
+                    delivery,
+                    transport_ack,
+                    policy_clock_origin,
                     path_baseline: None,
                     ice_counters: PathCounters::default(),
                     prefetched,
@@ -2376,6 +2630,13 @@ impl PeerSession {
             draining.close().await;
         }
         self.path.close_all();
+        let generation = self.path_generation();
+        let now = Instant::now();
+        self.scheduler = OutboundScheduler::new(0.0);
+        self.scheduler
+            .reset_generation(self.policy_now_ms(now), generation);
+        self.delivery.reset_generation(generation);
+        self.transport_ack.reset(generation);
         Ok(())
     }
 
@@ -2395,7 +2656,8 @@ impl PeerSession {
         {
             return Ok(());
         }
-        self.send(Kind::Control, 0, 0, PATH_KEEPALIVE).await?;
+        self.send_path_control(PathSlot(self.path_generation()), 0, PATH_KEEPALIVE)
+            .await?;
         self.last_keepalive = std::time::Instant::now();
         Ok(())
     }
@@ -2405,7 +2667,77 @@ impl PeerSession {
         self.signal.recv().await
     }
 
-    /// Send one encrypted data packet.
+    /// Queue one clear application packet without consuming a cipher counter.
+    pub fn queue(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+    ) -> Result<QueueOutcome, Error> {
+        self.queue_application(kind, channel, flags, payload, false)
+    }
+
+    /// Flush all application packets that are immediately serviceable.
+    ///
+    /// Sealing happens only after the scheduler has admitted a packet and
+    /// `DeliveryEstimator::can_record` has accepted its next outer counter.
+    /// Delivery history is updated only after the socket write succeeds.
+    pub async fn flush_outbound(&mut self) -> Result<FlushReport, Error> {
+        Ok(self.flush_outbound_inner().await?.report)
+    }
+
+    /// Flush application output while keeping delivery-history saturation
+    /// recoverable for receive-driven event loops.
+    ///
+    /// [`Error::OutboundHistoryFull`] is returned by the underlying flush
+    /// only after the scheduler has retained the packet that could not be
+    /// admitted. All other errors remain fatal and are returned unchanged.
+    pub async fn flush_outbound_recoverably(&mut self) -> Result<FlushOutcome, Error> {
+        match self.flush_outbound().await {
+            Ok(report) => Ok(FlushOutcome::Flushed(report)),
+            Err(Error::OutboundHistoryFull) => Ok(FlushOutcome::Backpressured),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Return the exact pacer delay before the next queued packet can run.
+    pub fn next_outbound_wake(&self) -> Option<Duration> {
+        let now_ms = self.policy_now_ms(Instant::now());
+        let wake_ms = self.scheduler.next_wake_ms(now_ms)?;
+        let wait_ms = (wake_ms - now_ms).max(0.0);
+        if !wait_ms.is_finite() {
+            return None;
+        }
+        Some(Duration::from_secs_f64(wait_ms / 1_000.0))
+    }
+
+    /// Number of clear application packets retained by the scheduler.
+    pub fn outbound_pending(&self) -> usize {
+        self.scheduler.pending()
+    }
+
+    /// Set the independent encrypted-wire pacing ceiling in decimal Mbps.
+    pub fn set_wire_pacing_rate(&mut self, rate_mbps: f64) -> Result<(), Error> {
+        if !rate_mbps.is_finite() || rate_mbps < 0.0 {
+            return Err(Error::InvalidWirePacingRate);
+        }
+        let now_ms = self.policy_now_ms(Instant::now());
+        self.scheduler.set_wire_rate_mbps(now_ms, rate_mbps);
+        Ok(())
+    }
+
+    /// Return the current independent wire pacing ceiling in decimal Mbps.
+    pub fn wire_pacing_rate(&self) -> f64 {
+        self.scheduler.wire_rate_mbps()
+    }
+
+    /// Return authenticated delivery telemetry for the active path generation.
+    pub fn transport_delivery_snapshot(&mut self, now: Instant) -> PeerDeliverySnapshot {
+        self.delivery.snapshot(self.policy_now_ms(now)).into()
+    }
+
+    /// Send one encrypted application packet through the bounded scheduler.
     pub async fn send(
         &mut self,
         kind: Kind,
@@ -2413,51 +2745,205 @@ impl PeerSession {
         flags: u8,
         payload: &[u8],
     ) -> Result<usize, Error> {
-        if self.path.active().state() == PathState::Closed {
-            return Err(PathMigrationError::PathUnavailable.into());
-        }
-        let slot = self.migration.application_slot()?;
-        self.send_sealed_on(slot, kind, channel, flags, payload, true)
+        self.send_application_with_flag(kind, channel, flags, payload, false)
             .await
     }
 
-    async fn send_sealed_on(
+    fn queue_application(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+        logical_retransmission: bool,
+    ) -> Result<QueueOutcome, Error> {
+        self.queue_application_with_id(kind, channel, flags, payload, logical_retransmission)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn queue_application_with_id(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+        logical_retransmission: bool,
+    ) -> Result<(QueueOutcome, u64), Error> {
+        if self.path.active().state() == PathState::Closed {
+            return Err(PathMigrationError::PathUnavailable.into());
+        }
+        self.migration.application_slot()?;
+        self.scheduler
+            .queue_with_id(kind, channel, flags, payload, logical_retransmission)
+            .map_err(|error| queue_error(kind, error))
+    }
+
+    async fn send_application_with_flag(
+        &mut self,
+        kind: Kind,
+        channel: u8,
+        flags: u8,
+        payload: &[u8],
+        logical_retransmission: bool,
+    ) -> Result<usize, Error> {
+        let (_, target_queue_id) =
+            self.queue_application_with_id(kind, channel, flags, payload, logical_retransmission)?;
+        loop {
+            let work = self.flush_outbound_inner().await?;
+            if let Some(emitted) = work
+                .emitted
+                .iter()
+                .find(|emitted| emitted.queue_id == target_queue_id)
+            {
+                return Ok(emitted.wire_bytes);
+            }
+            if self.outbound_pending() == 0 {
+                return Err(Error::OutboundHistoryFull);
+            }
+            if let Some(wait) = self.next_outbound_wake() {
+                if wait.is_zero() {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(wait).await;
+                }
+            } else {
+                return Err(Error::OutboundHistoryFull);
+            }
+        }
+    }
+
+    async fn flush_outbound_inner(&mut self) -> Result<FlushWork, Error> {
+        let slot = self.migration.application_slot()?;
+        let generation = self.path_generation();
+        let mut work = FlushWork::default();
+        loop {
+            let now = Instant::now();
+            let now_ms = self.policy_now_ms(now);
+            let next_counter = self.cipher.next_tx_counter();
+            let delivery = &self.delivery;
+            let packet = self
+                .scheduler
+                .pop_due(now_ms, next_counter, |counter| {
+                    delivery.can_record(generation, counter, now_ms)
+                })
+                .map_err(flush_error)?;
+            let Some(packet) = packet else {
+                break;
+            };
+            let (counter, datagram) = self
+                .cipher
+                .seal_with_counter(packet.kind, packet.channel, packet.flags, &packet.payload)
+                .map_err(|error| Error::Transport(openstream_transport::Error::Protocol(error)))?;
+            let sent = self.write_sealed_on(slot, &datagram, true).await?;
+            let sent_bytes = u32::try_from(sent).unwrap_or(u32::MAX);
+            let outcome = self
+                .delivery
+                .record_sent(SentPacket {
+                    generation,
+                    outer_counter: counter,
+                    bytes: sent_bytes,
+                    sent_at_ms: now_ms,
+                    traffic_class: traffic_class(packet.kind),
+                    ack_eliciting: true,
+                    logical_retransmission: packet.logical_retransmission,
+                })
+                .map_err(delivery_error)?;
+            if matches!(
+                self.path.at(slot).map(|path| path.backend()),
+                Some(PeerPathBackend::Ice(_))
+            ) {
+                self.ice_counters.record_sent(sent);
+            }
+            self.stats.sent_packets = self.stats.sent_packets.saturating_add(1);
+            self.stats.sent_wire_bytes = self.stats.sent_wire_bytes.saturating_add(sent as u64);
+            work.report.sent_packets = work.report.sent_packets.saturating_add(1);
+            work.report.sent_wire_bytes = work.report.sent_wire_bytes.saturating_add(sent);
+            work.report.stale_evictions = work
+                .report
+                .stale_evictions
+                .saturating_add(u64::from(outcome.stale_evicted));
+            work.report.logical_reliable_retries = work
+                .report
+                .logical_reliable_retries
+                .saturating_add(u64::from(outcome.logical_retransmission));
+            work.report.outer_retransmissions = work
+                .report
+                .outer_retransmissions
+                .saturating_add(u64::from(outcome.outer_retransmission));
+            work.emitted.push(EmittedPacket {
+                queue_id: packet.queue_id,
+                wire_bytes: sent,
+            });
+        }
+        work.report.pending_packets = self.scheduler.pending();
+        Ok(work)
+    }
+
+    async fn send_path_control(
+        &mut self,
+        slot: PathSlot,
+        channel: u8,
+        payload: &[u8],
+    ) -> Result<usize, Error> {
+        self.send_immediate_on(slot, Kind::Control, channel, 0, payload)
+            .await
+    }
+
+    async fn send_transport_ack(&mut self, ack: TransportAck) -> Result<usize, Error> {
+        let payload = ack
+            .encode()
+            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+        self.send_immediate_on(
+            PathSlot(self.path_generation()),
+            Kind::Control,
+            TRANSPORT_META_CHANNEL,
+            0,
+            &payload,
+        )
+        .await
+    }
+
+    async fn send_immediate_on(
         &mut self,
         slot: PathSlot,
         kind: Kind,
         channel: u8,
         flags: u8,
         payload: &[u8],
+    ) -> Result<usize, Error> {
+        let (_, datagram) = self
+            .cipher
+            .seal_with_counter(kind, channel, flags, payload)
+            .map_err(|error| Error::Transport(openstream_transport::Error::Protocol(error)))?;
+        self.write_sealed_on(slot, &datagram, false).await
+    }
+
+    async fn write_sealed_on(
+        &mut self,
+        slot: PathSlot,
+        datagram: &[u8],
         application: bool,
     ) -> Result<usize, Error> {
         let path = self
             .path
             .at(slot)
             .ok_or(PathMigrationError::PathUnavailable)?;
-        let datagram = self
-            .cipher
-            .seal(kind, channel, flags, payload)
-            .map_err(|error| Error::Transport(openstream_transport::Error::Protocol(error)))?;
-        let ice_path = matches!(path.backend(), PeerPathBackend::Ice(_));
-        let sent = match path.backend() {
+        match path.backend() {
             PeerPathBackend::Direct { transport, .. } => {
-                Ok(transport.send_sealed(&datagram, application).await?)
+                Ok(transport.send_sealed(datagram, application).await?)
             }
             PeerPathBackend::Ice(path) => path
                 .conn
-                .send(&datagram)
+                .send(datagram)
                 .await
                 .map_err(|error| Error::Ice(error.to_string())),
-        }?;
-        if !application {
-            return Ok(sent);
         }
-        if ice_path {
-            self.ice_counters.record_sent(sent);
-        }
-        self.stats.sent_packets = self.stats.sent_packets.saturating_add(1);
-        self.stats.sent_wire_bytes = self.stats.sent_wire_bytes.saturating_add(sent as u64);
-        Ok(sent)
+    }
+
+    fn policy_now_ms(&self, now: Instant) -> f64 {
+        now.saturating_duration_since(self.policy_clock_origin)
+            .as_secs_f64()
+            * 1_000.0
     }
 
     /// Receive and authenticate one encrypted data packet.
@@ -2476,15 +2962,55 @@ impl PeerSession {
         }
     }
 
-    async fn recv_step(&mut self) -> Result<Option<Packet>, Error> {
+    pub async fn recv_step(&mut self) -> Result<Option<Packet>, Error> {
+        let receive_now_ms = self.policy_now_ms(Instant::now());
+        let received = if let Some(wait) = self.transport_ack.next_wake(receive_now_ms) {
+            if wait.is_zero() {
+                self.send_due_transport_ack().await?;
+                return Ok(None);
+            }
+            match tokio::time::timeout(wait, self.recv_ingress()).await {
+                Ok(received) => received?,
+                Err(_) => {
+                    self.send_due_transport_ack().await?;
+                    return Ok(None);
+                }
+            }
+        } else {
+            self.recv_ingress().await?
+        };
         let Some(ReceivedPacket {
             packet,
             ingress,
             wire_bytes,
-        }) = self.recv_ingress().await?
+        }) = received
         else {
+            self.send_due_transport_ack().await?;
             return Ok(None);
         };
+        let now = Instant::now();
+        let now_ms = self.policy_now_ms(now);
+        if packet.kind == Kind::Control && packet.channel == TRANSPORT_META_CHANNEL {
+            if packet.flags != 0 {
+                return Err(Error::InvalidMessage(
+                    "transport metadata packet has non-zero flags".into(),
+                ));
+            }
+            let ack = TransportAck::decode(&packet.payload)
+                .map_err(|error| Error::InvalidMessage(error.to_string()))?;
+            if ingress == PathSlot(self.path_generation()) {
+                self.delivery
+                    .acknowledge(
+                        ack.generation,
+                        ack.largest_counter,
+                        ack.received_mask,
+                        ack.ack_delay_us,
+                        now_ms,
+                    )
+                    .map_err(delivery_error)?;
+            }
+            return Ok(None);
+        }
         if is_path_probe_packet(&packet) {
             return Ok(None);
         }
@@ -2494,13 +3020,13 @@ impl PeerSession {
         {
             if packet.flags == 0 {
                 if let Ok(record) = PathControl::decode(&packet.payload) {
-                    let actions = self.migration.receive(ingress, record, Instant::now());
+                    let actions = self.migration.receive(ingress, record, now);
                     self.apply_migration_actions(actions).await?;
                 }
             }
             return Ok(None);
         }
-        if !self.migration.accepts_application(ingress, Instant::now()) {
+        if !self.migration.accepts_application(ingress, now) {
             return Ok(None);
         }
         if let Some(bytes) = wire_bytes {
@@ -2514,12 +3040,19 @@ impl PeerSession {
         if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE {
             // A draining socket is receive-only; reply on the selected path.
             if self.migration.application_slot().is_ok() {
-                self.send(Kind::Control, 0, 0, PATH_KEEPALIVE_ACK).await?;
+                self.send_path_control(PathSlot(self.path_generation()), 0, PATH_KEEPALIVE_ACK)
+                    .await?;
             }
             return Ok(None);
         }
         if packet.kind == Kind::Control && packet.payload == PATH_KEEPALIVE_ACK {
             return Ok(None);
+        }
+        if ingress == PathSlot(self.path_generation()) && is_ack_eliciting_application(&packet) {
+            self.transport_ack.observe(packet.counter, now_ms);
+            if let Some(ack) = self.transport_ack.take(now_ms, self.path_generation()) {
+                self.send_transport_ack(ack).await?;
+            }
         }
         self.stats.received_packets = self.stats.received_packets.saturating_add(1);
         self.stats.received_payload_bytes = self
@@ -2527,6 +3060,14 @@ impl PeerSession {
             .received_payload_bytes
             .saturating_add(packet.payload.len() as u64);
         Ok(Some(packet))
+    }
+
+    async fn send_due_transport_ack(&mut self) -> Result<(), Error> {
+        let now_ms = self.policy_now_ms(Instant::now());
+        if let Some(ack) = self.transport_ack.take(now_ms, self.path_generation()) {
+            self.send_transport_ack(ack).await?;
+        }
+        Ok(())
     }
 
     async fn recv_ingress(&mut self) -> Result<Option<ReceivedPacket>, Error> {
@@ -3018,6 +3559,11 @@ fn is_path_probe_packet(packet: &Packet) -> bool {
         && (packet.payload == PATH_PROBE || packet.payload == PATH_PROBE_ACK)
 }
 
+fn is_ack_eliciting_application(packet: &Packet) -> bool {
+    !(packet.kind == Kind::Control
+        && (packet.payload == PATH_KEEPALIVE || packet.payload == PATH_KEEPALIVE_ACK))
+}
+
 fn host_candidates(local: SocketAddr) -> Vec<Candidate> {
     if !local.ip().is_unspecified() {
         return vec![Candidate {
@@ -3081,6 +3627,8 @@ mod tests {
 
     fn direct_test_session(transport: UdpTransport) -> PeerSession {
         let now = Instant::now();
+        let (scheduler, delivery, transport_ack, policy_clock_origin) =
+            new_transport_state(now, FIRST_PATH_GENERATION);
         PeerSession {
             signal: test_endpoint(),
             path: PathRuntime::initial_active(
@@ -3093,6 +3641,10 @@ mod tests {
             ),
             cipher: CipherSession::new(TEST_KEY, TEST_KEY),
             stats: SessionStats::default(),
+            scheduler,
+            delivery,
+            transport_ack,
+            policy_clock_origin,
             path_baseline: None,
             ice_counters: PathCounters::default(),
             prefetched: None,

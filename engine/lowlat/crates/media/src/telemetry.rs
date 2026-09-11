@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use openstream_transport::{PathGeneration, PeerTransportSnapshot, TransportSample};
+use openstream_transport_policy::{DeliverySnapshot, DeliverySnapshotView};
 
 use crate::adaptive::{MAX_PENDING_FRAMES, sequence_at_or_before};
 use crate::{AdaptiveBitrate, BitrateDecision, FrameAck};
@@ -22,6 +23,7 @@ pub struct PeerTelemetrySnapshot {
     pub path_generation: PathGeneration,
     pub path: Option<PeerTransportSnapshot>,
     pub path_sample_baseline: Option<TransportSample>,
+    pub delivery: Option<DeliverySnapshot>,
     pub bitrate_mbps: f64,
     pub pending_frames: usize,
     pub pending_encoded_bytes: usize,
@@ -38,6 +40,7 @@ pub struct PeerTelemetryAdapter {
     pending: BTreeMap<u32, PendingFrame>,
     path: Option<PeerTransportSnapshot>,
     path_sample_baseline: Option<TransportSample>,
+    delivery: Option<DeliverySnapshot>,
     last_now_ms: u64,
 }
 
@@ -49,6 +52,7 @@ impl PeerTelemetryAdapter {
             pending: BTreeMap::new(),
             path: None,
             path_sample_baseline: None,
+            delivery: None,
             last_now_ms: now_ms,
         }
     }
@@ -62,6 +66,7 @@ impl PeerTelemetryAdapter {
         if snapshot.path_generation > self.generation {
             self.generation = snapshot.path_generation;
             self.path_sample_baseline = None;
+            self.delivery = None;
             self.adaptive.suppress_ramp_until(now_ms);
         } else {
             self.path_sample_baseline = snapshot.sample;
@@ -128,6 +133,26 @@ impl PeerTelemetryAdapter {
         self.pending.len()
     }
 
+    /// Record current-generation packet-delivery evidence for diagnostics only.
+    ///
+    /// The small policy conversion boundary lets this adapter consume the
+    /// portable client's address-free snapshot without depending on the
+    /// session implementation. Stale and future generations are ignored;
+    /// future evidence can be submitted again after the adapter advances. It
+    /// never updates [`AdaptiveBitrate`].
+    pub fn observe_delivery<S: DeliverySnapshotView>(&mut self, snapshot: &S) {
+        let delivery = snapshot.delivery_snapshot();
+        if delivery.path_generation != self.generation {
+            return;
+        }
+        self.delivery = Some(delivery);
+    }
+
+    /// Return the latest packet-delivery observation, if one was provided.
+    pub fn latest_delivery_snapshot(&self) -> Option<DeliverySnapshot> {
+        self.delivery
+    }
+
     /// Return a snapshot using the latest timestamp observed by the adapter.
     pub fn snapshot(&self) -> PeerTelemetrySnapshot {
         self.snapshot_at(self.last_now_ms)
@@ -145,6 +170,7 @@ impl PeerTelemetryAdapter {
             path_generation: self.generation,
             path: self.path,
             path_sample_baseline: self.path_sample_baseline,
+            delivery: self.delivery,
             bitrate_mbps: self.bitrate_mbps(),
             pending_frames: self.pending_frames(),
             pending_encoded_bytes: self.pending.values().fold(0_usize, |total, frame| {

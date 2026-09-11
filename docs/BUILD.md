@@ -236,6 +236,30 @@ identity logging, relay unregister cleanup, and the absence of a second key
 exchange or second session. This is an OpenStream-owned opaque-relay test; it
 does not claim interoperability with TURN or stock Parsec clients.
 
+## Portable packet scheduler acceptance
+
+Run the focused authenticated portable transport suite from the repository
+root:
+
+```sh
+./scripts/portable-transport-smoke.sh
+```
+
+The script runs
+`cargo test -p openstream-client-core --test portable_transport --all-features --locked -- --test-threads=1`
+from `engine/lowlat`. The 19-test suite includes authenticated two-session
+opaque-relay acceptance for dropped/delayed transport ACK recovery, duplicate
+ACK and ACK-of-ACK suppression, a 64-counter video reordering boundary,
+generation-isolated late ACKs, bounded history backpressure, scheduler
+priority/fairness, and post-migration reliable `FrameAck` continuity. The
+relay fixture quiesces setup traffic, matches actions by direction and packet
+class, asserts both peers selected the relay, and serializes the process-wide
+force-relay environment across tests.
+
+The result is explicitly loopback/synthetic only. It does not claim external
+coturn, public NAT, WAN loss/reordering, portable DPLPMTUD, hardware capture
+or encoding, native zero-copy media acceptance, or Parsec/BUD compatibility.
+
 The current `webrtc-ice = 0.17.2` boundary is tested separately:
 
 ```sh

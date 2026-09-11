@@ -671,6 +671,7 @@ mod tests {
         FIRST_PATH_GENERATION, PathMtuState, PathState, PeerTransportSnapshot, TransportPathKind,
         TransportSample,
     };
+    use openstream_transport_policy::{DeliveryClassSnapshot, DeliverySnapshot};
 
     fn transport_snapshot(generation: u64, rate_mbps: f64) -> PeerTransportSnapshot {
         PeerTransportSnapshot {
@@ -691,6 +692,76 @@ mod tests {
                 receive_rate_mbps: rate_mbps,
             }),
         }
+    }
+
+    fn delivery_class_snapshot() -> DeliveryClassSnapshot {
+        DeliveryClassSnapshot {
+            sent_packets: 0,
+            sent_bytes: 0,
+            acknowledged_packets: 0,
+            acknowledged_bytes: 0,
+            delivery_rate_mbps: None,
+            in_flight: 0,
+            stale: 0,
+            logical_reliable_retries: 0,
+            outer_retransmissions: 0,
+        }
+    }
+
+    fn delivery_snapshot(generation: u64) -> DeliverySnapshot {
+        DeliverySnapshot {
+            path_generation: generation,
+            sample_interval_ms: 0.0,
+            srtt_ms: None,
+            aggregate: delivery_class_snapshot(),
+            video: delivery_class_snapshot(),
+            audio: delivery_class_snapshot(),
+            critical: delivery_class_snapshot(),
+        }
+    }
+
+    #[test]
+    fn stale_delivery_is_not_published_with_new_path_telemetry() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        let old_delivery = delivery_snapshot(FIRST_PATH_GENERATION);
+        telemetry.observe_delivery(&old_delivery);
+        assert_eq!(telemetry.latest_delivery_snapshot(), Some(old_delivery));
+
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION + 1, 100.0), 20);
+
+        assert_eq!(
+            telemetry.snapshot().path_generation,
+            FIRST_PATH_GENERATION + 1
+        );
+        assert_eq!(telemetry.latest_delivery_snapshot(), None);
+        telemetry.observe_delivery(&old_delivery);
+        assert_eq!(telemetry.latest_delivery_snapshot(), None);
+    }
+
+    #[test]
+    fn future_delivery_is_ignored_until_path_generation_advances() {
+        let mut telemetry = PeerTelemetryAdapter::new(
+            AdaptiveBitrate::new(10.0, 1.0, 20.0),
+            FIRST_PATH_GENERATION,
+            0,
+        );
+        let current_delivery = delivery_snapshot(FIRST_PATH_GENERATION);
+        let future_delivery = delivery_snapshot(FIRST_PATH_GENERATION + 1);
+        telemetry.observe_delivery(&current_delivery);
+
+        telemetry.observe_delivery(&future_delivery);
+
+        assert_eq!(telemetry.latest_delivery_snapshot(), Some(current_delivery));
+        assert_eq!(telemetry.snapshot().path_generation, FIRST_PATH_GENERATION);
+
+        telemetry.observe_path(&transport_snapshot(FIRST_PATH_GENERATION + 1, 100.0), 20);
+        assert_eq!(telemetry.latest_delivery_snapshot(), None);
+        telemetry.observe_delivery(&future_delivery);
+        assert_eq!(telemetry.latest_delivery_snapshot(), Some(future_delivery));
     }
 
     #[test]

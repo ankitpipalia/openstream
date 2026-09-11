@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use openstream_client_core::{
-    CandidateKind, Capabilities, ConnectionPath, MigrationTarget, Pairing, PeerSession, Role,
-    parse_stun_servers,
+    CandidateKind, Capabilities, ConnectionPath, FlushOutcome, MigrationTarget, Pairing,
+    PeerSession, QueueOutcome, Role, parse_stun_servers,
 };
 use openstream_media::{Assembler, Fragment, FrameAck, MAX_FRAGMENT_BYTES, fragment_frame};
 use openstream_protocol::Kind;
@@ -77,14 +77,7 @@ async fn run_legacy(
     match role {
         Role::Host => {
             session.negotiate_host().await?;
-            let source = vec![0x37; MAX_FRAGMENT_BYTES * 2 + 23];
-            for fragment in fragment_frame(1, 0, true, &source)? {
-                session.send(Kind::Video, 0, 0, &fragment).await?;
-            }
-            let frame_ack = session.recv().await?;
-            if frame_ack.kind != Kind::Control || FrameAck::decode(&frame_ack.payload).is_err() {
-                return Err("unexpected client frame acknowledgement".into());
-            }
+            send_frame_and_wait_ack(session, 1).await?;
             session.send(Kind::Control, 0, 0, b"openstream/end").await?;
             println!("host sent an authenticated fragmented video frame and received its ack");
         }
@@ -208,16 +201,52 @@ async fn send_frame_and_wait_ack(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = vec![0x37 ^ u8::try_from(frame_id).unwrap_or(0); MAX_FRAGMENT_BYTES * 2 + 23];
     for fragment in fragment_frame(frame_id, 0, true, &source)? {
-        session.send(Kind::Video, 0, 0, &fragment).await?;
+        queue_video_fragment(session, &fragment)?;
     }
     loop {
-        let packet = session.recv().await?;
-        if packet.kind == Kind::Control
-            && FrameAck::decode(&packet.payload).is_ok_and(|ack| ack.frame_id == frame_id)
-        {
-            return Ok(());
+        let outbound_backpressured = matches!(
+            session.flush_outbound_recoverably().await?,
+            FlushOutcome::Backpressured
+        );
+        let outbound_wake = if outbound_backpressured {
+            None
+        } else {
+            session.next_outbound_wake()
+        };
+        tokio::select! {
+            packet = session.recv() => {
+                let packet = packet?;
+                if packet.kind == Kind::Control
+                    && FrameAck::decode(&packet.payload).is_ok_and(|ack| ack.frame_id == frame_id)
+                {
+                    return Ok(());
+                }
+            }
+            _ = wait_for_outbound_wake(outbound_wake) => {
+                session.flush_outbound_recoverably().await?;
+            }
         }
     }
+}
+
+async fn wait_for_outbound_wake(wake: Option<Duration>) {
+    match wake {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn queue_video_fragment(
+    session: &mut PeerSession,
+    fragment: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(
+        session.queue(Kind::Video, 0, 0, fragment)?,
+        QueueOutcome::DroppedOldest
+    ) {
+        eprintln!("reference peer dropped oldest queued video packet");
+    }
+    Ok(())
 }
 
 async fn wait_for_drain(session: &mut PeerSession) -> Result<(), Box<dyn std::error::Error>> {

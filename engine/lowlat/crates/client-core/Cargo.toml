@@ -13,6 +13,7 @@ getrandom.workspace = true
 hex = "0.4"
 if-addrs.workspace = true
 openstream-protocol = { path = "../protocol" }
+openstream-transport-policy.workspace = true
 openstream-transport = { path = "../transport" }
 rustls.workspace = true
 serde.workspace = true
@@ -28,3 +29,7 @@ openstream-media = { path = "../media" }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "scheduler"
+path = "src/scheduler.rs"
