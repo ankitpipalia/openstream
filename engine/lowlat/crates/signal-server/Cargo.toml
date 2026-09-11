@@ -27,3 +27,6 @@ webrtc-ice.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true

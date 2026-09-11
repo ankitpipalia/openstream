@@ -1149,28 +1149,43 @@ fn close_sender(sender: &mpsc::Sender<Message>) {
     let _ = sender.try_send(Message::Close(None));
 }
 
+/// Remove and close both primary senders, and revoke both primary relay
+/// registrations. This is the only safe outcome when a readiness/reset or
+/// admission operation cannot be completed atomically.
+fn close_primary_pair(session: &mut Session) {
+    let host = session.host.take();
+    let client = session.client.take();
+    if let Some(host) = host.as_ref() {
+        close_sender(host);
+    }
+    if let Some(client) = client.as_ref() {
+        close_sender(client);
+    }
+    clear_relay_owner(session, "host");
+    clear_relay_owner(session, "client");
+    session.ready_pair = None;
+}
+
+fn expire_primary_pair(session: &mut Session) {
+    close_primary_pair(session);
+    session.expires_at = Instant::now();
+}
+
 /// Publish one server-authoritative direct epoch to the exact current host and
 /// client sockets. The generation is reserved before the two bounded enqueue
 /// operations, so an enqueue failure burns the epoch rather than ever
 /// allowing it to be reused.
 fn publish_ready(session: &mut Session) -> Result<u64, ReadinessError> {
     let Some(host) = session.host.clone() else {
+        close_primary_pair(session);
         return Err(ReadinessError::DeliveryFailed);
     };
     let Some(client) = session.client.clone() else {
+        close_primary_pair(session);
         return Err(ReadinessError::DeliveryFailed);
     };
     let Some(generation) = session.establishment_generation.checked_add(1) else {
-        let host = session.host.take();
-        let client = session.client.take();
-        if let Some(host) = host.as_ref() {
-            close_sender(host);
-        }
-        if let Some(client) = client.as_ref() {
-            close_sender(client);
-        }
-        session.ready_pair = None;
-        session.expires_at = Instant::now();
+        expire_primary_pair(session);
         return Err(ReadinessError::CounterExhausted);
     };
     session.establishment_generation = generation;
@@ -1211,9 +1226,7 @@ fn publish_ready(session: &mut Session) -> Result<u64, ReadinessError> {
         }
         close_sender(&client);
     }
-    session.host = None;
-    session.client = None;
-    session.ready_pair = None;
+    close_primary_pair(session);
     Err(ReadinessError::DeliveryFailed)
 }
 
@@ -1247,14 +1260,7 @@ fn invalidate_ready_epoch(
         ))
         .is_err()
     {
-        let host = session.host.take();
-        let client = session.client.take();
-        if let Some(host) = host.as_ref() {
-            close_sender(host);
-        }
-        if let Some(client) = client.as_ref() {
-            close_sender(client);
-        }
+        close_primary_pair(session);
         return Err(ReadinessError::DeliveryFailed);
     }
     Ok(())
@@ -1269,14 +1275,20 @@ fn admit_primary_socket(
     out_tx: &mpsc::Sender<Message>,
 ) -> Result<u64, AdmissionError> {
     let next_socket_generation = match role {
-        PrimaryRole::Host => session
-            .host_generation
-            .checked_add(1)
-            .ok_or(AdmissionError::SocketGenerationExhausted)?,
-        PrimaryRole::Client => session
-            .client_generation
-            .checked_add(1)
-            .ok_or(AdmissionError::SocketGenerationExhausted)?,
+        PrimaryRole::Host => match session.host_generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                expire_primary_pair(session);
+                return Err(AdmissionError::SocketGenerationExhausted);
+            }
+        },
+        PrimaryRole::Client => match session.client_generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                expire_primary_pair(session);
+                return Err(AdmissionError::SocketGenerationExhausted);
+            }
+        },
     };
     let replacing = match role {
         PrimaryRole::Host => session.host.is_some(),
@@ -1322,14 +1334,7 @@ fn admit_primary_socket(
         ),
     };
     if !drain_into(pending.0, pending.1, out_tx) {
-        match role {
-            PrimaryRole::Host => {
-                session.host = None;
-            }
-            PrimaryRole::Client => {
-                session.client = None;
-            }
-        }
+        close_primary_pair(session);
         return Err(AdmissionError::Readiness(ReadinessError::DeliveryFailed));
     }
 
@@ -1389,6 +1394,29 @@ fn primary_socket_is_current(
                     .as_ref()
                     .is_some_and(|current| current.same_channel(sender))
         }
+    }
+}
+
+/// Check that a WebSocket task still owns the sender published for its role.
+/// The token check identifies the guest slot, while the generation and channel
+/// checks prevent a stale task from forwarding or queueing after replacement.
+fn role_socket_is_current(
+    session: &Session,
+    role: &Role,
+    generation: u64,
+    sender: &mpsc::Sender<Message>,
+) -> bool {
+    match role {
+        Role::Host => primary_socket_is_current(session, PrimaryRole::Host, generation, sender),
+        Role::Client => primary_socket_is_current(session, PrimaryRole::Client, generation, sender),
+        Role::Guest(token) => session.guests.iter().any(|guest| {
+            ct_eq(&guest.token, token)
+                && guest.generation == generation
+                && guest
+                    .sender
+                    .as_ref()
+                    .is_some_and(|current| current.same_channel(sender))
+        }),
     }
 }
 
@@ -1745,18 +1773,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         sessions.remove(&session_id);
                     }
                     sessions.get(&session_id).and_then(|session| {
-                        if matches!(&role, Role::Host | Role::Client)
-                            && !primary_socket_is_current(
-                                session,
-                                match &role {
-                                    Role::Host => PrimaryRole::Host,
-                                    Role::Client => PrimaryRole::Client,
-                                    Role::Guest(_) => unreachable!("role matched above"),
-                                },
-                                generation,
-                                &out_tx,
-                            )
-                        {
+                        if !role_socket_is_current(session, &role, generation, &out_tx) {
                             return None;
                         }
                         Some(match &role {
@@ -1792,22 +1809,11 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         if let Some(session) = sessions.get_mut(&session_id) {
                             if session.expires_at <= Instant::now() {
                                 sessions.remove(&session_id);
-                            } else if matches!(&role, Role::Host | Role::Client)
-                                && !primary_socket_is_current(
-                                    session,
-                                    match &role {
-                                        Role::Host => PrimaryRole::Host,
-                                        Role::Client => PrimaryRole::Client,
-                                        Role::Guest(_) => unreachable!("role matched above"),
-                                    },
-                                    generation,
-                                    &out_tx,
-                                )
-                            {
+                            } else if !role_socket_is_current(session, &role, generation, &out_tx) {
                                 // A fail-closed admission/reset or a socket
-                                // replacement removed this sender. It must
-                                // not keep the session alive by queuing new
-                                // generic signaling records.
+                                // replacement removed this sender. It must not
+                                // keep the session alive by queuing new generic
+                                // signaling records.
                                 break 'socket;
                             } else {
                                 // Drop-new past the bounds: the oldest queued
@@ -2447,23 +2453,30 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CreationLimiter, DirectRoute, Guest, MAX_GUESTS_CEILING,
+        AdmissionError, AppState, CreationLimiter, DirectRoute, Guest, MAX_GUESTS_CEILING,
         MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
         RELAY_PACKETS_PER_SECOND, ReadinessError, RelaySlot, SESSION_CREATE_WINDOW, Session,
         admit_primary_socket, authorized, bearer_token, cleanup_primary_socket,
         direct_message_route, max_guests_for_new_session, prune_direct_establishment_messages,
-        publish_ready, queue_pending, reap_expired_sessions, relay_ticket, validate_signal_message,
+        publish_ready, queue_pending, reap_expired_sessions, relay_ticket, signal_socket,
+        validate_signal_message,
     };
+    use axum::Router;
     use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue};
+    use axum::routing::get;
+    use futures_util::SinkExt;
     use openstream_protocol::relay;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tokio::net::UdpSocket;
+    use tokio::net::{TcpListener, UdpSocket};
     use tokio::sync::{Mutex, mpsc};
     use tokio::time::timeout;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     fn test_session() -> Session {
         Session {
@@ -2638,6 +2651,124 @@ mod tests {
     fn guest_cap_is_bounded_and_defaults_sanely() {
         assert!(max_guests_for_new_session() >= 1);
         assert!(max_guests_for_new_session() <= MAX_GUESTS_CEILING);
+    }
+
+    #[tokio::test]
+    async fn replaced_guest_socket_cannot_forward_or_queue_generic_signaling() {
+        let (host_sender, mut host_receiver) = mpsc::channel(8);
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            admin_token: None,
+            allow_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"test-relay-secret".to_vec(),
+        };
+        state.sessions.lock().await.insert(
+            "session-1".into(),
+            Session {
+                expires_at: Instant::now() + Duration::from_secs(60),
+                host_token: "host-token".into(),
+                client_token: "client-token".into(),
+                host: Some(host_sender),
+                client: None,
+                host_generation: 1,
+                client_generation: 0,
+                establishment_generation: 0,
+                ready_pair: None,
+                pending_host: std::collections::VecDeque::new(),
+                pending_client: std::collections::VecDeque::new(),
+                pending_host_bytes: 0,
+                pending_client_bytes: 0,
+                relay_host: None,
+                relay_client: None,
+                guests: std::collections::VecDeque::from([Guest {
+                    id: "guest-id-1".into(),
+                    token: "guest-token".into(),
+                    input: false,
+                    sender: None,
+                    pending: std::collections::VecDeque::new(),
+                    pending_bytes: 0,
+                    active: false,
+                    generation: 0,
+                }]),
+                max_guests: 1,
+            },
+        );
+
+        let app = Router::new()
+            .route("/v1/signal/{session_id}/{role}", get(signal_socket))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        let websocket_request = || {
+            let mut request = format!("ws://{address}/v1/signal/session-1/guest")
+                .into_client_request()
+                .expect("websocket request");
+            request.headers_mut().insert(
+                "authorization",
+                "Bearer guest-token".parse().expect("authorization header"),
+            );
+            request
+        };
+        let (mut stale_socket, _) = connect_async(websocket_request())
+            .await
+            .expect("first guest connects");
+        let (mut current_socket, _) = connect_async(websocket_request())
+            .await
+            .expect("replacement guest connects");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state.sessions.lock().await["session-1"].guests[0].generation == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replacement generation is installed");
+
+        stale_socket
+            .send(ClientMessage::Text(
+                r#"{"type":"ice_candidate_done"}"#.into(),
+            ))
+            .await
+            .expect("stale socket can submit a frame");
+        assert!(
+            timeout(Duration::from_millis(100), host_receiver.recv())
+                .await
+                .is_err()
+        );
+
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut("session-1")
+            .expect("test session")
+            .host = None;
+        stale_socket
+            .send(ClientMessage::Text(
+                r#"{"type":"ice_candidate","candidate":"candidate:1"}"#.into(),
+            ))
+            .await
+            .expect("stale socket can submit another frame");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let session = state.sessions.lock().await;
+        assert!(session["session-1"].pending_host.is_empty());
+        drop(session);
+
+        let _ = stale_socket.close(None).await;
+        let _ = current_socket.close(None).await;
+        server.abort();
     }
 
     #[test]
@@ -3062,12 +3193,32 @@ mod tests {
         session.client = Some(client_tx);
         session.host_generation = 1;
         session.client_generation = 1;
+        session.relay_host = Some(RelaySlot {
+            addr: "127.0.0.1:40001".parse().expect("host relay address"),
+            owner: "host".into(),
+            ticket_digest: [3; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
+        session.relay_client = Some(RelaySlot {
+            addr: "127.0.0.1:40002".parse().expect("client relay address"),
+            owner: "client".into(),
+            ticket_digest: [4; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
 
         assert!(publish_ready(&mut session).is_err());
         assert!(session.ready_pair.is_none());
         assert_eq!(session.establishment_generation, 1);
         assert!(session.host.is_none());
         assert!(session.client.is_none());
+        assert!(session.relay_host.is_none());
+        assert!(session.relay_client.is_none());
         assert_peer_ready(host_rx.try_recv().expect("accepted readiness"), 1);
         let reset = message_text(host_rx.try_recv().expect("compensating reset"));
         assert_eq!(
@@ -3084,6 +3235,24 @@ mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(8);
         admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        session.relay_host = Some(RelaySlot {
+            addr: "127.0.0.1:40001".parse().expect("host relay address"),
+            owner: "host".into(),
+            ticket_digest: [5; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
+        session.relay_client = Some(RelaySlot {
+            addr: "127.0.0.1:40002".parse().expect("client relay address"),
+            owner: "client".into(),
+            ticket_digest: [6; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
         assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
         assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
         for _ in 0..8 {
@@ -3098,8 +3267,60 @@ mod tests {
         assert_eq!(session.establishment_generation, 1);
         assert!(session.host.is_none());
         assert!(session.client.is_none());
+        assert!(session.relay_host.is_none());
+        assert!(session.relay_client.is_none());
         assert!(new_host_rx.try_recv().is_err());
         assert!(matches!(old_host_rx.try_recv(), Ok(Message::Close(None))));
+    }
+
+    #[test]
+    fn pending_drain_failure_closes_both_primary_sockets_and_revokes_relays() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        let _ = old_host_rx.try_recv();
+        let _ = client_rx.try_recv();
+        session
+            .pending_host
+            .push_back(Message::Text(r#"{"type":"ice_candidate_done"}"#.into()));
+        session.pending_host_bytes = session.pending_host.iter().map(super::message_len).sum();
+        session.relay_host = Some(RelaySlot {
+            addr: "127.0.0.1:40001".parse().expect("host relay address"),
+            owner: "host".into(),
+            ticket_digest: [8; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
+        session.relay_client = Some(RelaySlot {
+            addr: "127.0.0.1:40002".parse().expect("client relay address"),
+            owner: "client".into(),
+            ticket_digest: [9; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
+
+        let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
+        replacement_tx
+            .try_send(Message::Text("full".into()))
+            .expect("fill replacement queue");
+        assert!(admit_primary_socket(&mut session, PrimaryRole::Host, &replacement_tx).is_err());
+        assert!(session.host.is_none());
+        assert!(session.client.is_none());
+        assert!(session.ready_pair.is_none());
+        assert!(session.relay_host.is_none());
+        assert!(session.relay_client.is_none());
+        assert!(matches!(old_host_rx.try_recv(), Ok(Message::Close(None))));
+        assert!(
+            matches!(client_rx.try_recv(), Ok(Message::Text(text)) if text.contains("peer_reset"))
+        );
+        assert!(matches!(client_rx.try_recv(), Ok(Message::Close(None))));
+        assert!(matches!(replacement_rx.try_recv(), Ok(Message::Text(text)) if text == "full"));
     }
 
     #[test]
@@ -3122,6 +3343,49 @@ mod tests {
         assert!(session.client.is_none());
         assert!(matches!(host_rx.try_recv(), Ok(Message::Close(None))));
         assert!(matches!(client_rx.try_recv(), Ok(Message::Close(None))));
+    }
+
+    #[test]
+    fn socket_generation_overflow_expires_and_drops_the_complete_primary_pair() {
+        let mut session = test_session();
+        let (host_tx, mut host_rx) = mpsc::channel(4);
+        let (client_tx, mut client_rx) = mpsc::channel(4);
+        session.host = Some(host_tx);
+        session.client = Some(client_tx);
+        session.host_generation = u64::MAX;
+        session.client_generation = 1;
+        session.relay_host = Some(RelaySlot {
+            addr: "127.0.0.1:40001".parse().expect("host relay address"),
+            owner: "host".into(),
+            ticket_digest: [1; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
+        session.relay_client = Some(RelaySlot {
+            addr: "127.0.0.1:40002".parse().expect("client relay address"),
+            owner: "client".into(),
+            ticket_digest: [2; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
+
+        let (replacement_tx, mut replacement_rx) = mpsc::channel(4);
+        assert_eq!(
+            admit_primary_socket(&mut session, PrimaryRole::Host, &replacement_tx),
+            Err(AdmissionError::SocketGenerationExhausted)
+        );
+        assert!(session.expires_at <= Instant::now());
+        assert!(session.host.is_none());
+        assert!(session.client.is_none());
+        assert!(session.relay_host.is_none());
+        assert!(session.relay_client.is_none());
+        assert!(matches!(host_rx.try_recv(), Ok(Message::Close(None))));
+        assert!(matches!(client_rx.try_recv(), Ok(Message::Close(None))));
+        assert!(replacement_rx.try_recv().is_err());
     }
 
     #[test]

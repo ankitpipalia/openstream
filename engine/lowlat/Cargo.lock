@@ -1940,6 +1940,7 @@ dependencies = [
  "sha1",
  "sha2",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "uuid",
  "webrtc-ice",
 ]
