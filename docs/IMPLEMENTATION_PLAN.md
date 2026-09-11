@@ -128,6 +128,30 @@ and configured full ICE; tokens are never accepted after expiry or revocation.
 The remaining connectivity gate is an external coturn deployment plus a
 public-NAT interoperability matrix.
 
+### Startup-order-independent direct establishment
+
+- [x] Add a server-authoritative monotonic direct establishment generation
+  distinct from per-WebSocket socket generations.
+- [x] Publish `peer_ready(N)` only to a complete current host/client pair;
+  fail closed on partial readiness/reset delivery and preserve unrelated
+  signaling records.
+- [x] Keep direct-v2 envelopes (`direct_candidate`,
+  `direct_candidate_done`, and `direct_key`) separate from the existing ICE
+  vocabulary; bind the direct key signature to session, generation, role, and
+  ephemeral key.
+- [x] Keep the peer-wait state outside the 15-second candidate/key deadlines,
+  invalidate stale epochs on replacement, and reset before publishing the next
+  ready epoch.
+- [x] Cover replacement races, stale signed keys, reconnect convergence, and
+  delayed host-first encrypted media/control in deterministic tests.
+- [x] Add `scripts/startup-order-smoke.sh`, which starts the host first and
+  delays the client beyond the historical deadline using one local pairing.
+
+Gate: the host may wait for a late client without consuming an establishment
+phase timeout; only the current direct-v2 generation can complete, while ICE
+continues to use its independent signaling messages. The smoke is local-only;
+external WAN/coturn, public-NAT, and hardware media gates remain separate.
+
 The performance acceptance target follows Parsec's documented policy: keep
 video queues bounded, prefer the newest decodable frame, and couple measured
 loss/RTT/queue pressure to encoder bitrate before latency grows. The initial

@@ -27,6 +27,7 @@ webrtc-util.workspace = true
 
 [dev-dependencies]
 openstream-media = { path = "../media" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

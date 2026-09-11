@@ -2914,6 +2914,8 @@ mod tests {
     use futures_util::task::{Context, Poll};
     use futures_util::{Sink, SinkExt, StreamExt};
     use openstream_protocol::relay;
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::collections::{HashMap, VecDeque};
     use std::convert::Infallible;
     use std::net::SocketAddr;
@@ -3098,6 +3100,45 @@ mod tests {
                 .map(str::len),
             Some(32)
         );
+    }
+
+    fn signed_direct_key_message(session_id: &str, generation: u64) -> Message {
+        let ephemeral = [0x42_u8; 32];
+        let key_pair = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .expect("generate test direct identity");
+        let key_pair =
+            Ed25519KeyPair::from_pkcs8(key_pair.as_ref()).expect("parse test direct identity");
+        let mut transcript = Vec::new();
+        transcript.extend_from_slice(b"OpenStream direct key v2");
+        transcript.extend_from_slice(
+            &u32::try_from(session_id.len())
+                .expect("test session id fits transcript")
+                .to_be_bytes(),
+        );
+        transcript.extend_from_slice(session_id.as_bytes());
+        transcript.extend_from_slice(&generation.to_be_bytes());
+        transcript.push(1); // authenticated host role
+        transcript.extend_from_slice(&ephemeral);
+        let signature = key_pair.sign(&transcript);
+        Message::Text(
+            serde_json::json!({
+                "type": "direct_key",
+                "establishment_generation": generation,
+                "public_key": test_hex(ephemeral),
+                "identity_public_key": test_hex(key_pair.public_key()),
+                "signature": test_hex(signature.as_ref()),
+            })
+            .to_string()
+            .into(),
+        )
+    }
+
+    fn test_hex(bytes: impl AsRef<[u8]>) -> String {
+        bytes
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     #[test]
@@ -4538,6 +4579,182 @@ mod tests {
             direct_message_route(&session, PrimaryRole::Host, 1, 1),
             DirectRoute::NotReady
         ));
+    }
+
+    #[test]
+    fn replacement_after_peer_ready_before_candidate_done_allows_only_next_epoch() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        assert_relay_proof(old_host_rx.try_recv().expect("host proof"), 1);
+        assert_relay_proof(client_rx.try_recv().expect("client proof"), 1);
+        assert_peer_ready(old_host_rx.try_recv().expect("host readiness"), 1);
+        assert_peer_ready(client_rx.try_recv().expect("client readiness"), 1);
+
+        // The old host has received peer_ready but has not completed its
+        // candidate exchange yet. A replacement must invalidate that epoch
+        // before any old candidate can be forwarded.
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 1),
+            DirectRoute::Forward(_)
+        ));
+        let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx)
+            .expect("replacement host");
+
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 1),
+            DirectRoute::StaleSocket
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 2, 1),
+            DirectRoute::DropStale
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 2, 2),
+            DirectRoute::Forward(_)
+        ));
+
+        assert_relay_proof(new_host_rx.try_recv().expect("replacement proof"), 2);
+        let reset = message_text(client_rx.try_recv().expect("one reset"));
+        let reset = serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON");
+        assert_eq!(reset["type"], "peer_reset");
+        assert_eq!(reset["establishment_generation"], 1);
+        assert_peer_ready(client_rx.try_recv().expect("next readiness"), 2);
+        assert!(client_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn replacement_after_candidate_done_before_key_exchange_rejects_old_key_epoch() {
+        let mut session = test_session();
+        let (host_tx, mut host_rx) = mpsc::channel(8);
+        let (old_client_tx, mut old_client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &old_client_tx).expect("client");
+        assert_relay_proof(host_rx.try_recv().expect("host proof"), 1);
+        assert_relay_proof(old_client_rx.try_recv().expect("client proof"), 1);
+        assert_peer_ready(host_rx.try_recv().expect("host readiness"), 1);
+        assert_peer_ready(old_client_rx.try_recv().expect("client readiness"), 1);
+
+        let candidate_done = Message::Text(
+            r#"{"type":"direct_candidate_done","establishment_generation":1,"count":1}"#.into(),
+        );
+        let peer = match direct_message_route(&session, PrimaryRole::Host, 1, 1) {
+            DirectRoute::Forward(peer) => peer,
+            other => panic!("candidate exchange should target current client: {other:?}"),
+        };
+        peer.try_send(candidate_done)
+            .expect("candidate done forwards");
+        assert!(matches!(
+            old_client_rx.try_recv(),
+            Ok(Message::Text(text)) if text.contains("direct_candidate_done")
+        ));
+
+        // The client is replaced after candidate completion but before its
+        // direct key. The old socket and its signed key must not participate
+        // in the next epoch.
+        let (new_client_tx, mut new_client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Client, &new_client_tx)
+            .expect("replacement client");
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Client, 1, 1),
+            DirectRoute::StaleSocket
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 1),
+            DirectRoute::DropStale
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 2),
+            DirectRoute::Forward(_)
+        ));
+
+        assert_relay_proof(new_client_rx.try_recv().expect("replacement proof"), 2);
+        let reset = message_text(host_rx.try_recv().expect("one reset"));
+        let reset = serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON");
+        assert_eq!(reset["type"], "peer_reset");
+        assert_eq!(reset["establishment_generation"], 1);
+        assert_peer_ready(host_rx.try_recv().expect("next readiness"), 2);
+        assert_peer_ready(new_client_rx.try_recv().expect("replacement readiness"), 2);
+        assert!(host_rx.try_recv().is_err());
+        assert!(new_client_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn correctly_signed_old_socket_key_is_not_forwarded_after_generation_change() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        assert_relay_proof(old_host_rx.try_recv().expect("host proof"), 1);
+        assert_relay_proof(client_rx.try_recv().expect("client proof"), 1);
+        assert_peer_ready(old_host_rx.try_recv().expect("host readiness"), 1);
+        assert_peer_ready(client_rx.try_recv().expect("client readiness"), 1);
+
+        let signed_old_key = signed_direct_key_message("session-1", 1);
+        let signed_old_key_text = message_text(signed_old_key);
+        assert!(validate_signal_message(&signed_old_key_text).is_ok());
+
+        let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx)
+            .expect("replacement host");
+        assert_relay_proof(new_host_rx.try_recv().expect("replacement proof"), 2);
+        let _ = client_rx.try_recv(); // peer_reset
+        assert_peer_ready(client_rx.try_recv().expect("replacement readiness"), 2);
+
+        // The signature is valid for session-1/host/epoch-1, but the socket
+        // generation is no longer current. It must not reach the client.
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 1),
+            DirectRoute::StaleSocket
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 2, 1),
+            DirectRoute::DropStale
+        ));
+        assert!(client_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reconnect_converges_with_exactly_one_reset_and_one_next_ready() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        for receiver in [&mut old_host_rx, &mut client_rx] {
+            let _ = receiver.try_recv(); // relay proof
+            let _ = receiver.try_recv(); // peer_ready(1)
+        }
+
+        let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx)
+            .expect("reconnect host");
+        assert_eq!(session.establishment_generation, 2);
+        assert_eq!(
+            session
+                .ready_pair
+                .expect("replacement epoch")
+                .establishment_generation,
+            2
+        );
+        assert_relay_proof(new_host_rx.try_recv().expect("new proof"), 2);
+
+        let reset = message_text(client_rx.try_recv().expect("reset exactly once"));
+        let reset = serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON");
+        assert_eq!(reset["type"], "peer_reset");
+        assert_eq!(reset["establishment_generation"], 1);
+        assert_peer_ready(client_rx.try_recv().expect("ready exactly once"), 2);
+        assert!(client_rx.try_recv().is_err());
+
+        // A stale cleanup of the old socket is a no-op and cannot publish a
+        // second reset or recover another epoch.
+        assert!(!cleanup_primary_socket(&mut session, PrimaryRole::Host, 1));
+        assert!(client_rx.try_recv().is_err());
+        assert_eq!(session.establishment_generation, 2);
     }
 
     #[test]

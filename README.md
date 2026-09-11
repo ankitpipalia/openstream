@@ -78,6 +78,18 @@ Run the authenticated full-ICE loopback smoke separately:
 ./scripts/full-ice-smoke.sh
 ```
 
+Verify startup-order-independent direct establishment with the synthetic
+reference peer:
+
+```sh
+./scripts/startup-order-smoke.sh
+```
+
+This starts the host first, waits 16 seconds (past the historical 15-second
+candidate deadline), then starts the client and checks direct-v2 encrypted
+media/control traffic. The smoke is loopback-only and does not claim WAN,
+coturn, hardware, or native zero-copy media support.
+
 On a Linux host, inspect native capture and device readiness before pairing:
 
 ```sh
@@ -162,11 +174,12 @@ commit it, put it in a public issue, or include it in logs.
 ## Current status
 
 The local development path is functional and validated through direct UDP,
-forced relay, and authenticated loopback ICE. The GitHub workflow also runs
-the full-ICE loopback, a short encrypted FFmpeg media loopback, and the
-host-checkable mobile acceptance harness on Ubuntu. The implementation is not
-yet a finished product: public-NAT/coturn interoperability, long-run Linux
-hardware acceptance, exact Direct3D11/native GPU-driver acceptance, durable
+forced relay, authenticated loopback ICE, and startup-order-independent
+direct-v2 establishment. The GitHub workflow also runs the full-ICE loopback,
+a short encrypted FFmpeg media loopback, and the host-checkable mobile
+acceptance harness on Ubuntu. The implementation is not yet a finished
+product: public-NAT/coturn interoperability, long-run Linux hardware
+acceptance, exact Direct3D11/native GPU-driver acceptance, durable
 signaling/account state, native Windows/macOS hosting, native desktop audio,
 OS virtual microphone routing, virtual displays, Windows/macOS virtual
 gamepads, Android/iOS device builds, USB passthrough, and multi-guest media

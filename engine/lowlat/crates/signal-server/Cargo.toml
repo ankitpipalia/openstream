@@ -29,4 +29,5 @@ webrtc-ice.workspace = true
 workspace = true
 
 [dev-dependencies]
+ring.workspace = true
 tokio-tungstenite.workspace = true

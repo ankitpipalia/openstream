@@ -1936,6 +1936,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "openstream-protocol",
+ "ring",
  "serde",
  "serde_json",
  "sha1",

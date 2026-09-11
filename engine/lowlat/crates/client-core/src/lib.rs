@@ -4300,6 +4300,88 @@ mod tests {
     }
 
     #[test]
+    fn direct_v2_reconnect_reset_is_single_epoch_transition_and_old_key_is_stale() {
+        let now = TokioInstant::now();
+        let mut handshake = DirectHandshake::new(Role::Client);
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 1,
+                }),
+                now,
+            )
+            .expect("initial readiness");
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "direct_candidate",
+                    "establishment_generation": 1,
+                    "kind": "host",
+                    "ip": "192.0.2.10",
+                    "port": 40001,
+                }),
+                now,
+            )
+            .expect("initial candidate");
+
+        assert_eq!(
+            handshake
+                .handle(
+                    &serde_json::json!({
+                        "type": "peer_reset",
+                        "establishment_generation": 1,
+                        "reason": "role_replaced",
+                    }),
+                    now,
+                )
+                .expect("initial reset"),
+            DirectMessageOutcome::Reset
+        );
+        assert_eq!(handshake.phase(), DirectPhase::WaitingForPeer);
+        assert_eq!(handshake.deadline(), None);
+        assert!(handshake.remote_candidates().is_empty());
+
+        // Duplicate reset delivery is stale after the state transition and
+        // cannot trigger another recovery or clear a later epoch.
+        assert_eq!(
+            handshake
+                .handle(
+                    &serde_json::json!({
+                        "type": "peer_reset",
+                        "establishment_generation": 1,
+                        "reason": "role_replaced",
+                    }),
+                    now,
+                )
+                .expect("duplicate reset"),
+            DirectMessageOutcome::Reset
+        );
+
+        handshake
+            .handle(
+                &serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 2,
+                }),
+                now,
+            )
+            .expect("replacement readiness");
+        let identity = IdentityKey::generate().expect("identity");
+        let key = KeyExchange::generate().expect("old ephemeral key");
+        let stale_key = encode_direct_key_message(&key, &identity, "session", 1, Role::Host)
+            .expect("signed old-generation key");
+        assert_eq!(
+            handshake
+                .handle(&stale_key, now)
+                .expect("stale signed key is ignored"),
+            DirectMessageOutcome::IgnoredStale
+        );
+        assert!(handshake.peer_key().is_none());
+        assert_eq!(handshake.generation(), 2);
+    }
+
+    #[test]
     fn direct_v2_transcript_is_exact_and_binds_session_epoch_role_and_key() {
         let ephemeral = [0x11; 32];
         let mut expected = Vec::new();

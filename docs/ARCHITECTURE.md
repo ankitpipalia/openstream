@@ -101,6 +101,17 @@ peer-reflexive/relay candidates, nomination, consent freshness, and optional
 TURN allocation. The signaling service also forwards opaque encrypted
 datagrams through its role-token-validated application relay.
 
+Direct establishment is now startup-order independent. The signaling service
+allocates a monotonic `establishment_generation` only for a complete current
+host/client WebSocket pair and sends a server-generated `peer_ready(N)` to
+those exact sockets. The direct client waits in a readiness state outside the
+15-second candidate/key phase timers, then exchanges only the generation-tagged
+`direct_candidate`, `direct_candidate_done`, and `direct_key` envelopes. A
+socket replacement invalidates the old epoch and publishes a new one after
+reset ordering succeeds. Socket generations remain separate from establishment
+generations, and the existing `ice_candidate`, `ice_candidate_done`, and
+legacy `key` vocabulary remains scoped to the independent ICE path.
+
 ### Shared transport policy boundary
 
 Pure transport policy now lives in `openstream-transport-policy`, a

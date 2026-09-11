@@ -1,6 +1,7 @@
 # Startup-Order-Independent Direct Establishment
 
-**Status:** proposed; awaiting review before implementation planning.
+**Status:** implemented and validated on 2026-09-12; direct-v2 startup-order,
+reconnect-race, and host-first smoke coverage are landed.
 
 **Baseline:** `65c1678514550ccbe11d237e7f38d56a50fb7f64`
 

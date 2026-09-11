@@ -80,6 +80,16 @@ fn as_on_off(granted: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn lock_environment() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
 
     fn save(keys: &[&'static str]) -> Vec<(&'static str, Option<String>)> {
         keys.iter()
@@ -100,6 +110,7 @@ mod tests {
 
     #[test]
     fn everything_defaults_to_off() {
+        let _environment = lock_environment();
         let keys = [
             "OPENSTREAM_ENABLE_INPUT",
             "OPENSTREAM_CLIPBOARD",
@@ -130,6 +141,7 @@ mod tests {
 
     #[test]
     fn explicit_opt_ins_enable_each_grant() {
+        let _environment = lock_environment();
         let keys = [
             "OPENSTREAM_ENABLE_INPUT",
             "OPENSTREAM_CLIPBOARD",
@@ -155,6 +167,7 @@ mod tests {
 
     #[test]
     fn nonstandard_values_do_not_enable_grants() {
+        let _environment = lock_environment();
         let keys = ["OPENSTREAM_ENABLE_INPUT", "OPENSTREAM_CLIPBOARD"];
         let saved = save(&keys);
         unsafe {

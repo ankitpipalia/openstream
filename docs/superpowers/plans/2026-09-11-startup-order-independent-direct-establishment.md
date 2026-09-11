@@ -38,19 +38,19 @@
 
 **Steps:**
 
-- [ ] RED: add tests proving that a first role receives no `peer_ready`, a complete current pair receives exactly one `peer_ready(1)`, and a role replacement invalidates the old epoch before publishing the next one.
-- [ ] RED: add tests for fail-closed partial readiness/reset delivery when one bounded sender is closed/full; no unusable generation may be marked ready.
-- [ ] RED: add tests proving old socket cleanup cannot clear or mutate a replacement sender and that a stale direct message is not forwarded.
-- [ ] RED: add tests proving only direct-establishment records are pruned from pending queues; ICE and unrelated supported messages remain.
-- [ ] GREEN: add a checked monotonic establishment-generation field and readiness bookkeeping distinct from socket generations.
-- [ ] GREEN: publish `peer_ready` directly to both current role senders only when both enqueue operations succeed; compensate/reset or close the affected sockets on partial failure.
-- [ ] GREEN: on replacement/disconnect, invalidate the old epoch immediately, enqueue `peer_reset` before any replacement readiness, and form the next epoch only from the exact current pair.
-- [ ] GREEN: reject client-originated `peer_ready`/`peer_reset`; reject direct records without a ready pair; drop stale generations; fail the sender on future generations.
-- [ ] GREEN: forward only validated generation-matching direct messages and retain generic queue behavior for non-establishment signaling.
-- [ ] GREEN: add bounded field validation for generation, candidate count/address/kind, direct key hex widths, and reset reason.
-- [ ] Run: `cargo test -p openstream-signal-server --all-features --locked`.
-- [ ] Run: `cargo clippy -p openstream-signal-server --all-targets --all-features --locked -- -D warnings`.
-- [ ] Commit: `feat: add server-authoritative direct establishment epochs`.
+- [x] RED: add tests proving that a first role receives no `peer_ready`, a complete current pair receives exactly one `peer_ready(1)`, and a role replacement invalidates the old epoch before publishing the next one.
+- [x] RED: add tests for fail-closed partial readiness/reset delivery when one bounded sender is closed/full; no unusable generation may be marked ready.
+- [x] RED: add tests proving old socket cleanup cannot clear or mutate a replacement sender and that a stale direct message is not forwarded.
+- [x] RED: add tests proving only direct-establishment records are pruned from pending queues; ICE and unrelated supported messages remain.
+- [x] GREEN: add a checked monotonic establishment-generation field and readiness bookkeeping distinct from socket generations.
+- [x] GREEN: publish `peer_ready` directly to both current role senders only when both enqueue operations succeed; compensate/reset or close the affected sockets on partial failure.
+- [x] GREEN: on replacement/disconnect, invalidate the old epoch immediately, enqueue `peer_reset` before any replacement readiness, and form the next epoch only from the exact current pair.
+- [x] GREEN: reject client-originated `peer_ready`/`peer_reset`; reject direct records without a ready pair; drop stale generations; fail the sender on future generations.
+- [x] GREEN: forward only validated generation-matching direct messages and retain generic queue behavior for non-establishment signaling.
+- [x] GREEN: add bounded field validation for generation, candidate count/address/kind, direct key hex widths, and reset reason.
+- [x] Run: `cargo test -p openstream-signal-server --all-features --locked`.
+- [x] Run: `cargo clippy -p openstream-signal-server --all-targets --all-features --locked -- -D warnings`.
+- [x] Commit: `feat: add server-authoritative direct establishment epochs`.
 
 **Expected result:** The service has a single authoritative direct epoch per complete current role pair, with fail-closed readiness/reset delivery and no stale direct-message forwarding.
 
@@ -67,18 +67,18 @@
 
 **Steps:**
 
-- [ ] RED: add tests for waiting past `PHASE_TIMEOUT` before `peer_ready`, accepting the first current readiness, stale reset/readiness handling, future-generation rejection, and direct records before readiness failing closed.
-- [ ] RED: add transcript tests showing session ID, generation, authenticated role, and ephemeral key all affect the signature; verify role reflection and cross-session replay fail.
-- [ ] RED: add duplicate candidate/done/key tests and conflicting duplicate-key rejection tests.
-- [ ] GREEN: wait in a bounded-by-WebSocket/session-lifetime state for `peer_ready(N)` before transmitting direct-v2 candidates.
-- [ ] GREEN: tag every direct candidate, completion marker, and key with N; start candidate deadline only after readiness and key deadline only after candidate completion.
-- [ ] GREEN: reset all epoch-local candidates, completion state, key material, and deadlines on `peer_reset`; regenerate ephemeral keys for the next epoch.
-- [ ] GREEN: replace direct key serialization/signing with the exact binary transcript; derive the sender role from the role-scoped endpoint and verify the opposite role.
-- [ ] GREEN: keep the ICE establishment implementation accepting only its existing ICE message types and legacy `key` envelope.
-- [ ] GREEN: preserve the existing candidate validation, deterministic nomination, relay registration, cipher derivation, and post-establishment behavior.
-- [ ] Run: `cargo test -p openstream-client-core --all-features --locked`.
-- [ ] Run: `cargo clippy -p openstream-client-core --all-targets --all-features --locked -- -D warnings`.
-- [ ] Commit: `feat: make direct establishment startup-order independent`.
+- [x] RED: add tests for waiting past `PHASE_TIMEOUT` before `peer_ready`, accepting the first current readiness, stale reset/readiness handling, future-generation rejection, and direct records before readiness failing closed.
+- [x] RED: add transcript tests showing session ID, generation, authenticated role, and ephemeral key all affect the signature; verify role reflection and cross-session replay fail.
+- [x] RED: add duplicate candidate/done/key tests and conflicting duplicate-key rejection tests.
+- [x] GREEN: wait in a bounded-by-WebSocket/session-lifetime state for `peer_ready(N)` before transmitting direct-v2 candidates.
+- [x] GREEN: tag every direct candidate, completion marker, and key with N; start candidate deadline only after readiness and key deadline only after candidate completion.
+- [x] GREEN: reset all epoch-local candidates, completion state, key material, and deadlines on `peer_reset`; regenerate ephemeral keys for the next epoch.
+- [x] GREEN: replace direct key serialization/signing with the exact binary transcript; derive the sender role from the role-scoped endpoint and verify the opposite role.
+- [x] GREEN: keep the ICE establishment implementation accepting only its existing ICE message types and legacy `key` envelope.
+- [x] GREEN: preserve the existing candidate validation, deterministic nomination, relay registration, cipher derivation, and post-establishment behavior.
+- [x] Run: `cargo test -p openstream-client-core --all-features --locked`.
+- [x] Run: `cargo clippy -p openstream-client-core --all-targets --all-features --locked -- -D warnings`.
+- [x] Commit: `feat: make direct establishment startup-order independent`.
 
 **Expected result:** A host can remain connected while waiting for a client, and both peers establish only from the current server-published direct epoch; ICE remains behaviorally unchanged.
 
@@ -96,17 +96,17 @@
 
 **Steps:**
 
-- [ ] RED: add deterministic tests for socket replacement after `peer_ready` but before candidate completion, after candidate completion but before key completion, and an old socket submitting a correctly signed stale key after N+1 exists.
-- [ ] RED: add an integration test with host-first startup exceeding the old 15-second candidate deadline, followed by client arrival and successful encrypted UDP data.
-- [ ] RED: add reconnect tests proving only one reset/recovery occurs and no old generation completes.
-- [ ] GREEN: implement the minimum test seam needed to exercise those races without weakening production validation.
-- [ ] GREEN: create the smoke script with explicit cleanup traps, bounded process timeouts, redacted logs, and checks for host-first/direct-v2 establishment plus post-handshake media/control traffic.
-- [ ] GREEN: update implementation/status docs to mark startup-order direct establishment implemented, preserve the local-auth caveat, and identify external WAN/coturn and native media as separate acceptance gates.
-- [ ] Run: `bash scripts/startup-order-smoke.sh`.
-- [ ] Run: `cargo test --workspace --all-features --locked`.
-- [ ] Run: `cargo fmt --all -- --check`.
-- [ ] Run: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-- [ ] Commit: `test: cover startup-order direct establishment races`.
+- [x] RED: add deterministic tests for socket replacement after `peer_ready` but before candidate completion, after candidate completion but before key completion, and an old socket submitting a correctly signed stale key after N+1 exists.
+- [x] RED: add an integration test with host-first startup exceeding the old 15-second candidate deadline, followed by client arrival and successful encrypted UDP data.
+- [x] RED: add reconnect tests proving only one reset/recovery occurs and no old generation completes.
+- [x] GREEN: implement the minimum test seam needed to exercise those races without weakening production validation.
+- [x] GREEN: create the smoke script with explicit cleanup traps, bounded process timeouts, redacted logs, and checks for host-first/direct-v2 establishment plus post-handshake media/control traffic.
+- [x] GREEN: update implementation/status docs to mark startup-order direct establishment implemented, preserve the local-auth caveat, and identify external WAN/coturn and native media as separate acceptance gates.
+- [x] Run: `bash scripts/startup-order-smoke.sh`.
+- [x] Run: `cargo test --workspace --all-features --locked`.
+- [x] Run: `cargo fmt --all -- --check`.
+- [x] Run: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
+- [x] Commit: `test: cover startup-order direct establishment races`.
 
 **Expected result:** Host-first startup and reconnect races are reproducibly covered, the existing local-network MVP path remains usable, and documentation no longer describes the startup protocol as merely proposed.
 
