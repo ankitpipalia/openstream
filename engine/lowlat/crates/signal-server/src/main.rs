@@ -283,6 +283,17 @@ enum DirectRoute {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectDispatch {
+    Sent,
+    DropStale,
+    NotReady,
+    Future,
+    StaleSocket,
+    Missing,
+    SendFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadinessError {
     CounterExhausted,
     DeliveryFailed,
@@ -1159,6 +1170,7 @@ fn publish_ready(session: &mut Session) -> Result<u64, ReadinessError> {
             close_sender(client);
         }
         session.ready_pair = None;
+        session.expires_at = Instant::now();
         return Err(ReadinessError::CounterExhausted);
     };
     session.establishment_generation = generation;
@@ -1279,6 +1291,15 @@ fn admit_primary_socket(
         prune_direct_establishment_messages(session);
     }
 
+    // A replacement must not inherit the old socket's relay registration. The
+    // new connection will fetch/register a fresh ticket, while the old
+    // registration is revoked immediately rather than waiting for stale task
+    // cleanup.
+    match role {
+        PrimaryRole::Host => clear_relay_owner(session, "host"),
+        PrimaryRole::Client => clear_relay_owner(session, "client"),
+    }
+
     let old = match role {
         PrimaryRole::Host => {
             session.host_generation = next_socket_generation;
@@ -1345,6 +1366,30 @@ fn cleanup_primary_socket(session: &mut Session, role: PrimaryRole, generation: 
     };
     let _ = invalidate_ready_epoch(session, RESET_REASON_PEER_DISCONNECTED, survivor);
     true
+}
+
+fn primary_socket_is_current(
+    session: &Session,
+    role: PrimaryRole,
+    generation: u64,
+    sender: &mpsc::Sender<Message>,
+) -> bool {
+    match role {
+        PrimaryRole::Host => {
+            session.host_generation == generation
+                && session
+                    .host
+                    .as_ref()
+                    .is_some_and(|current| current.same_channel(sender))
+        }
+        PrimaryRole::Client => {
+            session.client_generation == generation
+                && session
+                    .client
+                    .as_ref()
+                    .is_some_and(|current| current.same_channel(sender))
+        }
+    }
 }
 
 fn direct_message_route(
@@ -1623,7 +1668,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
 
                 let message = Message::Text(text);
                 if let Some(establishment_generation) = direct_message_generation(&message) {
-                    let route = {
+                    let dispatch = {
                         let mut sessions = state.sessions.lock().await;
                         if sessions
                             .get(&session_id)
@@ -1631,53 +1676,60 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         {
                             sessions.remove(&session_id);
                         }
-                        sessions.get(&session_id).map(|session| match &role {
-                            Role::Host => direct_message_route(
-                                session,
-                                PrimaryRole::Host,
-                                generation,
-                                establishment_generation,
-                            ),
-                            Role::Client => direct_message_route(
-                                session,
-                                PrimaryRole::Client,
-                                generation,
-                                establishment_generation,
-                            ),
-                            // Guests use the legacy client fan-out path and
-                            // cannot participate in direct-v2 establishment.
-                            Role::Guest(_) => DirectRoute::NotReady,
-                        })
+                        match sessions.get(&session_id) {
+                            None => DirectDispatch::Missing,
+                            Some(session) => {
+                                let route = match &role {
+                                    Role::Host => direct_message_route(
+                                        session,
+                                        PrimaryRole::Host,
+                                        generation,
+                                        establishment_generation,
+                                    ),
+                                    Role::Client => direct_message_route(
+                                        session,
+                                        PrimaryRole::Client,
+                                        generation,
+                                        establishment_generation,
+                                    ),
+                                    // Guests use the legacy client fan-out path and
+                                    // cannot participate in direct-v2 establishment.
+                                    Role::Guest(_) => DirectRoute::NotReady,
+                                };
+                                match route {
+                                    DirectRoute::Forward(peer) => {
+                                        if peer.try_send(message).is_ok() {
+                                            DirectDispatch::Sent
+                                        } else {
+                                            DirectDispatch::SendFailed
+                                        }
+                                    }
+                                    DirectRoute::DropStale => DirectDispatch::DropStale,
+                                    DirectRoute::NotReady => DirectDispatch::NotReady,
+                                    DirectRoute::Future => DirectDispatch::Future,
+                                    DirectRoute::StaleSocket => DirectDispatch::StaleSocket,
+                                }
+                            }
+                        }
                     };
-                    match route {
-                        None | Some(DirectRoute::StaleSocket) => break 'socket,
-                        Some(DirectRoute::DropStale) => continue,
-                        Some(DirectRoute::NotReady) => {
+                    match dispatch {
+                        DirectDispatch::Sent | DirectDispatch::DropStale => continue,
+                        DirectDispatch::Missing
+                        | DirectDispatch::StaleSocket
+                        | DirectDispatch::SendFailed => break 'socket,
+                        DirectDispatch::NotReady => {
                             let _ = out_tx.try_send(Message::Text(
-                                "{\"type\":\"error\",\"reason\":\"direct_not_ready\"}"
+                                "{\"type\":\"error\",\"reason\":\"direct_establishment_not_ready\"}"
                                     .into(),
                             ));
                             break 'socket;
                         }
-                        Some(DirectRoute::Future) => {
+                        DirectDispatch::Future => {
                             let _ = out_tx.try_send(Message::Text(
                                 "{\"type\":\"error\",\"reason\":\"direct_generation_future\"}"
                                     .into(),
                             ));
                             break 'socket;
-                        }
-                        Some(DirectRoute::Forward(peer)) => {
-                            if !matches!(
-                                tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    peer.send(message),
-                                )
-                                .await,
-                                Ok(Ok(()))
-                            ) {
-                                break 'socket;
-                            }
-                            continue;
                         }
                     }
                 }
@@ -1692,7 +1744,22 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                     {
                         sessions.remove(&session_id);
                     }
-                    sessions.get(&session_id).map(|session| match &role {
+                    sessions.get(&session_id).and_then(|session| {
+                        if matches!(&role, Role::Host | Role::Client)
+                            && !primary_socket_is_current(
+                                session,
+                                match &role {
+                                    Role::Host => PrimaryRole::Host,
+                                    Role::Client => PrimaryRole::Client,
+                                    Role::Guest(_) => unreachable!("role matched above"),
+                                },
+                                generation,
+                                &out_tx,
+                            )
+                        {
+                            return None;
+                        }
+                        Some(match &role {
                             // Host announcements fan out to the legacy
                             // client and the active guest.
                             Role::Host => {
@@ -1716,6 +1783,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                                 .map(|host| vec![host])
                                 .unwrap_or_default(),
                         })
+                    })
                 };
                 match peers {
                     None => break 'socket,
@@ -1724,6 +1792,23 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         if let Some(session) = sessions.get_mut(&session_id) {
                             if session.expires_at <= Instant::now() {
                                 sessions.remove(&session_id);
+                            } else if matches!(&role, Role::Host | Role::Client)
+                                && !primary_socket_is_current(
+                                    session,
+                                    match &role {
+                                        Role::Host => PrimaryRole::Host,
+                                        Role::Client => PrimaryRole::Client,
+                                        Role::Guest(_) => unreachable!("role matched above"),
+                                    },
+                                    generation,
+                                    &out_tx,
+                                )
+                            {
+                                // A fail-closed admission/reset or a socket
+                                // replacement removed this sender. It must
+                                // not keep the session alive by queuing new
+                                // generic signaling records.
+                                break 'socket;
                             } else {
                                 // Drop-new past the bounds: the oldest queued
                                 // messages are usually the handshake, which
@@ -1870,37 +1955,11 @@ fn validate_signal_message(text: &str) -> Result<(), &'static str> {
 
     match message_type {
         "peer_ready" | "peer_reset" => return Err("server_generated_message"),
-        "candidate" => {
-            let kind = object
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("candidate_kind_missing")?;
-            if !matches!(kind, "host" | "mapped" | "server_reflexive" | "relay") {
-                return Err("candidate_kind_invalid");
-            }
-            let ip = object
-                .get("ip")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("candidate_ip_missing")?;
-            if ip.parse::<std::net::IpAddr>().is_err() {
-                return Err("candidate_ip_invalid");
-            }
-            let port = object
-                .get("port")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or("candidate_port_missing")?;
-            if !(1..=u64::from(u16::MAX)).contains(&port) {
-                return Err("candidate_port_invalid");
-            }
-        }
-        "candidate_done" => {
-            let count = object
-                .get("count")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or("candidate_count_missing")?;
-            if !(1..=MAX_DIRECT_CANDIDATES).contains(&count) {
-                return Err("candidate_count_invalid");
-            }
+        // The historical untyped direct envelopes are deliberately not a
+        // compatibility mode: direct establishment is direct-v2 only. ICE
+        // continues to use its distinct `ice_*` vocabulary below.
+        "candidate" | "candidate_done" => {
+            return Err("legacy_direct_establishment_unsupported");
         }
         "direct_candidate" => {
             if object.len() != 5 {
@@ -2390,10 +2449,10 @@ mod tests {
     use super::{
         AppState, CreationLimiter, DirectRoute, Guest, MAX_GUESTS_CEILING,
         MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
-        RELAY_PACKETS_PER_SECOND, RelaySlot, SESSION_CREATE_WINDOW, Session, admit_primary_socket,
-        authorized, bearer_token, cleanup_primary_socket, direct_message_route,
-        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
-        queue_pending, reap_expired_sessions, relay_ticket, validate_signal_message,
+        RELAY_PACKETS_PER_SECOND, ReadinessError, RelaySlot, SESSION_CREATE_WINDOW, Session,
+        admit_primary_socket, authorized, bearer_token, cleanup_primary_socket,
+        direct_message_route, max_guests_for_new_session, prune_direct_establishment_messages,
+        publish_ready, queue_pending, reap_expired_sessions, relay_ticket, validate_signal_message,
     };
     use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue};
@@ -2772,13 +2831,6 @@ mod tests {
 
     #[test]
     fn signaling_validator_accepts_current_establishment_messages() {
-        assert!(
-            validate_signal_message(
-                r#"{"type":"candidate","kind":"host","ip":"127.0.0.1","port":4000}"#
-            )
-            .is_ok()
-        );
-        assert!(validate_signal_message(r#"{"type":"candidate_done","count":1}"#).is_ok());
         assert!(validate_signal_message(&format!(
             r#"{{"type":"path_candidate","generation":2,"token":"{}","kind":"direct_udp","ip":"127.0.0.1","port":4001}}"#,
             "aa".repeat(16),
@@ -2811,6 +2863,8 @@ mod tests {
         for message in [
             r#"[]"#,
             r#"{"type":"unknown"}"#,
+            r#"{"type":"candidate","kind":"host","ip":"127.0.0.1","port":4000}"#,
+            r#"{"type":"candidate_done","count":1}"#,
             r#"{"type":"candidate","kind":"host","ip":"not-an-ip","port":4000}"#,
             r#"{"type":"candidate","kind":"host","ip":"127.0.0.1","port":0}"#,
             r#"{"type":"path_candidate","generation":2,"token":"00","kind":"direct_udp","ip":"127.0.0.1","port":4001}"#,
@@ -2946,6 +3000,15 @@ mod tests {
         let (client_tx, mut client_rx) = mpsc::channel(8);
         admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        session.relay_host = Some(RelaySlot {
+            addr: "127.0.0.1:40001".parse().expect("relay address"),
+            owner: "host".into(),
+            ticket_digest: [7; 32],
+            last_seen: Instant::now(),
+            window_started: Instant::now(),
+            window_bytes: 0,
+            window_packets: 0,
+        });
         assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
         assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
 
@@ -2970,6 +3033,7 @@ mod tests {
                 .client_generation,
             1
         );
+        assert!(session.relay_host.is_none());
 
         let reset = message_text(client_rx.try_recv().expect("reset reaches survivor"));
         assert_eq!(
@@ -3036,6 +3100,28 @@ mod tests {
         assert!(session.client.is_none());
         assert!(new_host_rx.try_recv().is_err());
         assert!(matches!(old_host_rx.try_recv(), Ok(Message::Close(None))));
+    }
+
+    #[test]
+    fn epoch_overflow_expires_session_and_drops_current_senders() {
+        let mut session = test_session();
+        let (host_tx, mut host_rx) = mpsc::channel(2);
+        let (client_tx, mut client_rx) = mpsc::channel(2);
+        session.host = Some(host_tx);
+        session.client = Some(client_tx);
+        session.host_generation = 1;
+        session.client_generation = 1;
+        session.establishment_generation = u64::MAX;
+
+        assert_eq!(
+            publish_ready(&mut session),
+            Err(ReadinessError::CounterExhausted)
+        );
+        assert!(session.expires_at <= Instant::now());
+        assert!(session.host.is_none());
+        assert!(session.client.is_none());
+        assert!(matches!(host_rx.try_recv(), Ok(Message::Close(None))));
+        assert!(matches!(client_rx.try_recv(), Ok(Message::Close(None))));
     }
 
     #[test]
