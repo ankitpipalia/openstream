@@ -28,6 +28,7 @@ members = [
     "crates/bridge",
     "crates/daemon",
     "crates/tray",
+    "crates/settings",
 ]
 exclude = ["fuzz"]
 

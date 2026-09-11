@@ -36,13 +36,13 @@
 - Produces `openstream-settings::AppConfig`, `SettingsError`, `SettingsFile`, `SecretRef`, `load`, `save_atomic`, and `apply_environment_overrides`.
 - Consumes only `serde`, `serde_json`, and standard filesystem APIs.
 
-- [ ] Step 1: Add failing tests for default config, unknown-field tolerance, schema migration, invalid enum/value rejection, atomic-save permissions, and secret-free serialization.
-- [ ] Step 2: Run `cargo test -p openstream-settings --locked`; verify the new tests fail because the crate/types do not exist.
-- [ ] Step 3: Add the crate and workspace member. Define `AppConfig` with separate device/client/host/video/audio/input/network/privacy/advanced sections and explicit schema version `1`.
-- [ ] Step 4: Implement deterministic migration from schema `0` to `1`, reject newer schemas, validate all bounded numbers/strings, and keep the original file untouched on migration failure.
-- [ ] Step 5: Implement `save_atomic(path, config)` through a same-directory temporary file, restrictive Unix permissions where available, flush/rename, and no secret fields. Implement environment overrides as a non-persisting transformation.
-- [ ] Step 6: Run `cargo test -p openstream-settings --locked`, `cargo fmt --manifest-path engine/lowlat/Cargo.toml --all -- --check`, and Clippy for the crate.
-- [ ] Step 7: Commit `feat: add validated persistent application settings`.
+- [x] Step 1: Add failing tests for default config, unknown-field tolerance, schema migration, invalid enum/value rejection, atomic-save permissions, and secret-free serialization.
+- [x] Step 2: Run `cargo test -p openstream-settings --locked`; verify the new tests fail because the crate/types do not exist.
+- [x] Step 3: Add the crate and workspace member. Define `AppConfig` with separate device/client/host/video/audio/input/network/privacy/advanced sections and explicit schema version `1`.
+- [x] Step 4: Implement deterministic migration from schema `0` to `1`, reject newer schemas, validate all bounded numbers/strings, and keep the original file untouched on migration failure.
+- [x] Step 5: Implement `save_atomic(path, config)` through a same-directory temporary file, restrictive Unix permissions where available, flush/rename, and no secret fields. Implement environment overrides as a non-persisting transformation.
+- [x] Step 6: Run `cargo test -p openstream-settings --locked`, `cargo fmt --manifest-path engine/lowlat/Cargo.toml --all -- --check`, and Clippy for the crate.
+- [x] Step 7: Commit `feat: add validated persistent application settings`.
 
 **Expected result:** A host/client can load a versioned, validated configuration without storing credentials or relying on environment variables for ordinary settings.
 

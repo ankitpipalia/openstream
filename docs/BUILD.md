@@ -29,6 +29,26 @@ These checks cover the protocol, signaling, simulator, codec framing, and
 platform-independent client logic. Hardware-dependent capture, encoder, audio,
 and `/dev/uinput` tests are ignored or skipped when the device is unavailable.
 
+## Persistent application settings
+
+The `openstream-settings` crate provides the versioned application settings
+boundary used by the future shell and host agent. A settings file contains
+validated device/client/host/video/audio/input/network/privacy/advanced values
+and opaque secret-store references only; it never contains bearer tokens,
+pairing JSON, private keys, TURN passwords, relay tickets, clipboard text,
+audio, or frame data.
+
+```sh
+cd engine/lowlat
+cargo test -p openstream-settings --locked
+```
+
+`save_atomic` writes through a same-directory temporary file and creates a
+private parent/file when it owns those paths. Existing environment variables
+remain developer/headless overrides; `apply_environment_overrides` validates
+them without persisting them. The current settings schema is independent of
+the application, protocol, and future database versions.
+
 The 2026-09-07 verification run passed all five commands above. The dependency
 audit permits only a crate-scoped `CC0-1.0` exception for `hexf-parse`, the
 transitive shader-literal parser used by `wgpu`/`naga`; all other non-approved
