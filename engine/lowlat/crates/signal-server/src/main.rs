@@ -22,7 +22,7 @@ use openstream_protocol::relay;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 mod turn;
@@ -33,12 +33,14 @@ mod turn;
 /// WebSocket API capability. Instead, role holders fetch a relay ticket over
 /// the authenticated REST API (`GET /v1/session/{id}/relay`) and present
 /// that in the plaintext relay registration. A ticket is
-/// `hex(HMAC-SHA256(server HMAC input, "relay-ticket-v1" || 0x00 || session_id ||
-/// 0x00 || role_class || 0x00 || subject)) || "." || subject`, so it is
-/// session-, role-class-, and principal-bound, relay-only (useless on the
-/// WebSocket API), and invalidated by session expiry/revocation and by server
-/// restart when the secret is boot-random. The subject is an opaque role name
-/// (`host`/`client`) or guest id; it is not a bearer token.
+/// `hex(HMAC-SHA256(server HMAC input, "relay-ticket-v2" || 0x00 || session_id ||
+/// 0x00 || role_class || 0x00 || subject || 0x00 || socket_generation_be)) ||
+/// "." || socket_generation || "." || subject`, so it is session-,
+/// role-class-, principal-, and primary-socket-generation-bound, relay-only
+/// (useless on the WebSocket API), and invalidated by session
+/// expiry/revocation, socket replacement, and server restart when the secret
+/// is boot-random. The subject is an opaque role name (`host`/`client`) or
+/// guest id; it is not a bearer token.
 mod relay_ticket {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -56,32 +58,49 @@ mod relay_ticket {
     pub(crate) struct Verified {
         pub class: &'static str,
         pub subject: String,
+        pub socket_generation: u64,
     }
 
-    pub(crate) fn mint(secret: &[u8], session_id: &str, class: &str, subject: &str) -> String {
+    pub(crate) fn mint(
+        secret: &[u8],
+        session_id: &str,
+        class: &str,
+        subject: &str,
+        socket_generation: u64,
+    ) -> String {
         let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC takes any key");
-        mac.update(b"relay-ticket-v1");
+        mac.update(b"relay-ticket-v2");
         mac.update(b"\x00");
         mac.update(session_id.as_bytes());
         mac.update(b"\x00");
         mac.update(class.as_bytes());
         mac.update(b"\x00");
         mac.update(subject.as_bytes());
+        mac.update(b"\x00");
+        mac.update(&socket_generation.to_be_bytes());
         let bytes = mac.finalize().into_bytes();
-        let mut out = String::with_capacity(65 + subject.len());
+        let generation = socket_generation.to_string();
+        let mut out = String::with_capacity(66 + generation.len() + subject.len());
         for byte in bytes {
             let _ = core::fmt::write(&mut out, format_args!("{byte:02x}"));
         }
+        out.push('.');
+        out.push_str(&generation);
         out.push('.');
         out.push_str(subject);
         out
     }
 
     /// Verify a presented ticket against both role classes in constant time.
-    /// Returns the matched class and the non-secret principal subject.
+    /// Returns the matched class, non-secret principal subject, and the
+    /// primary socket generation to which the ticket is bound.
     pub(crate) fn verify(secret: &[u8], session_id: &str, ticket: &str) -> Option<Verified> {
-        let (mac, subject) = ticket.split_once('.')?;
+        let (mac, rest) = ticket.split_once('.')?;
+        let (generation_text, subject) = rest.split_once('.')?;
+        let socket_generation = generation_text.parse::<u64>().ok()?;
         if mac.len() != 64
+            || socket_generation == 0
+            || socket_generation.to_string() != generation_text
             || subject.is_empty()
             || subject.len() > MAX_SUBJECT_BYTES
             || !subject
@@ -92,10 +111,16 @@ mod relay_ticket {
         }
         [role_class(true), role_class(false)]
             .into_iter()
-            .find(|class| super::ct_eq(&mint(secret, session_id, class, subject), ticket))
+            .find(|class| {
+                super::ct_eq(
+                    &mint(secret, session_id, class, subject, socket_generation),
+                    ticket,
+                )
+            })
             .map(|class| Verified {
                 class,
                 subject: subject.to_string(),
+                socket_generation,
             })
     }
 }
@@ -211,6 +236,11 @@ struct Session {
     client_token: String,
     host: Option<mpsc::Sender<Message>>,
     client: Option<mpsc::Sender<Message>>,
+    /// Cancellation channels owned by the corresponding WebSocket tasks.
+    /// They are independent of the bounded outbound queues so fail-closed
+    /// teardown cannot be defeated by queue saturation.
+    host_cancel: Option<oneshot::Sender<()>>,
+    client_cancel: Option<oneshot::Sender<()>>,
     /// Connection generations: incremented on every admit, captured by the
     /// connection task, and compared on disconnect cleanup so a stale
     /// connection can never clear a newer connection's sender.
@@ -239,6 +269,8 @@ impl core::fmt::Debug for Session {
             .field("client_token", &"[redacted]")
             .field("host_connected", &self.host.is_some())
             .field("client_connected", &self.client.is_some())
+            .field("host_cancellable", &self.host_cancel.is_some())
+            .field("client_cancellable", &self.client_cancel.is_some())
             .field("establishment_generation", &self.establishment_generation)
             .field("ready_pair", &self.ready_pair)
             .field("pending_host", &self.pending_host.len())
@@ -294,6 +326,15 @@ enum DirectDispatch {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericDispatch {
+    Sent,
+    Queued,
+    Missing,
+    StaleSocket,
+    SendFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadinessError {
     CounterExhausted,
     DeliveryFailed,
@@ -312,6 +353,8 @@ struct RelaySlot {
     addr: SocketAddr,
     /// Redacted owner identity: "host", "client", or a guest id.
     owner: String,
+    /// Primary/guest signaling-socket generation bound into the ticket.
+    socket_generation: u64,
     /// Hash of the registration ticket. Keeping only a digest lets the relay
     /// distinguish a stale cleanup request from a newer registration without
     /// retaining or rendering the bearer capability itself.
@@ -327,6 +370,7 @@ impl core::fmt::Debug for RelaySlot {
         f.debug_struct("RelaySlot")
             .field("addr", &self.addr)
             .field("owner", &self.owner)
+            .field("socket_generation", &self.socket_generation)
             .field("ticket_digest", &"[redacted]")
             .field("last_seen", &self.last_seen)
             .field("window_started", &self.window_started)
@@ -804,6 +848,12 @@ async fn reap_expired_sessions(state: &AppState) -> Vec<mpsc::Sender<Message>> {
         let Some(mut session) = sessions.remove(&id) else {
             continue;
         };
+        if let Some(cancel) = session.host_cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(cancel) = session.client_cancel.take() {
+            let _ = cancel.send(());
+        }
         senders.extend(session.host.take());
         senders.extend(session.client.take());
         senders.extend(
@@ -845,6 +895,8 @@ async fn create_session(
         client_token: client_token.clone(),
         host: None,
         client: None,
+        host_cancel: None,
+        client_cancel: None,
         host_generation: 0,
         client_generation: 0,
         establishment_generation: 0,
@@ -871,8 +923,11 @@ async fn create_session(
     sessions.insert(id.clone(), session);
 
     let websocket_path = format!("/v1/signal/{id}/{{host|client}}");
-    let relay_host_ticket = relay_ticket::mint(&state.relay_secret, &id, "host", "host");
-    let relay_client_ticket = relay_ticket::mint(&state.relay_secret, &id, "client", "client");
+    // The first admitted primary socket for each role is generation one. The
+    // ticket returned with the pairing therefore remains usable when the
+    // role connects for the first time, but cannot be reused after replace.
+    let relay_host_ticket = relay_ticket::mint(&state.relay_secret, &id, "host", "host", 1);
+    let relay_client_ticket = relay_ticket::mint(&state.relay_secret, &id, "client", "client", 1);
     // The tokens are capabilities, so return them only over the create
     // response. The service never logs them.
     Json(SessionCreated {
@@ -906,6 +961,12 @@ async fn revoke_session(
             return (StatusCode::NOT_FOUND, "unknown session\n").into_response();
         };
         let mut senders = Vec::with_capacity(2 + session.guests.len());
+        if let Some(cancel) = session.host_cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(cancel) = session.client_cancel.take() {
+            let _ = cancel.send(());
+        }
         senders.extend(session.host.take());
         senders.extend(session.client.take());
         senders.extend(
@@ -1018,21 +1079,35 @@ async fn session_relay_ticket(
         return (StatusCode::GONE, "session expired\n").into_response();
     }
     let supplied_token = bearer_token(&headers);
-    let (class, subject) = if supplied_token.is_some_and(|token| ct_eq(token, &session.host_token))
-    {
-        ("host", "host".to_string())
-    } else if supplied_token.is_some_and(|token| ct_eq(token, &session.client_token)) {
-        ("client", "client".to_string())
-    } else if let Some(guest) = supplied_token.and_then(|token| {
-        session
-            .guests
-            .iter()
-            .find(|guest| guest.active && ct_eq(&guest.token, token))
-    }) {
-        ("client", guest.id.clone())
-    } else {
-        return (StatusCode::UNAUTHORIZED, "invalid session token\n").into_response();
-    };
+    let (class, subject, socket_generation) =
+        if supplied_token.is_some_and(|token| ct_eq(token, &session.host_token)) {
+            let Some(generation) = (if session.host.is_some() {
+                Some(session.host_generation)
+            } else {
+                session.host_generation.checked_add(1)
+            }) else {
+                return (StatusCode::CONFLICT, "socket generation exhausted\n").into_response();
+            };
+            ("host", "host".to_string(), generation)
+        } else if supplied_token.is_some_and(|token| ct_eq(token, &session.client_token)) {
+            let Some(generation) = (if session.client.is_some() {
+                Some(session.client_generation)
+            } else {
+                session.client_generation.checked_add(1)
+            }) else {
+                return (StatusCode::CONFLICT, "socket generation exhausted\n").into_response();
+            };
+            ("client", "client".to_string(), generation)
+        } else if let Some(guest) = supplied_token.and_then(|token| {
+            session
+                .guests
+                .iter()
+                .find(|guest| guest.active && guest.sender.is_some() && ct_eq(&guest.token, token))
+        }) {
+            ("client", guest.id.clone(), guest.generation)
+        } else {
+            return (StatusCode::UNAUTHORIZED, "invalid session token\n").into_response();
+        };
     #[derive(serde::Serialize)]
     struct RelayTicket {
         ticket: String,
@@ -1040,7 +1115,13 @@ async fn session_relay_ticket(
         role_class: &'static str,
     }
     Json(RelayTicket {
-        ticket: relay_ticket::mint(&state.relay_secret, &session_id, class, &subject),
+        ticket: relay_ticket::mint(
+            &state.relay_secret,
+            &session_id,
+            class,
+            &subject,
+            socket_generation,
+        ),
         session_id: session_id.clone(),
         role_class: class,
     })
@@ -1153,6 +1234,12 @@ fn close_sender(sender: &mpsc::Sender<Message>) {
 /// registrations. This is the only safe outcome when a readiness/reset or
 /// admission operation cannot be completed atomically.
 fn close_primary_pair(session: &mut Session) {
+    if let Some(cancel) = session.host_cancel.take() {
+        let _ = cancel.send(());
+    }
+    if let Some(cancel) = session.client_cancel.take() {
+        let _ = cancel.send(());
+    }
     let host = session.host.take();
     let client = session.client.take();
     if let Some(host) = host.as_ref() {
@@ -1273,6 +1360,7 @@ fn admit_primary_socket(
     session: &mut Session,
     role: PrimaryRole,
     out_tx: &mpsc::Sender<Message>,
+    cancel: oneshot::Sender<()>,
 ) -> Result<u64, AdmissionError> {
     let next_socket_generation = match role {
         PrimaryRole::Host => match session.host_generation.checked_add(1) {
@@ -1312,16 +1400,25 @@ fn admit_primary_socket(
         PrimaryRole::Client => clear_relay_owner(session, "client"),
     }
 
-    let old = match role {
+    let (old, old_cancel) = match role {
         PrimaryRole::Host => {
             session.host_generation = next_socket_generation;
-            session.host.replace(out_tx.clone())
+            (
+                session.host.replace(out_tx.clone()),
+                session.host_cancel.replace(cancel),
+            )
         }
         PrimaryRole::Client => {
             session.client_generation = next_socket_generation;
-            session.client.replace(out_tx.clone())
+            (
+                session.client.replace(out_tx.clone()),
+                session.client_cancel.replace(cancel),
+            )
         }
     };
+    if let Some(old_cancel) = old_cancel {
+        let _ = old_cancel.send(());
+    }
     if let Some(old) = old.as_ref() {
         close_sender(old);
     }
@@ -1357,9 +1454,11 @@ fn cleanup_primary_socket(session: &mut Session, role: PrimaryRole, generation: 
     match role {
         PrimaryRole::Host => {
             session.host.take();
+            session.host_cancel.take();
         }
         PrimaryRole::Client => {
             session.client.take();
+            session.client_cancel.take();
         }
     }
     let survivor = if session.host.is_some() {
@@ -1418,6 +1517,82 @@ fn role_socket_is_current(
                     .is_some_and(|current| current.same_channel(sender))
         }),
     }
+}
+
+/// Validate the source and enqueue generic signaling while the session lock
+/// is held. Keeping target selection and `try_send` in this critical section
+/// prevents an old target sender from being copied, the role being replaced,
+/// and the message then being delivered asynchronously to the stale socket.
+fn dispatch_generic_message(
+    session: &mut Session,
+    role: &Role,
+    generation: u64,
+    sender: &mpsc::Sender<Message>,
+    message: Message,
+) -> GenericDispatch {
+    if !role_socket_is_current(session, role, generation, sender) {
+        return GenericDispatch::StaleSocket;
+    }
+
+    let peers = match role {
+        Role::Host => {
+            // Host announcements fan out to the legacy client and the active
+            // guest.
+            let mut peers = Vec::with_capacity(2);
+            if let Some(client) = session.client.as_ref() {
+                peers.push(client.clone());
+            }
+            if let Some(guest) = session
+                .guests
+                .iter()
+                .find(|guest| guest.active)
+                .and_then(|guest| guest.sender.as_ref())
+            {
+                peers.push(guest.clone());
+            }
+            peers
+        }
+        Role::Client | Role::Guest(_) => session
+            .host
+            .as_ref()
+            .map(|host| vec![host.clone()])
+            .unwrap_or_default(),
+    };
+
+    if peers.is_empty() {
+        // Drop-new past the bounds: the oldest queued messages are usually
+        // the handshake, which must survive a flooding peer.
+        match role {
+            Role::Host => {
+                // Prefer the active guest's queue when one is bridged;
+                // otherwise use the legacy client queue.
+                if let Some(guest) = session.guests.iter_mut().find(|guest| guest.active) {
+                    queue_pending(&mut guest.pending, &mut guest.pending_bytes, message);
+                } else {
+                    queue_pending(
+                        &mut session.pending_client,
+                        &mut session.pending_client_bytes,
+                        message,
+                    );
+                }
+            }
+            Role::Client | Role::Guest(_) => {
+                queue_pending(
+                    &mut session.pending_host,
+                    &mut session.pending_host_bytes,
+                    message,
+                );
+            }
+        }
+        return GenericDispatch::Queued;
+    }
+
+    for peer in peers {
+        if peer.try_send(message.clone()).is_err() {
+            return GenericDispatch::SendFailed;
+        }
+    }
+    GenericDispatch::Sent
 }
 
 fn direct_message_route(
@@ -1535,6 +1710,9 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
     // infrequent; backpressure is preferable to allowing a stalled peer to
     // consume unbounded memory in the service.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(MAX_PENDING_MESSAGES);
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    let mut cancel_tx = Some(cancel_tx);
+    let mut cancel_rx = Some(cancel_rx);
 
     let (expires_at, generation) = {
         let mut sessions = state.sessions.lock().await;
@@ -1548,15 +1726,23 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
         let expires_at = session.expires_at;
         let generation = match &role {
             Role::Host => {
-                let Ok(generation) = admit_primary_socket(session, PrimaryRole::Host, &out_tx)
-                else {
+                let Ok(generation) = admit_primary_socket(
+                    session,
+                    PrimaryRole::Host,
+                    &out_tx,
+                    cancel_tx.take().expect("host cancellation sender"),
+                ) else {
                     return;
                 };
                 generation
             }
             Role::Client => {
-                let Ok(generation) = admit_primary_socket(session, PrimaryRole::Client, &out_tx)
-                else {
+                let Ok(generation) = admit_primary_socket(
+                    session,
+                    PrimaryRole::Client,
+                    &out_tx,
+                    cancel_tx.take().expect("client cancellation sender"),
+                ) else {
                     return;
                 };
                 // The media path stays 1:1: a legacy client claim parks any
@@ -1582,6 +1768,8 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                 generation
             }
             Role::Guest(token) => {
+                drop(cancel_tx.take());
+                cancel_rx = None;
                 let position = session
                     .guests
                     .iter()
@@ -1638,13 +1826,42 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
         (expires_at, generation)
     };
 
+    let (terminal_tx, mut terminal_rx) = oneshot::channel::<Message>();
+    let mut terminal_tx = Some(terminal_tx);
     let mut writer = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
-            if sink.send(message).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                biased;
+                terminal = &mut terminal_rx => {
+                    let Ok(terminal) = terminal else {
+                        break;
+                    };
+                    // A terminal protocol error takes precedence over queued
+                    // non-terminal records. Those records are intentionally
+                    // discarded because the socket closes immediately after
+                    // this diagnostic is delivered.
+                    let _ = sink.send(terminal).await;
+                    break;
+                }
+                message = out_rx.recv() => {
+                    let Some(message) = message else {
+                        break;
+                    };
+                    if sink.send(message).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
+    let cancellation = async move {
+        if let Some(receiver) = cancel_rx {
+            let _ = receiver.await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::pin!(cancellation);
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + SIGNAL_PING_INTERVAL,
         SIGNAL_PING_INTERVAL,
@@ -1746,22 +1963,40 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         | DirectDispatch::StaleSocket
                         | DirectDispatch::SendFailed => break 'socket,
                         DirectDispatch::NotReady => {
-                            let _ = out_tx.try_send(Message::Text(
+                            let error = Message::Text(
                                 "{\"type\":\"error\",\"reason\":\"direct_establishment_not_ready\"}"
                                     .into(),
-                            ));
+                            );
+                            if let Some(sender) = terminal_tx.take() {
+                                if sender.send(error).is_ok() {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        &mut writer,
+                                    )
+                                    .await;
+                                }
+                            }
                             break 'socket;
                         }
                         DirectDispatch::Future => {
-                            let _ = out_tx.try_send(Message::Text(
+                            let error = Message::Text(
                                 "{\"type\":\"error\",\"reason\":\"direct_generation_future\"}"
                                     .into(),
-                            ));
+                            );
+                            if let Some(sender) = terminal_tx.take() {
+                                if sender.send(error).is_ok() {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(1),
+                                        &mut writer,
+                                    )
+                                    .await;
+                                }
+                            }
                             break 'socket;
                         }
                     }
                 }
-                let peers = {
+                let dispatch = {
                     let mut sessions = state.sessions.lock().await;
                     // An expired session stops forwarding immediately; the
                     // entry is reaped here rather than lingering until the
@@ -1772,94 +2007,22 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                     {
                         sessions.remove(&session_id);
                     }
-                    sessions.get(&session_id).and_then(|session| {
-                        if !role_socket_is_current(session, &role, generation, &out_tx) {
-                            return None;
-                        }
-                        Some(match &role {
-                            // Host announcements fan out to the legacy
-                            // client and the active guest.
-                            Role::Host => {
-                                let mut peers = Vec::with_capacity(2);
-                                if let Some(client) = session.client.clone() {
-                                    peers.push(client);
-                                }
-                                if let Some(guest) = session
-                                    .guests
-                                    .iter()
-                                    .find(|guest| guest.active)
-                                    .and_then(|guest| guest.sender.clone())
-                                {
-                                    peers.push(guest);
-                                }
-                                peers
-                            }
-                            Role::Client | Role::Guest(_) => session
-                                .host
-                                .clone()
-                                .map(|host| vec![host])
-                                .unwrap_or_default(),
-                        })
-                    })
+                    match sessions.get_mut(&session_id) {
+                        None => GenericDispatch::Missing,
+                        Some(session) => dispatch_generic_message(
+                            session,
+                            &role,
+                            generation,
+                            &out_tx,
+                            message,
+                        ),
+                    }
                 };
-                match peers {
-                    None => break 'socket,
-                    Some(peers) if peers.is_empty() => {
-                        let mut sessions = state.sessions.lock().await;
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            if session.expires_at <= Instant::now() {
-                                sessions.remove(&session_id);
-                            } else if !role_socket_is_current(session, &role, generation, &out_tx) {
-                                // A fail-closed admission/reset or a socket
-                                // replacement removed this sender. It must not
-                                // keep the session alive by queuing new generic
-                                // signaling records.
-                                break 'socket;
-                            } else {
-                                // Drop-new past the bounds: the oldest queued
-                                // messages are usually the handshake, which
-                                // must survive a flooding peer.
-                                match &role {
-                                    Role::Host => {
-                                        // Prefer the active guest's queue when
-                                        // one is bridged; otherwise legacy.
-                                        if let Some(guest) = session
-                                            .guests
-                                            .iter_mut()
-                                            .find(|guest| guest.active)
-                                        {
-                                            let queue = &mut guest.pending;
-                                            let bytes = &mut guest.pending_bytes;
-                                            queue_pending(queue, bytes, message);
-                                        } else {
-                                            let queue = &mut session.pending_client;
-                                            let bytes = &mut session.pending_client_bytes;
-                                            queue_pending(queue, bytes, message);
-                                        }
-                                    }
-                                    Role::Client | Role::Guest(_) => {
-                                        let queue = &mut session.pending_host;
-                                        let bytes = &mut session.pending_host_bytes;
-                                        queue_pending(queue, bytes, message);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some(peers) => {
-                        for peer in peers {
-                            if !matches!(
-                                tokio::time::timeout(
-                                    Duration::from_secs(2),
-                                    peer.send(message.clone()),
-                                )
-                                .await,
-                                Ok(Ok(()))
-                            ) {
-                                break 'socket;
-                            }
-                        }
-                    }
+                match dispatch {
+                    GenericDispatch::Sent | GenericDispatch::Queued => {}
+                    GenericDispatch::Missing
+                    | GenericDispatch::StaleSocket
+                    | GenericDispatch::SendFailed => break 'socket,
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
@@ -1876,6 +2039,11 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                 // The peer-facing writer failed or was closed. Do not leave
                 // this role published in the session map while its reader is
                 // still able to accept and queue messages.
+                break;
+            }
+            _ = &mut cancellation => {
+                // Fail-closed teardown uses this cancellation path because
+                // the bounded outbound queue may already be full.
                 break;
             }
         }
@@ -2128,6 +2296,45 @@ fn clear_relay_owner(session: &mut Session, owner: &str) {
     }
 }
 
+/// Return the relay owner only when a verified ticket still belongs to the
+/// currently admitted signaling socket for that principal. A ticket issued
+/// to an earlier socket generation remains cryptographically valid, but it is
+/// deliberately unusable after that socket is replaced.
+fn relay_owner_for_ticket(
+    session: &Session,
+    role: relay::Role,
+    ticket: &relay_ticket::Verified,
+) -> Option<String> {
+    match role {
+        relay::Role::Host
+            if ticket.class == "host"
+                && ticket.subject == "host"
+                && session.host.is_some()
+                && ticket.socket_generation == session.host_generation =>
+        {
+            Some("host".to_string())
+        }
+        relay::Role::Client if ticket.class == "client" => {
+            if ticket.subject == "client" {
+                (session.client.is_some() && ticket.socket_generation == session.client_generation)
+                    .then(|| "client".to_string())
+            } else {
+                session
+                    .guests
+                    .iter()
+                    .find(|guest| {
+                        guest.active
+                            && guest.sender.is_some()
+                            && guest.id == ticket.subject
+                            && guest.generation == ticket.socket_generation
+                    })
+                    .map(|guest| guest.id.clone())
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Drain a bounded pending queue into a fresh WebSocket sender. Returns
 /// false when backpressure never clears (the caller drops the connection),
 /// shared by every role so the bound means the same thing everywhere.
@@ -2236,29 +2443,20 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                             None => false,
                             Some(session) if session.expires_at <= Instant::now() => false,
                             Some(session) => {
-                                let owner = relay_ticket::verify(
+                                let verified = relay_ticket::verify(
                                     &state.relay_secret,
                                     unregister.session_id,
                                     unregister.token,
-                                )
-                                .and_then(|ticket| match unregister.role {
-                                    relay::Role::Host
-                                        if ticket.class == "host"
-                                            && ticket.subject == "host"
-                                            && session.host.is_some() => Some("host".to_string()),
-                                    relay::Role::Client
-                                        if ticket.class == "client"
-                                            && ((ticket.subject == "client"
-                                                && session.client.is_some())
-                                                || session.guests.iter().any(|guest| {
-                                                    guest.id == ticket.subject
-                                                        && guest.active
-                                                        && guest.sender.is_some()
-                                                })) => Some(ticket.subject),
-                                    _ => None,
+                                );
+                                let owner = verified.as_ref().and_then(|ticket| {
+                                    relay_owner_for_ticket(session, unregister.role, ticket)
                                 });
                                 if let Some(owner) = owner {
                                     let ticket_digest = relay_ticket_digest(unregister.token);
+                                    let socket_generation = verified
+                                        .as_ref()
+                                        .expect("owner requires a verified relay ticket")
+                                        .socket_generation;
                                     let slot = match unregister.role {
                                         relay::Role::Host => &mut session.relay_host,
                                         relay::Role::Client => &mut session.relay_client,
@@ -2270,6 +2468,7 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                                     if slot.as_ref().is_some_and(|current| {
                                         current.addr == source
                                             && current.owner == owner
+                                            && current.socket_generation == socket_generation
                                             && current.ticket_digest == ticket_digest
                                     }) {
                                         *slot = None;
@@ -2305,75 +2504,38 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                                 ) {
                                     None => false,
                                     Some(ticket) => {
-                                        let class_matches = match registration.role {
-                                            relay::Role::Host => {
-                                                ticket.class == "host" && ticket.subject == "host"
-                                            }
-                                            relay::Role::Client => ticket.class == "client",
-                                        };
-                                        if !class_matches {
-                                            false
-                                        } else {
-                                            let owner = match registration.role {
-                                                relay::Role::Host => "host".to_string(),
-                                                relay::Role::Client => {
-                                                    ticket.subject.clone()
-                                                }
+                                        if let Some(owner) = relay_owner_for_ticket(
+                                            session,
+                                            registration.role,
+                                            &ticket,
+                                        ) {
+                                            let now = Instant::now();
+                                            let slot = RelaySlot {
+                                                addr: source,
+                                                owner,
+                                                socket_generation: ticket.socket_generation,
+                                                ticket_digest: relay_ticket_digest(
+                                                    registration.token,
+                                                ),
+                                                last_seen: now,
+                                                window_started: now,
+                                                window_bytes: 0,
+                                                window_packets: 0,
                                             };
-                                            // A valid ticket is not enough on
-                                            // its own: require the bound
-                                            // principal's live signaling
-                                            // connection. This prevents a
-                                            // parked/kicked guest from using a
-                                            // previously issued client-class
-                                            // ticket after losing admission.
-                                            let principal_connected = match registration.role {
+                                            match registration.role {
                                                 relay::Role::Host => {
-                                                    session.host.is_some()
-                                                        && ticket.subject == "host"
+                                                    // Last registration wins,
+                                                    // but only within one role
+                                                    // class.
+                                                    session.relay_host = Some(slot);
                                                 }
                                                 relay::Role::Client => {
-                                                    if ticket.subject == "client" {
-                                                        session.client.is_some()
-                                                    } else {
-                                                        session.guests.iter().any(|guest| {
-                                                            guest.active
-                                                                && guest.sender.is_some()
-                                                                && guest.id == ticket.subject
-                                                        })
-                                                    }
+                                                    session.relay_client = Some(slot);
                                                 }
-                                            };
-                                            if principal_connected {
-                                                let slot = RelaySlot {
-                                                    addr: source,
-                                                    owner,
-                                                    ticket_digest: relay_ticket_digest(
-                                                        registration.token,
-                                                    ),
-                                                    last_seen: Instant::now(),
-                                                    window_started: Instant::now(),
-                                                    window_bytes: 0,
-                                                    window_packets: 0,
-                                                };
-                                                match registration.role {
-                                                    relay::Role::Host => {
-                                                        // Last registration wins,
-                                                        // but only within one role
-                                                        // class: host and client
-                                                        // slots are separate, so a
-                                                        // guest can never hijack
-                                                        // the host slot.
-                                                        session.relay_host = Some(slot);
-                                                    }
-                                                    relay::Role::Client => {
-                                                        session.relay_client = Some(slot);
-                                                    }
-                                                }
-                                                true
-                                            } else {
-                                                false
                                             }
+                                            true
+                                        } else {
+                                            false
                                         }
                                     }
                                 }
@@ -2453,26 +2615,27 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
 #[cfg(test)]
 mod tests {
     use super::{
-        AdmissionError, AppState, CreationLimiter, DirectRoute, Guest, MAX_GUESTS_CEILING,
-        MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
-        RELAY_PACKETS_PER_SECOND, ReadinessError, RelaySlot, SESSION_CREATE_WINDOW, Session,
-        admit_primary_socket, authorized, bearer_token, cleanup_primary_socket,
-        direct_message_route, max_guests_for_new_session, prune_direct_establishment_messages,
-        publish_ready, queue_pending, reap_expired_sessions, relay_ticket, signal_socket,
+        AdmissionError, AppState, CreationLimiter, DirectRoute, GenericDispatch, Guest,
+        MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
+        RELAY_PACKETS_PER_SECOND, ReadinessError, RelaySlot, Role, SESSION_CREATE_WINDOW, Session,
+        admit_primary_socket as admit_primary_socket_with_cancel, authorized, bearer_token,
+        cleanup_primary_socket, close_primary_pair, direct_message_route, dispatch_generic_message,
+        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
+        queue_pending, reap_expired_sessions, relay_owner_for_ticket, relay_ticket, signal_socket,
         validate_signal_message,
     };
     use axum::Router;
     use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue};
     use axum::routing::get;
-    use futures_util::SinkExt;
+    use futures_util::{SinkExt, StreamExt};
     use openstream_protocol::relay;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::{TcpListener, UdpSocket};
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::{Mutex, mpsc, oneshot};
     use tokio::time::timeout;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
@@ -2485,6 +2648,8 @@ mod tests {
             client_token: "client-token".into(),
             host: None,
             client: None,
+            host_cancel: None,
+            client_cancel: None,
             host_generation: 0,
             client_generation: 0,
             establishment_generation: 0,
@@ -2498,6 +2663,15 @@ mod tests {
             guests: std::collections::VecDeque::new(),
             max_guests: 1,
         }
+    }
+
+    fn admit_primary_socket(
+        session: &mut Session,
+        role: PrimaryRole,
+        out_tx: &mpsc::Sender<Message>,
+    ) -> Result<u64, AdmissionError> {
+        let (cancel, _receiver) = oneshot::channel();
+        admit_primary_socket_with_cancel(session, role, out_tx, cancel)
     }
 
     fn message_text(message: Message) -> String {
@@ -2593,8 +2767,8 @@ mod tests {
     #[test]
     fn relay_tickets_verify_per_class_and_reject_forgeries() {
         let secret = b"test-relay-secret-0123456789";
-        let host = relay_ticket::mint(secret, "session-1", "host", "host");
-        let client = relay_ticket::mint(secret, "session-1", "client", "client");
+        let host = relay_ticket::mint(secret, "session-1", "host", "host", 1);
+        let client = relay_ticket::mint(secret, "session-1", "client", "client", 1);
         let verified_host =
             relay_ticket::verify(secret, "session-1", &host).expect("host ticket verifies");
         assert_eq!(verified_host.class, "host");
@@ -2603,7 +2777,7 @@ mod tests {
             relay_ticket::verify(secret, "session-1", &client).expect("client ticket verifies");
         assert_eq!(verified_client.class, "client");
         assert_eq!(verified_client.subject, "client");
-        let guest = relay_ticket::mint(secret, "session-1", "client", "guest-id-1");
+        let guest = relay_ticket::mint(secret, "session-1", "client", "guest-id-1", 1);
         assert_eq!(
             relay_ticket::verify(secret, "session-1", &guest)
                 .expect("guest ticket verifies")
@@ -2626,11 +2800,63 @@ mod tests {
     }
 
     #[test]
+    fn relay_tickets_bind_to_the_primary_socket_generation() {
+        let secret = b"test-relay-secret-0123456789";
+        let first = relay_ticket::mint(secret, "session-1", "host", "host", 1);
+        let replacement = relay_ticket::mint(secret, "session-1", "host", "host", 2);
+        assert_ne!(first, replacement);
+        assert_eq!(
+            relay_ticket::verify(secret, "session-1", &first)
+                .expect("first ticket verifies")
+                .socket_generation,
+            1
+        );
+        assert_eq!(
+            relay_ticket::verify(secret, "session-1", &replacement)
+                .expect("replacement ticket verifies")
+                .socket_generation,
+            2
+        );
+    }
+
+    #[test]
+    fn old_relay_ticket_cannot_reclaim_ownership_after_primary_replacement() {
+        let secret = b"test-relay-secret-0123456789";
+        let (host_sender, _) = mpsc::channel(1);
+        let mut session = test_session();
+        session.host = Some(host_sender);
+        session.host_generation = 1;
+
+        let old_ticket = relay_ticket::mint(secret, "session-1", "host", "host", 1);
+        let old_verified =
+            relay_ticket::verify(secret, "session-1", &old_ticket).expect("old ticket verifies");
+        assert_eq!(
+            relay_owner_for_ticket(&session, relay::Role::Host, &old_verified),
+            Some("host".into())
+        );
+
+        session.host_generation = 2;
+        assert_eq!(
+            relay_owner_for_ticket(&session, relay::Role::Host, &old_verified),
+            None
+        );
+
+        let new_ticket = relay_ticket::mint(secret, "session-1", "host", "host", 2);
+        let new_verified = relay_ticket::verify(secret, "session-1", &new_ticket)
+            .expect("replacement ticket verifies");
+        assert_eq!(
+            relay_owner_for_ticket(&session, relay::Role::Host, &new_verified),
+            Some("host".into())
+        );
+    }
+
+    #[test]
     fn relay_slot_enforces_packet_and_byte_budgets() {
         let start = Instant::now();
         let mut slot = RelaySlot {
             addr: "127.0.0.1:9000".parse().expect("address"),
             owner: "host".into(),
+            socket_generation: 1,
             ticket_digest: [0; 32],
             last_seen: start,
             window_started: start,
@@ -2654,6 +2880,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_primary_queues_still_cancel_both_fail_closed_tasks() {
+        let (host_tx, mut host_rx) = mpsc::channel(1);
+        host_tx
+            .try_send(Message::Text("full".into()))
+            .expect("fill host queue");
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        client_tx
+            .try_send(Message::Text("full".into()))
+            .expect("fill client queue");
+        let (host_cancel, host_cancelled) = oneshot::channel();
+        let (client_cancel, client_cancelled) = oneshot::channel();
+        let host_task = tokio::spawn(async move {
+            host_cancelled.await.expect("host cancellation");
+        });
+        let client_task = tokio::spawn(async move {
+            client_cancelled.await.expect("client cancellation");
+        });
+        let mut session = test_session();
+        session.host = Some(host_tx);
+        session.client = Some(client_tx);
+        session.host_cancel = Some(host_cancel);
+        session.client_cancel = Some(client_cancel);
+
+        close_primary_pair(&mut session);
+
+        timeout(Duration::from_secs(1), host_task)
+            .await
+            .expect("host task is cancelled")
+            .expect("host task joins");
+        timeout(Duration::from_secs(1), client_task)
+            .await
+            .expect("client task is cancelled")
+            .expect("client task joins");
+        assert!(session.host.is_none());
+        assert!(session.client.is_none());
+        assert!(host_rx.try_recv().is_ok());
+        assert!(client_rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn direct_not_ready_error_reaches_client_before_socket_closes() {
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            admin_token: None,
+            allow_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"test-relay-secret".to_vec(),
+        };
+        state
+            .sessions
+            .lock()
+            .await
+            .insert("session-1".into(), test_session());
+
+        let app = Router::new()
+            .route("/v1/signal/{session_id}/{role}", get(signal_socket))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        let mut request = format!("ws://{address}/v1/signal/session-1/host")
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            "Bearer host-token".parse().expect("authorization header"),
+        );
+        let (mut socket, _) = connect_async(request).await.expect("host connects");
+        socket
+            .send(ClientMessage::Text(
+                r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"192.0.2.10","port":40001}"#.into(),
+            ))
+            .await
+            .expect("send not-ready direct message");
+
+        let response = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("protocol error arrives before timeout")
+            .expect("socket yields a frame")
+            .expect("websocket frame is valid");
+        assert!(matches!(
+            response,
+            ClientMessage::Text(text) if text.contains("direct_establishment_not_ready")
+        ));
+        let _ = timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("socket closes after protocol error");
+
+        server.abort();
+    }
+
+    #[test]
+    fn generic_dispatch_uses_only_the_current_target_after_replacement() {
+        let (old_host, mut old_host_rx) = mpsc::channel(1);
+        old_host
+            .try_send(Message::Text("occupied".into()))
+            .expect("fill old target queue");
+        let (new_host, mut new_host_rx) = mpsc::channel(1);
+        let (client, _client_rx) = mpsc::channel(1);
+        let mut session = test_session();
+        session.host = Some(old_host);
+        session.host_generation = 1;
+        session.client = Some(client.clone());
+        session.client_generation = 1;
+
+        // The replacement is installed before the source is dispatched. The
+        // dispatch must use the current target, never a sender copied from the
+        // previous ownership epoch.
+        session.host = Some(new_host);
+        session.host_generation = 2;
+        assert_eq!(
+            dispatch_generic_message(
+                &mut session,
+                &Role::Client,
+                1,
+                &client,
+                Message::Text(r#"{"type":"ice_candidate_done"}"#.into()),
+            ),
+            GenericDispatch::Sent
+        );
+        assert!(matches!(
+            new_host_rx.try_recv(),
+            Ok(Message::Text(text)) if text.contains("ice_candidate_done")
+        ));
+        assert!(matches!(
+            old_host_rx.try_recv(),
+            Ok(Message::Text(text)) if text == "occupied"
+        ));
+    }
+
+    #[tokio::test]
     async fn replaced_guest_socket_cannot_forward_or_queue_generic_signaling() {
         let (host_sender, mut host_receiver) = mpsc::channel(8);
         let state = AppState {
@@ -2673,6 +3037,8 @@ mod tests {
                 client_token: "client-token".into(),
                 host: Some(host_sender),
                 client: None,
+                host_cancel: None,
+                client_cancel: None,
                 host_generation: 1,
                 client_generation: 0,
                 establishment_generation: 0,
@@ -2748,6 +3114,20 @@ mod tests {
                 .is_err()
         );
 
+        current_socket
+            .send(ClientMessage::Text(
+                r#"{"type":"ice_candidate_done"}"#.into(),
+            ))
+            .await
+            .expect("current socket can submit a frame");
+        assert!(matches!(
+            timeout(Duration::from_millis(100), host_receiver.recv())
+                .await
+                .expect("current socket forwards")
+                .expect("host receiver remains connected"),
+            Message::Text(text) if text.contains("ice_candidate_done")
+        ));
+
         state
             .sessions
             .lock()
@@ -2804,6 +3184,8 @@ mod tests {
                 client_token: "client-token".into(),
                 host: Some(sender),
                 client: None,
+                host_cancel: None,
+                client_cancel: None,
                 host_generation: 1,
                 client_generation: 0,
                 establishment_generation: 0,
@@ -2849,6 +3231,8 @@ mod tests {
                 client_token: "client-token".into(),
                 host: Some(host_sender),
                 client: None,
+                host_cancel: None,
+                client_cancel: None,
                 host_generation: 1,
                 client_generation: 0,
                 establishment_generation: 0,
@@ -2877,7 +3261,7 @@ mod tests {
         let new_socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
             .await
             .unwrap();
-        let ticket = relay_ticket::mint(&secret, "session-1", "host", "host");
+        let ticket = relay_ticket::mint(&secret, "session-1", "host", "host", 1);
 
         old_socket
             .send_to(
@@ -3134,6 +3518,7 @@ mod tests {
         session.relay_host = Some(RelaySlot {
             addr: "127.0.0.1:40001".parse().expect("relay address"),
             owner: "host".into(),
+            socket_generation: 1,
             ticket_digest: [7; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3196,6 +3581,7 @@ mod tests {
         session.relay_host = Some(RelaySlot {
             addr: "127.0.0.1:40001".parse().expect("host relay address"),
             owner: "host".into(),
+            socket_generation: 1,
             ticket_digest: [3; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3205,6 +3591,7 @@ mod tests {
         session.relay_client = Some(RelaySlot {
             addr: "127.0.0.1:40002".parse().expect("client relay address"),
             owner: "client".into(),
+            socket_generation: 1,
             ticket_digest: [4; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3238,6 +3625,7 @@ mod tests {
         session.relay_host = Some(RelaySlot {
             addr: "127.0.0.1:40001".parse().expect("host relay address"),
             owner: "host".into(),
+            socket_generation: 1,
             ticket_digest: [5; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3247,6 +3635,7 @@ mod tests {
         session.relay_client = Some(RelaySlot {
             addr: "127.0.0.1:40002".parse().expect("client relay address"),
             owner: "client".into(),
+            socket_generation: 1,
             ticket_digest: [6; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3289,6 +3678,7 @@ mod tests {
         session.relay_host = Some(RelaySlot {
             addr: "127.0.0.1:40001".parse().expect("host relay address"),
             owner: "host".into(),
+            socket_generation: 1,
             ticket_digest: [8; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3298,6 +3688,7 @@ mod tests {
         session.relay_client = Some(RelaySlot {
             addr: "127.0.0.1:40002".parse().expect("client relay address"),
             owner: "client".into(),
+            socket_generation: 1,
             ticket_digest: [9; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3357,6 +3748,7 @@ mod tests {
         session.relay_host = Some(RelaySlot {
             addr: "127.0.0.1:40001".parse().expect("host relay address"),
             owner: "host".into(),
+            socket_generation: 1,
             ticket_digest: [1; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
@@ -3366,6 +3758,7 @@ mod tests {
         session.relay_client = Some(RelaySlot {
             addr: "127.0.0.1:40002".parse().expect("client relay address"),
             owner: "client".into(),
+            socket_generation: 1,
             ticket_digest: [2; 32],
             last_seen: Instant::now(),
             window_started: Instant::now(),
