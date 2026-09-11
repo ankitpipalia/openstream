@@ -86,7 +86,7 @@
 
   #[test]
   fn an_ack_bit_that_underflows_largest_counter_is_rejected() {
-      let ack = TransportAck { largest_counter: 1, received_mask: 1 << 2, ..valid_ack() };
+      let ack = TransportAck { largest_counter: 1, received_mask: 1 | (1 << 2), ..valid_ack() };
       assert_eq!(TransportAck::decode(&ack.encode().unwrap()), Err(TransportMetaError::CounterUnderflow));
   }
   ```
@@ -143,8 +143,8 @@
 
 - Produces `TrafficClass::{Critical, Audio, Video}`.
 - Produces `SentPacket`, `DeliveryEstimator`, `DeliverySnapshot`, `DeliveryClassSnapshot`, `AckOutcome`, `SendOutcome`, and `DeliveryError`.
-- `DeliveryEstimator` uses exactly 256 `Option<SentPacket>` history slots, `STALE_AFTER_MS = 250.0`, and a `10.0 ms` minimum delivery-rate sample interval.
-- `acknowledge` rejects future counters without mutation, ignores stale generations, retires a matching slot at most once, subtracts `ack_delay_us / 1000.0` from the largest newly acknowledged RTT sample, and exposes decimal Mbps.
+- `DeliveryEstimator` uses exactly 2048 `Option<SentPacket>` history slots, `STALE_AFTER_MS = 250.0`, and a `10.0 ms` minimum delivery-rate sample interval. The fixed bound covers the documented 100 Mbps / 100 ms portable bandwidth-delay envelope at the 1200-byte wire ceiling.
+- `acknowledge` rejects future counters without mutation, ignores stale generations, retires a matching slot at most once, subtracts `ack_delay_us / 1000.0` only when `largest_counter` itself is newly acknowledged, and exposes decimal Mbps.
 
 - [ ] **Step 1: Add failing estimator contract tests.**
 

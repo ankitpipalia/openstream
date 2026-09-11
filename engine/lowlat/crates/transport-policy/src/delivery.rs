@@ -1,7 +1,11 @@
 use core::fmt;
 
 /// Number of fixed delivery-history slots.
-pub const DELIVERY_HISTORY_CAPACITY: usize = 256;
+///
+/// At the portable default wire size (1,200 bytes), this supports the
+/// documented 100 Mbps / 100 ms bandwidth-delay envelope with headroom while
+/// keeping the estimator allocation-free and bounded.
+pub const DELIVERY_HISTORY_CAPACITY: usize = 2_048;
 /// Age at which an unresolved history entry may be explicitly evicted.
 pub const STALE_AFTER_MS: f64 = 250.0;
 /// Minimum interval used when producing a delivery-rate sample.
@@ -77,7 +81,8 @@ pub struct AckOutcome {
     pub newly_acknowledged_packets: u32,
     /// Unique wire bytes retired by this ACK.
     pub newly_acknowledged_bytes: u64,
-    /// RTT sample from the largest newly acknowledged packet, when present.
+    /// RTT sample from `largest_counter` when that packet is newly
+    /// acknowledged by this ACK, when present.
     pub rtt_sample_ms: Option<f64>,
     /// True only for the stale-generation compatibility outcome.
     pub ignored_stale_generation: bool,
@@ -388,7 +393,7 @@ impl DeliveryEstimator {
 
         let mut newly_acknowledged_packets = 0_u32;
         let mut newly_acknowledged_bytes = 0_u64;
-        let mut largest_newly_acknowledged: Option<SentPacket> = None;
+        let mut largest_acknowledged: Option<SentPacket> = None;
 
         for bit in 0_u32..64 {
             if received_mask & (1_u64 << bit) == 0 {
@@ -409,14 +414,15 @@ impl DeliveryEstimator {
             newly_acknowledged_packets = newly_acknowledged_packets.saturating_add(1);
             newly_acknowledged_bytes =
                 newly_acknowledged_bytes.saturating_add(u64::from(entry.bytes));
-            if largest_newly_acknowledged
-                .is_none_or(|largest| entry.outer_counter > largest.outer_counter)
-            {
-                largest_newly_acknowledged = Some(entry);
+            // ACK delay is defined relative to largest_counter. Do not use
+            // the delay for that packet when a later bitmap merely retires an
+            // older packet.
+            if bit == 0 {
+                largest_acknowledged = Some(entry);
             }
         }
 
-        let rtt_sample_ms = largest_newly_acknowledged.map(|entry| {
+        let rtt_sample_ms = largest_acknowledged.map(|entry| {
             let delay_ms = f64::from(ack_delay_us) / 1_000.0;
             let elapsed = elapsed_ms(now_ms, entry.sent_at_ms);
             (elapsed - delay_ms).max(0.0)
@@ -654,6 +660,24 @@ mod tests {
     }
 
     #[test]
+    fn ack_delay_is_not_applied_when_only_an_older_packet_is_newly_acknowledged() {
+        let mut estimator = DeliveryEstimator::new(1);
+        estimator.record_sent(sent(1, 100, 0.0)).unwrap();
+        estimator.record_sent(sent(1, 101, 1.0)).unwrap();
+
+        let first = estimator.acknowledge(1, 101, 1, 0, 11.0).unwrap();
+        assert!((first.rtt_sample_ms.unwrap() - 10.0).abs() < f64::EPSILON);
+
+        // The largest counter was already acknowledged. The second ACK only
+        // retires counter 100, so the delay carried for counter 101 cannot be
+        // subtracted from counter 100's RTT.
+        let second = estimator.acknowledge(1, 101, 0b11, 9_000, 20.0).unwrap();
+        assert_eq!(second.newly_acknowledged_packets, 1);
+        assert_eq!(second.rtt_sample_ms, None);
+        assert!((estimator.snapshot(20.0).srtt_ms.unwrap() - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn first_and_second_rtt_samples_follow_the_fixed_ewma() {
         let mut estimator = DeliveryEstimator::new(1);
         estimator.record_sent(sent(1, 1, 0.0)).unwrap();
@@ -766,19 +790,34 @@ mod tests {
 
     #[test]
     fn ring_aliasing_rejects_a_young_collision_and_explicitly_evicts_stale_entry() {
+        let alias_counter = DELIVERY_HISTORY_CAPACITY as u64 + 1;
         let mut estimator = DeliveryEstimator::new(1);
         estimator
             .record_sent(sent_class(1, 1, 0.0, 100, TrafficClass::Audio, false))
             .unwrap();
 
-        assert!(!estimator.can_record(1, 257, 100.0));
+        assert!(!estimator.can_record(1, alias_counter, 100.0));
         assert_eq!(
-            estimator.record_sent(sent_class(1, 257, 100.0, 200, TrafficClass::Video, false)),
+            estimator.record_sent(sent_class(
+                1,
+                alias_counter,
+                100.0,
+                200,
+                TrafficClass::Video,
+                false
+            )),
             Err(DeliveryError::HistoryFull)
         );
 
         let eviction = estimator
-            .record_sent(sent_class(1, 257, 250.0, 200, TrafficClass::Video, false))
+            .record_sent(sent_class(
+                1,
+                alias_counter,
+                250.0,
+                200,
+                TrafficClass::Video,
+                false,
+            ))
             .unwrap();
         assert!(eviction.stale_evicted);
         assert_eq!(estimator.snapshot(250.0).aggregate.stale, 1);
@@ -789,8 +828,42 @@ mod tests {
         assert_eq!(old_ack.newly_acknowledged_bytes, 0);
         assert_eq!(estimator.snapshot(260.0).aggregate.in_flight, 1);
 
-        estimator.acknowledge(1, 257, 1, 0, 270.0).unwrap();
+        estimator
+            .acknowledge(1, alias_counter, 1, 0, 270.0)
+            .unwrap();
         assert_eq!(estimator.snapshot(270.0).aggregate.in_flight, 0);
+    }
+
+    #[test]
+    fn history_covers_the_documented_hundred_mbps_hundred_ms_bdp() {
+        const PACKET_BYTES: u32 = 1_200;
+        const PACKETS_IN_FLIGHT: u64 = 1_050;
+        const RATE_MBPS: f64 = 100.0;
+        let packet_interval_ms =
+            f64::from(PACKET_BYTES) * 8.0 / (RATE_MBPS * 1_000_000.0) * 1_000.0;
+        let mut estimator = DeliveryEstimator::new(1);
+
+        for counter in 0..PACKETS_IN_FLIGHT {
+            let sent_at_ms = counter as f64 * packet_interval_ms;
+            estimator
+                .record_sent(sent_class(
+                    1,
+                    counter,
+                    sent_at_ms,
+                    PACKET_BYTES,
+                    TrafficClass::Video,
+                    false,
+                ))
+                .expect("documented BDP must not exhaust delivery history");
+        }
+
+        assert_eq!(
+            estimator
+                .snapshot((PACKETS_IN_FLIGHT - 1) as f64 * packet_interval_ms)
+                .aggregate
+                .in_flight,
+            u32::try_from(PACKETS_IN_FLIGHT).expect("test packet count fits in in-flight counter")
+        );
     }
 
     #[test]

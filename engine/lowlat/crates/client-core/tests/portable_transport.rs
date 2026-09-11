@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use openstream_client_core::{
     Capabilities, DeliveryClassSnapshot, FlushOutcome, MigrationTarget, Pairing,
-    PeerDeliverySnapshot, PeerSession, ReliableControl, Role,
+    PeerDeliverySnapshot, PeerSession, ReliableControl, Role, scheduler::CRITICAL_QUEUE_CAPACITY,
 };
 use openstream_media::{AdaptiveBitrate, FrameAck, PeerTelemetryAdapter};
 use openstream_protocol::{Kind, MAX_DATAGRAM, MAX_PLAINTEXT, Session as CipherSession, relay};
+use openstream_transport_policy::DELIVERY_HISTORY_CAPACITY;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -1061,12 +1062,18 @@ async fn history_backpressure_keeps_receive_path_alive() {
     sender.set_wire_pacing_rate(0.0).unwrap();
 
     // Fill every delivery-history slot without letting the receiver process
-    // the packets and return transport ACKs.
-    for _ in 0..256 {
-        sender.queue(Kind::Control, 0, 0, b"history").unwrap();
+    // the packets and return transport ACKs. The application queue is smaller
+    // than the delivery window, so fill the history in bounded batches.
+    let mut sent_packets = 0_usize;
+    while sent_packets < DELIVERY_HISTORY_CAPACITY {
+        let batch = (DELIVERY_HISTORY_CAPACITY - sent_packets).min(CRITICAL_QUEUE_CAPACITY);
+        for _ in 0..batch {
+            sender.queue(Kind::Control, 0, 0, b"history").unwrap();
+        }
+        let report = sender.flush_outbound().await.unwrap();
+        sent_packets += report.sent_packets;
     }
-    let report = sender.flush_outbound().await.unwrap();
-    assert_eq!(report.sent_packets, 256);
+    assert_eq!(sent_packets, DELIVERY_HISTORY_CAPACITY);
     assert_eq!(sender.outbound_pending(), 0);
 
     sender.queue(Kind::Video, 0, 0, b"retained").unwrap();
@@ -1076,11 +1083,11 @@ async fn history_backpressure_keeps_receive_path_alive() {
     );
     assert_eq!(sender.outbound_pending(), 1);
 
-    for _ in 0..256 {
+    for _ in 0..DELIVERY_HISTORY_CAPACITY {
         assert_eq!(receiver.recv().await.unwrap().kind, Kind::Control);
     }
 
-    for _ in 0..256 {
+    for _ in 0..DELIVERY_HISTORY_CAPACITY {
         if sender
             .transport_delivery_snapshot(Instant::now())
             .aggregate

@@ -3,6 +3,21 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Harden portable packet delivery accounting
+
+Portable RTT sampling now uses receiver ACK delay only when the ACK newly
+acknowledges its `largest_counter`; a later bitmap that retires an older
+packet cannot apply the newer packet's delay to the wrong RTT sample. The
+authenticated transport-ACK codec now requires bit 0 of `received_mask` to be
+set, matching the documented bitmap meaning.
+
+The bounded delivery-history ring is now 2,048 entries, covering the
+documented 100 Mbps / 100 ms portable bandwidth-delay envelope at the
+1,200-byte wire ceiling without making the estimator dynamically allocated.
+The regression suite exercises that high-BDP case and the two-ACK RTT-delay
+case. This remains a bounded transport-policy change; it does not claim
+external-WAN acceptance or change the portable wire format.
+
 ## Portable sends now use bounded packet scheduling
 
 `PeerSession` now routes established video, audio, input, and application

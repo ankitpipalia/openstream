@@ -1238,7 +1238,11 @@ pub struct PeerSession {
     cipher: CipherSession,
     stats: SessionStats,
     scheduler: OutboundScheduler,
-    delivery: DeliveryEstimator,
+    // The policy ring is intentionally fixed-size and allocation-free, but
+    // its portable session owner keeps it off async/task stacks. This avoids
+    // making a 100 Mbps / 100 ms delivery window depend on the executor's
+    // thread-stack size.
+    delivery: Box<DeliveryEstimator>,
     transport_ack: TransportAckWindow,
     policy_clock_origin: Instant,
     path_baseline: Option<PathSampleBaseline>,
@@ -1332,13 +1336,13 @@ fn new_transport_state(
     generation: PathGeneration,
 ) -> (
     OutboundScheduler,
-    DeliveryEstimator,
+    Box<DeliveryEstimator>,
     TransportAckWindow,
     Instant,
 ) {
     (
         OutboundScheduler::new(0.0),
-        DeliveryEstimator::new(generation),
+        Box::new(DeliveryEstimator::new(generation)),
         TransportAckWindow::new(generation, TransportAckConfig::default()),
         now,
     )

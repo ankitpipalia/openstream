@@ -32,6 +32,7 @@ pub enum TransportMetaError {
     UnsupportedVersion(u8),
     UnsupportedRecordType(u8),
     ReservedBytes,
+    LargestNotAcknowledged,
     CounterUnderflow,
     AckDelayTooLarge(u32),
 }
@@ -53,6 +54,9 @@ impl core::fmt::Display for TransportMetaError {
                 )
             }
             Self::ReservedBytes => f.write_str("transport metadata reserved bytes are non-zero"),
+            Self::LargestNotAcknowledged => {
+                f.write_str("transport metadata ACK must acknowledge its largest counter")
+            }
             Self::CounterUnderflow => {
                 f.write_str("transport metadata acknowledgement counter underflows")
             }
@@ -71,6 +75,9 @@ impl std::error::Error for TransportMetaError {}
 impl TransportAck {
     /// Encode the fixed v1 acknowledgement record.
     pub fn encode(self) -> Result<[u8; RECORD_LEN], TransportMetaError> {
+        if self.received_mask & 1 == 0 {
+            return Err(TransportMetaError::LargestNotAcknowledged);
+        }
         if self.ack_delay_us > MAX_ACK_DELAY_US {
             return Err(TransportMetaError::AckDelayTooLarge(self.ack_delay_us));
         }
@@ -121,6 +128,9 @@ impl TransportAck {
                 .try_into()
                 .expect("transport metadata length is checked"),
         );
+        if received_mask & 1 == 0 {
+            return Err(TransportMetaError::LargestNotAcknowledged);
+        }
         let ack_delay_us = u32::from_be_bytes(
             bytes[ACK_DELAY_OFFSET..RECORD_LEN]
                 .try_into()
@@ -170,21 +180,21 @@ mod tests {
         let ack = TransportAck {
             generation: 0x0102_0304_0506_0708,
             largest_counter: 0x1112_1314_1516_1718,
-            received_mask: 0x2122_2324_2526_2728,
+            received_mask: 0x2122_2324_2526_2729,
             ack_delay_us: 0x0000_61A8,
         };
         assert_eq!(
             ack.encode().unwrap(),
             [
                 1, 1, 0, 0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14,
-                0x15, 0x16, 0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x00, 0x00,
+                0x15, 0x16, 0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x29, 0x00, 0x00,
                 0x61, 0xA8,
             ]
         );
     }
 
     #[test]
-    fn transport_ack_accepts_all_zero_and_maximum_counters() {
+    fn transport_ack_rejects_missing_largest_bit_and_accepts_maximum_counter() {
         let zero = TransportAck {
             generation: 0,
             largest_counter: 0,
@@ -198,7 +208,17 @@ mod tests {
             ack_delay_us: MAX_ACK_DELAY_US,
         };
 
-        assert_eq!(TransportAck::decode(&zero.encode().unwrap()).unwrap(), zero);
+        assert_eq!(
+            zero.encode(),
+            Err(TransportMetaError::LargestNotAcknowledged)
+        );
+        let mut missing_largest = valid_ack().encode().unwrap();
+        missing_largest[RECEIVED_MASK_OFFSET..ACK_DELAY_OFFSET]
+            .copy_from_slice(&0_u64.to_be_bytes());
+        assert_eq!(
+            TransportAck::decode(&missing_largest),
+            Err(TransportMetaError::LargestNotAcknowledged)
+        );
         assert_eq!(
             TransportAck::decode(&maximum.encode().unwrap()).unwrap(),
             maximum
@@ -293,7 +313,7 @@ mod tests {
     fn an_ack_bit_that_underflows_largest_counter_is_rejected() {
         let ack = TransportAck {
             largest_counter: 1,
-            received_mask: 1 << 2,
+            received_mask: 1 | (1 << 2),
             ..valid_ack()
         };
         assert_eq!(

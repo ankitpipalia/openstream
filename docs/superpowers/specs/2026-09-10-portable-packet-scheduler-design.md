@@ -64,10 +64,13 @@ Out of scope:
    `ReliableControl`, and are coalesced rather than queued.
 2. Every transport ACK carries a bounded `ack_delay_us` for the largest
    acknowledged packet. RTT sampling subtracts only that receiver-controlled
-   delay and uses the largest newly acknowledged ack-eliciting packet.
+   delay and is produced only when `largest_counter` itself is newly
+   acknowledged. A later bitmap that retires only older packets produces no
+   RTT sample, because its delay does not describe those packets.
 3. The ACK bitmap has an exact mathematical meaning: bit 0 acknowledges
    `largest_counter`; bit `n` acknowledges `largest_counter - n` for
-   `1 <= n < 64`. A set bit that would underflow the counter is invalid.
+   `1 <= n < 64`. Bit 0 must be set. A set bit that would underflow the
+   counter is invalid.
 4. ACKs are irrevocable. Once an outer counter is acknowledged, a later ACK
    with a smaller bitmap cannot make it outstanding again.
 5. An ACK with `largest_counter` above the highest outer counter sent for its
@@ -130,7 +133,8 @@ offset  size  field
 
 `MAX_ACK_DELAY_US` is `25_000`. Encoders must reject a larger delay rather
 than wrap it; decoders must reject non-zero reserved bytes, an unsupported
-version/type, counter-underflow bits, or a delay above that bound.
+version/type, a `received_mask` whose bit 0 is clear, counter-underflow bits,
+or a delay above that bound.
 
 The receiver's receive window is the same 64-counter recent window used by
 the record. The receiver tracks only authenticated, active-generation,
@@ -157,8 +161,10 @@ causes the receiver to schedule another ACK.
 
 `openstream-transport-policy::DeliveryEstimator` is dependency-free and
 `#![no_std]`, like the existing pacer. It has
-`DELIVERY_HISTORY_CAPACITY = 256`, `STALE_AFTER_MS = 250.0`, and a minimum
-delivery-rate sample interval of `10.0 ms`.
+`DELIVERY_HISTORY_CAPACITY = 2048`, `STALE_AFTER_MS = 250.0`, and a minimum
+delivery-rate sample interval of `10.0 ms`. The 2048-entry bound covers the
+documented 100 Mbps / 100 ms portable bandwidth-delay envelope at the
+1200-byte wire ceiling while remaining allocation-free and bounded.
 
 The estimator accepts these exact operations:
 
@@ -207,11 +213,14 @@ later occupies the same modulo slot. A successful ACK reports newly
 acknowledged counts/bytes and an optional RTT sample. A duplicate ACK reports
 zero newly acknowledged bytes and cannot change SRTT or delivery totals.
 
-RTT is measured from the largest newly acknowledged entry that is present in
-the history:
+RTT is measured only when the entry for `largest_counter` is present in the
+history and is newly retired by this ACK:
 
 ```text
-sample_ms = max(0, now_ms - sent_at_ms - ack_delay_us / 1000.0)
+if largest_counter is newly acknowledged:
+    sample_ms = max(0, now_ms - sent_at_ms - ack_delay_us / 1000.0)
+else:
+    no RTT sample
 ```
 
 The first sample seeds SRTT. Later samples use the fixed EWMA
