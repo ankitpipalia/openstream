@@ -100,6 +100,13 @@ The report distinguishes DRM/KMS framebuffer reachability, X11/PipeWire
 availability, FFmpeg and hardware candidates, and `/dev/uinput` presence. It
 is diagnostic output, not proof of a live encoder/driver stream.
 
+The physical Linux-NVIDIA → Apple-Silicon macOS MVP acceptance is recorded in
+[`docs/BUILD.md`](docs/BUILD.md#physical-linux-nvidia--macos-apple-silicon-mvp-acceptance).
+It validates the X11/FFmpeg `h264_nvenc` fallback, direct authenticated UDP,
+the existing FFmpeg decoder, and software/wgpu Metal presentation. Native
+DRM/KMS capture, VideoToolbox decode/encode, decoded-frame zero-copy, and
+WAN/TURN acceptance remain separate gates.
+
 To exercise the built-in opaque relay, configure a reachable relay endpoint
 and set `OPENSTREAM_FORCE_RELAY=1`. For local testing:
 
@@ -174,16 +181,17 @@ commit it, put it in a public issue, or include it in logs.
 ## Current status
 
 The local development path is functional and validated through direct UDP,
-forced relay, authenticated loopback ICE, and startup-order-independent
-direct-v2 establishment. The GitHub workflow also runs the full-ICE loopback,
-a short encrypted FFmpeg media loopback, and the host-checkable mobile
-acceptance harness on Ubuntu. The implementation is not yet a finished
-product: public-NAT/coturn interoperability, long-run Linux hardware
-acceptance, exact Direct3D11/native GPU-driver acceptance, durable
-signaling/account state, native Windows/macOS hosting, native desktop audio,
-OS virtual microphone routing, virtual displays, Windows/macOS virtual
-gamepads, Android/iOS device builds, USB passthrough, and multi-guest media
-fan-out remain tracked work.
+forced relay, authenticated loopback ICE, startup-order-independent direct-v2
+establishment, and a real SteamOS/NVIDIA Linux-host → Apple-Silicon macOS-client
+fallback stream. The GitHub workflow also runs the full-ICE loopback, a short
+encrypted FFmpeg media loopback, and the host-checkable mobile acceptance
+harness on Ubuntu. The implementation is not yet a finished product:
+public-NAT/coturn interoperability, native DRM/KMS capture, long-run hardware
+quality, exact Direct3D11/native GPU-driver acceptance, native macOS/Windows
+capture and encode, VideoToolbox/zero-copy decode, durable signaling/account
+state, native desktop audio, OS virtual microphone routing, virtual displays,
+Windows/macOS virtual gamepads, Android/iOS device builds, USB passthrough,
+and multi-guest media fan-out remain tracked work.
 
 The legacy `lowlat-tray` binary is intentionally not load-bearing and remains
 an open compatibility-engine phase. It is separate from the OpenStream

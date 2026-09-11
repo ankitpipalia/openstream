@@ -28,6 +28,12 @@ connectivity gate; entries marked "not yet run" are honest gaps, not claims.
 | CGNAT (shared address space) | CGNAT, same provider | Direct only with opt-in shared-space candidates | Not yet run |
 | Any | Any, UDP blocked | TURN/TCP or failure with typed outcome | Not yet run (UDP-only relay at present) |
 
+The same-LAN hardware acceptance is recorded separately from the NAT matrix:
+the SteamOS/NVIDIA X11/FFmpeg host delivered H.264 to the Apple Silicon macOS
+client over an authenticated direct UDP host-candidate path. The signaling
+service was loopback-bound and SSH-forwarded; this does not prove public NAT,
+CGNAT, coturn, or WAN behavior.
+
 ## OpenStream-owned path migration
 
 Direct and the application-owned opaque relay are separate OpenStream path

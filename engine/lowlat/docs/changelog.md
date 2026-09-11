@@ -3,6 +3,37 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Linux NVIDIA host to Apple Silicon macOS client acceptance
+
+The documented fallback MVP now has a physical Linux-host/macOS-client
+acceptance record. A SteamOS x86_64 host with an NVIDIA GeForce GTX 970 used
+X11 capture and FFmpeg `h264_nvenc` to stream authenticated H.264 over direct
+LAN UDP to an Apple M1 Max client. The client decoded the stream with FFmpeg;
+both the software presenter and the existing wgpu Metal presenter ran.
+
+This is evidence for the X11/FFmpeg/NVENC fallback path only. The native DRM
+capture adapter, ScreenCaptureKit/VideoToolbox media path, decoded-frame
+zero-copy presentation, public-NAT/TURN behavior, audio/input, and long-run
+hardware quality remain separate acceptance gates. The full reproducible
+record, safe firewall guidance, and observed environment are in
+[`docs/BUILD.md`](../../../docs/BUILD.md#physical-linux-nvidia--macos-apple-silicon-mvp-acceptance).
+
+## Startup-order-independent direct establishment
+
+Direct-v2 establishment now waits for a server-published readiness epoch
+instead of consuming the candidate/key phase timeout while the peer is not
+yet connected. The signaling service keeps socket generations separate from
+monotonic establishment generations, publishes readiness only to the current
+host/client pair, invalidates epochs on replacement, and preserves unrelated
+signaling records during reset.
+
+Generation-tagged direct candidates, completion markers, and signed keys are
+kept separate from the existing ICE vocabulary. The direct key transcript is
+bound to the session, establishment generation, authenticated role, and
+ephemeral key. Reconnect races, stale signed keys, duplicate records, and a
+host-first delay beyond the historical 15-second deadline are covered by
+deterministic tests and `scripts/startup-order-smoke.sh`.
+
 ## Harden portable packet delivery accounting
 
 Portable RTT sampling now uses receiver ACK delay only when the ACK newly

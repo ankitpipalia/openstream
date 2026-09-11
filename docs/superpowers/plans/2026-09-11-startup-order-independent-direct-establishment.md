@@ -123,23 +123,24 @@
 
 **Steps:**
 
-- [ ] Run Linux preflight and record GPU, capture, encoder, output, input, and audio diagnostics without secrets.
-- [ ] Run the host-first smoke using a fresh local pairing, direct LAN UDP, H.264, and a bounded 10-minute or available-duration stream.
-- [ ] Run macOS software presentation first, then the existing wgpu Metal presentation smoke/session if software is stable.
-- [ ] Capture evidence: exact commit, OS/kernel/driver/FFmpeg versions, negotiated codec/resolution/FPS, direct path, duration, frame acknowledgements, errors, and clean shutdown.
-- [ ] If native DRM fails, make the fallback selection/reporting explicit and preserve X11/FFmpeg/NVENC as the supported MVP path; do not silently advertise native DRM success.
-- [ ] Update docs only with observed results and remaining gates; redact pairing JSON, tokens, keys, IPs if not needed, and user data.
-- [ ] Run: the narrow hardware commands plus a final workspace test/lint/build on the exact commit.
-- [ ] Commit: `docs: record Linux NVIDIA to macOS MVP acceptance`.
+- [x] Run Linux preflight and record GPU, capture, encoder, output, input, and audio diagnostics without secrets.
+- [x] Run the host-first smoke using a fresh local pairing, direct LAN UDP, H.264, and a bounded available-duration stream.
+- [x] Run macOS software presentation first, then the existing wgpu Metal presentation smoke/session after software was stable.
+- [x] Capture evidence: exact commit, OS/kernel/driver/FFmpeg versions, negotiated codec/resolution/FPS, direct path, duration, frame acknowledgements, errors, and clean shutdown.
+- [x] If native DRM fails, make the fallback selection/reporting explicit and preserve X11/FFmpeg/NVENC as the supported MVP path; do not silently advertise native DRM success.
+- [x] Update docs only with observed results and remaining gates; redact pairing JSON, tokens, keys, IPs if not needed, and user data.
+- [x] Run: the narrow hardware commands plus a final workspace test/lint/build on the exact commit.
+- [x] Commit: `docs: record Linux NVIDIA to macOS MVP acceptance`.
 
 **Expected result:** The repository contains a reproducible, honest acceptance record for the real Linux-host/macOS-client MVP and clearly separates tested fallback functionality from untested native/advanced backends.
 
 ## Completion Checklist
 
-- [ ] Tasks 1–3 implementation/tests pass locally and in PR CI.
-- [ ] Direct host-first startup no longer fails merely because the client arrived after 15 seconds.
-- [ ] ICE behavior remains unchanged and direct-v2 messages cannot be confused with ICE messages.
-- [ ] Secure authentication/identity paths remain implemented; local no-auth mode is explicit and constrained.
-- [ ] Linux NVIDIA → macOS Apple Silicon stream is reproduced from documented commands with clean shutdown.
-- [ ] No production claim says native DRM, VideoToolbox decode, zero-copy Metal, WAN/TURN, or fancy device integrations are tested unless evidence exists.
-- [ ] Remaining production gaps are recorded rather than hidden: durable product accounts/UI, signed packaging/updates, native media, external NAT, virtual devices, and long-run QA.
+- [x] Tasks 1–3 implementation/tests pass locally.
+- [ ] A PR-triggered protected CI run verifies Tasks 1–3 on this branch.
+- [x] Direct host-first startup no longer fails merely because the client arrived after 15 seconds.
+- [x] ICE behavior remains unchanged and direct-v2 messages cannot be confused with ICE messages.
+- [x] Secure authentication/identity paths remain implemented; local no-auth mode is explicit and constrained.
+- [x] Linux NVIDIA → macOS Apple Silicon stream is reproduced from documented commands with clean shutdown.
+- [x] No production claim says native DRM, VideoToolbox decode, zero-copy Metal, WAN/TURN, or fancy device integrations are tested unless evidence exists.
+- [x] Remaining production gaps are recorded rather than hidden: durable product accounts/UI, signed packaging/updates, native media, external NAT, virtual devices, and long-run QA.

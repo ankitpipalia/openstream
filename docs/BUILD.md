@@ -48,6 +48,80 @@ best-effort. This verifies the application fallback path on a machine without
 a controlled test IGD; it is not evidence of successful physical-router
 mapping.
 
+## Physical Linux NVIDIA → macOS Apple Silicon MVP acceptance
+
+On 2026-09-12, commit `b407d5474f799ca4b5bca4a50c90eca1454b5763` was tested
+between a SteamOS Linux host and an Apple Silicon macOS client on the same
+LAN. The signal service was bound to loopback and reached from macOS through
+an SSH port forward; the media path was direct UDP between the two LAN
+addresses. Pairing and identity material stayed outside the repository.
+
+The tested host fallback was deliberately explicit because the native DRM
+preflight could not reach the NVIDIA scanout buffer:
+
+```sh
+DISPLAY=:0 \
+XDG_RUNTIME_DIR=/run/user/1000 \
+WAYLAND_DISPLAY=wayland-0 \
+OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:18080 \
+OPENSTREAM_PAIRING_JSON="$(cat /tmp/openstream-pairing.json)" \
+OPENSTREAM_UDP_BIND=<linux-lan-address>:40001 \
+OPENSTREAM_VIDEO_MBPS=8 \
+OPENSTREAM_VIDEO_ENCODER=h264_nvenc \
+OPENSTREAM_CAPTURE_BACKEND=x11grab \
+OPENSTREAM_FFMPEG_INPUT=:0.0 \
+target/release/openstream-ffmpeg-host </dev/null
+```
+
+The client was checked with the software presenter and then with the existing
+wgpu Metal presenter:
+
+```sh
+OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:18080 \
+OPENSTREAM_PAIRING_JSON="$(cat /tmp/openstream-pairing.json)" \
+OPENSTREAM_UDP_BIND=<mac-lan-address>:40002 \
+OPENSTREAM_RENDERER=software \
+target/release/openstream-desktop-client
+
+# Repeat with OPENSTREAM_RENDERER=metal after software presentation is stable.
+```
+
+Observed environment and results:
+
+| Side | Observed environment/result |
+|---|---|
+| Linux host | SteamOS Holo, x86_64, kernel `6.16.12-valve24.5-1-neptune-616-gb2f7cfe85e45` |
+| Linux GPU | NVIDIA GeForce GTX 970, driver `580.178.04` |
+| Linux FFmpeg | `n7.1.1`; direct `h264_nvenc` encode smoke passed |
+| Capture/encode | X11 `:0.0` → FFmpeg `h264_nvenc`, 1920×1080, 60 fps, 8 Mbps |
+| macOS client | macOS `26.6.2`, Apple M1 Max, FFmpeg `9.0.1` |
+| Transport | authenticated direct UDP; H.264 negotiated at 1920×1080/60; audio and input disabled |
+| Headless media run | 15 seconds; Linux sent 894 encoded chunks and macOS wrote 894 decoded access units |
+| Client transport counters | 908 sent packets / 51,127 sent wire bytes; 1,841 received packets / 104,831 received payload bytes |
+| Host transport counters | 1,841 sent packets / 163,743 sent wire bytes; 908 received packets / 22,071 received payload bytes |
+| Presenters | software session ran; Metal initialized as `Metal via Metal (Apple M1 Max)` and the windowed session ran |
+
+The Linux preflight reported an HDMI-A-1 output and active X11/PipeWire
+sources, but `native_drm.capturable` was `not_reachable` and
+`host_capture_gate` was `false`. The physical acceptance therefore proves the
+X11/FFmpeg/NVENC fallback, not the native DRM/KMS capture adapter. On this
+SteamOS image the filesystem-only NVIDIA library probe also reported
+`nvenc_library=false` even though an explicit FFmpeg `h264_nvenc` smoke and
+the live session succeeded with the runtime loader configuration. Use the
+explicit encoder setting above until automatic encoder discovery understands
+that non-standard driver layout.
+
+The macOS application firewall must allow the actual packaged desktop client
+executable to receive the direct UDP response. An unapproved development
+worktree binary failed with `NoReachableCandidate`; the same build ran from an
+allow-listed application path. Do not disable the firewall or use a raw UDP
+preflight as a product workaround—sign/package the client or approve its path
+in the normal macOS firewall controls.
+
+This acceptance does not claim native DRM capture, ScreenCaptureKit,
+VideoToolbox decode/encode, decoded-frame zero-copy, WAN/public-NAT, TURN,
+audio, input, or long-run hardware quality. Those remain separate gates.
+
 Use [`scripts/build-openstream.sh`](../scripts/build-openstream.sh), or
 [`scripts/build-openstream.ps1`](../scripts/build-openstream.ps1) on native
 Windows, to build the project-owned artifacts for one target.
