@@ -105,6 +105,10 @@ const DEFAULT_TTL_SECONDS: u64 = 3600;
 const MAX_TTL_SECONDS: u64 = 24 * 60 * 60;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_PENDING_MESSAGES: usize = 128;
+const MAX_DIRECT_CANDIDATES: u64 = 32;
+const RESET_REASON_ROLE_REPLACED: &str = "role_replaced";
+const RESET_REASON_PEER_DISCONNECTED: &str = "peer_disconnected";
+const RESET_REASON_DELIVERY_FAILED: &str = "delivery_failed";
 /// Maximum queued signaling bytes per pending queue. Queues are dropped-new
 /// past this so a flooding peer cannot flush handshake messages or grow a
 /// session's memory without bound.
@@ -212,6 +216,11 @@ struct Session {
     /// connection can never clear a newer connection's sender.
     host_generation: u64,
     client_generation: u64,
+    /// Monotonic server-owned direct-establishment epoch. This is separate
+    /// from the per-role socket generations above.
+    establishment_generation: u64,
+    /// The only direct epoch currently usable by the exact current pair.
+    ready_pair: Option<ReadyPair>,
     pending_host: VecDeque<Message>,
     pending_client: VecDeque<Message>,
     pending_host_bytes: usize,
@@ -230,6 +239,8 @@ impl core::fmt::Debug for Session {
             .field("client_token", &"[redacted]")
             .field("host_connected", &self.host.is_some())
             .field("client_connected", &self.client.is_some())
+            .field("establishment_generation", &self.establishment_generation)
+            .field("ready_pair", &self.ready_pair)
             .field("pending_host", &self.pending_host.len())
             .field("pending_client", &self.pending_client.len())
             .field("relay_host", &self.relay_host)
@@ -238,6 +249,49 @@ impl core::fmt::Debug for Session {
             .field("max_guests", &self.max_guests)
             .finish_non_exhaustive()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadyPair {
+    establishment_generation: u64,
+    host_generation: u64,
+    client_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryRole {
+    Host,
+    Client,
+}
+
+impl PrimaryRole {
+    fn opposite(self) -> Self {
+        match self {
+            Self::Host => Self::Client,
+            Self::Client => Self::Host,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DirectRoute {
+    Forward(mpsc::Sender<Message>),
+    DropStale,
+    NotReady,
+    Future,
+    StaleSocket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessError {
+    CounterExhausted,
+    DeliveryFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionError {
+    SocketGenerationExhausted,
+    Readiness(ReadinessError),
 }
 
 /// One relay endpoint registration: the source address plus which session
@@ -782,6 +836,8 @@ async fn create_session(
         client: None,
         host_generation: 0,
         client_generation: 0,
+        establishment_generation: 0,
+        ready_pair: None,
         pending_host: VecDeque::new(),
         pending_client: VecDeque::new(),
         pending_host_bytes: 0,
@@ -1019,6 +1075,315 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
+fn direct_ready_message(generation: u64) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "peer_ready",
+            "establishment_generation": generation,
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+fn direct_reset_message(generation: u64, reason: &'static str) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "peer_reset",
+            "establishment_generation": generation,
+            "reason": reason,
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+fn direct_message_generation(message: &Message) -> Option<u64> {
+    let Message::Text(text) = message else {
+        return None;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let message_type = value.get("type").and_then(serde_json::Value::as_str)?;
+    matches!(
+        message_type,
+        "direct_candidate" | "direct_candidate_done" | "direct_key"
+    )
+    .then(|| {
+        value
+            .get("establishment_generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    })
+}
+
+fn prune_direct_queue(queue: &mut VecDeque<Message>, queued_bytes: &mut usize) {
+    queue.retain(|message| !is_direct_establishment_message(message));
+    *queued_bytes = queue.iter().map(message_len).sum();
+}
+
+/// Remove only project-owned direct-establishment records. ICE and unrelated
+/// signaling envelopes remain available to a reconnecting socket.
+fn prune_direct_establishment_messages(session: &mut Session) {
+    prune_direct_queue(&mut session.pending_host, &mut session.pending_host_bytes);
+    prune_direct_queue(
+        &mut session.pending_client,
+        &mut session.pending_client_bytes,
+    );
+    for guest in &mut session.guests {
+        prune_direct_queue(&mut guest.pending, &mut guest.pending_bytes);
+    }
+}
+
+fn close_sender(sender: &mpsc::Sender<Message>) {
+    let _ = sender.try_send(Message::Close(None));
+}
+
+/// Publish one server-authoritative direct epoch to the exact current host and
+/// client sockets. The generation is reserved before the two bounded enqueue
+/// operations, so an enqueue failure burns the epoch rather than ever
+/// allowing it to be reused.
+fn publish_ready(session: &mut Session) -> Result<u64, ReadinessError> {
+    let Some(host) = session.host.clone() else {
+        return Err(ReadinessError::DeliveryFailed);
+    };
+    let Some(client) = session.client.clone() else {
+        return Err(ReadinessError::DeliveryFailed);
+    };
+    let Some(generation) = session.establishment_generation.checked_add(1) else {
+        let host = session.host.take();
+        let client = session.client.take();
+        if let Some(host) = host.as_ref() {
+            close_sender(host);
+        }
+        if let Some(client) = client.as_ref() {
+            close_sender(client);
+        }
+        session.ready_pair = None;
+        return Err(ReadinessError::CounterExhausted);
+    };
+    session.establishment_generation = generation;
+    session.ready_pair = None;
+    prune_direct_establishment_messages(session);
+
+    let mut accepted_host = false;
+    let mut accepted_client = false;
+    if host.try_send(direct_ready_message(generation)).is_ok() {
+        accepted_host = true;
+    }
+    if client.try_send(direct_ready_message(generation)).is_ok() {
+        accepted_client = true;
+    }
+    if accepted_host && accepted_client {
+        session.ready_pair = Some(ReadyPair {
+            establishment_generation: generation,
+            host_generation: session.host_generation,
+            client_generation: session.client_generation,
+        });
+        return Ok(generation);
+    }
+
+    // A partial readiness publication is never a usable pair. Compensate the
+    // sender that accepted readiness, then remove both current senders so the
+    // next epoch can only be formed by a clean pair of sockets.
+    if accepted_host {
+        let reset = direct_reset_message(generation, RESET_REASON_DELIVERY_FAILED);
+        if host.try_send(reset).is_err() {
+            close_sender(&host);
+        }
+        close_sender(&host);
+    }
+    if accepted_client {
+        let reset = direct_reset_message(generation, RESET_REASON_DELIVERY_FAILED);
+        if client.try_send(reset).is_err() {
+            close_sender(&client);
+        }
+        close_sender(&client);
+    }
+    session.host = None;
+    session.client = None;
+    session.ready_pair = None;
+    Err(ReadinessError::DeliveryFailed)
+}
+
+/// Invalidate a currently published epoch while preserving the single current
+/// sender for the role that did not change. A failed reset is fail-closed: the
+/// survivor is dropped and no replacement readiness may be published.
+fn invalidate_ready_epoch(
+    session: &mut Session,
+    reason: &'static str,
+    survivor: Option<PrimaryRole>,
+) -> Result<(), ReadinessError> {
+    let Some(previous) = session.ready_pair.take() else {
+        prune_direct_establishment_messages(session);
+        return Ok(());
+    };
+    prune_direct_establishment_messages(session);
+    let Some(survivor) = survivor else {
+        return Ok(());
+    };
+    let sender = match survivor {
+        PrimaryRole::Host => session.host.as_ref(),
+        PrimaryRole::Client => session.client.as_ref(),
+    };
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+    if sender
+        .try_send(direct_reset_message(
+            previous.establishment_generation,
+            reason,
+        ))
+        .is_err()
+    {
+        let host = session.host.take();
+        let client = session.client.take();
+        if let Some(host) = host.as_ref() {
+            close_sender(host);
+        }
+        if let Some(client) = client.as_ref() {
+            close_sender(client);
+        }
+        return Err(ReadinessError::DeliveryFailed);
+    }
+    Ok(())
+}
+
+/// Install a current host/client sender and, when the pair is complete,
+/// publish the next direct epoch. This helper is deliberately synchronous
+/// under the session-map lock so a replacement cannot race readiness.
+fn admit_primary_socket(
+    session: &mut Session,
+    role: PrimaryRole,
+    out_tx: &mpsc::Sender<Message>,
+) -> Result<u64, AdmissionError> {
+    let next_socket_generation = match role {
+        PrimaryRole::Host => session
+            .host_generation
+            .checked_add(1)
+            .ok_or(AdmissionError::SocketGenerationExhausted)?,
+        PrimaryRole::Client => session
+            .client_generation
+            .checked_add(1)
+            .ok_or(AdmissionError::SocketGenerationExhausted)?,
+    };
+    let replacing = match role {
+        PrimaryRole::Host => session.host.is_some(),
+        PrimaryRole::Client => session.client.is_some(),
+    };
+    if replacing {
+        invalidate_ready_epoch(session, RESET_REASON_ROLE_REPLACED, Some(role.opposite()))
+            .map_err(AdmissionError::Readiness)?;
+    } else {
+        // A disconnected role invalidates any stale direct queues even if the
+        // previous ready pair was already cleared by cleanup.
+        prune_direct_establishment_messages(session);
+    }
+
+    let old = match role {
+        PrimaryRole::Host => {
+            session.host_generation = next_socket_generation;
+            session.host.replace(out_tx.clone())
+        }
+        PrimaryRole::Client => {
+            session.client_generation = next_socket_generation;
+            session.client.replace(out_tx.clone())
+        }
+    };
+    if let Some(old) = old.as_ref() {
+        close_sender(old);
+    }
+
+    let pending = match role {
+        PrimaryRole::Host => (&mut session.pending_host, &mut session.pending_host_bytes),
+        PrimaryRole::Client => (
+            &mut session.pending_client,
+            &mut session.pending_client_bytes,
+        ),
+    };
+    if !drain_into(pending.0, pending.1, out_tx) {
+        match role {
+            PrimaryRole::Host => {
+                session.host = None;
+            }
+            PrimaryRole::Client => {
+                session.client = None;
+            }
+        }
+        return Err(AdmissionError::Readiness(ReadinessError::DeliveryFailed));
+    }
+
+    if session.host.is_some() && session.client.is_some() {
+        publish_ready(session).map_err(AdmissionError::Readiness)?;
+    }
+    Ok(next_socket_generation)
+}
+
+/// Remove a primary sender only when the cleanup belongs to the current socket.
+/// Stale tasks have no authority to invalidate the current direct epoch.
+fn cleanup_primary_socket(session: &mut Session, role: PrimaryRole, generation: u64) -> bool {
+    let current_generation = match role {
+        PrimaryRole::Host => session.host_generation,
+        PrimaryRole::Client => session.client_generation,
+    };
+    if current_generation != generation {
+        return false;
+    }
+    match role {
+        PrimaryRole::Host => {
+            session.host.take();
+        }
+        PrimaryRole::Client => {
+            session.client.take();
+        }
+    }
+    let survivor = if session.host.is_some() {
+        Some(PrimaryRole::Host)
+    } else if session.client.is_some() {
+        Some(PrimaryRole::Client)
+    } else {
+        None
+    };
+    let _ = invalidate_ready_epoch(session, RESET_REASON_PEER_DISCONNECTED, survivor);
+    true
+}
+
+fn direct_message_route(
+    session: &Session,
+    role: PrimaryRole,
+    socket_generation: u64,
+    establishment_generation: u64,
+) -> DirectRoute {
+    let current_socket_generation = match role {
+        PrimaryRole::Host => session.host_generation,
+        PrimaryRole::Client => session.client_generation,
+    };
+    if current_socket_generation != socket_generation {
+        return DirectRoute::StaleSocket;
+    }
+    let Some(ready) = session.ready_pair else {
+        return DirectRoute::NotReady;
+    };
+    let expected_socket_generation = match role {
+        PrimaryRole::Host => ready.host_generation,
+        PrimaryRole::Client => ready.client_generation,
+    };
+    if expected_socket_generation != socket_generation {
+        return DirectRoute::StaleSocket;
+    }
+    if establishment_generation < ready.establishment_generation {
+        return DirectRoute::DropStale;
+    }
+    if establishment_generation > ready.establishment_generation {
+        return DirectRoute::Future;
+    }
+    let peer = match role {
+        PrimaryRole::Host => session.client.clone(),
+        PrimaryRole::Client => session.host.clone(),
+    };
+    peer.map(DirectRoute::Forward)
+        .unwrap_or(DirectRoute::NotReady)
+}
+
 async fn signal_socket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -1110,38 +1475,17 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
         let expires_at = session.expires_at;
         let generation = match &role {
             Role::Host => {
-                session.host_generation = session.host_generation.wrapping_add(1);
-                let generation = session.host_generation;
-                // A duplicate host connection replaces the old one: close it
-                // promptly (try_send never blocks under the map lock) so the
-                // stale task cannot keep forwarding as this role.
-                if let Some(old) = session.host.replace(out_tx.clone()) {
-                    let _ = old.try_send(Message::Close(None));
-                }
-                if !drain_into(
-                    &mut session.pending_host,
-                    &mut session.pending_host_bytes,
-                    &out_tx,
-                ) {
-                    session.host.take();
+                let Ok(generation) = admit_primary_socket(session, PrimaryRole::Host, &out_tx)
+                else {
                     return;
-                }
+                };
                 generation
             }
             Role::Client => {
-                session.client_generation = session.client_generation.wrapping_add(1);
-                let generation = session.client_generation;
-                if let Some(old) = session.client.replace(out_tx.clone()) {
-                    let _ = old.try_send(Message::Close(None));
-                }
-                if !drain_into(
-                    &mut session.pending_client,
-                    &mut session.pending_client_bytes,
-                    &out_tx,
-                ) {
-                    session.client.take();
+                let Ok(generation) = admit_primary_socket(session, PrimaryRole::Client, &out_tx)
+                else {
                     return;
-                }
+                };
                 // The media path stays 1:1: a legacy client claim parks any
                 // bridged guest so two writers never race the host.
                 let parked = session
@@ -1278,6 +1622,65 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                 }
 
                 let message = Message::Text(text);
+                if let Some(establishment_generation) = direct_message_generation(&message) {
+                    let route = {
+                        let mut sessions = state.sessions.lock().await;
+                        if sessions
+                            .get(&session_id)
+                            .is_some_and(|session| session.expires_at <= Instant::now())
+                        {
+                            sessions.remove(&session_id);
+                        }
+                        sessions.get(&session_id).map(|session| match &role {
+                            Role::Host => direct_message_route(
+                                session,
+                                PrimaryRole::Host,
+                                generation,
+                                establishment_generation,
+                            ),
+                            Role::Client => direct_message_route(
+                                session,
+                                PrimaryRole::Client,
+                                generation,
+                                establishment_generation,
+                            ),
+                            // Guests use the legacy client fan-out path and
+                            // cannot participate in direct-v2 establishment.
+                            Role::Guest(_) => DirectRoute::NotReady,
+                        })
+                    };
+                    match route {
+                        None | Some(DirectRoute::StaleSocket) => break 'socket,
+                        Some(DirectRoute::DropStale) => continue,
+                        Some(DirectRoute::NotReady) => {
+                            let _ = out_tx.try_send(Message::Text(
+                                "{\"type\":\"error\",\"reason\":\"direct_not_ready\"}"
+                                    .into(),
+                            ));
+                            break 'socket;
+                        }
+                        Some(DirectRoute::Future) => {
+                            let _ = out_tx.try_send(Message::Text(
+                                "{\"type\":\"error\",\"reason\":\"direct_generation_future\"}"
+                                    .into(),
+                            ));
+                            break 'socket;
+                        }
+                        Some(DirectRoute::Forward(peer)) => {
+                            if !matches!(
+                                tokio::time::timeout(
+                                    Duration::from_secs(2),
+                                    peer.send(message),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ) {
+                                break 'socket;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let peers = {
                     let mut sessions = state.sessions.lock().await;
                     // An expired session stops forwarding immediately; the
@@ -1403,17 +1806,15 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
         } else if let Some(session) = sessions.get_mut(&session_id) {
             match &role {
                 Role::Host => {
-                    if session.host_generation == generation {
-                        session.host.take();
+                    if cleanup_primary_socket(session, PrimaryRole::Host, generation) {
+                        clear_relay_owner(session, "host");
                     }
-                    clear_relay_owner(session, "host");
                     None
                 }
                 Role::Client => {
-                    if session.client_generation == generation {
-                        session.client.take();
+                    if cleanup_primary_socket(session, PrimaryRole::Client, generation) {
+                        clear_relay_owner(session, "client");
                     }
-                    clear_relay_owner(session, "client");
                     None
                 }
                 Role::Guest(token) => {
@@ -1468,6 +1869,7 @@ fn validate_signal_message(text: &str) -> Result<(), &'static str> {
         .ok_or("message_type_missing")?;
 
     match message_type {
+        "peer_ready" | "peer_reset" => return Err("server_generated_message"),
         "candidate" => {
             let kind = object
                 .get("kind")
@@ -1496,8 +1898,78 @@ fn validate_signal_message(text: &str) -> Result<(), &'static str> {
                 .get("count")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or("candidate_count_missing")?;
-            if !(1..=32).contains(&count) {
+            if !(1..=MAX_DIRECT_CANDIDATES).contains(&count) {
                 return Err("candidate_count_invalid");
+            }
+        }
+        "direct_candidate" => {
+            if object.len() != 5 {
+                return Err("direct_candidate_fields_invalid");
+            }
+            let generation = object
+                .get("establishment_generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("direct_candidate_generation_missing")?;
+            if generation == 0 {
+                return Err("direct_candidate_generation_invalid");
+            }
+            let kind = object
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("direct_candidate_kind_missing")?;
+            if !matches!(kind, "host" | "mapped" | "server_reflexive" | "relay") {
+                return Err("direct_candidate_kind_invalid");
+            }
+            let ip = object
+                .get("ip")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("direct_candidate_ip_missing")?;
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                return Err("direct_candidate_ip_invalid");
+            }
+            let port = object
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("direct_candidate_port_missing")?;
+            if !(1..=u64::from(u16::MAX)).contains(&port) {
+                return Err("direct_candidate_port_invalid");
+            }
+        }
+        "direct_candidate_done" => {
+            if object.len() != 3 {
+                return Err("direct_candidate_done_fields_invalid");
+            }
+            let generation = object
+                .get("establishment_generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("direct_candidate_done_generation_missing")?;
+            if generation == 0 {
+                return Err("direct_candidate_done_generation_invalid");
+            }
+            let count = object
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("direct_candidate_done_count_missing")?;
+            if !(1..=MAX_DIRECT_CANDIDATES).contains(&count) {
+                return Err("direct_candidate_done_count_invalid");
+            }
+        }
+        "direct_key" => {
+            if object.len() != 5 {
+                return Err("direct_key_fields_invalid");
+            }
+            let generation = object
+                .get("establishment_generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("direct_key_generation_missing")?;
+            if generation == 0 {
+                return Err("direct_key_generation_invalid");
+            }
+            if !valid_hex_field(object, "public_key", 32)
+                || !valid_hex_field(object, "identity_public_key", 32)
+                || !valid_hex_field(object, "signature", 64)
+            {
+                return Err("direct_key_encoding_invalid");
             }
         }
         "path_candidate" => {
@@ -1634,12 +2106,35 @@ fn message_len(message: &Message) -> usize {
 /// count or byte bound: evicting the oldest would flush handshake-critical
 /// messages a malicious or buggy peer could then re-trigger forever.
 fn queue_pending(queue: &mut VecDeque<Message>, queued_bytes: &mut usize, message: Message) {
+    if is_direct_establishment_message(&message) {
+        return;
+    }
     let size = message_len(&message);
     if queue.len() >= MAX_PENDING_MESSAGES || *queued_bytes + size > MAX_PENDING_BYTES {
         return;
     }
     *queued_bytes += size;
     queue.push_back(message);
+}
+
+fn is_direct_establishment_message(message: &Message) -> bool {
+    let Message::Text(text) = message else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|message_type| {
+                    matches!(
+                        message_type,
+                        "direct_candidate" | "direct_candidate_done" | "direct_key"
+                    )
+                })
+        })
+        .unwrap_or(false)
 }
 
 /// Forward opaque encrypted datagrams between the validated host and client
@@ -1893,10 +2388,12 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CreationLimiter, Guest, MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE,
-        RELAY_BYTES_PER_SECOND, RELAY_PACKETS_PER_SECOND, RelaySlot, SESSION_CREATE_WINDOW,
-        Session, authorized, bearer_token, max_guests_for_new_session, reap_expired_sessions,
-        relay_ticket, validate_signal_message,
+        AppState, CreationLimiter, DirectRoute, Guest, MAX_GUESTS_CEILING,
+        MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
+        RELAY_PACKETS_PER_SECOND, RelaySlot, SESSION_CREATE_WINDOW, Session, admit_primary_socket,
+        authorized, bearer_token, cleanup_primary_socket, direct_message_route,
+        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
+        queue_pending, reap_expired_sessions, relay_ticket, validate_signal_message,
     };
     use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue};
@@ -1908,6 +2405,53 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::sync::{Mutex, mpsc};
     use tokio::time::timeout;
+
+    fn test_session() -> Session {
+        Session {
+            expires_at: Instant::now() + Duration::from_secs(60),
+            host_token: "host-token".into(),
+            client_token: "client-token".into(),
+            host: None,
+            client: None,
+            host_generation: 0,
+            client_generation: 0,
+            establishment_generation: 0,
+            ready_pair: None,
+            pending_host: std::collections::VecDeque::new(),
+            pending_client: std::collections::VecDeque::new(),
+            pending_host_bytes: 0,
+            pending_client_bytes: 0,
+            relay_host: None,
+            relay_client: None,
+            guests: std::collections::VecDeque::new(),
+            max_guests: 1,
+        }
+    }
+
+    fn message_text(message: Message) -> String {
+        match message {
+            Message::Text(text) => text.to_string(),
+            other => panic!("expected text message, got {other:?}"),
+        }
+    }
+
+    fn assert_peer_ready(message: Message, generation: u64) {
+        let text = message_text(message);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text)
+                .expect("peer_ready JSON")
+                .get("type")
+                .and_then(serde_json::Value::as_str),
+            Some("peer_ready")
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text)
+                .expect("peer_ready JSON")
+                .get("establishment_generation")
+                .and_then(serde_json::Value::as_u64),
+            Some(generation)
+        );
+    }
 
     #[test]
     fn no_admin_token_refuses_everything_without_explicit_dev_opt_in() {
@@ -2072,6 +2616,8 @@ mod tests {
                 client: None,
                 host_generation: 1,
                 client_generation: 0,
+                establishment_generation: 0,
+                ready_pair: None,
                 pending_host: std::collections::VecDeque::new(),
                 pending_client: std::collections::VecDeque::new(),
                 pending_host_bytes: 0,
@@ -2115,6 +2661,8 @@ mod tests {
                 client: None,
                 host_generation: 1,
                 client_generation: 0,
+                establishment_generation: 0,
+                ready_pair: None,
                 pending_host: std::collections::VecDeque::new(),
                 pending_client: std::collections::VecDeque::new(),
                 pending_host_bytes: 0,
@@ -2274,5 +2822,324 @@ mod tests {
                 "accepted {message}"
             );
         }
+    }
+
+    #[test]
+    fn direct_v2_validator_requires_bounded_positive_epoch_and_exact_fields() {
+        assert!(validate_signal_message(
+            r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"192.0.2.10","port":40001}"#
+        )
+        .is_ok());
+        assert!(
+            validate_signal_message(
+                r#"{"type":"direct_candidate_done","establishment_generation":1,"count":2}"#
+            )
+            .is_ok()
+        );
+        assert!(validate_signal_message(&format!(
+            r#"{{"type":"direct_key","establishment_generation":1,"public_key":"{}","identity_public_key":"{}","signature":"{}"}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+            "cc".repeat(64),
+        ))
+        .is_ok());
+
+        for message in [
+            r#"{"type":"direct_candidate","kind":"host","ip":"192.0.2.10","port":40001}"#,
+            r#"{"type":"direct_candidate","establishment_generation":0,"kind":"host","ip":"192.0.2.10","port":40001}"#,
+            r#"{"type":"direct_candidate","establishment_generation":1,"kind":"unknown","ip":"192.0.2.10","port":40001}"#,
+            r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"not-an-ip","port":40001}"#,
+            r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"192.0.2.10","port":0}"#,
+            r#"{"type":"direct_candidate_done","establishment_generation":1,"count":0}"#,
+            r#"{"type":"direct_candidate_done","establishment_generation":1,"count":33}"#,
+            r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"192.0.2.10","port":40001,"extra":true}"#,
+            r#"{"type":"direct_key","establishment_generation":1,"public_key":"00","identity_public_key":"00","signature":"00"}"#,
+        ] {
+            assert!(
+                validate_signal_message(message).is_err(),
+                "accepted malformed direct message {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_and_reset_are_server_generated_only() {
+        assert!(
+            validate_signal_message(r#"{"type":"peer_ready","establishment_generation":1}"#)
+                .is_err()
+        );
+        assert!(
+            validate_signal_message(
+                r#"{"type":"peer_reset","establishment_generation":1,"reason":"role_replaced"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            validate_signal_message(
+                r#"{"type":"peer_reset","establishment_generation":1,"reason":"a"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_queue_drops_direct_records_but_preserves_ice_and_supported_messages() {
+        let mut queue = std::collections::VecDeque::new();
+        let mut queued_bytes = 0;
+        queue_pending(
+            &mut queue,
+            &mut queued_bytes,
+            Message::Text(
+                r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"192.0.2.10","port":40001}"#.into(),
+            ),
+        );
+        queue_pending(
+            &mut queue,
+            &mut queued_bytes,
+            Message::Text(r#"{"type":"ice_candidate_done"}"#.into()),
+        );
+        queue_pending(
+            &mut queue,
+            &mut queued_bytes,
+            Message::Text(r#"{"type":"ice_candidate","candidate":"candidate:1"}"#.into()),
+        );
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queued_bytes,
+            queue.iter().map(super::message_len).sum::<usize>()
+        );
+        assert!(
+            matches!(queue.front(), Some(Message::Text(text)) if text.contains("ice_candidate_done"))
+        );
+    }
+
+    #[test]
+    fn first_role_waits_and_complete_pair_gets_one_ready_record_per_socket() {
+        let mut session = test_session();
+        let (host_tx, mut host_rx) = mpsc::channel(8);
+        assert_eq!(
+            admit_primary_socket(&mut session, PrimaryRole::Host, &host_tx)
+                .expect("first role is admitted"),
+            1
+        );
+        assert!(session.ready_pair.is_none());
+        assert!(host_rx.try_recv().is_err());
+
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        assert_eq!(
+            admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx)
+                .expect("second role is admitted"),
+            1
+        );
+        assert_eq!(session.establishment_generation, 1);
+        assert_peer_ready(host_rx.try_recv().expect("host readiness"), 1);
+        assert_peer_ready(client_rx.try_recv().expect("client readiness"), 1);
+        assert!(host_rx.try_recv().is_err());
+        assert!(client_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn replacement_sends_reset_before_next_ready_and_keeps_generations_distinct() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
+        assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
+
+        let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
+        assert_eq!(
+            admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx)
+                .expect("replacement host"),
+            2
+        );
+        assert_eq!(session.establishment_generation, 2);
+        assert_eq!(
+            session
+                .ready_pair
+                .expect("replacement readiness")
+                .host_generation,
+            2
+        );
+        assert_eq!(
+            session
+                .ready_pair
+                .expect("replacement readiness")
+                .client_generation,
+            1
+        );
+
+        let reset = message_text(client_rx.try_recv().expect("reset reaches survivor"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON")["type"],
+            "peer_reset"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON")["establishment_generation"],
+            1
+        );
+        assert_peer_ready(client_rx.try_recv().expect("next readiness"), 2);
+        assert_peer_ready(new_host_rx.try_recv().expect("replacement readiness"), 2);
+        assert!(client_rx.try_recv().is_err());
+        assert!(old_host_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn partial_readiness_delivery_is_compensated_and_closes_the_pair() {
+        let mut session = test_session();
+        let (host_tx, mut host_rx) = mpsc::channel(8);
+        let (client_tx, _client_rx) = mpsc::channel(1);
+        client_tx
+            .try_send(Message::Text("already-full".into()))
+            .expect("fill client queue");
+        session.host = Some(host_tx);
+        session.client = Some(client_tx);
+        session.host_generation = 1;
+        session.client_generation = 1;
+
+        assert!(publish_ready(&mut session).is_err());
+        assert!(session.ready_pair.is_none());
+        assert_eq!(session.establishment_generation, 1);
+        assert!(session.host.is_none());
+        assert!(session.client.is_none());
+        assert_peer_ready(host_rx.try_recv().expect("accepted readiness"), 1);
+        let reset = message_text(host_rx.try_recv().expect("compensating reset"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON")["type"],
+            "peer_reset"
+        );
+        assert!(matches!(host_rx.try_recv(), Ok(Message::Close(None))));
+    }
+
+    #[test]
+    fn reset_delivery_failure_closes_survivor_and_publishes_no_replacement_epoch() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
+        assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
+        for _ in 0..8 {
+            client_tx
+                .try_send(Message::Text("full".into()))
+                .expect("fill survivor queue");
+        }
+
+        let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
+        assert!(admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx).is_err());
+        assert!(session.ready_pair.is_none());
+        assert_eq!(session.establishment_generation, 1);
+        assert!(session.host.is_none());
+        assert!(session.client.is_none());
+        assert!(new_host_rx.try_recv().is_err());
+        assert!(matches!(old_host_rx.try_recv(), Ok(Message::Close(None))));
+    }
+
+    #[test]
+    fn stale_cleanup_cannot_clear_or_reset_a_replacement_socket() {
+        let mut session = test_session();
+        let (old_host_tx, mut old_host_rx) = mpsc::channel(8);
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &old_host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+        let _ = old_host_rx.try_recv();
+        let _ = client_rx.try_recv();
+        let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx).expect("replacement");
+        let _ = client_rx.try_recv();
+        let _ = client_rx.try_recv();
+        let _ = new_host_rx.try_recv();
+
+        assert!(!cleanup_primary_socket(&mut session, PrimaryRole::Host, 1));
+        assert_eq!(session.host_generation, 2);
+        assert_eq!(
+            session
+                .ready_pair
+                .expect("current epoch")
+                .establishment_generation,
+            2
+        );
+        assert!(new_host_rx.try_recv().is_err());
+        assert!(client_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn direct_forwarding_requires_current_socket_and_ready_generation() {
+        let mut session = test_session();
+        let (host_tx, _host_rx) = mpsc::channel(8);
+        let (client_tx, _client_rx) = mpsc::channel(8);
+        admit_primary_socket(&mut session, PrimaryRole::Host, &host_tx).expect("host");
+        admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
+
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 1),
+            DirectRoute::Forward(_)
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 0),
+            DirectRoute::DropStale
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 2),
+            DirectRoute::Future
+        ));
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 0, 1),
+            DirectRoute::StaleSocket
+        ));
+
+        session.ready_pair = None;
+        assert!(matches!(
+            direct_message_route(&session, PrimaryRole::Host, 1, 1),
+            DirectRoute::NotReady
+        ));
+    }
+
+    #[test]
+    fn epoch_pruning_removes_only_direct_v2_records_and_recomputes_queue_bytes() {
+        let mut session = test_session();
+        session.pending_host.push_back(Message::Text(
+            r#"{"type":"direct_candidate","establishment_generation":1,"kind":"host","ip":"192.0.2.1","port":4000}"#.into(),
+        ));
+        session
+            .pending_host
+            .push_back(Message::Text(r#"{"type":"ice_candidate_done"}"#.into()));
+        session.pending_host.push_back(Message::Text(
+            r#"{"type":"path_candidate","generation":1,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct_udp","ip":"192.0.2.2","port":4001}"#.into(),
+        ));
+        session.pending_host_bytes = session.pending_host.iter().map(super::message_len).sum();
+
+        prune_direct_establishment_messages(&mut session);
+
+        assert_eq!(session.pending_host.len(), 2);
+        assert!(
+            session
+                .pending_host
+                .iter()
+                .all(|message| !super::is_direct_establishment_message(message))
+        );
+        assert_eq!(
+            session.pending_host_bytes,
+            session
+                .pending_host
+                .iter()
+                .map(super::message_len)
+                .sum::<usize>()
+        );
+        assert!(
+            session
+                .pending_host
+                .iter()
+                .any(|message| message_text(message.clone()).contains("ice_candidate_done"))
+        );
+        assert!(
+            session
+                .pending_host
+                .iter()
+                .any(|message| message_text(message.clone()).contains("path_candidate"))
+        );
     }
 }
