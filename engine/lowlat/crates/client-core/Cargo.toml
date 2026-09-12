@@ -12,9 +12,11 @@ futures-util.workspace = true
 getrandom.workspace = true
 hex = "0.4"
 if-addrs.workspace = true
+libc.workspace = true
 openstream-protocol = { path = "../protocol" }
 openstream-transport-policy.workspace = true
 openstream-transport = { path = "../transport" }
+ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +28,7 @@ webrtc-util.workspace = true
 
 [dev-dependencies]
 openstream-media = { path = "../media" }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

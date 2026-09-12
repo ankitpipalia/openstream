@@ -42,6 +42,93 @@ impl Drop for LoopbackIceEnv {
 }
 
 async fn websocket_bridge() -> (String, JoinHandle<()>) {
+    websocket_bridge_with_direct_readiness(false).await
+}
+
+async fn direct_websocket_bridge() -> (String, JoinHandle<()>) {
+    websocket_bridge_with_direct_readiness(true).await
+}
+
+async fn host_first_direct_websocket_bridge() -> (
+    String,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+    JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind host-first signaling bridge");
+    let address = listener.local_addr().expect("host-first bridge address");
+    let (host_connected_tx, host_connected_rx) = oneshot::channel();
+    let (allow_client_tx, allow_client_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.expect("accept host first");
+        let first = accept_async(first).await.expect("upgrade host first");
+        host_connected_tx.send(()).expect("report host connection");
+        allow_client_rx.await.expect("release client admission");
+
+        let (second, _) = listener.accept().await.expect("accept delayed client");
+        let second = accept_async(second).await.expect("upgrade delayed client");
+        let (mut first_sink, mut first_source) = first.split();
+        let (mut second_sink, mut second_source) = second.split();
+        let (to_first, mut first_queue) = mpsc::channel::<Message>(128);
+        let (to_second, mut second_queue) = mpsc::channel::<Message>(128);
+        let readiness = Message::Text(
+            serde_json::json!({
+                "type": "peer_ready",
+                "establishment_generation": 1,
+            })
+            .to_string(),
+        );
+        to_first
+            .send(readiness.clone())
+            .await
+            .expect("queue host readiness");
+        to_second
+            .send(readiness)
+            .await
+            .expect("queue client readiness");
+        let first_writer = tokio::spawn(async move {
+            while let Some(message) = first_queue.recv().await {
+                if first_sink.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let second_writer = tokio::spawn(async move {
+            while let Some(message) = second_queue.recv().await {
+                if second_sink.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        loop {
+            tokio::select! {
+                message = first_source.next() => {
+                    let Some(Ok(message)) = message else { break };
+                    if to_second.send(message).await.is_err() { break; }
+                }
+                message = second_source.next() => {
+                    let Some(Ok(message)) = message else { break };
+                    if to_first.send(message).await.is_err() { break; }
+                }
+            }
+        }
+        first_writer.abort();
+        second_writer.abort();
+    });
+    (
+        format!("http://{address}"),
+        host_connected_rx,
+        allow_client_tx,
+        task,
+    )
+}
+
+async fn websocket_bridge_with_direct_readiness(
+    publish_direct_readiness: bool,
+) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback signaling bridge");
@@ -56,6 +143,24 @@ async fn websocket_bridge() -> (String, JoinHandle<()>) {
         let (mut second_sink, mut second_source) = second.split();
         let (to_first, mut first_queue) = mpsc::channel::<Message>(128);
         let (to_second, mut second_queue) = mpsc::channel::<Message>(128);
+
+        if publish_direct_readiness {
+            let readiness = Message::Text(
+                serde_json::json!({
+                    "type": "peer_ready",
+                    "establishment_generation": 1,
+                })
+                .to_string(),
+            );
+            to_first
+                .send(readiness.clone())
+                .await
+                .expect("queue direct readiness for first peer");
+            to_second
+                .send(readiness)
+                .await
+                .expect("queue direct readiness for second peer");
+        }
 
         let first_writer = tokio::spawn(async move {
             while let Some(message) = first_queue.recv().await {
@@ -385,7 +490,7 @@ async fn connected_relay_test_sessions()
 -> (PeerSession, PeerSession, ControllableRelay, JoinHandle<()>) {
     let relay = ControllableRelay::new().await;
     let force_relay = ForceRelayEnv::enable().await;
-    let (origin, bridge) = websocket_bridge().await;
+    let (origin, bridge) = direct_websocket_bridge().await;
     let pairing = Arc::new(relay.pairing());
     let (sender_result, receiver_result) = tokio::join!(
         PeerSession::establish_with_stun(
@@ -1053,6 +1158,75 @@ async fn no_immediate_media_bypass_behavior() {
 
     sender.close().await.unwrap();
     receiver.close().await.unwrap();
+    bridge.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn host_first_waits_past_old_phase_deadline_then_exchanges_encrypted_control() {
+    let (origin, host_connected, allow_client, bridge) = host_first_direct_websocket_bridge().await;
+    let pairing = Arc::new(pairing());
+    let host_origin = origin.clone();
+    let host_pairing = pairing.clone();
+    let host_task = tokio::spawn(async move {
+        PeerSession::establish_with_stun(
+            &host_origin,
+            &host_pairing,
+            Role::Host,
+            "127.0.0.1:0".parse::<SocketAddr>().expect("host bind"),
+            &[],
+        )
+        .await
+    });
+
+    host_connected.await.expect("host reaches signaling");
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::pause();
+    // The old implementation would have started candidate exchange as soon
+    // as the host WebSocket opened and timed out after 15 seconds. Advancing
+    // Tokio's deterministic test clock proves the new waiting state is not
+    // charged against that phase deadline without sleeping in real time.
+    tokio::time::advance(Duration::from_secs(16)).await;
+    assert!(
+        !host_task.is_finished(),
+        "host must still await peer readiness"
+    );
+
+    allow_client.send(()).expect("release delayed client");
+    tokio::time::resume();
+    let client_origin = origin.clone();
+    let client_pairing = pairing.clone();
+    let client_task = tokio::spawn(async move {
+        PeerSession::establish_with_stun(
+            &client_origin,
+            &client_pairing,
+            Role::Client,
+            "127.0.0.1:0".parse::<SocketAddr>().expect("client bind"),
+            &[],
+        )
+        .await
+    });
+    let (host_result, client_result) = tokio::join!(host_task, client_task);
+    let mut host = host_result
+        .expect("host establishment task completes")
+        .expect("host establishes after delayed client");
+    let mut client = client_result
+        .expect("client establishment task completes")
+        .expect("client establishes after delayed arrival");
+
+    host.send(Kind::Control, 0, 0, b"host-first-encrypted-control")
+        .await
+        .expect("host sends authenticated control");
+    let packet = client
+        .recv()
+        .await
+        .expect("client receives authenticated control");
+    assert_eq!(packet.kind, Kind::Control);
+    assert_eq!(packet.payload, b"host-first-encrypted-control");
+
+    host.close().await.expect("close host");
+    client.close().await.expect("close client");
     bridge.abort();
 }
 

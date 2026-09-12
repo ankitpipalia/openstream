@@ -11,8 +11,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use openstream_client_core::{
-    Capabilities, FlushOutcome, Pairing, PeerSession, ReliableControl, Role, VideoCodec,
-    parse_stun_servers,
+    Capabilities, FlushOutcome, PeerSession, ReliableControl, Role, VideoCodec,
+    load_pairing_from_environment, parse_stun_servers,
 };
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
@@ -25,10 +25,7 @@ use tokio::process::{Child, Command};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let pairing: Pairing = serde_json::from_str(
-        &env::var("OPENSTREAM_PAIRING_JSON")
-            .map_err(|_| "OPENSTREAM_PAIRING_JSON must contain the create-session response")?,
-    )?;
+    let pairing = load_pairing_from_environment()?;
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| "0.0.0.0:0".to_string())
         .parse::<SocketAddr>()?;

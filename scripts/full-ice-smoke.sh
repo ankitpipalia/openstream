@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+unset OPENSTREAM_PAIRING_JSON OPENSTREAM_DEVELOPER_OVERRIDE
+
 # Run from any directory after building the OpenStream development binaries.
 # The script intentionally uses loopback and emits only success/failure text;
 # pairing JSON contains bearer capabilities and is never printed.
 
+umask 077
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../engine/lowlat" && pwd)"
 port="${OPENSTREAM_SMOKE_PORT:-18083}"
 server_log="$(mktemp -t openstream-signal.XXXXXX)"
@@ -45,11 +48,10 @@ curl -fsS -X POST "http://127.0.0.1:$port/v1/session" \
     -H 'content-type: application/json' \
     -d '{"ttl_seconds":120}' >"$pairing_file"
 
-pairing_json="$(tr -d '\n' <"$pairing_file")"
 common_env=(
     OPENSTREAM_ICE=1
     OPENSTREAM_SIGNAL_ORIGIN="http://127.0.0.1:$port"
-    OPENSTREAM_PAIRING_JSON="$pairing_json"
+    OPENSTREAM_PAIRING_FILE="$pairing_file"
 )
 if [[ -n "${OPENSTREAM_ICE_URLS:-}" ]]; then
     # With an external STUN/TURN profile, leave loopback out so a successful

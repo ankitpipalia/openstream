@@ -47,6 +47,12 @@ jobs:
       - name: Alpine/musl helper syntax
         run: sh -n scripts/alpine-musl-ci.sh
 
+      - name: Local session launcher smoke
+        run: |
+          bash -n scripts/openstream-local-session.sh scripts/test-openstream-local-session.sh
+          bash scripts/test-openstream-local-session.sh
+        working-directory: .
+
       - name: Format
         run: cargo fmt --all --check
 
@@ -68,6 +74,18 @@ jobs:
 
       - name: Build release
         run: cargo build --workspace --release --locked
+
+      - name: Release artifact manifest
+        run: ./scripts/check-release-artifacts.sh
+        working-directory: .
+
+      - name: MVP acceptance documentation boundary
+        run: |
+          grep -Fq 'physical Linux-NVIDIA' README.md
+          grep -Fq 'X11/FFmpeg/NVENC fallback' README.md
+          grep -Fq 'This acceptance does not claim native DRM capture' docs/BUILD.md
+          grep -Fq 'decoded-frame zero-copy' docs/BUILD.md
+        working-directory: .
 
   openstream-portable:
     name: OpenStream crates (${{ matrix.os }})
@@ -347,6 +365,22 @@ jobs:
           /workspace/engine/lowlat/scripts/alpine-musl-ci.sh
         working-directory: .
 
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Scan committed source tree with gitleaks
+        run: |
+          scan_dir="$(mktemp -d)"
+          trap 'rm -rf "$scan_dir"' EXIT
+          git archive --format=tar HEAD | tar -xf - -C "$scan_dir"
+          docker run --rm --platform linux/amd64 \
+            --mount type=bind,src="$scan_dir",dst=/workspace,readonly \
+            docker.io/zricethezav/gitleaks:v8.30.1 \
+            dir /workspace --redact --no-banner --exit-code 1
+        working-directory: .
+
   ci-gate:
     name: CI gate
     if: ${{ always() }}
@@ -360,6 +394,7 @@ jobs:
       - smoke
       - sanitizers
       - alpine-musl
+      - secret-scan
     runs-on: ubuntu-latest
     steps:
       - name: Require every CI job to pass
@@ -373,9 +408,11 @@ jobs:
           SMOKE: ${{ needs.smoke.result }}
           SANITIZERS: ${{ needs.sanitizers.result }}
           ALPINE_MUSL: ${{ needs.alpine-musl.result }}
+          SECRET_SCAN: ${{ needs.secret-scan.result }}
         run: |
           for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
-              "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS" "$ALPINE_MUSL"; do
+              "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS" "$ALPINE_MUSL" \
+              "$SECRET_SCAN"; do
             if [ "$result" != success ]; then
               echo "CI job result was $result" >&2
               exit 1

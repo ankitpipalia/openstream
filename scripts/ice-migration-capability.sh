@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+unset OPENSTREAM_PAIRING_JSON OPENSTREAM_DEVELOPER_OVERRIDE
+
 # Verify the truthful ICE migration boundary on a loopback full-ICE session.
 # This deliberately proves only the typed UnsupportedIceRestart result; it
 # does not claim TURN/public-NAT migration support.
 
+umask 077
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/.." && pwd)"
 lowlat_dir="$repo_dir/engine/lowlat"
@@ -66,13 +69,12 @@ fi
 curl -fsS -X POST "http://127.0.0.1:$signal_port/v1/session" \
     -H 'content-type: application/json' \
     -d '{"ttl_seconds":120}' >"$pairing_file"
-pairing_json="$(tr -d '\n' <"$pairing_file")"
 common_env=(
     "OPENSTREAM_ICE=1"
     "OPENSTREAM_ICE_INCLUDE_LOOPBACK=1"
     "OPENSTREAM_ICE_MIGRATION_PROBE=1"
     "OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:$signal_port"
-    "OPENSTREAM_PAIRING_JSON=$pairing_json"
+    "OPENSTREAM_PAIRING_FILE=$pairing_file"
     "OPENSTREAM_PATH_MIGRATION=1"
 )
 

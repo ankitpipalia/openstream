@@ -7,12 +7,40 @@
 //! and a malformed or unsupported event is rejected before it reaches an OS
 //! API.
 
-use std::env;
+use std::fmt;
 
-use openstream_media::input::{InputEvent, RumbleEvent};
+use openstream_media::input::{InputCapability, InputEvent, InputKind, RumbleEvent};
+use openstream_platform::policy::{
+    DeviceCapability, HostPolicy, RuntimeAvailability, UnavailableReason,
+};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use openstream_media::input::{FLAG_RELATIVE, InputKind};
+use openstream_media::input::FLAG_RELATIVE;
+
+#[derive(Debug)]
+pub(crate) enum InputError {
+    Malformed(String),
+    Unavailable {
+        capability: DeviceCapability,
+        reason: UnavailableReason,
+    },
+    Adapter(String),
+}
+
+impl fmt::Display for InputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed(error) => write!(formatter, "malformed input event: {error}"),
+            Self::Unavailable { capability, reason } => write!(
+                formatter,
+                "input capability {capability:?} unavailable: {reason:?}"
+            ),
+            Self::Adapter(error) => write!(formatter, "input adapter failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for InputError {}
 
 pub(crate) enum HostInput {
     Disabled,
@@ -25,11 +53,51 @@ pub(crate) enum HostInput {
 }
 
 impl HostInput {
+    pub(crate) fn adapter_probe() -> RuntimeAvailability {
+        #[cfg(target_os = "linux")]
+        {
+            return match lowlat_inject::uinput::Devices::probe() {
+                Ok(()) => RuntimeAvailability::Available,
+                Err(error) => RuntimeAvailability::Unavailable(match error {
+                    lowlat_inject::uinput::Error::NoModule => UnavailableReason::DeviceUnavailable,
+                    lowlat_inject::uinput::Error::NotPermitted => {
+                        UnavailableReason::PermissionDenied
+                    }
+                    lowlat_inject::uinput::Error::Confined(_)
+                    | lowlat_inject::uinput::Error::Failed(_) => {
+                        UnavailableReason::OsApiUnavailable
+                    }
+                }),
+            };
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            return RuntimeAvailability::Available;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            return match MacInput::new(1, 1) {
+                Ok(input) => {
+                    drop(input);
+                    RuntimeAvailability::Available
+                }
+                Err(_) => RuntimeAvailability::Unavailable(UnavailableReason::OsApiUnavailable),
+            };
+        }
+
+        #[allow(unreachable_code)]
+        RuntimeAvailability::Unavailable(UnavailableReason::UnsupportedPlatform)
+    }
+
     pub(crate) fn from_environment(
         width: u16,
         height: u16,
+        policy: HostPolicy,
+        enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        if env::var("OPENSTREAM_ENABLE_INPUT").as_deref() != Ok("1") {
+        if !enabled || !policy.input {
             return Ok(Self::Disabled);
         }
 
@@ -37,9 +105,18 @@ impl HostInput {
         {
             let extents = lowlat_inject::event::Extents::alone(u32::from(width), u32::from(height));
             let injector = lowlat_inject::event::Injector::new(extents);
-            let devices = lowlat_inject::uinput::Devices::create("openstream")
+            let mut devices = lowlat_inject::uinput::Devices::create("openstream")
                 .map_err(|error| error.to_string())?;
-            return Ok(Self::Linux(Box::new(LinuxInput { injector, devices })));
+            let gamepad_enabled = policy.gamepad;
+            let permissions =
+                lowlat_inject::event::Permissions::from_host_grants(true, gamepad_enabled);
+            let mut injector = injector;
+            injector.set_permissions(permissions, &mut devices);
+            return Ok(Self::Linux(Box::new(LinuxInput {
+                injector,
+                devices,
+                gamepad_enabled,
+            })));
         }
 
         #[cfg(target_os = "windows")]
@@ -56,20 +133,43 @@ impl HostInput {
         Err("host input is unsupported on this target".into())
     }
 
-    pub(crate) fn apply(&mut self, payload: &[u8]) -> Result<(), String> {
+    pub(crate) fn apply(&mut self, payload: &[u8]) -> Result<(), InputError> {
         if matches!(self, Self::Disabled) {
             return Ok(());
         }
-        let event = InputEvent::decode(payload).map_err(|error| error.to_string())?;
+        let event = InputEvent::decode(payload)
+            .map_err(|error| InputError::Malformed(error.to_string()))?;
+        validate_event_capability(
+            event.kind,
+            self.gamepad_enabled(),
+            self.gamepad_implemented(),
+            false,
+        )?;
         match self {
             Self::Disabled => Ok(()),
             #[cfg(target_os = "linux")]
-            Self::Linux(input) => input.apply(event),
+            Self::Linux(input) => input.apply(event).map_err(InputError::Adapter),
             #[cfg(target_os = "windows")]
-            Self::Windows(input) => input.apply(event),
+            Self::Windows(input) => input.apply(event).map_err(InputError::Adapter),
             #[cfg(target_os = "macos")]
-            Self::Mac(input) => input.apply(event),
+            Self::Mac(input) => input.apply(event).map_err(InputError::Adapter),
         }
+    }
+
+    fn gamepad_enabled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Self::Linux(input) = self {
+            return input.gamepad_enabled;
+        }
+        false
+    }
+
+    fn gamepad_implemented(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Linux(_)) {
+            return true;
+        }
+        false
     }
 
     pub(crate) fn tick(&mut self) {
@@ -116,6 +216,7 @@ impl Drop for HostInput {
 pub(crate) struct LinuxInput {
     injector: lowlat_inject::event::Injector,
     devices: lowlat_inject::uinput::Devices,
+    gamepad_enabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -139,6 +240,31 @@ impl LinuxInput {
 
     fn release_all(&mut self) {
         self.injector.release_all(&mut self.devices);
+    }
+}
+
+fn validate_event_capability(
+    kind: InputKind,
+    gamepad_enabled: bool,
+    gamepad_implemented: bool,
+    tablet_enabled: bool,
+) -> Result<(), InputError> {
+    match kind.capability() {
+        InputCapability::BasicInput => Ok(()),
+        InputCapability::Gamepad if gamepad_implemented && gamepad_enabled => Ok(()),
+        InputCapability::Gamepad if gamepad_implemented => Err(InputError::Unavailable {
+            capability: DeviceCapability::Gamepad,
+            reason: UnavailableReason::DisabledByPolicy,
+        }),
+        InputCapability::Gamepad => Err(InputError::Unavailable {
+            capability: DeviceCapability::Gamepad,
+            reason: UnavailableReason::AdapterNotImplemented,
+        }),
+        InputCapability::Tablet if tablet_enabled => Ok(()),
+        InputCapability::Tablet => Err(InputError::Unavailable {
+            capability: DeviceCapability::Tablet,
+            reason: UnavailableReason::AdapterNotImplemented,
+        }),
     }
 }
 
@@ -226,14 +352,14 @@ mod windows {
                 InputKind::PointerButton => self.button(event.code, event.value != 0),
                 InputKind::Wheel => self.wheel(event.value, event.value2),
                 InputKind::Release => self.release_all(),
-                InputKind::GamepadButton | InputKind::GamepadAxis | InputKind::GamepadUnplug => {
-                    Ok(())
+                InputKind::GamepadButton
+                | InputKind::GamepadAxis
+                | InputKind::GamepadUnplug
+                | InputKind::PenMotion
+                | InputKind::PenButton
+                | InputKind::PenProximity => {
+                    Err("advanced input adapter is not implemented".to_string())
                 }
-                // Pen rides the absolute pointer path; pressure/tilt have no
-                // SendInput/CoreGraphics equivalent here. Proximity is inert.
-                InputKind::PenMotion => self.motion(event),
-                InputKind::PenButton => self.button(event.code, event.value != 0),
-                InputKind::PenProximity => Ok(()),
             }
         }
 
@@ -583,14 +709,14 @@ mod macos {
                 InputKind::PointerButton => self.button(event.code, event.value != 0),
                 InputKind::Wheel => self.wheel(event.value, event.value2),
                 InputKind::Release => self.release_all(),
-                InputKind::GamepadButton | InputKind::GamepadAxis | InputKind::GamepadUnplug => {
-                    Ok(())
+                InputKind::GamepadButton
+                | InputKind::GamepadAxis
+                | InputKind::GamepadUnplug
+                | InputKind::PenMotion
+                | InputKind::PenButton
+                | InputKind::PenProximity => {
+                    Err("advanced input adapter is not implemented".to_string())
                 }
-                // Pen rides the absolute pointer path; pressure/tilt have no
-                // SendInput/CoreGraphics equivalent here. Proximity is inert.
-                InputKind::PenMotion => self.motion(event),
-                InputKind::PenButton => self.button(event.code, event.value != 0),
-                InputKind::PenProximity => Ok(()),
             }
         }
 
@@ -819,7 +945,45 @@ use macos::MacInput;
 
 #[cfg(test)]
 mod tests {
-    use openstream_media::input::InputEvent;
+    use super::{InputError, validate_event_capability};
+    use openstream_media::input::{InputEvent, InputKind};
+    use openstream_platform::policy::{DeviceCapability, UnavailableReason};
+
+    #[test]
+    fn basic_input_grant_does_not_enable_advanced_events() {
+        assert!(validate_event_capability(InputKind::Keyboard, true, true, false).is_ok());
+        let gamepad = validate_event_capability(InputKind::GamepadAxis, false, true, false)
+            .expect_err("gamepad must require an explicit grant");
+        assert!(matches!(
+            gamepad,
+            InputError::Unavailable {
+                capability: DeviceCapability::Gamepad,
+                reason: UnavailableReason::DisabledByPolicy,
+            }
+        ));
+        let tablet = validate_event_capability(InputKind::PenMotion, true, true, false)
+            .expect_err("tablet adapter is not implemented");
+        assert!(matches!(
+            tablet,
+            InputError::Unavailable {
+                capability: DeviceCapability::Tablet,
+                reason: UnavailableReason::AdapterNotImplemented,
+            }
+        ));
+    }
+
+    #[test]
+    fn unsupported_gamepad_adapter_is_reported_as_unimplemented() {
+        let error = validate_event_capability(InputKind::GamepadButton, false, false, false)
+            .expect_err("an unsupported adapter must not consume a gamepad event");
+        assert!(matches!(
+            error,
+            InputError::Unavailable {
+                capability: DeviceCapability::Gamepad,
+                reason: UnavailableReason::AdapterNotImplemented,
+            }
+        ));
+    }
 
     #[test]
     fn malformed_input_is_rejected_before_platform_translation() {

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-process-per-role acceptance test for the OpenStream-owned path switch.
-# Pairing material is kept in a private temporary file and environment value;
-# it is never printed or copied into a log.
+unset OPENSTREAM_PAIRING_JSON OPENSTREAM_DEVELOPER_OVERRIDE
 
+# One-process-per-role acceptance test for the OpenStream-owned path switch.
+# Pairing material is kept in a private temporary file and passed by path; it
+# is never printed or copied into a log.
+
+umask 077
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/.." && pwd)"
 lowlat_dir="$repo_dir/engine/lowlat"
@@ -84,10 +87,9 @@ if missing:
     raise SystemExit("pairing is missing relay migration fields: " + ",".join(missing))
 PY
 
-pairing_json="$(tr -d '\n' <"$pairing_file")"
 common_env=(
     "OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:$signal_port"
-    "OPENSTREAM_PAIRING_JSON=$pairing_json"
+    "OPENSTREAM_PAIRING_FILE=$pairing_file"
     "OPENSTREAM_PATH_MIGRATION=1"
 )
 

@@ -6,6 +6,9 @@ These templates are intentionally explicit about the current boundary:
   signaling process behind a TLS reverse proxy;
 - `openstream-ffmpeg-host.service` runs the desktop host adapter as a user
   service, where it can access the graphical session and FFmpeg capture source;
+- `openstream-host-agent.service` owns and supervises the FFmpeg host child,
+  exposes bounded health/lifecycle IPC, and survives a desktop-shell restart;
+  use this unit for persistent hosting;
 - `openstream-linux-host.service` runs the native Linux display/encoder and
   optional uinput adapter as a user service inside the graphical session;
   `openstream-linux-host-system.service` is the unattended variant that runs
@@ -19,10 +22,33 @@ These templates are intentionally explicit about the current boundary:
 - `turnserver.conf.example` provides a coturn deployment profile for the
   optional full-ICE/TURN client path in `openstream-client-core`.
 
-Build release binaries from `engine/lowlat`, install them as
-`openstream-signal-server` and `openstream-ffmpeg-host`, then copy the units
-into the appropriate systemd unit directory. Put only short-lived pairing
-material in `%h/.config/openstream/host.env`; do not commit it.
+Build release binaries from `engine/lowlat`, install
+`openstream-signal-server`, `openstream-ffmpeg-host`, and
+`openstream-host-agent`, then copy the units into the appropriate systemd
+unit directory. The agent unit is the persistent entrypoint; the direct
+FFmpeg unit remains useful for compatibility and diagnostics. Create
+`%h/.config/openstream/host.env` with mode `0600` and put only short-lived
+runtime values there; do not commit it. Pairing material is passed to the
+child only through a validated `OPENSTREAM_PAIRING_FILE` path and is never
+placed in an `ExecStart` argument or ordinary settings. The persistent agent
+does not accept or propagate raw `OPENSTREAM_PAIRING_JSON`; that variable is
+reserved for explicitly marked developer/reference flows.
+
+For a user service, enable the persistent agent with:
+
+```sh
+install -m 0755 target/release/openstream-host-agent ~/.local/bin/
+install -m 0755 target/release/openstream-ffmpeg-host ~/.local/bin/
+install -m 0644 deploy/openstream-host-agent.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now openstream-host-agent.service
+```
+
+The agent socket defaults to `%t/openstream/host-agent.sock`; override it
+with `OPENSTREAM_HOST_AGENT_SOCKET` only when the parent directory remains
+private. The agent rejects an active endpoint and safely removes only a
+refused stale socket after a crash; it never unlinks an active or unrelated
+path.
 
 Set `OPENSTREAM_ADMIN_TOKEN` in `/etc/openstream/signal.env` for any deployment
 that is reachable beyond a trusted local development machine. Send
@@ -35,6 +61,26 @@ the service rejects that mode on a non-loopback bind and prints a warning.
 The administrator token must be at least 16 bytes; use a randomly generated
 value and keep it in the protected environment file rather than in a unit
 file or command-line argument.
+
+For Trusted LAN mode - no account authentication, use the separate,
+explicitly opt-in mode below. The bind must be one real numeric LAN address;
+wildcard, loopback, public, and shared-CGNAT binds are rejected:
+
+```text
+OPENSTREAM_LOCAL_NO_AUTH=1
+OPENSTREAM_SIGNAL_BIND=192.168.1.69:8080
+# Leave OPENSTREAM_ADMIN_TOKEN and OPENSTREAM_ALLOW_NO_AUTH unset.
+```
+
+This disables only management/admin authentication for devices on that
+trusted LAN. RFC1918/private addressing is not an identity or authentication
+boundary: anyone who can reach the bind can create or revoke sessions. Do not
+expose it through port forwarding, a reverse proxy, or a public interface.
+Role-scoped session capabilities, encrypted peer identity, and relay/TURN
+authorization remain required. Clients using an `http://` origin must also
+set `OPENSTREAM_LOCAL_NO_AUTH=1`; plaintext is accepted there only for numeric
+RFC1918/ULA/link-local origins. Use the admin-token HTTPS/WSS mode before
+leaving a trusted LAN.
 
 For the built-in relay, bind one UDP socket privately and advertise its
 reachable numeric endpoint:
@@ -56,7 +102,7 @@ The host environment normally contains:
 
 ```text
 OPENSTREAM_SIGNAL_ORIGIN=https://signal.example.invalid
-OPENSTREAM_PAIRING_JSON={...}
+OPENSTREAM_PAIRING_FILE=/run/user/1000/openstream/pairing.json
 OPENSTREAM_UDP_BIND=0.0.0.0:0
 OPENSTREAM_FFMPEG=/usr/bin/ffmpeg
 # Optional direct-path router mapping. This changes local router state and is
@@ -102,6 +148,13 @@ OPENSTREAM_GAMEPAD=0
 OPENSTREAM_MIC=0
 OPENSTREAM_APPROVAL=auto
 ```
+
+Pairing JSON contains role bearer capabilities. Treat it as a secret and never
+commit it, put it in a public issue, or include it in logs. The normal
+launcher/client boundary reads the JSON from the private file named by
+OPENSTREAM_PAIRING_FILE and requires an absolute, owner-only path. For
+developer-only compatibility, OPENSTREAM_PAIRING_JSON requires
+OPENSTREAM_DEVELOPER_OVERRIDE=1; do not use that override in a service unit.
 
 For Wayland, use the PipeWire/portal native adapter once enabled rather than
 passing an X11 display. The external FFmpeg service is a development backend;

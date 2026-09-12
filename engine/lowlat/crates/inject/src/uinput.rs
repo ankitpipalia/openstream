@@ -792,6 +792,16 @@ struct PadNode {
 }
 
 impl Devices {
+    /// Probe whether this process can open the Linux virtual-input node.
+    ///
+    /// The probe does not create a device or claim a guest slot. Callers use
+    /// it before capability negotiation so a failed uinput permission check
+    /// cannot be advertised as working input.
+    pub fn probe() -> Result<(), Error> {
+        let _node = Node::open()?;
+        Ok(())
+    }
+
     /// Create all three, or none.
     ///
     /// **Named with the guest's own label** so a device listing says which

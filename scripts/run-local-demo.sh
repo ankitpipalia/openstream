@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+unset OPENSTREAM_PAIRING_JSON OPENSTREAM_DEVELOPER_OVERRIDE
+
 # Start the self-hosted signal service, a real FFmpeg test-pattern host, and a
 # headless OpenStream client. Pairing JSON and logs remain in private temporary
 # files and are never printed. Override OPENSTREAM_FFMPEG_ARGS to use a real
 # display/device input instead of the synthetic source.
 
+umask 077
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 engine_dir="$repo_dir/engine/lowlat"
 port="${OPENSTREAM_DEMO_PORT:-18084}"
@@ -79,12 +82,10 @@ fi
 curl -fsS -X POST "http://127.0.0.1:$port/v1/session" \
     -H 'content-type: application/json' \
     -d '{"ttl_seconds":120}' >"$pairing_file"
-pairing_json="$(tr -d '\n' <"$pairing_file")"
-
 ffmpeg_args="${OPENSTREAM_FFMPEG_ARGS:--f lavfi -i testsrc2=size=1280x720:rate=30}"
 common_env=(
     OPENSTREAM_SIGNAL_ORIGIN="http://127.0.0.1:$port"
-    OPENSTREAM_PAIRING_JSON="$pairing_json"
+    OPENSTREAM_PAIRING_FILE="$pairing_file"
     OPENSTREAM_UDP_BIND="127.0.0.1:0"
     OPENSTREAM_HOST_SECONDS="$seconds"
     OPENSTREAM_CLIENT_SECONDS="$seconds"

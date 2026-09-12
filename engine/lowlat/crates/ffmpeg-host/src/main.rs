@@ -13,8 +13,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
-    Capabilities, FlushOutcome, Pairing, PeerSession, QueueOutcome, ReliableControl, Role,
-    VideoCodec, parse_stun_servers,
+    Capabilities, FlushOutcome, PeerSession, QueueOutcome, ReliableControl, Role, VideoCodec,
+    load_pairing_from_environment, parse_stun_servers,
 };
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
@@ -25,6 +25,9 @@ use openstream_media::{
 };
 use openstream_platform::clipboard as platform_clipboard;
 use openstream_platform::clipboard_policy::ClipboardPolicy;
+use openstream_platform::policy::{
+    HostCapabilityProbes, HostDeviceCapabilities, RuntimeAvailability, UnavailableReason,
+};
 use openstream_protocol::Kind;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
@@ -77,10 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let origin =
         env::var("OPENSTREAM_SIGNAL_ORIGIN").unwrap_or_else(|_| DEFAULT_SIGNAL_ORIGIN.to_string());
-    let pairing: Pairing = serde_json::from_str(
-        &env::var("OPENSTREAM_PAIRING_JSON")
-            .map_err(|_| "OPENSTREAM_PAIRING_JSON must contain the create-session response")?,
-    )?;
+    let pairing = load_pairing_from_environment()?;
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| DEFAULT_UDP_BIND.to_string())
         .parse::<SocketAddr>()?;
@@ -119,15 +119,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{}", host_policy.log_line());
     let clipboard_policy = ClipboardPolicy::from_env();
     eprintln!("{}", clipboard_policy.log_line());
-    let input_enabled = host_policy.input;
+    let device_capabilities = HostDeviceCapabilities::discover(
+        host_policy,
+        HostCapabilityProbes {
+            input: if host_policy.input {
+                input::HostInput::adapter_probe()
+            } else {
+                RuntimeAvailability::Unavailable(UnavailableReason::DisabledByPolicy)
+            },
+            clipboard: if platform_clipboard::available() {
+                RuntimeAvailability::Available
+            } else {
+                RuntimeAvailability::Unavailable(UnavailableReason::DeviceUnavailable)
+            },
+            microphone: if openstream_media::microphone::GuestMicSink::decoder_available() {
+                RuntimeAvailability::Available
+            } else {
+                RuntimeAvailability::Unavailable(UnavailableReason::OsApiUnavailable)
+            },
+        },
+    );
+    eprintln!("{}", device_capabilities.log_line());
+    let input_enabled = device_capabilities.input.can_advertise();
+    let microphone_enabled = device_capabilities.microphone.can_advertise();
     let audio_requested = env::var("OPENSTREAM_AUDIO").as_deref() == Ok("1");
-    let clipboard_requested = host_policy.clipboard;
+    let clipboard_enabled = device_capabilities.clipboard.can_advertise();
     let mut host_capabilities =
         Capabilities::host_with_limits(requested_width, requested_height, requested_fps);
     host_capabilities.input = input_enabled;
-    host_capabilities.rumble = host_policy.gamepad && cfg!(target_os = "linux");
-    host_capabilities.clipboard = clipboard_requested && platform_clipboard::available();
-    host_capabilities.microphone = host_policy.microphone;
+    host_capabilities.rumble = device_capabilities.gamepad.can_advertise();
+    host_capabilities.pen = device_capabilities.tablet.can_advertise();
+    host_capabilities.clipboard = clipboard_enabled;
+    host_capabilities.microphone = microphone_enabled;
     host_capabilities.multi_monitor = display_selection_enabled;
     // 10-bit and 4:4:4 are opt-in host profiles: the encoder emits them only
     // when both the host allows them here and the client negotiates them.
@@ -139,7 +162,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let negotiated = session
         .negotiate_host_with_capabilities(host_capabilities)
         .await?;
-    let mut host_input = input::HostInput::from_environment(negotiated.width, negotiated.height)?;
+    let mut host_input = input::HostInput::from_environment(
+        negotiated.width,
+        negotiated.height,
+        host_policy,
+        input_enabled,
+    )?;
     eprintln!(
         "OpenStream negotiated {:?} {}x{} at up to {} fps; audio={:?}; input={}",
         negotiated.video,
@@ -153,7 +181,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Guest-microphone intake: negotiated capability plus explicit policy.
     // Accepted frames decode into the verification sink when configured.
     let mut mic_sink = openstream_media::microphone::GuestMicSink::from_env(
-        negotiated.microphone && host_policy.microphone,
+        negotiated.microphone && microphone_enabled,
     );
     if mic_sink.accepting() {
         eprintln!("OpenStream guest microphone intake enabled");

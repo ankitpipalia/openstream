@@ -135,6 +135,21 @@ impl Default for Permissions {
     }
 }
 
+impl Permissions {
+    /// Build host grants from the basic-input and explicit gamepad policy.
+    ///
+    /// Gamepads are virtual devices, so enabling keyboard/pointer input must
+    /// never implicitly create or drive one.
+    #[must_use]
+    pub const fn from_host_grants(input: bool, gamepad: bool) -> Self {
+        Self {
+            keyboard: input,
+            pointer: input,
+            gamepad: input && gamepad,
+        }
+    }
+}
+
 /// The extents absolute coordinates are expressed in, and where they land.
 ///
 /// **This is the captured output's shape, not the encoded frame's.** A peer
@@ -1090,6 +1105,26 @@ mod tests {
 
     fn injector() -> Injector {
         Injector::new(Extents::alone(1920, 1080))
+    }
+
+    #[test]
+    fn basic_input_grant_does_not_enable_gamepad_without_explicit_policy() {
+        assert_eq!(
+            Permissions::from_host_grants(true, false),
+            Permissions {
+                keyboard: true,
+                pointer: true,
+                gamepad: false,
+            }
+        );
+        assert_eq!(
+            Permissions::from_host_grants(false, true),
+            Permissions {
+                keyboard: false,
+                pointer: false,
+                gamepad: false,
+            }
+        );
     }
 
     fn control(opcode: u8, a0: u32, a1: u32, a2: u32) -> Control<'static> {

@@ -3,6 +3,124 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## 2026-09-12 - Production MVP hardening status
+
+The production-MVP review hardening is complete locally. Named diagnostic
+settings now use field-aware redaction in both JSON and text exports, including
+tokens, credentials, private keys, clipboard content, and user paths. The
+host-agent lifecycle now keeps a child in `Stopping` until termination is
+observed and reaped, escalates after a bounded grace period, and contains Unix
+process-group descendants. Windows settings replacement preserves the existing
+destination while using a replacement primitive; Unix directory durability is
+best effort after the atomic rename.
+
+Linux native-DRM readiness is now obtained from one shared library-level probe
+used by both host preflight and the persistent agent. The legacy readiness
+environment flag cannot select a backend; the known-good X11/FFmpeg/NVENC
+fallback remains the truthful choice when the native pipeline is not explicitly
+enabled and usable. Backend selection now distinguishes DRM framebuffer
+reachability from native pipeline usability: `Auto` does not select native DRM
+from reachability alone, while an explicit DRM request fails instead of
+silently falling back. The persistent agent accepts only a validated
+`OPENSTREAM_PAIRING_FILE` path,
+removes inherited pairing variables, and does not accept or propagate raw
+`OPENSTREAM_PAIRING_JSON`. Windows pairing-file consumption also rejects
+reparse points, and diagnostic/configuration debug output remains secret-free.
+
+Task-level verification included focused diagnostics, host-agent, settings,
+host/preflight, client-core, IPC, formatting, Clippy, target checks, and
+diff checks. Repository documentation checks and the exact protected PR CI
+run remain the final remote gate for this status. The current release script
+is only artifact manifest/presence validation; package signatures,
+notarization, checksums/SBOM, package launch, upgrade/rollback, and full
+package-integrity checks remain deferred, along with native DRM hardware
+acceptance, native zero-copy media, WAN/TURN, durable accounts, and product UI.
+
+## Production MVP diagnostics and capability gates
+
+Added the dependency-light `openstream-diagnostics` crate with bounded,
+secret-redacted JSON and text support bundles, typed release manifests, and
+safe diagnostic errors. Pairing data, bearer tokens, identity keys, private
+keys, clipboard content, and user paths are redacted before export; callers
+must provide already-collected records, so the bundle does not read logs or
+settings files implicitly.
+
+Advanced device capabilities now have separate protocol, implementation,
+runtime, and hardware-validation states. Linux gamepad support is advertised
+only behind explicit input/gamepad policy and a successful uinput probe.
+Unimplemented Windows/macOS virtual devices, tablets, virtual microphones,
+virtual displays, and USB passthrough are never advertised as ready.
+
+Repository/release checks validate the operator-facing artifact manifest and
+required acceptance documentation, and scan the committed source tree with
+gitleaks. The recorded
+Linux NVIDIA -> Apple Silicon macOS acceptance remains explicitly scoped to
+the X11/FFmpeg/NVENC fallback and current BGRA/wgpu presentation path; it does
+not claim native DRM capture, VideoToolbox media, decoded-frame zero-copy, or
+WAN/TURN readiness.
+
+## Local-first pairing and session launch
+
+Added a bounded local-session launcher that accepts an absolute private pairing
+file or one-shot stdin, captures child output in private temporary state, and
+terminates host/client/session children after a finite duration. The launcher
+uses explicit role selection, shell-free command arguments, cleanup traps, and
+bounded graceful shutdown with a forced fallback.
+
+All Rust host/client/reference entrypoints now share a pairing loader that
+rejects relative paths, symlinks, non-regular files, non-owner-only Unix
+permissions, wrong ownership, oversized input, and invalid JSON without
+printing pairing contents. The historical raw JSON environment is retained
+only behind OPENSTREAM_DEVELOPER_OVERRIDE=1. Existing local, ICE, migration,
+and Windows demo paths now pass a private pairing-file path instead.
+
+## Persistent host-agent supervision
+
+Added `openstream-host-agent`, a bounded Tokio supervisor for the proven
+external-FFmpeg host. It owns a validated argv/environment specification,
+classifies child exits, applies deterministic exponential restart backoff,
+enforces an optional child lifetime, and exposes redacted typed health rather
+than raw process output.
+
+The agent serves lifecycle and health commands over a private Unix-domain
+socket using the bounded `openstream-local-ipc` framing layer. It performs a
+safe active-endpoint probe before removing only a refused stale socket, keeps
+the desktop shell independent from host lifetime, and shuts down the managed
+child on SIGINT/SIGTERM or an IPC shutdown command. Native DRM is never
+reported as selected without an explicit positive preflight result; the
+current persistent child path remains the X11/PipeWire/FFmpeg fallback.
+
+## Linux NVIDIA host to Apple Silicon macOS client acceptance
+
+The documented fallback MVP now has a physical Linux-host/macOS-client
+acceptance record. A SteamOS x86_64 host with an NVIDIA GeForce GTX 970 used
+X11 capture and FFmpeg `h264_nvenc` to stream authenticated H.264 over direct
+LAN UDP to an Apple M1 Max client. The client decoded the stream with FFmpeg;
+both the software presenter and the existing wgpu Metal presenter ran.
+
+This is evidence for the X11/FFmpeg/NVENC fallback path only. The native DRM
+capture adapter, ScreenCaptureKit/VideoToolbox media path, decoded-frame
+zero-copy presentation, public-NAT/TURN behavior, audio/input, and long-run
+hardware quality remain separate acceptance gates. The full reproducible
+record, safe firewall guidance, and observed environment are in
+[`docs/BUILD.md`](../../../docs/BUILD.md#physical-linux-nvidia--macos-apple-silicon-mvp-acceptance).
+
+## Startup-order-independent direct establishment
+
+Direct-v2 establishment now waits for a server-published readiness epoch
+instead of consuming the candidate/key phase timeout while the peer is not
+yet connected. The signaling service keeps socket generations separate from
+monotonic establishment generations, publishes readiness only to the current
+host/client pair, invalidates epochs on replacement, and preserves unrelated
+signaling records during reset.
+
+Generation-tagged direct candidates, completion markers, and signed keys are
+kept separate from the existing ICE vocabulary. The direct key transcript is
+bound to the session, establishment generation, authenticated role, and
+ephemeral key. Reconnect races, stale signed keys, duplicate records, and a
+host-first delay beyond the historical 15-second deadline are covered by
+deterministic tests and `scripts/startup-order-smoke.sh`.
+
 ## Harden portable packet delivery accounting
 
 Portable RTT sampling now uses receiver ACK delay only when the ACK newly

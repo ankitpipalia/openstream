@@ -10,6 +10,10 @@ cargo check --workspace --locked
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 bash -n scripts/netns-fixtures.sh
+
+cd ..
+scripts/check-release-artifacts.sh
+scripts/secret-scan.sh
 ```
 
 The parser fuzz package is intentionally excluded from the normal workspace
@@ -29,6 +33,86 @@ These checks cover the protocol, signaling, simulator, codec framing, and
 platform-independent client logic. Hardware-dependent capture, encoder, audio,
 and `/dev/uinput` tests are ignored or skipped when the device is unavailable.
 
+The release check performs artifact manifest/presence validation for the
+operator-facing host, client, signal, and agent binaries in the selected Cargo
+profile. It is not full release validation: package signatures/notarization,
+checksums/SBOM, package launch, upgrade/rollback, and package-integrity checks
+remain deferred. The secret scan requires a clean worktree, archives the
+committed source tree into private temporary state, and runs gitleaks without
+printing matched material.
+
+## Persistent application settings
+
+The `openstream-settings` crate provides the versioned application settings
+boundary used by the future shell and host agent. A settings file contains
+validated device/client/host/video/audio/input/network/privacy/advanced values
+and opaque secret-store references only; it never contains bearer tokens,
+pairing JSON, private keys, TURN passwords, relay tickets, clipboard text,
+audio, or frame data.
+
+```sh
+cd engine/lowlat
+cargo test -p openstream-settings --locked
+```
+
+`save_atomic` writes through a same-directory temporary file and creates a
+private parent/file when it owns those paths. Existing environment variables
+remain developer/headless overrides; `apply_environment_overrides` validates
+them without persisting them. The current settings schema is independent of
+the application, protocol, and future database versions.
+
+## Local-first session launcher
+
+The normal headless/native boundary is a private pairing file rather than a
+raw bearer response in an environment value. Start the signal service
+separately, provision a session into a mode-0600 file, and use the bounded
+launcher:
+
+```sh
+umask 077
+pairing_file="$(mktemp "${TMPDIR:-/tmp}/openstream-pairing.XXXXXX")"
+trap 'rm -f "$pairing_file"' EXIT
+OPENSTREAM_FETCH_TURN=0 ./scripts/create-session.sh >"$pairing_file"
+chmod 600 "$pairing_file"
+./scripts/openstream-local-session.sh \
+  --role both --pairing-file "$pairing_file" --duration 60
+```
+
+Use --role host or --role client on separate machines. The helper may also
+read a one-shot pairing from --pairing-stdin; it stores that input in a
+private temporary file, passes only the path to child processes, captures
+child output, and terminates children after the bounded duration. It does not
+start a signaling service unless an explicit --signal-command is supplied;
+the pairing's signal origin remains the operator's choice.
+
+The Rust entrypoints validate the file again: the path must be absolute,
+regular, owner-only, and no larger than 64 KiB. The persistent host agent
+accepts and propagates only the validated `OPENSTREAM_PAIRING_FILE` path.
+`OPENSTREAM_PAIRING_JSON` is accepted only with
+`OPENSTREAM_DEVELOPER_OVERRIDE=1` for deliberately ephemeral developer or
+reference shells; it is not accepted or propagated by the persistent agent.
+
+## Trusted LAN mode - no account authentication
+
+For a trusted local network, the signal service can disable only the
+administrator/account login flow with an explicit private-address bind:
+
+```sh
+OPENSTREAM_LOCAL_NO_AUTH=1 \
+OPENSTREAM_SIGNAL_BIND=192.168.1.69:8080 \
+target/release/openstream-signal-server
+```
+
+`OPENSTREAM_ADMIN_TOKEN` must be unset for this mode. The service rejects
+wildcard, loopback, public, and shared-CGNAT binds and prints a warning. This
+is not an open media mode: role capabilities and the encrypted peer handshake
+remain mandatory. RFC1918/private addressing is not an identity or
+authentication boundary; any device that can reach the bind may attempt
+management operations. A client using a private-LAN `http://` origin must set
+the same explicit `OPENSTREAM_LOCAL_NO_AUTH=1` override; secure HTTPS/WSS mode
+is required for anything beyond a trusted LAN. Do not publish this listener
+via port forwarding or a reverse proxy.
+
 The 2026-09-07 verification run passed all five commands above. The dependency
 audit permits only a crate-scoped `CC0-1.0` exception for `hexf-parse`, the
 transitive shader-literal parser used by `wgpu`/`naga`; all other non-approved
@@ -42,11 +126,115 @@ client reassembled all 164, and the optional audio path produced a valid
 48 kHz stereo `s16le` output file of 1,044,480 bytes. This is a loopback
 acceptance test, not the Linux 1080p60 hardware gate.
 
+## Persistent host agent
+
+For a host that must continue running after the desktop shell closes, install
+and enable `openstream-host-agent.service`. The agent supervises
+`openstream-ffmpeg-host`, polls it without blocking the event loop, applies
+bounded restart backoff, and exposes typed health/lifecycle commands through
+`%t/openstream/host-agent.sock`. The service creates that runtime directory
+with mode `0700`; do not move the socket below a shared or world-writable
+directory.
+
+The agent's child command is an argv vector and never a shell command.
+Pairing material, when needed by the current developer/headless flow, is
+provided through an absolute private runtime file with mode 0600 via
+OPENSTREAM_PAIRING_FILE; it is never persisted by application settings or
+put in an ExecStart argument. Child diagnostics are intentionally
+typed/redacted. The persistent agent removes inherited pairing variables and
+propagates only the validated file path. The raw OPENSTREAM_PAIRING_JSON
+environment is reserved for the explicitly marked
+OPENSTREAM_DEVELOPER_OVERRIDE=1 developer/reference flows and is not accepted
+or propagated by the persistent agent.
+The current agent manages the tested X11/PipeWire plus external-FFmpeg
+fallback. The DRM framebuffer probe is diagnostic reachability, not proof that
+the native import/conversion/encoder pipeline works. In `Auto`, native DRM is
+selected only when the probe is positive, a native child is configured with
+`OPENSTREAM_HOST_CHILD`, and `OPENSTREAM_EXPERIMENTAL_NATIVE_DRM=1` is set
+explicitly. Otherwise the agent prefers X11/FFmpeg, then PipeWire/FFmpeg. An
+explicit DRM request fails preflight when that native gate is not satisfied;
+it never silently falls back to another capture backend. Native DRM still has
+its own Linux hardware acceptance gate.
+
 The same host/client demo was rerun with `OPENSTREAM_UPNP=1`; it completed and
-produced valid 1920×1080 H.264 while treating the router mapping as
+produced valid 1920x1080 H.264 while treating the router mapping as
 best-effort. This verifies the application fallback path on a machine without
 a controlled test IGD; it is not evidence of successful physical-router
 mapping.
+
+## Physical Linux NVIDIA -> macOS Apple Silicon MVP acceptance
+
+On 2026-09-12, commit `b407d5474f799ca4b5bca4a50c90eca1454b5763` was tested
+between a SteamOS Linux host and an Apple Silicon macOS client on the same
+LAN. The signal service was bound to loopback and reached from macOS through
+an SSH port forward; the media path was direct UDP between the two LAN
+addresses. Pairing and identity material stayed outside the repository.
+
+The tested host fallback was deliberately explicit because the native DRM
+preflight could not reach the NVIDIA scanout buffer:
+
+```sh
+DISPLAY=:0 \
+XDG_RUNTIME_DIR=/run/user/1000 \
+WAYLAND_DISPLAY=wayland-0 \
+OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:18080 \
+OPENSTREAM_PAIRING_FILE=/tmp/openstream-pairing.json \
+OPENSTREAM_UDP_BIND=<linux-lan-address>:40001 \
+OPENSTREAM_VIDEO_MBPS=8 \
+OPENSTREAM_VIDEO_ENCODER=h264_nvenc \
+OPENSTREAM_CAPTURE_BACKEND=x11grab \
+OPENSTREAM_FFMPEG_INPUT=:0.0 \
+target/release/openstream-ffmpeg-host </dev/null
+```
+
+The client was checked with the software presenter and then with the existing
+wgpu Metal presenter:
+
+```sh
+OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:18080 \
+OPENSTREAM_PAIRING_FILE=/tmp/openstream-pairing.json \
+OPENSTREAM_UDP_BIND=<mac-lan-address>:40002 \
+OPENSTREAM_RENDERER=software \
+target/release/openstream-desktop-client
+
+# Repeat with OPENSTREAM_RENDERER=metal after software presentation is stable.
+```
+
+Observed environment and results:
+
+| Side | Observed environment/result |
+|---|---|
+| Linux host | SteamOS Holo, x86_64, kernel `6.16.12-valve24.5-1-neptune-616-gb2f7cfe85e45` |
+| Linux GPU | NVIDIA GeForce GTX 970, driver `580.178.04` |
+| Linux FFmpeg | `n7.1.1`; direct `h264_nvenc` encode smoke passed |
+| Capture/encode | X11 `:0.0` -> FFmpeg `h264_nvenc`, 1920x1080, 60 fps, 8 Mbps |
+| macOS client | macOS `26.6.2`, Apple M1 Max, FFmpeg `9.0.1` |
+| Transport | authenticated direct UDP; H.264 negotiated at 1920x1080/60; audio and input disabled |
+| Headless media run | 15 seconds; Linux sent 894 encoded chunks and macOS wrote 894 decoded access units |
+| Client transport counters | 908 sent packets / 51,127 sent wire bytes; 1,841 received packets / 104,831 received payload bytes |
+| Host transport counters | 1,841 sent packets / 163,743 sent wire bytes; 908 received packets / 22,071 received payload bytes |
+| Presenters | software session ran; Metal initialized as `Metal via Metal (Apple M1 Max)` and the windowed session ran |
+
+The Linux preflight reported an HDMI-A-1 output and active X11/PipeWire
+sources, but `native_drm.capturable` was `not_reachable` and
+`host_capture_gate` was `false`. The physical acceptance therefore proves the
+X11/FFmpeg/NVENC fallback, not the native DRM/KMS capture adapter. On this
+SteamOS image the filesystem-only NVIDIA library probe also reported
+`nvenc_library=false` even though an explicit FFmpeg `h264_nvenc` smoke and
+the live session succeeded with the runtime loader configuration. Use the
+explicit encoder setting above until automatic encoder discovery understands
+that non-standard driver layout.
+
+The macOS application firewall must allow the actual packaged desktop client
+executable to receive the direct UDP response. An unapproved development
+worktree binary failed with `NoReachableCandidate`; the same build ran from an
+allow-listed application path. Do not disable the firewall or use a raw UDP
+preflight as a product workaround--sign/package the client or approve its path
+in the normal macOS firewall controls.
+
+This acceptance does not claim native DRM capture, ScreenCaptureKit,
+VideoToolbox decode/encode, decoded-frame zero-copy, WAN/public-NAT, TURN,
+audio, input, or long-run hardware quality. Those remain separate gates.
 
 Use [`scripts/build-openstream.sh`](../scripts/build-openstream.sh), or
 [`scripts/build-openstream.ps1`](../scripts/build-openstream.ps1) on native
@@ -58,7 +246,7 @@ client-only mobile bridge. The script uses `--locked` and never includes the
 supplied Parsec artifacts.
 
 A separate H.265 loopback selection also passed: the host negotiated H.265,
-sent 112 access units, and `ffprobe` identified the output as 320×240 HEVC at
+sent 112 access units, and `ffprobe` identified the output as 320x240 HEVC at
 25 fps. Native hardware decode/render acceptance remains platform-specific.
 
 The release signaling binary's admin mode was also checked over HTTP: session
@@ -279,15 +467,15 @@ forwards opaque datagrams and does not possess the peer encryption key.
 
 The high-rate release FFmpeg smoke also exercised the bounded-control
 backpressure path: 17,530 encoded H.264 access units were sent and
-reassembled, and `ffprobe` confirmed 320×240 at 25 fps. Capability negotiation
-also reported the actual configured 320×240 stream dimensions to the client.
+reassembled, and `ffprobe` confirmed 320x240 at 25 fps. Capability negotiation
+also reported the actual configured 320x240 stream dimensions to the client.
 Redundant per-frame ACKs now yield to the bounded window instead of turning a
 fast producer into a fatal control error; strict input, keyframe, and session
 controls remain reliable/error-reporting.
 
 After adding the negotiated-size FFmpeg filter, a fresh four-second real-time
 `lavfi` loopback sent 112 H.264 access units from the host and reassembled 111
-on the client; `ffprobe` confirmed the output dimensions remained 320×240.
+on the client; `ffprobe` confirmed the output dimensions remained 320x240.
 The raw Annex-B output has no presentation timestamps, so its guessed frame
 rate is not used as a timing assertion.
 

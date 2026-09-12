@@ -1,0 +1,27 @@
+[Unit]
+Description=OpenStream persistent host agent
+After=graphical-session.target network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/openstream/host.env
+Environment=OPENSTREAM_HOST_AGENT_SOCKET=%t/openstream/host-agent.sock
+ExecStart=%h/.local/bin/openstream-host-agent
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+KillMode=mixed
+RuntimeDirectory=openstream
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/openstream %t/openstream
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target

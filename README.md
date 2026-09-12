@@ -30,7 +30,7 @@ deployed with infrastructure that you control.
 - Bounded queues, fuzz targets, CI checks, deployment templates, and detailed
   architecture/protocol documentation.
 - Generation-scoped transport telemetry, a shared frame-feedback adapter, and
-  host-authoritative direct ↔ opaque-relay ↔ direct migration over one
+  host-authoritative direct <-> opaque-relay <-> direct migration over one
   encrypted session. ICE migration reports the typed unsupported result on the
   current `webrtc-ice` boundary.
 
@@ -72,11 +72,46 @@ ports, output path, or FFmpeg input with `OPENSTREAM_DEMO_SECONDS`,
 `OPENSTREAM_DEMO_PORT`, `OPENSTREAM_DEMO_OUTPUT`, and
 `OPENSTREAM_FFMPEG_ARGS`.
 
+For a normal local-first role launch, keep the pairing response in a private
+file and pass only its path to the launcher. Start the signal server
+separately, then run the helper on one or both roles:
+
+```sh
+umask 077
+pairing_file="$(mktemp "${TMPDIR:-/tmp}/openstream-pairing.XXXXXX")"
+trap 'rm -f "$pairing_file"' EXIT
+OPENSTREAM_FETCH_TURN=0 ./scripts/create-session.sh >"$pairing_file"
+chmod 600 "$pairing_file"
+OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:8080 \
+  ./scripts/openstream-local-session.sh \
+  --role both --pairing-file "$pairing_file" --duration 60
+```
+
+For two machines, copy the private pairing file through a secure channel and
+run the helper separately with --role host and --role client. The helper
+captures child output, enforces a finite duration, and never prints pairing
+contents. The normal persistent-agent boundary is the protected
+OPENSTREAM_PAIRING_FILE path. The raw OPENSTREAM_PAIRING_JSON environment is a
+developer-only override using OPENSTREAM_DEVELOPER_OVERRIDE=1; it is not
+accepted or propagated by the persistent host agent.
+
 Run the authenticated full-ICE loopback smoke separately:
 
 ```sh
 ./scripts/full-ice-smoke.sh
 ```
+
+Verify startup-order-independent direct establishment with the synthetic
+reference peer:
+
+```sh
+./scripts/startup-order-smoke.sh
+```
+
+This starts the host first, waits 16 seconds (past the historical 15-second
+candidate deadline), then starts the client and checks direct-v2 encrypted
+media/control traffic. The smoke is loopback-only and does not claim WAN,
+coturn, hardware, or native zero-copy media support.
 
 On a Linux host, inspect native capture and device readiness before pairing:
 
@@ -87,6 +122,14 @@ On a Linux host, inspect native capture and device readiness before pairing:
 The report distinguishes DRM/KMS framebuffer reachability, X11/PipeWire
 availability, FFmpeg and hardware candidates, and `/dev/uinput` presence. It
 is diagnostic output, not proof of a live encoder/driver stream.
+
+The physical Linux-NVIDIA -> Apple-Silicon macOS MVP acceptance is recorded in
+[`docs/BUILD.md`](docs/BUILD.md#physical-linux-nvidia---macos-apple-silicon-mvp-acceptance).
+It validates the X11/FFmpeg `h264_nvenc` fallback, direct authenticated UDP,
+the existing FFmpeg decoder, and software/wgpu Metal presentation. This is
+the X11/FFmpeg/NVENC fallback path only. Native
+DRM/KMS capture, VideoToolbox decode/encode, decoded-frame zero-copy, and
+WAN/TURN acceptance remain separate gates.
 
 To exercise the built-in opaque relay, configure a reachable relay endpoint
 and set `OPENSTREAM_FORCE_RELAY=1`. For local testing:
@@ -106,7 +149,7 @@ Run the one-session, three-generation migration acceptance:
 ./scripts/ice-migration-capability.sh
 ```
 
-The first command proves direct → application-owned opaque relay → direct;
+The first command proves direct -> application-owned opaque relay -> direct;
 the second reports `UnsupportedIceRestart` for the current
 `webrtc-ice 0.17.2` boundary. Neither command claims external coturn,
 public-NAT, native zero-copy media, or stock Parsec compatibility.
@@ -122,6 +165,10 @@ cargo test --workspace --all-features --locked -- --test-threads=1
 cargo check --manifest-path fuzz/Cargo.toml --locked
 cargo deny check
 cargo build --workspace --release --locked
+
+cd ..
+scripts/check-release-artifacts.sh
+scripts/secret-scan.sh
 ```
 
 The fuzz package is intentionally outside the normal Cargo workspace. With
@@ -136,6 +183,13 @@ Hardware-dependent capture, GPU encoder, sound-server, uinput, Android, and
 iOS tests require their native operating system, SDK, device, or driver and
 are explicitly marked in the test and feature matrix.
 
+The release check is an artifact manifest/presence validation for the
+host/client/server binaries produced by the locked build. It is not full
+release validation: package signatures/notarization, checksums/SBOM, package
+launch, upgrade/rollback, and package-integrity checks remain deferred. The
+secret scan uses gitleaks on the committed source tree only; it does not scan
+build output or print matched material.
+
 ## Self-hosting
 
 Build the release binaries from `engine/lowlat` and use the templates in
@@ -143,6 +197,18 @@ Build the release binaries from `engine/lowlat` and use the templates in
 non-loopback deployment. Set a strong `OPENSTREAM_ADMIN_TOKEN`; without it,
 session-management endpoints refuse requests unless the server is explicitly
 run in loopback-only development mode with `OPENSTREAM_ALLOW_NO_AUTH=1`.
+
+For the local-first MVP, an explicit Trusted LAN mode - no account
+authentication - is available with `OPENSTREAM_LOCAL_NO_AUTH=1` plus a
+numeric RFC1918/ULA/link-local
+`OPENSTREAM_SIGNAL_BIND` (for example `192.168.1.69:8080`). It rejects
+wildcard/public binds and requires no admin token. This removes only the
+account/admin flow; role-scoped capabilities and encrypted peer sessions stay
+enabled. RFC1918/private addressing is not an identity or authentication
+boundary: any device that can reach the bind may attempt management
+operations. Clients using a private-LAN `http://` origin must opt in with the
+same variable. Treat the LAN as trusted and switch to admin-token HTTPS/WSS
+before exposing the service beyond it.
 
 For the application relay, configure:
 
@@ -158,19 +224,25 @@ separately and are never placed in pairing JSON or URLs.
 
 Pairing JSON contains role bearer capabilities. Treat it as a secret and never
 commit it, put it in a public issue, or include it in logs.
+Persistent host-agent launches use the validated `OPENSTREAM_PAIRING_FILE`
+boundary. Raw `OPENSTREAM_PAIRING_JSON` is not accepted or propagated by the
+persistent agent and is reserved for explicitly marked developer/reference
+flows.
 
 ## Current status
 
 The local development path is functional and validated through direct UDP,
-forced relay, and authenticated loopback ICE. The GitHub workflow also runs
-the full-ICE loopback, a short encrypted FFmpeg media loopback, and the
-host-checkable mobile acceptance harness on Ubuntu. The implementation is not
-yet a finished product: public-NAT/coturn interoperability, long-run Linux
-hardware acceptance, exact Direct3D11/native GPU-driver acceptance, durable
-signaling/account state, native Windows/macOS hosting, native desktop audio,
-OS virtual microphone routing, virtual displays, Windows/macOS virtual
-gamepads, Android/iOS device builds, USB passthrough, and multi-guest media
-fan-out remain tracked work.
+forced relay, authenticated loopback ICE, startup-order-independent direct-v2
+establishment, and a real SteamOS/NVIDIA Linux-host -> Apple-Silicon macOS-client
+fallback stream. The GitHub workflow also runs the full-ICE loopback, a short
+encrypted FFmpeg media loopback, and the host-checkable mobile acceptance
+harness on Ubuntu. The implementation is not yet a finished product:
+public-NAT/coturn interoperability, native DRM/KMS capture, long-run hardware
+quality, exact Direct3D11/native GPU-driver acceptance, native macOS/Windows
+capture and encode, VideoToolbox/zero-copy decode, durable signaling/account
+state, native desktop audio, OS virtual microphone routing, virtual displays,
+Windows/macOS virtual gamepads, Android/iOS device builds, USB passthrough,
+and multi-guest media fan-out remain tracked work.
 
 The legacy `lowlat-tray` binary is intentionally not load-bearing and remains
 an open compatibility-engine phase. It is separate from the OpenStream

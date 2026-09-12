@@ -50,6 +50,31 @@ pub enum Capturable {
     NotReachable,
 }
 
+/// Bounded result of the native DRM capture-readiness probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeDrmProbe {
+    Ready,
+    NothingLit,
+    Unreachable,
+}
+
+impl NativeDrmProbe {
+    /// Whether native DRM capture can reach a framebuffer plane right now.
+    pub const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
+/// Probe the same DRM card, output, scanout, and framebuffer-plane path used
+/// when opening native capture.
+pub fn native_drm_probe() -> NativeDrmProbe {
+    match Display::capturable() {
+        Capturable::Yes => NativeDrmProbe::Ready,
+        Capturable::NothingLit => NativeDrmProbe::NothingLit,
+        Capturable::NotReachable => NativeDrmProbe::Unreachable,
+    }
+}
+
 /// Which of these outputs a published capture checksum names.
 ///
 /// **The checksum is how the loop says what it is capturing without a lock**

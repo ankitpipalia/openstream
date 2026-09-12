@@ -28,6 +28,11 @@ members = [
     "crates/bridge",
     "crates/daemon",
     "crates/tray",
+    "crates/settings",
+    "crates/app-core",
+    "crates/local-ipc",
+    "crates/host-agent",
+    "crates/diagnostics",
 ]
 exclude = ["fuzz"]
 
