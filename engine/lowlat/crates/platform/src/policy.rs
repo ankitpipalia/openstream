@@ -323,6 +323,8 @@ impl Approval {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostPolicy {
     pub input: bool,
+    pub keyboard: bool,
+    pub mouse: bool,
     pub clipboard: bool,
     pub gamepad: bool,
     pub microphone: bool,
@@ -341,8 +343,11 @@ impl HostPolicy {
     /// Approval mode comes from `OPENSTREAM_APPROVAL` (`auto`/`owner`).
     pub fn from_env() -> Self {
         let flag = |name: &str| std::env::var(name).as_deref() == Ok("1");
+        let input = flag("OPENSTREAM_ENABLE_INPUT");
         Self {
-            input: flag("OPENSTREAM_ENABLE_INPUT"),
+            input,
+            keyboard: input || flag("OPENSTREAM_ENABLE_KEYBOARD"),
+            mouse: input || flag("OPENSTREAM_ENABLE_MOUSE"),
             clipboard: flag("OPENSTREAM_CLIPBOARD"),
             gamepad: flag("OPENSTREAM_GAMEPAD"),
             microphone: flag("OPENSTREAM_MIC"),
@@ -356,8 +361,10 @@ impl HostPolicy {
     /// One redacted startup-log line naming the effective grants.
     pub fn log_line(&self) -> String {
         format!(
-            "host policy: input={} clipboard={} gamepad={} microphone={} approval={:?}",
+            "host policy: input={} keyboard={} mouse={} clipboard={} gamepad={} microphone={} approval={:?}",
             as_on_off(self.input),
+            as_on_off(self.keyboard),
+            as_on_off(self.mouse),
             as_on_off(self.clipboard),
             as_on_off(self.gamepad),
             as_on_off(self.microphone),
@@ -406,6 +413,8 @@ mod tests {
         let _environment = lock_environment();
         let keys = [
             "OPENSTREAM_ENABLE_INPUT",
+            "OPENSTREAM_ENABLE_KEYBOARD",
+            "OPENSTREAM_ENABLE_MOUSE",
             "OPENSTREAM_CLIPBOARD",
             "OPENSTREAM_GAMEPAD",
             "OPENSTREAM_MIC",
@@ -422,6 +431,8 @@ mod tests {
             policy,
             HostPolicy {
                 input: false,
+                keyboard: false,
+                mouse: false,
                 clipboard: false,
                 gamepad: false,
                 microphone: false,
@@ -437,6 +448,8 @@ mod tests {
         let _environment = lock_environment();
         let keys = [
             "OPENSTREAM_ENABLE_INPUT",
+            "OPENSTREAM_ENABLE_KEYBOARD",
+            "OPENSTREAM_ENABLE_MOUSE",
             "OPENSTREAM_CLIPBOARD",
             "OPENSTREAM_GAMEPAD",
             "OPENSTREAM_MIC",
@@ -484,6 +497,8 @@ mod tests {
     fn capability_report_keeps_support_layers_separate() {
         let policy = HostPolicy {
             input: true,
+            keyboard: true,
+            mouse: true,
             clipboard: true,
             gamepad: true,
             microphone: true,
@@ -513,6 +528,8 @@ mod tests {
     fn policy_or_runtime_failure_never_becomes_an_advertisement() {
         let policy = HostPolicy {
             input: true,
+            keyboard: true,
+            mouse: true,
             clipboard: false,
             gamepad: true,
             microphone: true,
@@ -548,6 +565,8 @@ mod tests {
     fn unsupported_desktop_virtual_adapters_are_not_ready() {
         let policy = HostPolicy {
             input: true,
+            keyboard: true,
+            mouse: true,
             clipboard: false,
             gamepad: true,
             microphone: true,
@@ -566,6 +585,8 @@ mod tests {
     fn capability_log_names_each_support_layer() {
         let policy = HostPolicy {
             input: true,
+            keyboard: true,
+            mouse: true,
             clipboard: false,
             gamepad: true,
             microphone: false,
@@ -585,6 +606,8 @@ mod tests {
     fn linux_gamepad_requires_both_input_and_gamepad_policy() {
         let mut policy = HostPolicy {
             input: true,
+            keyboard: true,
+            mouse: true,
             clipboard: false,
             gamepad: false,
             microphone: false,

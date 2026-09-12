@@ -359,4 +359,28 @@ mod tests {
             120
         );
     }
+
+    #[test]
+    fn session_credential_expiry_is_at_or_before_the_session_deadline() {
+        let config = TurnConfig {
+            secret: b"test-secret-0123456789".to_vec(),
+            realm: "openstream".into(),
+            urls: vec!["turn:turn.example:3478".into()],
+            ttl_seconds: 3600,
+        };
+        let now = 1_700_000_000;
+        let session_deadline = now + 120;
+        let issued = config
+            .issue_for_session("session", "client", now, session_deadline - now)
+            .expect("credential fits inside the session");
+
+        let expiry = issued
+            .username
+            .split_once(':')
+            .expect("TURN username contains an expiry")
+            .0
+            .parse::<u64>()
+            .expect("TURN expiry is numeric");
+        assert_eq!(expiry, session_deadline);
+    }
 }

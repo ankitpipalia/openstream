@@ -42,7 +42,11 @@ jobs:
         run: python3 scripts/check-ascii.py
 
       - name: Shell fixture syntax
-        run: bash -n scripts/netns-fixtures.sh
+        run: |
+          bash -n scripts/netns-fixtures.sh
+          bash -n scripts/wan-acceptance.sh scripts/network-fault-matrix.sh
+          bash -n scripts/check-openstream-1-0-release.sh scripts/test-openstream-1-0-release.sh
+          scripts/test-openstream-1-0-release.sh
 
       - name: Alpine/musl helper syntax
         run: sh -n scripts/alpine-musl-ci.sh
@@ -278,6 +282,24 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-desktop-client
 
+  desktop-shell:
+    name: OpenStream desktop product shell
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install frontend dependencies
+        working-directory: desktop
+        run: npm install --no-audit --no-fund --ignore-scripts
+      - name: Typecheck and bundle shell
+        working-directory: desktop
+        run: npm run build
+      - name: Run shell tests
+        working-directory: desktop
+        run: npm test -- --run
+
   loom:
     name: model checking
     runs-on: ubuntu-latest
@@ -389,6 +411,7 @@ jobs:
       - openstream-portable
       - openstream-target-matrix
       - openstream-desktop-target-matrix
+      - desktop-shell
       - loom
       - deny
       - smoke
@@ -403,6 +426,7 @@ jobs:
           PORTABLE: ${{ needs.openstream-portable.result }}
           TARGETS: ${{ needs.openstream-target-matrix.result }}
           DESKTOP_TARGETS: ${{ needs.openstream-desktop-target-matrix.result }}
+          DESKTOP_SHELL: ${{ needs.desktop-shell.result }}
           LOOM: ${{ needs.loom.result }}
           DENY: ${{ needs.deny.result }}
           SMOKE: ${{ needs.smoke.result }}
@@ -411,7 +435,7 @@ jobs:
           SECRET_SCAN: ${{ needs.secret-scan.result }}
         run: |
           for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
-              "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS" "$ALPINE_MUSL" \
+              "$DESKTOP_SHELL" "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS" "$ALPINE_MUSL" \
               "$SECRET_SCAN"; do
             if [ "$result" != success ]; then
               echo "CI job result was $result" >&2

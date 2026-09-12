@@ -6,7 +6,8 @@
 //! secrets remain in the control/session boundary that owns them.
 
 use openstream_app_core::{
-    AppErrorCode, AppEvent, AppState, DeviceSummary, DiagnosticSnapshot, HostStatus, PermissionSet,
+    AppErrorCode, AppEvent, AppState, ConnectionRejectReason, DeviceSummary, DiagnosticSnapshot,
+    HostStatus, PermissionSet,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -160,6 +161,7 @@ pub enum IpcEvent {
     },
     ConnectionRejected {
         request_id: RequestId,
+        reason: ConnectionRejectReason,
     },
     ConnectionNegotiationStarted,
     ConnectionReady {
@@ -169,9 +171,6 @@ pub enum IpcEvent {
     ReconnectStarted,
     DisconnectRequested,
     Disconnected,
-    RequestExpired {
-        request_id: RequestId,
-    },
     HostStartRequested,
     HostReady,
     HostStopRequested,
@@ -202,8 +201,9 @@ impl TryFrom<AppEvent> for IpcEvent {
                 request_id: RequestId::new(request_id)?,
                 permissions,
             },
-            AppEvent::ConnectionRejected { request_id } => Self::ConnectionRejected {
+            AppEvent::ConnectionRejected { request_id, reason } => Self::ConnectionRejected {
                 request_id: RequestId::new(request_id)?,
+                reason,
             },
             AppEvent::ConnectionNegotiationStarted => Self::ConnectionNegotiationStarted,
             AppEvent::ConnectionReady {
@@ -216,9 +216,6 @@ impl TryFrom<AppEvent> for IpcEvent {
             AppEvent::ReconnectStarted => Self::ReconnectStarted,
             AppEvent::DisconnectRequested => Self::DisconnectRequested,
             AppEvent::Disconnected => Self::Disconnected,
-            AppEvent::RequestExpired { request_id } => Self::RequestExpired {
-                request_id: RequestId::new(request_id)?,
-            },
             AppEvent::HostStartRequested => Self::HostStartRequested,
             AppEvent::HostReady => Self::HostReady,
             AppEvent::HostStopRequested => Self::HostStopRequested,
@@ -598,6 +595,26 @@ mod tests {
         assert!(!text.contains("private_key"));
         assert!(!text.contains("pairing"));
         let _ = PermissionSet::view_only();
+    }
+
+    #[test]
+    fn typed_connection_rejection_round_trips_over_ipc() {
+        let event = IpcEvent::try_from(openstream_app_core::AppEvent::ConnectionRejected {
+            request_id: "request-1".into(),
+            reason: openstream_app_core::ConnectionRejectReason::Expired,
+        })
+        .expect("domain rejection maps to IPC");
+        assert_eq!(
+            event,
+            IpcEvent::ConnectionRejected {
+                request_id: RequestId::new("request-1").expect("request id"),
+                reason: openstream_app_core::ConnectionRejectReason::Expired,
+            }
+        );
+
+        let encoded = encode_frame(&event).expect("rejection encodes");
+        let decoded: IpcEvent = decode_frame(&encoded).expect("rejection decodes");
+        assert_eq!(decoded, event);
     }
 
     #[tokio::test]

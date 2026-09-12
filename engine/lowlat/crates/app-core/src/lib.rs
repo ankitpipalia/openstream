@@ -1,4 +1,5 @@
 use openstream_settings::AppConfig;
+pub use openstream_settings::setting_descriptors;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -147,6 +148,33 @@ impl DeviceSummary {
     }
 }
 
+/// Repository-neutral identity captured when a device joins the control plane.
+/// The public key is durable identity material, not a bearer credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEnrollment {
+    pub device_id: String,
+    pub name: String,
+    pub platform: String,
+    pub public_key: [u8; 32],
+    pub enrolled_at_ms: u64,
+}
+
+/// Durable trust state for an enrolled device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceTrustState {
+    Pending,
+    Trusted,
+    Revoked,
+}
+
+/// Repository-neutral update used for both trust and revocation changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceTrustUpdate {
+    pub device_id: String,
+    pub state: DeviceTrustState,
+    pub changed_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionRequest {
     pub request_id: String,
@@ -157,6 +185,12 @@ pub struct ConnectionRequest {
 }
 
 impl ConnectionRequest {
+    /// Return whether the request can no longer be approved or rejected as a
+    /// live request.
+    pub const fn is_expired(&self, now_ms: u64) -> bool {
+        now_ms >= self.expires_at_ms
+    }
+
     fn validate(&self, now_ms: u64) -> Result<(), AppError> {
         validate_id("request_id", &self.request_id)?;
         validate_id("device_id", &self.device_id)?;
@@ -167,7 +201,7 @@ impl ConnectionRequest {
                 "a connection request must include view permission",
             ));
         }
-        if self.expires_at_ms <= self.created_at_ms || now_ms >= self.expires_at_ms {
+        if self.expires_at_ms <= self.created_at_ms || self.is_expired(now_ms) {
             return Err(AppError::new(
                 AppErrorCode::ExpiredRequest,
                 false,
@@ -275,6 +309,17 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+/// Why a connection request was rejected. Expiry is a domain outcome rather
+/// than an untyped timeout, so both peers can render and audit it consistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionRejectReason {
+    Denied,
+    Expired,
+}
+
+/// Short name used by control-plane implementations and future repositories.
+pub type RejectReason = ConnectionRejectReason;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppCommand {
     BeginAuthentication,
@@ -327,6 +372,7 @@ pub enum AppEvent {
     },
     ConnectionRejected {
         request_id: String,
+        reason: ConnectionRejectReason,
     },
     ConnectionNegotiationStarted,
     ConnectionReady {
@@ -336,9 +382,6 @@ pub enum AppEvent {
     ReconnectStarted,
     DisconnectRequested,
     Disconnected,
-    RequestExpired {
-        request_id: String,
-    },
     HostStartRequested,
     HostReady,
     HostStopRequested,
@@ -358,6 +401,24 @@ pub struct AppModel {
     active_device_id: Option<String>,
     active_session_id: Option<String>,
     active_permissions: PermissionSet,
+}
+
+/// Secret-free snapshot exposed to a product shell over local IPC.
+///
+/// Session credentials, pairing JSON, relay tickets, and private keys are
+/// deliberately absent. The shell receives state and capability observations;
+/// the Rust control/session owners retain all bearer material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSnapshot {
+    pub mode: DeploymentMode,
+    pub state: AppState,
+    pub host_status: HostStatus,
+    pub devices: Vec<DeviceSummary>,
+    pub pending_request: Option<ConnectionRequest>,
+    pub active_device_id: Option<String>,
+    pub active_session_id: Option<String>,
+    pub active_permissions: PermissionSet,
+    pub diagnostics: DiagnosticSnapshot,
 }
 
 impl AppModel {
@@ -421,6 +482,21 @@ impl AppModel {
         &self.devices
     }
 
+    /// Build a UI-safe state snapshot without exposing session bearer data.
+    pub fn snapshot(&self, diagnostics: DiagnosticSnapshot) -> AppSnapshot {
+        AppSnapshot {
+            mode: self.mode,
+            state: self.state.clone(),
+            host_status: self.host_status.clone(),
+            devices: self.devices.clone(),
+            pending_request: self.pending_request.clone(),
+            active_device_id: self.active_device_id.clone(),
+            active_session_id: self.active_session_id.clone(),
+            active_permissions: self.active_permissions,
+            diagnostics,
+        }
+    }
+
     pub fn dispatch(&mut self, command: AppCommand) -> Result<Vec<AppEvent>, AppError> {
         match command {
             AppCommand::BeginAuthentication => {
@@ -462,15 +538,19 @@ impl AppModel {
                 self.state = AppState::Ready;
                 Ok(vec![AppEvent::ConnectionRejected {
                     request_id: request.request_id,
+                    reason: ConnectionRejectReason::Denied,
                 }])
             }
             AppCommand::Tick { now_ms } => {
                 if let Some(request) = &self.pending_request {
-                    if now_ms >= request.expires_at_ms {
+                    if request.is_expired(now_ms) {
                         let request_id = request.request_id.clone();
                         self.pending_request = None;
                         self.state = AppState::Ready;
-                        return Ok(vec![AppEvent::RequestExpired { request_id }]);
+                        return Ok(vec![AppEvent::ConnectionRejected {
+                            request_id,
+                            reason: ConnectionRejectReason::Expired,
+                        }]);
                     }
                 }
                 Ok(Vec::new())
@@ -743,6 +823,7 @@ mod tests {
     use super::{
         AppCommand, AppErrorCode, AppEvent, AppModel, AppState, HostStatus, PermissionSet,
     };
+    use openstream_settings::{CapabilityState, SettingVisibility, setting_descriptors};
 
     fn model() -> AppModel {
         AppModel::local_default()
@@ -956,5 +1037,120 @@ mod tests {
         let encoded = serde_json::to_string(&state).expect("state serializes");
         let decoded: AppState = serde_json::from_str(&encoded).expect("state deserializes");
         assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn app_core_exposes_the_rust_owned_settings_descriptor_catalog() {
+        let descriptors = super::setting_descriptors();
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.key == "client.profile"
+                && descriptor.capability == CapabilityState::Available
+        }));
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.key == "host.capture.drm"
+                && descriptor.visibility == SettingVisibility::Experimental
+        }));
+
+        let direct = setting_descriptors();
+        assert_eq!(descriptors, direct);
+    }
+
+    #[test]
+    fn device_control_contract_is_repository_neutral_and_secret_free() {
+        let enrollment = super::DeviceEnrollment {
+            device_id: "mac-1".into(),
+            name: "MacBook Pro".into(),
+            platform: "macos".into(),
+            public_key: [7; 32],
+            enrolled_at_ms: 100,
+        };
+        let trusted = super::DeviceTrustUpdate {
+            device_id: enrollment.device_id.clone(),
+            state: super::DeviceTrustState::Trusted,
+            changed_at_ms: 101,
+        };
+        let revoked = super::DeviceTrustUpdate {
+            device_id: enrollment.device_id.clone(),
+            state: super::DeviceTrustState::Revoked,
+            changed_at_ms: 102,
+        };
+        let encoded =
+            serde_json::to_string(&(enrollment.clone(), trusted.clone(), revoked.clone()))
+                .expect("device control values serialize");
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("private_key"));
+
+        let decoded: (
+            super::DeviceEnrollment,
+            super::DeviceTrustUpdate,
+            super::DeviceTrustUpdate,
+        ) = serde_json::from_str(&encoded).expect("device control values deserialize");
+        assert_eq!(decoded, (enrollment, trusted, revoked));
+    }
+
+    #[test]
+    fn expired_request_is_a_typed_connection_rejection_event() {
+        let mut model = model();
+        model.add_device(super::DeviceSummary::online("mac-1", "Mac client"));
+        model
+            .dispatch(AppCommand::Connect {
+                device_id: "mac-1".into(),
+                request_id: "request-1".into(),
+                requested: PermissionSet::view_only(),
+                now_ms: 100,
+            })
+            .expect("request is created");
+
+        let events = model
+            .dispatch(AppCommand::Tick { now_ms: 30_100 })
+            .expect("expired request is observed");
+        assert_eq!(
+            events,
+            vec![AppEvent::ConnectionRejected {
+                request_id: "request-1".into(),
+                reason: super::ConnectionRejectReason::Expired,
+            }]
+        );
+    }
+
+    #[test]
+    fn explicit_request_rejection_has_a_typed_reason() {
+        let mut model = model();
+        model.add_device(super::DeviceSummary::online("mac-1", "Mac client"));
+        model
+            .dispatch(AppCommand::Connect {
+                device_id: "mac-1".into(),
+                request_id: "request-1".into(),
+                requested: PermissionSet::view_only(),
+                now_ms: 100,
+            })
+            .expect("request is created");
+
+        let events = model
+            .dispatch(AppCommand::RejectRequest {
+                request_id: "request-1".into(),
+                now_ms: 200,
+            })
+            .expect("request is rejected");
+        assert_eq!(
+            events,
+            vec![AppEvent::ConnectionRejected {
+                request_id: "request-1".into(),
+                reason: super::ConnectionRejectReason::Denied,
+            }]
+        );
+    }
+
+    #[test]
+    fn product_snapshot_is_serializable_and_contains_no_bearer_fields() {
+        let model = AppModel::local_default();
+        let snapshot = model.snapshot(DiagnosticSnapshot::default());
+        let encoded = serde_json::to_string(&snapshot).expect("snapshot serializes");
+
+        assert!(encoded.contains("host_status"));
+        assert!(encoded.contains("diagnostics"));
+        assert!(!encoded.contains("pairing_json"));
+        assert!(!encoded.contains("relay_ticket"));
+        assert!(!encoded.contains("private_key"));
     }
 }

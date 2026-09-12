@@ -67,6 +67,133 @@ impl HwReport {
     }
 }
 
+/// Decoder implementation requested by the client session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderBackend {
+    /// Prefer a native zero-copy decoder, then the compatibility fallbacks.
+    Auto,
+    /// Apple VideoToolbox backed decode.
+    VideoToolbox,
+    /// FFmpeg process/library decode.
+    Ffmpeg,
+    /// A CPU decoder owned by the session runner.
+    Software,
+}
+
+impl DecoderBackend {
+    /// Parse a user-facing decoder name. Unknown values remain conservative.
+    pub fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "videotoolbox" | "vt" => Self::VideoToolbox,
+            "ffmpeg" => Self::Ffmpeg,
+            "software" | "cpu" => Self::Software,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// A decoder capability with a user-safe reason for unavailability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Capability {
+    Ready,
+    Unavailable(String),
+}
+
+impl Capability {
+    pub fn ready() -> Self {
+        Self::Ready
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable(reason.into())
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Ready => None,
+            Self::Unavailable(reason) => Some(reason),
+        }
+    }
+}
+
+/// Runtime decoder capabilities discovered by the platform/session layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoderCapabilities {
+    pub videotoolbox: Capability,
+    pub ffmpeg: Capability,
+    pub software: Capability,
+}
+
+/// Why a requested decoder could not be selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecoderSelectionError {
+    Unavailable {
+        backend: DecoderBackend,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for DecoderSelectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { backend, reason } => {
+                write!(formatter, "{backend:?} decoder unavailable: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DecoderSelectionError {}
+
+/// Select a decoder without silently claiming that a native path is usable.
+/// `Auto` follows the product order VideoToolbox → FFmpeg → software; an
+/// explicit request returns the recorded capability reason instead.
+pub fn resolve_decoder(
+    requested: DecoderBackend,
+    capabilities: &DecoderCapabilities,
+) -> Result<DecoderBackend, DecoderSelectionError> {
+    let candidates = [
+        (DecoderBackend::VideoToolbox, &capabilities.videotoolbox),
+        (DecoderBackend::Ffmpeg, &capabilities.ffmpeg),
+        (DecoderBackend::Software, &capabilities.software),
+    ];
+    if requested == DecoderBackend::Auto {
+        if let Some((backend, _)) = candidates
+            .iter()
+            .find(|(_, capability)| matches!(capability, &&Capability::Ready))
+        {
+            return Ok(*backend);
+        }
+        let reason = candidates
+            .iter()
+            .filter_map(|(backend, capability)| {
+                capability
+                    .reason()
+                    .map(|reason| format!("{backend:?}: {reason}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DecoderSelectionError::Unavailable {
+            backend: DecoderBackend::Auto,
+            reason,
+        });
+    }
+
+    let capability = match requested {
+        DecoderBackend::VideoToolbox => &capabilities.videotoolbox,
+        DecoderBackend::Ffmpeg => &capabilities.ffmpeg,
+        DecoderBackend::Software => &capabilities.software,
+        DecoderBackend::Auto => unreachable!("auto is handled above"),
+    };
+    match capability {
+        Capability::Ready => Ok(requested),
+        Capability::Unavailable(reason) => Err(DecoderSelectionError::Unavailable {
+            backend: requested,
+            reason: reason.clone(),
+        }),
+    }
+}
+
 /// Codec requested for hardware encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderCodec {
@@ -417,5 +544,57 @@ mod tests {
         assert_eq!(EncoderCodec::parse("H264"), Some(EncoderCodec::H264));
         assert_eq!(EncoderCodec::parse("hevc"), Some(EncoderCodec::H265));
         assert_eq!(EncoderCodec::parse("av1"), None);
+    }
+
+    #[test]
+    fn auto_decoder_prefers_videotoolbox_then_ffmpeg_then_software() {
+        let capabilities = DecoderCapabilities {
+            videotoolbox: Capability::ready(),
+            ffmpeg: Capability::ready(),
+            software: Capability::ready(),
+        };
+        assert_eq!(
+            resolve_decoder(DecoderBackend::Auto, &capabilities),
+            Ok(DecoderBackend::VideoToolbox)
+        );
+
+        let capabilities = DecoderCapabilities {
+            videotoolbox: Capability::unavailable("not on this target"),
+            ..capabilities
+        };
+        assert_eq!(
+            resolve_decoder(DecoderBackend::Auto, &capabilities),
+            Ok(DecoderBackend::Ffmpeg)
+        );
+
+        let capabilities = DecoderCapabilities {
+            videotoolbox: Capability::unavailable("not on this target"),
+            ffmpeg: Capability::unavailable("ffmpeg missing"),
+            ..capabilities
+        };
+        assert_eq!(
+            resolve_decoder(DecoderBackend::Auto, &capabilities),
+            Ok(DecoderBackend::Software)
+        );
+    }
+
+    #[test]
+    fn explicit_decoder_requests_fail_with_the_capability_reason() {
+        let capabilities = DecoderCapabilities {
+            videotoolbox: Capability::unavailable("VideoToolbox requires macOS"),
+            ffmpeg: Capability::ready(),
+            software: Capability::ready(),
+        };
+        assert_eq!(
+            resolve_decoder(DecoderBackend::VideoToolbox, &capabilities),
+            Err(DecoderSelectionError::Unavailable {
+                backend: DecoderBackend::VideoToolbox,
+                reason: "VideoToolbox requires macOS".to_string(),
+            })
+        );
+        assert_eq!(
+            resolve_decoder(DecoderBackend::Ffmpeg, &capabilities),
+            Ok(DecoderBackend::Ffmpeg)
+        );
     }
 }

@@ -43,6 +43,10 @@ use tokio::sync::mpsc as async_mpsc;
 mod display;
 mod mic;
 mod render;
+// Pure lifecycle/input-safety seam; a future winit presenter can consume it
+// without making this minifb path or the dependency graph change in this slice.
+#[allow(dead_code)]
+mod session;
 
 const DEFAULT_WIDTH: usize = 1280;
 const DEFAULT_HEIGHT: usize = 720;

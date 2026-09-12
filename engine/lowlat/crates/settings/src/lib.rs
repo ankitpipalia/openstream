@@ -6,9 +6,16 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod descriptors;
+
+pub use descriptors::{
+    CapabilityState, SettingApplyMode, SettingDescriptor, SettingScope, SettingVisibility,
+    setting_descriptors,
+};
+
 /// The on-disk schema version. This is deliberately independent from the
 /// application, protocol, and database versions.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 const MAX_NAME_BYTES: usize = 128;
 const MAX_ORIGIN_BYTES: usize = 2048;
 const MAX_FFMPEG_PATH_BYTES: usize = 4096;
@@ -48,6 +55,92 @@ macro_rules! string_mode {
         }
     };
 }
+
+macro_rules! string_mode_with_default {
+    ($name:ident, $default:ident { $( $variant:ident => $text:literal ),+ $(,)? }) => {
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub enum $name {
+            $( $variant, )+
+            Unknown(String),
+        }
+
+        impl Default for $name {
+            fn default() -> Self { Self::$default }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where S: Serializer {
+                let text = match self {
+                    $( Self::$variant => $text, )+
+                    Self::Unknown(value) => value.as_str(),
+                };
+                serializer.serialize_str(text)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where D: Deserializer<'de> {
+                let value = String::deserialize(deserializer)?;
+                Ok(match value.as_str() {
+                    $( $text => Self::$variant, )+
+                    _ => Self::Unknown(value),
+                })
+            }
+        }
+    };
+}
+
+string_mode_with_default!(StreamProfile, Balanced {
+    Performance => "performance",
+    Balanced => "balanced",
+    Quality => "quality",
+    Custom => "custom",
+});
+
+string_mode_with_default!(WindowMode, Windowed {
+    Windowed => "windowed",
+    Borderless => "borderless",
+    Fullscreen => "fullscreen",
+});
+
+string_mode_with_default!(VsyncMode, Auto {
+    Auto => "auto",
+    On => "on",
+    Off => "off",
+});
+
+/// Compatibility spelling for callers that capitalize the acronym.
+pub type VSyncMode = VsyncMode;
+
+string_mode_with_default!(ChromaPreference, Auto {
+    Auto => "auto",
+    Yuv420 => "yuv420",
+    Yuv444 => "yuv444",
+});
+
+string_mode_with_default!(BitDepthPreference, Auto {
+    Auto => "auto",
+    Eight => "8",
+    Ten => "10",
+});
+
+string_mode_with_default!(AudioCodec, Opus {
+    Opus => "opus",
+});
+
+string_mode_with_default!(AudioLatencyMode, Balanced {
+    Low => "low",
+    Balanced => "balanced",
+    Quality => "quality",
+});
+
+string_mode_with_default!(CongestionIntent, Balanced {
+    LowLatency => "low_latency",
+    Balanced => "balanced",
+    Throughput => "throughput",
+});
 
 string_mode!(RendererMode {
     Auto => "auto",
@@ -166,11 +259,25 @@ pub struct ClientConfig {
     #[serde(default = "default_signal_origin")]
     pub signal_origin: String,
     #[serde(default)]
+    pub profile: StreamProfile,
+    #[serde(default)]
+    pub window_mode: WindowMode,
+    #[serde(default)]
     pub renderer: RendererMode,
     #[serde(default)]
     pub decoder: DecoderMode,
     #[serde(default)]
     pub codec: CodecPreference,
+    #[serde(default)]
+    pub vsync: VsyncMode,
+    #[serde(default)]
+    pub chroma: ChromaPreference,
+    #[serde(default)]
+    pub bit_depth: BitDepthPreference,
+    #[serde(default)]
+    pub immersive: bool,
+    #[serde(default = "default_true")]
+    pub show_warnings: bool,
     #[serde(default)]
     pub bandwidth_cap_mbps: Option<f64>,
     #[serde(default = "default_true")]
@@ -181,10 +288,16 @@ pub struct ClientConfig {
 pub struct HostConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_host_name")]
+    pub name: String,
+    #[serde(default)]
+    pub stay_awake: bool,
     #[serde(default)]
     pub capture: CaptureMode,
     #[serde(default)]
     pub encoder: EncoderMode,
+    #[serde(default)]
+    pub aggregate_bandwidth_cap_mbps: Option<f64>,
     #[serde(default)]
     pub approval: ApprovalMode,
     #[serde(default = "default_max_guests")]
@@ -215,14 +328,22 @@ pub struct VideoConfig {
 pub struct AudioConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub codec: AudioCodec,
     #[serde(default = "default_audio_bitrate")]
     pub bitrate_kbps: u16,
+    #[serde(default)]
+    pub latency_mode: AudioLatencyMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub keyboard: bool,
+    #[serde(default)]
+    pub mouse: bool,
     #[serde(default)]
     pub clipboard: bool,
     #[serde(default)]
@@ -231,18 +352,26 @@ pub struct InputConfig {
     pub microphone: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub upnp: bool,
     #[serde(default)]
     pub ice: bool,
     #[serde(default)]
+    pub turn: bool,
+    #[serde(default)]
     pub force_relay: bool,
     #[serde(default)]
     pub local_no_auth: bool,
     #[serde(default)]
     pub udp_port: Option<u16>,
+    #[serde(default)]
+    pub client_port: Option<u16>,
+    #[serde(default)]
+    pub host_start_port: Option<u16>,
+    #[serde(default)]
+    pub congestion: CongestionIntent,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,6 +397,24 @@ pub struct SettingsFile {
     pub path: PathBuf,
     pub config: AppConfig,
     pub migrated_from: Option<u32>,
+}
+
+/// A validated configuration after profile policy and explicit low-level
+/// overrides have been resolved. This is an in-memory contract and is never
+/// written as the settings file shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveConfig {
+    pub schema_version: u32,
+    pub device: DeviceConfig,
+    pub profile: StreamProfile,
+    pub client: ClientConfig,
+    pub host: HostConfig,
+    pub video: VideoConfig,
+    pub audio: AudioConfig,
+    pub input: InputConfig,
+    pub network: NetworkConfig,
+    pub privacy: PrivacyConfig,
+    pub advanced: AdvancedConfig,
 }
 
 #[derive(Debug)]
@@ -318,6 +465,7 @@ impl AppConfig {
             });
         }
         validate_text("device.name", &self.device.name, 1, MAX_NAME_BYTES)?;
+        validate_text("host.name", &self.host.name, 1, MAX_NAME_BYTES)?;
         validate_text(
             "client.signal_origin",
             &self.client.signal_origin,
@@ -327,12 +475,32 @@ impl AppConfig {
         if self.client.signal_origin.chars().any(char::is_whitespace) {
             return invalid("client.signal_origin", "must not contain whitespace");
         }
+        validate_mode("client.profile", &self.client.profile, is_profile_known)?;
+        validate_mode("client.window_mode", &self.client.window_mode, is_window_known)?;
         validate_mode("client.renderer", &self.client.renderer, is_renderer_known)?;
         validate_mode("client.decoder", &self.client.decoder, is_decoder_known)?;
         validate_mode("client.codec", &self.client.codec, is_codec_known)?;
+        validate_mode("client.vsync", &self.client.vsync, is_vsync_known)?;
+        validate_mode("client.chroma", &self.client.chroma, is_chroma_known)?;
+        validate_mode(
+            "client.bit_depth",
+            &self.client.bit_depth,
+            is_bit_depth_known,
+        )?;
         validate_mode("host.capture", &self.host.capture, is_capture_known)?;
         validate_mode("host.encoder", &self.host.encoder, is_encoder_known)?;
         validate_mode("host.approval", &self.host.approval, is_approval_known)?;
+        validate_mode("audio.codec", &self.audio.codec, is_audio_codec_known)?;
+        validate_mode(
+            "audio.latency_mode",
+            &self.audio.latency_mode,
+            is_audio_latency_known,
+        )?;
+        validate_mode(
+            "network.congestion",
+            &self.network.congestion,
+            is_congestion_known,
+        )?;
         validate_mode("video.codec", &self.video.codec, is_codec_known)?;
         validate_mode(
             "video.pixel_format",
@@ -367,12 +535,25 @@ impl AppConfig {
         if let Some(rate) = self.client.bandwidth_cap_mbps {
             validate_rate("client.bandwidth_cap_mbps", rate, 0.1, 1000.0)?;
         }
+        if let Some(rate) = self.host.aggregate_bandwidth_cap_mbps {
+            validate_rate("host.aggregate_bandwidth_cap_mbps", rate, 0.1, 1000.0)?;
+        }
         if !(8..=512).contains(&self.audio.bitrate_kbps) {
             return invalid("audio.bitrate_kbps", "must be in 8..=512");
         }
         if let Some(port) = self.network.udp_port {
             if port == 0 {
                 return invalid("network.udp_port", "must not be zero");
+            }
+        }
+        if let Some(port) = self.network.client_port {
+            if port == 0 {
+                return invalid("network.client_port", "must not be zero");
+            }
+        }
+        if let Some(port) = self.network.host_start_port {
+            if port == 0 {
+                return invalid("network.host_start_port", "must not be zero");
             }
         }
         if let Some(display) = &self.host.selected_display {
@@ -392,6 +573,13 @@ impl AppConfig {
         }
         Ok(())
     }
+
+    /// Resolve the selected profile and any low-level overrides into the
+    /// configuration consumed by a session or host runner.
+    #[must_use]
+    pub fn effective(&self) -> EffectiveConfig {
+        effective_config(self)
+    }
 }
 
 /// Return a complete safe configuration for a first local session.
@@ -407,6 +595,154 @@ pub fn default_config() -> AppConfig {
         network: NetworkConfig::default(),
         privacy: PrivacyConfig::default(),
         advanced: AdvancedConfig::default(),
+    }
+}
+
+/// Resolve platform defaults, the selected profile, and explicit low-level
+/// edits in a stable order. Values that differ from the Balanced baseline are
+/// treated as explicit overrides when a named profile is selected; this keeps
+/// profile policy from being copied into the persisted settings blob.
+pub fn effective_config(config: &AppConfig) -> EffectiveConfig {
+    let baseline = profile_config(StreamProfile::Balanced);
+    let selected_profile = config.client.profile.clone();
+    let named_profile = matches!(
+        &selected_profile,
+        StreamProfile::Performance | StreamProfile::Balanced | StreamProfile::Quality
+    );
+    let resolved_profile = resolve_profile(config, &baseline);
+    let mut effective = EffectiveConfig::from_config(config, resolved_profile.clone());
+
+    if named_profile {
+        let policy = profile_config(selected_profile);
+        apply_profile_policy(&mut effective, config, &baseline, &policy);
+    }
+
+    effective.profile = resolved_profile.clone();
+    effective.client.profile = resolved_profile;
+    effective
+}
+
+fn resolve_profile(config: &AppConfig, baseline: &AppConfig) -> StreamProfile {
+    if matches!(config.client.profile, StreamProfile::Custom) {
+        return StreamProfile::Custom;
+    }
+    if profile_overridden(config, baseline) {
+        StreamProfile::Custom
+    } else {
+        config.client.profile.clone()
+    }
+}
+
+fn profile_overridden(config: &AppConfig, baseline: &AppConfig) -> bool {
+    config.client.renderer != baseline.client.renderer
+        || config.client.decoder != baseline.client.decoder
+        || config.client.codec != baseline.client.codec
+        || config.client.vsync != baseline.client.vsync
+        || config.client.chroma != baseline.client.chroma
+        || config.client.bit_depth != baseline.client.bit_depth
+        || config.client.bandwidth_cap_mbps != baseline.client.bandwidth_cap_mbps
+        || config.video != baseline.video
+}
+
+fn apply_profile_policy(
+    effective: &mut EffectiveConfig,
+    source: &AppConfig,
+    baseline: &AppConfig,
+    policy: &AppConfig,
+) {
+    if source.client.renderer == baseline.client.renderer {
+        effective.client.renderer = policy.client.renderer.clone();
+    }
+    if source.client.decoder == baseline.client.decoder {
+        effective.client.decoder = policy.client.decoder.clone();
+    }
+    if source.client.codec == baseline.client.codec {
+        effective.client.codec = policy.client.codec.clone();
+    }
+    if source.client.vsync == baseline.client.vsync {
+        effective.client.vsync = policy.client.vsync.clone();
+    }
+    if source.client.chroma == baseline.client.chroma {
+        effective.client.chroma = policy.client.chroma.clone();
+    }
+    if source.client.bit_depth == baseline.client.bit_depth {
+        effective.client.bit_depth = policy.client.bit_depth.clone();
+    }
+    if source.client.bandwidth_cap_mbps == baseline.client.bandwidth_cap_mbps {
+        effective.client.bandwidth_cap_mbps = policy.client.bandwidth_cap_mbps;
+    }
+
+    if source.video.width == baseline.video.width {
+        effective.video.width = policy.video.width;
+    }
+    if source.video.height == baseline.video.height {
+        effective.video.height = policy.video.height;
+    }
+    if source.video.fps == baseline.video.fps {
+        effective.video.fps = policy.video.fps;
+    }
+    if source.video.bitrate_mbps == baseline.video.bitrate_mbps {
+        effective.video.bitrate_mbps = policy.video.bitrate_mbps;
+    }
+    if source.video.min_bitrate_mbps == baseline.video.min_bitrate_mbps {
+        effective.video.min_bitrate_mbps = policy.video.min_bitrate_mbps;
+    }
+    if source.video.codec == baseline.video.codec {
+        effective.video.codec = policy.video.codec.clone();
+    }
+    if source.video.pixel_format == baseline.video.pixel_format {
+        effective.video.pixel_format = policy.video.pixel_format.clone();
+    }
+}
+
+fn profile_config(profile: StreamProfile) -> AppConfig {
+    let mut config = default_config();
+    config.client.profile = profile.clone();
+    match profile {
+        StreamProfile::Performance => {
+            config.client.decoder = DecoderMode::Hardware;
+            config.client.codec = CodecPreference::H264;
+            config.client.chroma = ChromaPreference::Yuv420;
+            config.client.bit_depth = BitDepthPreference::Eight;
+            config.video.width = 1280;
+            config.video.height = 720;
+            config.video.bitrate_mbps = 6.0;
+            config.video.min_bitrate_mbps = 1.0;
+            config.video.codec = CodecPreference::H264;
+            config.video.pixel_format = PixelFormat::Yuv420p;
+        }
+        StreamProfile::Balanced => {}
+        StreamProfile::Quality => {
+            config.client.codec = CodecPreference::H265;
+            config.client.chroma = ChromaPreference::Yuv444;
+            config.client.bit_depth = BitDepthPreference::Auto;
+            config.video.width = 2560;
+            config.video.height = 1440;
+            config.video.bitrate_mbps = 25.0;
+            config.video.min_bitrate_mbps = 2.0;
+            config.video.codec = CodecPreference::H265;
+            config.video.pixel_format = PixelFormat::Yuv444p;
+        }
+        StreamProfile::Custom | StreamProfile::Unknown(_) => {}
+    }
+    config
+}
+
+impl EffectiveConfig {
+    fn from_config(config: &AppConfig, profile: StreamProfile) -> Self {
+        Self {
+            schema_version: config.schema_version,
+            device: config.device.clone(),
+            profile,
+            client: config.client.clone(),
+            host: config.host.clone(),
+            video: config.video.clone(),
+            audio: config.audio.clone(),
+            input: config.input.clone(),
+            network: config.network.clone(),
+            privacy: config.privacy.clone(),
+            advanced: config.advanced.clone(),
+        }
     }
 }
 
@@ -434,8 +770,10 @@ pub fn load(path: impl AsRef<Path>) -> Result<SettingsFile, SettingsError> {
         });
     }
     let migrated_from = (version < CURRENT_SCHEMA_VERSION).then_some(version);
-    if version == 0 {
-        migrate_schema_zero(&mut value)?;
+    match version {
+        0 => migrate_schema_zero(&mut value)?,
+        1 => migrate_schema_one(&mut value)?,
+        _ => {}
     }
     let config: AppConfig =
         serde_json::from_value(value).map_err(|error| SettingsError::Json(error.to_string()))?;
@@ -552,7 +890,16 @@ fn apply_one(config: &mut AppConfig, key: &str, value: &str) -> Result<(), Setti
         "OPENSTREAM_VIDEO_ENCODER" => config.host.encoder = mode_from_string(key, value)?,
         "OPENSTREAM_CAPTURE_BACKEND" => config.host.capture = mode_from_string(key, value)?,
         "OPENSTREAM_AUDIO" => config.audio.enabled = parse_bool(key, value)?,
-        "OPENSTREAM_ENABLE_INPUT" => config.input.enabled = parse_bool(key, value)?,
+        "OPENSTREAM_ENABLE_INPUT" => {
+            let enabled = parse_bool(key, value)?;
+            config.input.enabled = enabled;
+            if enabled {
+                config.input.keyboard = true;
+                config.input.mouse = true;
+            }
+        }
+        "OPENSTREAM_ENABLE_KEYBOARD" => config.input.keyboard = parse_bool(key, value)?,
+        "OPENSTREAM_ENABLE_MOUSE" => config.input.mouse = parse_bool(key, value)?,
         "OPENSTREAM_CLIPBOARD" => config.input.clipboard = parse_bool(key, value)?,
         "OPENSTREAM_GAMEPAD" => config.input.gamepad = parse_bool(key, value)?,
         "OPENSTREAM_MIC" => config.input.microphone = parse_bool(key, value)?,
@@ -583,6 +930,26 @@ fn migrate_schema_zero(value: &mut Value) -> Result<(), SettingsError> {
         object
             .entry(section.to_string())
             .or_insert_with(|| Value::Object(Default::default()));
+    }
+    Ok(())
+}
+
+fn migrate_schema_one(value: &mut Value) -> Result<(), SettingsError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| SettingsError::Json("settings root must be an object".to_string()))?;
+    object.insert(
+        "schema_version".to_string(),
+        Value::from(CURRENT_SCHEMA_VERSION),
+    );
+
+    // Schema v1 had one coarse input switch. Preserve the user's explicit
+    // enablement for the two production input categories introduced in v2;
+    // fields already present in a hand-written v1 file remain authoritative.
+    if let Some(input) = object.get_mut("input").and_then(Value::as_object_mut) {
+        let enabled = input.get("enabled").cloned().unwrap_or(Value::Bool(false));
+        input.entry("keyboard").or_insert_with(|| enabled.clone());
+        input.entry("mouse").or_insert(enabled);
     }
     Ok(())
 }
@@ -873,6 +1240,30 @@ fn is_pixel_known(value: &PixelFormat) -> bool {
 fn is_approval_known(value: &ApprovalMode) -> bool {
     !matches!(value, ApprovalMode::Unknown(_))
 }
+fn is_profile_known(value: &StreamProfile) -> bool {
+    !matches!(value, StreamProfile::Unknown(_))
+}
+fn is_window_known(value: &WindowMode) -> bool {
+    !matches!(value, WindowMode::Unknown(_))
+}
+fn is_vsync_known(value: &VsyncMode) -> bool {
+    !matches!(value, VsyncMode::Unknown(_))
+}
+fn is_chroma_known(value: &ChromaPreference) -> bool {
+    !matches!(value, ChromaPreference::Unknown(_))
+}
+fn is_bit_depth_known(value: &BitDepthPreference) -> bool {
+    !matches!(value, BitDepthPreference::Unknown(_))
+}
+fn is_audio_codec_known(value: &AudioCodec) -> bool {
+    !matches!(value, AudioCodec::Unknown(_))
+}
+fn is_audio_latency_known(value: &AudioLatencyMode) -> bool {
+    !matches!(value, AudioLatencyMode::Unknown(_))
+}
+fn is_congestion_known(value: &CongestionIntent) -> bool {
+    !matches!(value, CongestionIntent::Unknown(_))
+}
 
 fn parse_bool(field: &str, value: &str) -> Result<bool, SettingsError> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -922,6 +1313,9 @@ const fn current_schema_version() -> u32 {
 fn default_device_name() -> String {
     "OpenStream device".to_string()
 }
+fn default_host_name() -> String {
+    "OpenStream host".to_string()
+}
 fn default_signal_origin() -> String {
     "http://127.0.0.1:8080".to_string()
 }
@@ -966,9 +1360,16 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             signal_origin: default_signal_origin(),
+            profile: StreamProfile::Balanced,
+            window_mode: WindowMode::Windowed,
             renderer: RendererMode::Auto,
             decoder: DecoderMode::Auto,
             codec: CodecPreference::Auto,
+            vsync: VsyncMode::Auto,
+            chroma: ChromaPreference::Auto,
+            bit_depth: BitDepthPreference::Auto,
+            immersive: false,
+            show_warnings: true,
             bandwidth_cap_mbps: None,
             overlay: true,
         }
@@ -978,8 +1379,11 @@ impl Default for HostConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            name: default_host_name(),
+            stay_awake: false,
             capture: CaptureMode::Auto,
             encoder: EncoderMode::Auto,
+            aggregate_bandwidth_cap_mbps: None,
             approval: ApprovalMode::Auto,
             max_guests: default_max_guests(),
             selected_display: None,
@@ -1003,7 +1407,9 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            codec: AudioCodec::Opus,
             bitrate_kbps: default_audio_bitrate(),
+            latency_mode: AudioLatencyMode::Balanced,
         }
     }
 }
@@ -1015,6 +1421,35 @@ impl Default for PrivacyConfig {
         }
     }
 }
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keyboard: false,
+            mouse: false,
+            clipboard: false,
+            gamepad: false,
+            microphone: false,
+        }
+    }
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            upnp: false,
+            ice: false,
+            turn: false,
+            force_relay: false,
+            local_no_auth: false,
+            udp_port: None,
+            client_port: None,
+            host_start_port: None,
+            congestion: CongestionIntent::Balanced,
+        }
+    }
+}
+
 impl Default for AdvancedConfig {
     fn default() -> Self {
         Self {
@@ -1028,8 +1463,9 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_SCHEMA_VERSION, DecoderMode, EncoderMode, RendererMode, SecretRef, SettingsError,
-        apply_overrides, default_config, load, save_atomic,
+        apply_overrides, default_config, effective_config, load, save_atomic, setting_descriptors,
+        CapabilityState, ChromaPreference, CURRENT_SCHEMA_VERSION, DecoderMode, EncoderMode,
+        RendererMode, SecretRef, SettingVisibility, StreamProfile, WindowMode, SettingsError,
     };
     use serde_json::json;
     use std::cell::{Cell, RefCell};
@@ -1115,6 +1551,115 @@ mod tests {
         assert!(loaded.config.host.enabled);
         assert_eq!(loaded.migrated_from, Some(0));
         cleanup(&path);
+    }
+
+    #[test]
+    fn schema_v1_migrates_explicitly_to_v2_with_balanced_defaults() {
+        let path = temp_path("schema-v1-migration");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "client": {
+                    "renderer": "metal",
+                    "overlay": false
+                },
+                "input": {
+                    "enabled": true,
+                    "clipboard": true
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load(&path).expect("schema v1 migrates");
+        assert_eq!(loaded.config.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(loaded.migrated_from, Some(1));
+        assert_eq!(loaded.config.client.profile, StreamProfile::Balanced);
+        assert_eq!(loaded.config.client.window_mode, WindowMode::Windowed);
+        assert!(loaded.config.input.keyboard);
+        assert!(loaded.config.input.mouse);
+        assert!(loaded.config.input.clipboard);
+        assert_eq!(loaded.config.client.renderer, RendererMode::Metal);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn v2_input_permissions_remain_independent() {
+        let path = temp_path("independent-input");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "input": {
+                    "keyboard": true,
+                    "mouse": false,
+                    "gamepad": true,
+                    "clipboard": false,
+                    "microphone": true
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load(&path).expect("v2 input permissions load");
+        assert!(loaded.config.input.keyboard);
+        assert!(!loaded.config.input.mouse);
+        assert!(loaded.config.input.gamepad);
+        assert!(!loaded.config.input.clipboard);
+        assert!(loaded.config.input.microphone);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn unknown_modes_round_trip_without_selecting_a_known_backend() {
+        let mode: RendererMode = serde_json::from_str("\"future-renderer\"").unwrap();
+        assert_eq!(mode, RendererMode::Unknown("future-renderer".to_string()));
+        assert_eq!(serde_json::to_string(&mode).unwrap(), "\"future-renderer\"");
+    }
+
+    #[test]
+    fn profile_resolution_is_deterministic_and_low_level_edits_become_custom() {
+        let mut balanced = default_config();
+        balanced.client.profile = StreamProfile::Balanced;
+        let first = effective_config(&balanced);
+        let second = effective_config(&balanced);
+        assert_eq!(first, second);
+        assert_eq!(first.profile, StreamProfile::Balanced);
+
+        let mut edited = balanced;
+        edited.client.profile = StreamProfile::Quality;
+        edited.video.fps = 120;
+        let effective = effective_config(&edited);
+        assert_eq!(effective.profile, StreamProfile::Custom);
+        assert_eq!(effective.video.fps, 120);
+        assert_eq!(effective.video.bitrate_mbps, 25.0);
+    }
+
+    #[test]
+    fn descriptor_catalog_exposes_truthful_metadata() {
+        let descriptors = setting_descriptors();
+        let native_drm = descriptors
+            .iter()
+            .find(|descriptor| descriptor.key == "host.capture.drm")
+            .expect("native DRM descriptor");
+        assert_eq!(native_drm.visibility, SettingVisibility::Experimental);
+        assert_eq!(native_drm.capability, CapabilityState::Experimental);
+
+        for key in [
+            "input.keyboard",
+            "input.mouse",
+            "input.gamepad",
+            "input.clipboard",
+            "input.microphone",
+        ] {
+            assert!(
+                descriptors.iter().any(|descriptor| descriptor.key == key),
+                "missing descriptor {key}"
+            );
+        }
     }
 
     #[test]
