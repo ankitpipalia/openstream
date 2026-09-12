@@ -43,10 +43,11 @@ jobs:
 
       - name: Shell fixture syntax
         run: |
-          bash -n scripts/netns-fixtures.sh
+          bash -n engine/lowlat/scripts/netns-fixtures.sh
           bash -n scripts/wan-acceptance.sh scripts/network-fault-matrix.sh
           bash -n scripts/check-openstream-1-0-release.sh scripts/test-openstream-1-0-release.sh
           scripts/test-openstream-1-0-release.sh
+        working-directory: .
 
       - name: Alpine/musl helper syntax
         run: sh -n scripts/alpine-musl-ci.sh
