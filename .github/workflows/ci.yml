@@ -292,9 +292,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Validate frontend lockfile
+        working-directory: desktop
+        run: node -e 'JSON.parse(require("fs").readFileSync("package-lock.json","utf8"))'
       - name: Install frontend dependencies
         working-directory: desktop
-        run: npm install --no-audit --no-fund --ignore-scripts
+        run: npm ci --no-audit --no-fund --ignore-scripts
       - name: Typecheck and bundle shell
         working-directory: desktop
         run: npm run build

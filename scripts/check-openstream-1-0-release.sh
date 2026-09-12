@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Arrays that accumulate during parsing are expanded as
+# ${name[@]+"${name[@]}"}. bash 3.2, still the macOS system shell, treats a
+# bare "${name[@]}" on an empty array as an unbound variable under `set -u`.
+
 # Authoritative, fail-closed evidence check for an OpenStream 1.0 release.
 # Hardware and WAN tests are supplied as explicit report evidence; this script
 # verifies that the required artifacts and evidence are present and coherent.
@@ -158,7 +162,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                     continue
                     ;;
             esac
-            if ! append_unique "$id" "${meta_ids[@]}"; then
+            if ! append_unique "$id" ${meta_ids[@]+"${meta_ids[@]}"}; then
                 fail "manifest contains duplicate meta id: $id"
                 continue
             fi
@@ -170,7 +174,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                 fail "artifact $id has an unsafe relative path: $value"
                 continue
             fi
-            if ! append_unique "$id" "${artifact_ids[@]}"; then
+            if ! append_unique "$id" ${artifact_ids[@]+"${artifact_ids[@]}"}; then
                 fail "manifest contains duplicate artifact id: $id"
                 continue
             fi
@@ -189,7 +193,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
                 fail "evidence $id has an unsafe relative path: $value"
                 continue
             fi
-            if ! append_unique "$id" "${evidence_ids[@]}"; then
+            if ! append_unique "$id" ${evidence_ids[@]+"${evidence_ids[@]}"}; then
                 fail "manifest contains duplicate evidence id: $id"
                 continue
             fi
@@ -197,7 +201,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
             evidence_paths+=("$value")
             ;;
         gate)
-            if ! append_unique "$id" "${gate_ids[@]}"; then
+            if ! append_unique "$id" ${gate_ids[@]+"${gate_ids[@]}"}; then
                 fail "manifest contains duplicate gate id: $id"
                 continue
             fi
@@ -253,7 +257,7 @@ evidence_path_for() {
 gate_present() {
     local wanted=$1
     local item
-    for item in "${gate_ids[@]}"; do
+    for item in ${gate_ids[@]+"${gate_ids[@]}"}; do
         [[ "$item" == "$wanted" ]] && return 0
     done
     return 1
@@ -397,7 +401,7 @@ if [[ -n "$checksum_file" && -n "$hash_tool" ]]; then
         fi
     done
 else
-    for artifact_relative in "${artifact_paths[@]}"; do
+    for artifact_relative in ${artifact_paths[@]+"${artifact_paths[@]}"}; do
         if [[ ! -f "$artifact_root/$artifact_relative" ]]; then
             fail "missing release artifact: $artifact_root/$artifact_relative"
         fi
@@ -451,7 +455,7 @@ if [[ -n "$signing_file" ]]; then
             fail "signing evidence line $signing_line is malformed"
             continue
         fi
-        if ! append_unique "$signing_id" "${signing_ids[@]}"; then
+        if ! append_unique "$signing_id" ${signing_ids[@]+"${signing_ids[@]}"}; then
             fail "signing evidence contains duplicate artifact id: $signing_id"
             continue
         fi
@@ -477,7 +481,7 @@ signing_status_for() {
 }
 
 if [[ -n "$signing_file" ]]; then
-    for artifact_id in "${artifact_ids[@]}"; do
+    for artifact_id in ${artifact_ids[@]+"${artifact_ids[@]}"}; do
         signing_record="$(signing_status_for "$artifact_id" 2>/dev/null || true)"
         signing_status="${signing_record%%$'\t'*}"
         signing_signer="${signing_record#*$'\t'}"
@@ -532,7 +536,7 @@ else
             fail "gate report names an id not declared in the manifest: $report_id"
             continue
         fi
-        if ! append_unique "$report_id" "${report_ids[@]}"; then
+        if ! append_unique "$report_id" ${report_ids[@]+"${report_ids[@]}"}; then
             fail "gate report contains duplicate gate id: $report_id"
             continue
         fi
@@ -560,7 +564,7 @@ fi
 
 for required_id in "${required_gate_ids[@]}"; do
     found=0
-    for report_id in "${report_ids[@]}"; do
+    for report_id in ${report_ids[@]+"${report_ids[@]}"}; do
         if [[ "$report_id" == "$required_id" ]]; then
             found=1
             break

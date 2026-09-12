@@ -1,9 +1,33 @@
+import { useState } from "react";
+
+import type { ProductAdapter } from "../adapters/productAdapter";
+import { createRuntimeUnavailableSnapshot } from "../adapters/productAdapter";
 import type { ProductSnapshot } from "../model";
 import { CapabilityBadge, ComputerStatusBadge } from "../components/StatusBadge";
 import { EmptyState, PageHeader, SectionCard } from "../components/AppShell";
 
-export function ComputersPage({ snapshot }: { snapshot: ProductSnapshot }) {
+export function ComputersPage({
+  snapshot,
+  adapter,
+  onSnapshot,
+}: {
+  snapshot: ProductSnapshot;
+  adapter: ProductAdapter;
+  onSnapshot: (snapshot: ProductSnapshot) => void;
+}) {
+  const [refreshing, setRefreshing] = useState(false);
   const controlPlane = snapshot.access.controlPlane;
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    try {
+      onSnapshot(await adapter.refresh());
+    } catch {
+      onSnapshot(createRuntimeUnavailableSnapshot("The runtime bridge did not respond."));
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   return (
     <div className="page-stack">
@@ -11,7 +35,11 @@ export function ComputersPage({ snapshot }: { snapshot: ProductSnapshot }) {
         eyebrow="Workspace"
         title="Computers"
         description="Discover trusted OpenStream hosts and start a session when the control plane reports one as available."
-        actions={<button className="secondary-button" type="button" disabled title="Refresh is waiting for the control-plane adapter">Refresh</button>}
+        actions={
+          <button className="secondary-button" type="button" onClick={handleRefresh} disabled={refreshing}>
+            Refresh
+          </button>
+        }
       />
 
       <SectionCard title="Your computers" description="Only hosts reported by the configured control plane appear here.">

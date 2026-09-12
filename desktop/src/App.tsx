@@ -1,34 +1,46 @@
 import { useEffect, useState } from "react";
 
 import { AppShell } from "./components/AppShell";
-import { createLocalAdapter } from "./adapters/productAdapter";
+import { createRuntimeUnavailableSnapshot } from "./adapters/productAdapter";
 import type { ProductAdapter } from "./adapters/productAdapter";
-import type { PageId } from "./model";
+import { createDefaultAdapter } from "./adapters/tauriAdapter";
+import type { PageId, ProductSnapshot } from "./model";
 import { AboutPage } from "./pages/AboutPage";
 import { AccessPage } from "./pages/AccessPage";
 import { ComputersPage } from "./pages/ComputersPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
-const defaultAdapter = createLocalAdapter();
+const defaultAdapter = createDefaultAdapter();
+const BRIDGE_UNAVAILABLE_DETAIL = "The runtime bridge did not respond.";
 
 interface AppProps {
   adapter?: ProductAdapter;
   initialPage?: PageId;
 }
 
-function Page({ page, adapterSnapshot }: { page: PageId; adapterSnapshot: ReturnType<ProductAdapter["getSnapshot"]> }) {
+function Page({
+  page,
+  adapter,
+  snapshot,
+  onSnapshot,
+}: {
+  page: PageId;
+  adapter: ProductAdapter;
+  snapshot: ProductSnapshot;
+  onSnapshot: (snapshot: ProductSnapshot) => void;
+}) {
   switch (page) {
     case "computers":
-      return <ComputersPage snapshot={adapterSnapshot} />;
+      return <ComputersPage snapshot={snapshot} adapter={adapter} onSnapshot={onSnapshot} />;
     case "access":
-      return <AccessPage snapshot={adapterSnapshot} />;
+      return <AccessPage snapshot={snapshot} />;
     case "settings":
-      return <SettingsPage snapshot={adapterSnapshot} />;
+      return <SettingsPage snapshot={snapshot} />;
     case "diagnostics":
-      return <DiagnosticsPage snapshot={adapterSnapshot} />;
+      return <DiagnosticsPage snapshot={snapshot} />;
     case "about":
-      return <AboutPage snapshot={adapterSnapshot} />;
+      return <AboutPage snapshot={snapshot} />;
   }
 }
 
@@ -37,13 +49,30 @@ export function App({ adapter = defaultAdapter, initialPage = "computers" }: App
   const [snapshot, setSnapshot] = useState(() => adapter.getSnapshot());
 
   useEffect(() => {
+    let cancelled = false;
     setSnapshot(adapter.getSnapshot());
-    return adapter.subscribe(setSnapshot);
+    const unsubscribe = adapter.subscribe(setSnapshot);
+    adapter
+      .refresh()
+      .then((next) => {
+        if (!cancelled) {
+          setSnapshot(next);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setSnapshot(createRuntimeUnavailableSnapshot(BRIDGE_UNAVAILABLE_DETAIL));
+        }
+      });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
   }, [adapter]);
 
   return (
     <AppShell activePage={activePage} snapshot={snapshot} onNavigate={setActivePage}>
-      <Page page={activePage} adapterSnapshot={snapshot} />
+      <Page page={activePage} adapter={adapter} snapshot={snapshot} onSnapshot={setSnapshot} />
     </AppShell>
   );
 }

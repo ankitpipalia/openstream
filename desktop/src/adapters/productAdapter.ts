@@ -3,6 +3,7 @@ import type {
   Capability,
   DiagnosticsSnapshot,
   ProductSnapshot,
+  RuntimeCommand,
   SettingSection,
 } from "../model";
 
@@ -11,11 +12,16 @@ export interface ProductAdapter {
   getSnapshot(): ProductSnapshot;
   subscribe(listener: (snapshot: ProductSnapshot) => void): () => void;
   refresh(): Promise<ProductSnapshot>;
-  /** Fixture-only mutation hook; a real transport adapter can omit this. */
+  dispatch(command: RuntimeCommand): Promise<ProductSnapshot>;
+  updateSettings(config: unknown): Promise<ProductSnapshot>;
+}
+
+export interface LocalProductAdapter extends ProductAdapter {
+  /** Fixture-only mutation hook; a real transport adapter does not expose this. */
   setSnapshot(snapshot: ProductSnapshot): void;
 }
 
-function capability(
+export function capability(
   id: string,
   label: string,
   state: Capability["state"],
@@ -182,7 +188,7 @@ export function createEmptySnapshot(): ProductSnapshot {
   };
 }
 
-export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmptySnapshot()): ProductAdapter {
+export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmptySnapshot()): LocalProductAdapter {
   let currentSnapshot = initialSnapshot;
   const listeners = new Set<(snapshot: ProductSnapshot) => void>();
 
@@ -193,11 +199,28 @@ export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmpt
       return () => listeners.delete(listener);
     },
     refresh: async () => currentSnapshot,
+    dispatch: async () => currentSnapshot,
+    updateSettings: async () => currentSnapshot,
     setSnapshot: (snapshot) => {
       currentSnapshot = snapshot;
       for (const listener of listeners) {
         listener(currentSnapshot);
       }
     },
+  };
+}
+
+/** Honest fallback rendered when the runtime bridge cannot be reached. */
+export function createRuntimeUnavailableSnapshot(reason: string): ProductSnapshot {
+  const empty = createEmptySnapshot();
+  const controlPlane = capability("control-plane", "Control plane", "unavailable", reason);
+
+  return {
+    ...empty,
+    connection: { state: "unavailable", detail: reason },
+    access: { ...empty.access, controlPlane },
+    capabilities: empty.capabilities.map((item) =>
+      item.id === "control-plane" ? controlPlane : { ...item, state: "unavailable", detail: reason },
+    ),
   };
 }

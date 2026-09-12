@@ -236,6 +236,61 @@ This acceptance does not claim native DRM capture, ScreenCaptureKit,
 VideoToolbox decode/encode, decoded-frame zero-copy, WAN/public-NAT, TURN,
 audio, input, or long-run hardware quality. Those remain separate gates.
 
+### 2026-09-13 runtime-integration re-verification
+
+The same two machines were re-tested on 2026-09-13 from branch
+`codex/runtime-integration`. Both sides were built from `ce4e8c8`; the later
+shell commits on that branch do not touch `engine/lowlat`, so the media
+binaries correspond to the branch's engine tree. The Linux binaries were
+built in a `docker.io/library/rust:1-bookworm` container because this SteamOS
+image has no C linker; the resulting glibc binaries run unmodified on the
+host.
+
+| Side | Observed environment/result |
+|---|---|
+| Linux host | SteamOS Holo, x86_64, kernel `6.16.12-valve24.5-1-neptune-616-gb2f7cfe85e45` |
+| Linux GPU | NVIDIA GeForce GTX 970, driver `580.178.04` |
+| Linux FFmpeg | `n7.1.1` with `h264_nvenc`, `hevc_nvenc`, `x11grab`, `kmsgrab` |
+| macOS client | macOS `26.6.2` (`25G83`), Apple M1 Max, FFmpeg `9.0.1` |
+| Signaling | loopback-bound on the host, reached from macOS over an SSH port forward |
+| Transport | authenticated direct UDP, `DirectUdp { candidate: Host }`, H.264 1920x1080 at up to 60 fps, audio and input disabled |
+| Desktop-source run | 25 seconds; host sent 1494 encoded chunks and macOS wrote 1494 decoded access units, 8518/8512 packets, 530,183 host wire bytes |
+| Synthetic-source run | 25 seconds at a realtime 1080p60 source; host sent 1600 encoded chunks, macOS wrote 1209 access units and 20,205,000 bytes, decoded by FFmpeg with no errors |
+
+The desktop-source run proves the transport and media path frame-for-frame,
+but its pixels were empty. Three separate capture findings were recorded on
+this rig:
+
+- This host runs a KDE Plasma **Wayland** session. `x11grab` on `:0.0`
+  captures the Xwayland root window, which holds only the cursor because KWin
+  composites X11 clients into the Wayland scene rather than painting that
+  root. A plain `ffmpeg -f x11grab` capture run outside OpenStream produced
+  the same black frame, so this is the capture source, not the adapter.
+- The host's FFmpeg build has no `pipewire` demuxer, so the adapter's
+  PipeWire profile cannot be exercised here.
+- `kmsgrab` reaches the scanout but rejects this display's framebuffer format
+  `ABGR2101010` as unsupported.
+
+Real desktop content on a Wayland host therefore needs the native DRM/KMS
+adapter or a PipeWire portal source, both of which remain open work. The
+synthetic-source run was added to separate those capture limits from the rest
+of the pipeline: it carried varying full-colour 1080p content with a running
+timecode from NVENC through the encrypted session to a clean FFmpeg decode on
+the client.
+
+Two operational notes for this image:
+
+- `h264_nvenc` fails with `Cannot load libcuda.so.1` unless `LD_LIBRARY_PATH`
+  includes the Flatpak NVIDIA GL runtime directory, which is where SteamOS
+  keeps the NVIDIA userspace libraries. Derive it at runtime rather than
+  hardcoding the versioned path.
+- `x11grab` needs the graphical session's `XAUTHORITY` cookie. Read it from a
+  process already inside that session instead of assuming `~/.Xauthority`.
+
+This re-verification claims the X11/FFmpeg/NVENC fallback path only. It is
+not native capture, VideoToolbox, zero-copy, raw input, audio, WAN, TURN, or
+release-readiness evidence.
+
 Use [`scripts/build-openstream.sh`](../scripts/build-openstream.sh), or
 [`scripts/build-openstream.ps1`](../scripts/build-openstream.ps1) on native
 Windows, to build the project-owned artifacts for one target.
