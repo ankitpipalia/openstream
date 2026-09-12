@@ -29,6 +29,10 @@ deployed with infrastructure that you control.
   VideoToolbox/AudioEngine integration sources.
 - Bounded queues, fuzz targets, CI checks, deployment templates, and detailed
   architecture/protocol documentation.
+- A capability-aware Tauri 2 + React desktop shell with Computers, Access,
+  Settings, Diagnostics, and About surfaces. The shell keeps transport and
+  credentials in Rust-owned boundaries and reports unavailable capabilities
+  explicitly.
 - Generation-scoped transport telemetry, a shared frame-feedback adapter, and
   host-authoritative direct <-> opaque-relay <-> direct migration over one
   encrypted session. ICE migration reports the typed unsupported result on the
@@ -42,6 +46,7 @@ deployed with infrastructure that you control.
 | `mobile/android` | Android client shell and JNI bridge |
 | `mobile/ios` | iOS client integration sources |
 | `include` | Public C header for the client-only mobile bridge |
+| `desktop` | Tauri 2 + React product shell and local IPC boundary |
 | `deploy` | systemd and coturn deployment templates |
 | `scripts` | Build, pairing, smoke-test, and mobile acceptance helpers |
 | `docs` | Architecture, protocol, deployment, testing, compatibility, and research notes |
@@ -182,6 +187,20 @@ cargo fuzz run openstream-media -- -runs=10000
 Hardware-dependent capture, GPU encoder, sound-server, uinput, Android, and
 iOS tests require their native operating system, SDK, device, or driver and
 are explicitly marked in the test and feature matrix.
+
+The desktop shell can be checked independently with Node.js:
+
+```sh
+cd desktop
+npm install --ignore-scripts
+npm run build
+npm test -- --run
+```
+
+The production 1.0 release is fail-closed on packaging, signing, hardware,
+and WAN evidence. Run the deterministic checker and read its gate report in
+[`docs/OPENSTREAM_1_0_RELEASE_GATES.md`](docs/OPENSTREAM_1_0_RELEASE_GATES.md)
+before creating a release tag.
 
 The release check is an artifact manifest/presence validation for the
 host/client/server binaries produced by the locked build. It is not full

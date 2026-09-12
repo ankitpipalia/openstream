@@ -1,0 +1,7 @@
+# Replace every UNVERIFIED row with evidence from the release signing system.
+# The checker requires one VERIFIED row, with a non-placeholder signer, per
+# artifact declared in openstream-1.0-gates.tsv.
+artifact_id	status	signer
+linux-host-package	UNVERIFIED	TBD
+macos-apple-silicon-package	UNVERIFIED	TBD
+macos-apple-silicon-app-archive	UNVERIFIED	TBD

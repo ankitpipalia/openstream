@@ -1,0 +1,6 @@
+# Copy this template to <artifact-root>/evidence/gate-report.tsv only after
+# replacing every TBD with a dated, reproducible acceptance result.
+gate_id	result	observed_at	evidence
+physical-linux-nvidia-to-apple-silicon	TBD	TBD	TBD
+wan-turn	TBD	TBD	TBD
+package-launch-upgrade	TBD	TBD	TBD

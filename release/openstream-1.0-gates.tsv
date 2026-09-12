@@ -1,0 +1,23 @@
+# OpenStream 1.0 release gate manifest v1.
+# Paths in artifact/evidence rows are relative to meta.artifact_root.
+kind	id	value
+meta	manifest_version	1
+meta	release_version	1.0.0
+meta	artifact_root	dist/openstream-1.0.0
+
+# The Linux host package and both standard Apple Silicon distribution forms
+# are required release artifacts. The checker rejects missing or unchecksummed
+# files; add further artifacts here when the packaging contract grows.
+artifact	linux-host-package	linux-x86_64/OpenStream-Linux-x86_64.tar.gz
+artifact	macos-apple-silicon-package	macos-aarch64/OpenStream-macOS-arm64.dmg
+artifact	macos-apple-silicon-app-archive	macos-aarch64/OpenStream-macOS-arm64.zip
+
+evidence	checksums	checksums/SHA256SUMS
+evidence	sbom	sbom/openstream-1.0.0.spdx.json
+evidence	signing	signing/openstream-1.0.0-signing.tsv
+
+# These are physical/package acceptance gates. A report row is valid only
+# when its exact id is present with result PASS and non-placeholder evidence.
+gate	physical-linux-nvidia-to-apple-silicon	Physical Linux NVIDIA host to Apple Silicon client
+gate	wan-turn	WAN session through an external TURN relay
+gate	package-launch-upgrade	Package launch, upgrade, and rollback smoke

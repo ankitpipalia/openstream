@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         load_pairing_from_environment, parse_stun_servers,
     };
     use openstream_media::clipboard::{Assembler as ClipboardAssembler, fragment_text};
-    use openstream_media::input::RumbleEvent;
+    use openstream_media::input::{InputLease, RumbleEvent};
     use openstream_media::microphone::GuestMicSink;
     use openstream_media::{
         AdaptiveBitrate, AudioFrame, FrameAck, KEYFRAME_REQUEST, fragment_frame,
@@ -243,6 +243,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // A client that disappears without sending a final release must not leave
+    // a key or button held on the host. The lease is renewed by every valid
+    // input event and is intentionally inactive until the first event.
+    let mut input_lease = InputLease::new(input_lease_timeout_us());
 
     let started = Instant::now();
     let mut frame_id = 0_u32;
@@ -314,7 +318,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 && payload != b"openstream/end"
                                 && let Some((injector, devices)) = input.as_mut()
                             {
-                                apply_input_payload(&payload, injector, devices, gamepad_enabled);
+                                apply_input_payload(
+                                    &payload,
+                                    injector,
+                                    devices,
+                                    gamepad_enabled,
+                                    &mut input_lease,
+                                    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+                                );
                             }
                         }
                         continue;
@@ -376,13 +387,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Some((injector, devices)) = input.as_mut() else {
                     continue;
                 };
-                match lowlat_core::control::parse(&packet.payload) {
-                    Ok(control) => injector.on_control(&control, devices),
-                    Err(error) => eprintln!("OpenStream dropped malformed input: {error}"),
-                }
+                apply_input_payload(
+                    &packet.payload,
+                    injector,
+                    devices,
+                    gamepad_enabled,
+                    &mut input_lease,
+                    started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+                );
             }
             _ = tick.tick() => {
-                if let Some((_, devices)) = input.as_mut() {
+                if let Some((injector, devices)) = input.as_mut() {
+                    if input_lease
+                        .poll_expiry(started.elapsed().as_micros().try_into().unwrap_or(u64::MAX))
+                        .is_some()
+                    {
+                        // `Devices::tick` is still called below so any
+                        // pending force-feedback cleanup proceeds normally.
+                        // The injector owns the exact set of held keys/buttons.
+                        injector.release_all(devices);
+                    }
                     devices.tick();
                     while let Some(rumble) = devices.rumble() {
                         let payload = RumbleEvent {
@@ -913,11 +937,18 @@ fn apply_input_payload(
     injector: &mut lowlat_inject::event::Injector,
     devices: &mut lowlat_inject::uinput::Devices,
     gamepad_enabled: bool,
+    input_lease: &mut openstream_media::input::InputLease,
+    now_us: u64,
 ) {
     if let Ok(event) = openstream_media::input::InputEvent::decode(payload) {
         if !input_event_allowed(event, gamepad_enabled) {
             eprintln!("OpenStream rejected an input event without a local adapter");
             return;
+        }
+        if matches!(event.kind, openstream_media::input::InputKind::Release) {
+            input_lease.disarm();
+        } else {
+            input_lease.renew(now_us);
         }
         let fields = event.lowlat_fields();
         if fields.opcode == lowlat_core::control::op::RELEASE {
@@ -943,8 +974,26 @@ fn apply_input_payload(
     // Keep accepting the imported lowlat control payload while older desktop
     // clients migrate to the project-owned OI envelope.
     if let Ok(control) = lowlat_core::control::parse(payload) {
+        if control.opcode == lowlat_core::control::op::RELEASE {
+            input_lease.disarm();
+        } else {
+            input_lease.renew(now_us);
+        }
         injector.on_control(&control, devices);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn input_lease_timeout_us() -> u64 {
+    const DEFAULT_MS: u64 = 2_000;
+    const MIN_MS: u64 = 250;
+    const MAX_MS: u64 = 60_000;
+    let milliseconds = env::var("OPENSTREAM_INPUT_LEASE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(MIN_MS, MAX_MS))
+        .unwrap_or(DEFAULT_MS);
+    milliseconds.saturating_mul(1_000)
 }
 
 #[cfg(target_os = "linux")]

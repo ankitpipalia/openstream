@@ -1,0 +1,27 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to validate
+        required: true
+        default: 1.0.0
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release-gates:
+    name: fail-closed release gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax and deterministic release tests
+        run: |
+          bash -n scripts/check-openstream-1-0-release.sh scripts/test-openstream-1-0-release.sh
+          scripts/test-openstream-1-0-release.sh
+      - name: Require staged artifacts and reviewed evidence
+        run: scripts/check-openstream-1-0-release.sh

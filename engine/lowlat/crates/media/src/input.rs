@@ -5,6 +5,8 @@
 //! the event into its local input API. The fixed 32-byte form is small enough
 //! for the reliable control channel and has no platform-specific ABI.
 
+use std::collections::VecDeque;
+
 /// Relative-pointer bit for [`InputKind::PointerMotion`].
 pub const FLAG_RELATIVE: u16 = 0x0001;
 /// Eraser-end bit for [`InputKind::PenMotion`]: the inverted end is down.
@@ -307,8 +309,16 @@ impl InputEvent {
         }
     }
 
-    /// Construct a focus-loss release event.
+    /// Construct a focus-loss release-all event.
     pub const fn release(timestamp_us: u64) -> Self {
+        Self::release_all(timestamp_us)
+    }
+
+    /// Construct a release-all event for the host input adapter.
+    ///
+    /// This is only a project-owned event. The platform adapter is responsible
+    /// for applying it to the local OS input API.
+    pub const fn release_all(timestamp_us: u64) -> Self {
         Self {
             kind: InputKind::Release,
             flags: 0,
@@ -370,6 +380,181 @@ impl InputEvent {
             InputKind::PenProximity => (17, 0, 0, 0),
         };
         LowlatFields { opcode, a0, a1, a2 }
+    }
+}
+
+/// Result of adding an event to an [`InputQueue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueStatus {
+    /// The event was appended to the FIFO queue.
+    Enqueued,
+    /// Relative pointer motion was merged into the preceding motion event.
+    Coalesced,
+    /// Relative pointer motion was dropped because the bounded queue was full.
+    ///
+    /// Relative motion is the only lossy event class in this queue. Callers
+    /// should use this result for diagnostics, not treat it as delivery.
+    DroppedRelativeMotion,
+}
+
+/// Bounded input queue failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputQueueError {
+    /// A non-coalescible event could not be enqueued without dropping it.
+    Full { kind: InputKind },
+}
+
+impl std::fmt::Display for InputQueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full { kind } => write!(f, "input queue is full for {kind:?}"),
+        }
+    }
+}
+
+impl std::error::Error for InputQueueError {}
+
+/// A bounded FIFO for host-directed input events.
+///
+/// Consecutive relative pointer-motion events are coalesced by saturating the
+/// two deltas and retaining the newest timestamp. Keyboard, button, wheel,
+/// gamepad, tablet, and release events remain FIFO-ordered and are never
+/// silently dropped. The queue does not interact with an OS input API.
+#[derive(Debug)]
+pub struct InputQueue {
+    events: VecDeque<InputEvent>,
+    capacity: usize,
+}
+
+impl InputQueue {
+    /// Construct an empty queue with an explicit event capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            events: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Return the maximum number of queued events.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Return the current number of queued events.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Return whether the queue has no pending events.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Add one event while preserving reliable-event ordering.
+    pub fn push(&mut self, event: InputEvent) -> Result<EnqueueStatus, InputQueueError> {
+        if let Some(previous) = self.events.back_mut() {
+            if Self::can_coalesce(*previous, event) {
+                previous.value = previous.value.saturating_add(event.value);
+                previous.value2 = previous.value2.saturating_add(event.value2);
+                previous.timestamp_us = event.timestamp_us;
+                return Ok(EnqueueStatus::Coalesced);
+            }
+        }
+
+        if self.events.len() >= self.capacity {
+            if event.is_relative_motion() {
+                return Ok(EnqueueStatus::DroppedRelativeMotion);
+            }
+            return Err(InputQueueError::Full { kind: event.kind });
+        }
+
+        self.events.push_back(event);
+        Ok(EnqueueStatus::Enqueued)
+    }
+
+    /// Remove and return the oldest pending event.
+    pub fn pop_front(&mut self) -> Option<InputEvent> {
+        self.events.pop_front()
+    }
+
+    fn can_coalesce(previous: InputEvent, next: InputEvent) -> bool {
+        previous.kind == InputKind::PointerMotion
+            && next.kind == InputKind::PointerMotion
+            && previous.flags == next.flags
+            && previous.flags & FLAG_RELATIVE != 0
+            && previous.device_id == next.device_id
+            && previous.code == next.code
+    }
+}
+
+impl InputEvent {
+    fn is_relative_motion(self) -> bool {
+        self.kind == InputKind::PointerMotion && self.flags & FLAG_RELATIVE != 0
+    }
+}
+
+/// Client input lease/watchdog state.
+///
+/// A lease becomes active when [`InputLease::renew`] is called. Once its
+/// deadline passes, or when focus is lost, the first poll returns exactly one
+/// project-owned release-all event. Further polls return `None` until the
+/// lease is renewed. This state machine does not schedule timers or invoke an
+/// OS API; the caller supplies its monotonic timestamp and enqueues/applies
+/// the returned event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputLease {
+    timeout_us: u64,
+    renewed_at_us: Option<u64>,
+}
+
+impl InputLease {
+    /// Construct an inactive lease with the supplied timeout in microseconds.
+    pub const fn new(timeout_us: u64) -> Self {
+        Self {
+            timeout_us,
+            renewed_at_us: None,
+        }
+    }
+
+    /// Return the configured lease timeout in microseconds.
+    #[must_use]
+    pub const fn timeout_us(self) -> u64 {
+        self.timeout_us
+    }
+
+    /// Return whether a renewal is currently holding the lease open.
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        self.renewed_at_us.is_some()
+    }
+
+    /// Renew the lease at a caller-supplied monotonic timestamp.
+    pub fn renew(&mut self, timestamp_us: u64) {
+        self.renewed_at_us = Some(timestamp_us);
+    }
+
+    /// Stop the lease after an explicit release has already been applied.
+    pub fn disarm(&mut self) {
+        self.renewed_at_us = None;
+    }
+
+    /// Emit the single release-all event after the lease deadline, if due.
+    pub fn poll_expiry(&mut self, timestamp_us: u64) -> Option<InputEvent> {
+        let renewed_at_us = self.renewed_at_us?;
+        if timestamp_us < renewed_at_us.saturating_add(self.timeout_us) {
+            return None;
+        }
+        self.renewed_at_us = None;
+        Some(InputEvent::release_all(timestamp_us))
+    }
+
+    /// Mark client focus lost and emit one release-all event, if active.
+    pub fn focus_lost(&mut self, timestamp_us: u64) -> Option<InputEvent> {
+        self.renewed_at_us.take()?;
+        Some(InputEvent::release_all(timestamp_us))
     }
 }
 
@@ -471,7 +656,10 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_RELATIVE, InputCapability, InputEvent, InputKind, RumbleEvent};
+    use super::{
+        EnqueueStatus, FLAG_RELATIVE, InputCapability, InputEvent, InputKind, InputLease,
+        InputQueue, InputQueueError, RumbleEvent,
+    };
 
     #[test]
     fn input_kinds_select_the_required_device_adapter() {
@@ -627,6 +815,103 @@ mod tests {
         assert_eq!(
             RumbleEvent::decode(&bytes[..11]),
             Err(super::RumbleError::BadLength)
+        );
+    }
+
+    #[test]
+    fn input_queue_coalesces_relative_motion_without_reordering_reliable_events() {
+        let mut queue = InputQueue::with_capacity(8);
+        let keyboard = InputEvent::keyboard(4, 0, true, 3);
+        let button = InputEvent::pointer_button(1, true, 5);
+        let release = InputEvent::release(6);
+
+        assert_eq!(
+            queue.push(InputEvent::pointer_motion(true, 1, 2, 1)),
+            Ok(EnqueueStatus::Enqueued)
+        );
+        assert_eq!(
+            queue.push(InputEvent::pointer_motion(true, 3, 4, 2)),
+            Ok(EnqueueStatus::Coalesced)
+        );
+        assert_eq!(queue.push(keyboard), Ok(EnqueueStatus::Enqueued));
+        assert_eq!(
+            queue.push(InputEvent::pointer_motion(true, 5, 6, 4)),
+            Ok(EnqueueStatus::Enqueued)
+        );
+        assert_eq!(queue.push(button), Ok(EnqueueStatus::Enqueued));
+        assert_eq!(queue.push(release), Ok(EnqueueStatus::Enqueued));
+
+        assert_eq!(
+            queue.pop_front(),
+            Some(InputEvent::pointer_motion(true, 4, 6, 2))
+        );
+        assert_eq!(queue.pop_front(), Some(keyboard));
+        assert_eq!(
+            queue.pop_front(),
+            Some(InputEvent::pointer_motion(true, 5, 6, 4))
+        );
+        assert_eq!(queue.pop_front(), Some(button));
+        assert_eq!(queue.pop_front(), Some(release));
+        assert_eq!(queue.pop_front(), None);
+    }
+
+    #[test]
+    fn input_lease_emits_one_release_on_expiry_until_renewed() {
+        let mut lease = InputLease::new(100);
+
+        assert_eq!(lease.poll_expiry(0), None);
+        lease.renew(10);
+        assert_eq!(lease.poll_expiry(109), None);
+        assert_eq!(lease.poll_expiry(110), Some(InputEvent::release_all(110)));
+        assert_eq!(lease.poll_expiry(111), None);
+
+        lease.renew(200);
+        assert_eq!(lease.poll_expiry(299), None);
+        assert_eq!(lease.poll_expiry(300), Some(InputEvent::release_all(300)));
+    }
+
+    #[test]
+    fn input_lease_emits_one_release_on_focus_loss_until_renewed() {
+        let mut lease = InputLease::new(1_000);
+        lease.renew(10);
+
+        assert_eq!(lease.focus_lost(20), Some(InputEvent::release_all(20)));
+        assert_eq!(lease.focus_lost(21), None);
+        assert_eq!(lease.poll_expiry(2_000), None);
+
+        lease.renew(30);
+        assert_eq!(lease.focus_lost(31), Some(InputEvent::release_all(31)));
+    }
+
+    #[test]
+    fn input_queue_drops_only_lossy_motion_and_reports_reliable_overflow() {
+        let mut queue = InputQueue::with_capacity(2);
+        let keyboard = InputEvent::keyboard(4, 0, true, 1);
+        let button = InputEvent::pointer_button(1, true, 2);
+
+        assert_eq!(queue.push(keyboard), Ok(EnqueueStatus::Enqueued));
+        assert_eq!(queue.push(button), Ok(EnqueueStatus::Enqueued));
+        assert_eq!(
+            queue.push(InputEvent::pointer_motion(true, 8, 9, 3)),
+            Ok(EnqueueStatus::DroppedRelativeMotion)
+        );
+        assert_eq!(queue.pop_front(), Some(keyboard));
+        assert_eq!(queue.pop_front(), Some(button));
+
+        let mut full = InputQueue::with_capacity(1);
+        assert_eq!(
+            full.push(InputEvent::pointer_motion(true, 1, 1, 1)),
+            Ok(EnqueueStatus::Enqueued)
+        );
+        assert_eq!(
+            full.push(keyboard),
+            Err(InputQueueError::Full {
+                kind: InputKind::Keyboard,
+            })
+        );
+        assert_eq!(
+            full.pop_front(),
+            Some(InputEvent::pointer_motion(true, 1, 1, 1))
         );
     }
 }

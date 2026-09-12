@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OpenStream
+Comment=Self-hosted low-latency desktop streaming
+Exec=openstream-desktop
+Icon=openstream
+Terminal=false
+Categories=Network;RemoteAccess;
