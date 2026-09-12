@@ -1855,6 +1855,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "openstream-ffmpeg-host"
 version = "0.1.0"
 dependencies = [
