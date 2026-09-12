@@ -408,6 +408,30 @@ jobs:
             dir /workspace --redact --no-banner --exit-code 1
         working-directory: .
 
+  desktop-runtime:
+    name: OpenStream desktop runtime shell
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install toolchain
+        run: rustup component add rustfmt clippy
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: ${{ runner.os }}-tauri-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+      - name: Format
+        run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked
+    # The Tauri shell is the actual product surface. It was previously absent
+    # from CI entirely, so a change that broke it could still go green.
+
   ci-gate:
     name: CI gate
     if: ${{ always() }}
@@ -417,6 +441,7 @@ jobs:
       - openstream-target-matrix
       - openstream-desktop-target-matrix
       - desktop-shell
+      - desktop-runtime
       - loom
       - deny
       - smoke
@@ -432,6 +457,7 @@ jobs:
           TARGETS: ${{ needs.openstream-target-matrix.result }}
           DESKTOP_TARGETS: ${{ needs.openstream-desktop-target-matrix.result }}
           DESKTOP_SHELL: ${{ needs.desktop-shell.result }}
+          DESKTOP_RUNTIME: ${{ needs.desktop-runtime.result }}
           LOOM: ${{ needs.loom.result }}
           DENY: ${{ needs.deny.result }}
           SMOKE: ${{ needs.smoke.result }}
@@ -440,7 +466,8 @@ jobs:
           SECRET_SCAN: ${{ needs.secret-scan.result }}
         run: |
           for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
-              "$DESKTOP_SHELL" "$LOOM" "$DENY" "$SMOKE" "$SANITIZERS" "$ALPINE_MUSL" \
+              "$DESKTOP_SHELL" "$DESKTOP_RUNTIME" "$LOOM" "$DENY" "$SMOKE" \
+              "$SANITIZERS" "$ALPINE_MUSL" \
               "$SECRET_SCAN"; do
             if [ "$result" != success ]; then
               echo "CI job result was $result" >&2
