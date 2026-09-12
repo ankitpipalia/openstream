@@ -107,6 +107,7 @@ jobs:
       - name: Install toolchain
         run: rustup component add rustfmt
       - name: Format OpenStream additions
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: Test portable protocol/service/client crates
         run: cargo test --locked -p openstream-client-core -p openstream-protocol -p openstream-transport -p openstream-signal-server -p openstream-reference-peer -p openstream-media -p openstream-platform -p openstream-client -p openstream-desktop-client -p openstream-ffmpeg-host -p openstream-mobile-ffi -p openstream-bridge -- --test-threads=1
