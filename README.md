@@ -163,6 +163,15 @@ non-loopback deployment. Set a strong `OPENSTREAM_ADMIN_TOKEN`; without it,
 session-management endpoints refuse requests unless the server is explicitly
 run in loopback-only development mode with `OPENSTREAM_ALLOW_NO_AUTH=1`.
 
+For the local-first MVP, an explicit trusted-LAN mode is available with
+`OPENSTREAM_LOCAL_NO_AUTH=1` plus a numeric RFC1918/ULA/link-local
+`OPENSTREAM_SIGNAL_BIND` (for example `192.168.1.69:8080`). It rejects
+wildcard/public binds and requires no admin token. This removes only the
+account/admin flow; role-scoped capabilities and encrypted peer sessions stay
+enabled. Clients using a private-LAN `http://` origin must opt in with the
+same variable. Treat the LAN as trusted and switch to admin-token HTTPS/WSS
+before exposing the service beyond it.
+
 For the application relay, configure:
 
 ```text

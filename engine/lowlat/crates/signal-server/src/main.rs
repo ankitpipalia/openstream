@@ -7,7 +7,7 @@
 //! forwarded only to the opposite role in the same session.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -249,6 +249,83 @@ const MIN_ADMIN_TOKEN_BYTES: usize = 16;
 const RELAY_BYTES_PER_SECOND: usize = 8 * 1024 * 1024;
 const RELAY_PACKETS_PER_SECOND: u32 = 10_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    AdminToken,
+    LoopbackNoAuth,
+    PrivateLanNoAuth,
+    LockedDown,
+}
+
+/// Return whether an address belongs to an explicitly local-only network.
+///
+/// This deliberately does not treat shared CGNAT space, documentation space,
+/// or arbitrary hostnames as private LAN addresses. Private-LAN no-account
+/// mode must use a numeric bind address so it cannot accidentally expose an
+/// unauthenticated wildcard or public listener.
+fn is_private_lan_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            (octets[0] == 10)
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+        }
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
+
+/// Validate the startup authentication/bind combination before the listener
+/// is created. `bind_explicit` is separate from the parsed address so private
+/// LAN mode cannot silently fall back to the loopback default.
+fn validate_startup_auth(
+    address: SocketAddr,
+    bind_explicit: bool,
+    admin_token_configured: bool,
+    allow_no_auth: bool,
+    local_no_auth: bool,
+) -> Result<AuthMode, &'static str> {
+    if allow_no_auth && local_no_auth {
+        return Err("OPENSTREAM_ALLOW_NO_AUTH and OPENSTREAM_LOCAL_NO_AUTH cannot both be enabled");
+    }
+    if local_no_auth {
+        if admin_token_configured {
+            return Err("OPENSTREAM_LOCAL_NO_AUTH requires OPENSTREAM_ADMIN_TOKEN to be unset");
+        }
+        if !bind_explicit {
+            return Err(
+                "OPENSTREAM_LOCAL_NO_AUTH requires an explicit OPENSTREAM_SIGNAL_BIND address",
+            );
+        }
+        if !is_private_lan_address(address.ip()) {
+            return Err(
+                "OPENSTREAM_LOCAL_NO_AUTH requires an explicit RFC1918, ULA, or link-local bind",
+            );
+        }
+        return Ok(AuthMode::PrivateLanNoAuth);
+    }
+    if allow_no_auth && !address.ip().is_loopback() {
+        return Err("OPENSTREAM_ALLOW_NO_AUTH requires a loopback bind");
+    }
+    if admin_token_configured {
+        return Ok(AuthMode::AdminToken);
+    }
+    if !address.ip().is_loopback() {
+        return Err(
+            "non-loopback signaling requires OPENSTREAM_ADMIN_TOKEN or explicit local mode",
+        );
+    }
+    if allow_no_auth {
+        Ok(AuthMode::LoopbackNoAuth)
+    } else {
+        Ok(AuthMode::LockedDown)
+    }
+}
+
 /// Length-timing-safe equality for bearer tokens.
 ///
 /// Not a substitute for short random tokens (which these are: 128-bit
@@ -271,6 +348,10 @@ struct AppState {
     /// Explicit loopback development mode. With no admin token and without
     /// this flag, management endpoints refuse every request.
     allow_no_auth: bool,
+    /// Explicit private-LAN no-account mode. This bypasses only management
+    /// admin authentication after startup verifies a private numeric bind;
+    /// role/session capabilities remain mandatory everywhere else.
+    local_no_auth: bool,
     relay_address: Option<SocketAddr>,
     turn: Option<turn::TurnConfig>,
     /// Server-side secret for relay-ticket MACs. Random per boot unless
@@ -290,6 +371,7 @@ impl core::fmt::Debug for AppState {
                 &self.admin_token.as_ref().map(|_| "[redacted]"),
             )
             .field("allow_no_auth", &self.allow_no_auth)
+            .field("local_no_auth", &self.local_no_auth)
             .field("relay_address", &self.relay_address)
             .field("turn", &self.turn)
             .field("relay_secret", &"[redacted]")
@@ -816,7 +898,11 @@ impl Role {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bind = std::env::var("OPENSTREAM_SIGNAL_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let configured_bind = std::env::var("OPENSTREAM_SIGNAL_BIND").ok();
+    let bind = configured_bind
+        .as_deref()
+        .unwrap_or(DEFAULT_BIND)
+        .to_string();
     let address: SocketAddr = bind.parse()?;
     let relay_bind = std::env::var("OPENSTREAM_RELAY_BIND")
         .ok()
@@ -858,23 +944,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
         admin_token,
         allow_no_auth: std::env::var("OPENSTREAM_ALLOW_NO_AUTH").as_deref() == Ok("1"),
+        local_no_auth: std::env::var("OPENSTREAM_LOCAL_NO_AUTH").as_deref() == Ok("1"),
         relay_address,
         turn: turn::TurnConfig::from_env(),
         relay_secret,
     };
-    if !state.allow_no_auth && state.admin_token.is_none() {
+    let auth_mode = validate_startup_auth(
+        address,
+        configured_bind.is_some(),
+        state.admin_token.is_some(),
+        state.allow_no_auth,
+        state.local_no_auth,
+    )
+    .map_err(|reason| format!("invalid signaling authentication/bind configuration: {reason}"))?;
+    if matches!(auth_mode, AuthMode::LockedDown) {
         eprintln!(
             "OPENSTREAM_ADMIN_TOKEN is unset and OPENSTREAM_ALLOW_NO_AUTH is not 1: session management endpoints will refuse every request"
         );
     }
-    // Fail closed: a non-loopback bind without an admin token would expose
-    // management to the network with no authentication.
-    if state.admin_token.is_none() && !address.ip().is_loopback() {
-        return Err(
-            "refusing non-loopback OPENSTREAM_SIGNAL_BIND without OPENSTREAM_ADMIN_TOKEN".into(),
+    if matches!(auth_mode, AuthMode::PrivateLanNoAuth) {
+        eprintln!(
+            "WARNING: OPENSTREAM_LOCAL_NO_AUTH is enabled on private-LAN bind {address}; management authentication is disabled for trusted local-network use only"
         );
     }
-    let admin_enabled = state.admin_token.is_some();
     if state.turn.is_none() {
         eprintln!(
             "OPENSTREAM_TURN_SECRET/OPENSTREAM_TURN_URLS are unset; the /turn endpoint reports unavailable"
@@ -902,7 +994,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state.clone());
 
     println!("openstream-signal-server listening on http://{address}");
-    if !admin_enabled {
+    if matches!(auth_mode, AuthMode::LockedDown) {
         eprintln!(
             "OPENSTREAM_ADMIN_TOKEN is unset; management endpoints require OPENSTREAM_ALLOW_NO_AUTH=1 (loopback development only)"
         );
@@ -1338,12 +1430,14 @@ async fn session_relay_ticket(
 /// With a configured admin token, the request must present it (constant-time
 /// comparison, either header form). Without one, every request is refused
 /// unless the operator explicitly opted into loopback development with
-/// `OPENSTREAM_ALLOW_NO_AUTH=1` -- and startup already refuses a non-loopback
-/// bind in that case, so the open mode cannot reach the network.
+/// `OPENSTREAM_ALLOW_NO_AUTH=1` or private-LAN development with
+/// `OPENSTREAM_LOCAL_NO_AUTH=1`. Startup validation constrains those modes to
+/// their respective bind scopes. This helper is used only by management
+/// endpoints; role/session bearer checks remain independent.
 fn admin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
     match state.admin_token.as_deref() {
         Some(expected) => authorized(headers, Some(expected)),
-        None => state.allow_no_auth,
+        None => state.allow_no_auth || state.local_no_auth,
     }
 }
 
@@ -2897,14 +2991,15 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
 #[cfg(test)]
 mod tests {
     use super::{
-        AdmissionError, AppState, CreationLimiter, DirectRoute, GenericDispatch, Guest,
+        AdmissionError, AppState, AuthMode, CreationLimiter, DirectRoute, GenericDispatch, Guest,
         MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
         RELAY_PACKETS_PER_SECOND, ReadinessError, RelaySlot, Role, SESSION_CREATE_WINDOW, Session,
-        admit_primary_socket as admit_primary_socket_with_cancel, authorized, bearer_token,
-        cleanup_primary_socket, close_primary_pair, direct_message_route, dispatch_generic_message,
-        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
-        queue_pending, reap_expired_sessions, relay_owner_for_ticket, relay_ticket, signal_socket,
-        validate_signal_message,
+        admin_allowed, admit_primary_socket as admit_primary_socket_with_cancel, authorized,
+        bearer_token, cleanup_primary_socket, close_primary_pair, direct_message_route,
+        dispatch_generic_message, is_private_lan_address, max_guests_for_new_session,
+        prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
+        relay_owner_for_ticket, relay_ticket, signal_socket, supplied_token_is_host,
+        validate_signal_message, validate_startup_auth,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -3145,6 +3240,142 @@ mod tests {
     fn no_admin_token_refuses_everything_without_explicit_dev_opt_in() {
         // Fail closed: no token means no access, even with empty headers.
         assert!(!authorized(&HeaderMap::new(), None));
+    }
+
+    #[test]
+    fn private_lan_no_auth_accepts_explicit_private_and_link_local_binds() {
+        assert!(is_private_lan_address(
+            "192.168.1.69".parse().expect("private IPv4")
+        ));
+        assert!(is_private_lan_address(
+            "fd00::69".parse().expect("ULA IPv6")
+        ));
+        assert!(is_private_lan_address(
+            "fe80::69".parse().expect("link-local IPv6")
+        ));
+        assert_eq!(
+            validate_startup_auth(
+                "192.168.1.69:8080".parse().expect("private bind"),
+                true,
+                false,
+                false,
+                true,
+            ),
+            Ok(AuthMode::PrivateLanNoAuth)
+        );
+        assert_eq!(
+            validate_startup_auth(
+                "[fd00::69]:8080".parse().expect("ULA bind"),
+                true,
+                false,
+                false,
+                true,
+            ),
+            Ok(AuthMode::PrivateLanNoAuth)
+        );
+    }
+
+    #[test]
+    fn private_lan_no_auth_rejects_wildcard_public_loopback_and_implicit_binds() {
+        for address in [
+            "0.0.0.0:8080",
+            "127.0.0.1:8080",
+            "8.8.8.8:8080",
+            "[::]:8080",
+            "[::1]:8080",
+            "[2001:db8::69]:8080",
+        ] {
+            assert!(
+                validate_startup_auth(
+                    address.parse().expect("test address"),
+                    true,
+                    false,
+                    false,
+                    true,
+                )
+                .is_err(),
+                "unexpectedly accepted {address}"
+            );
+        }
+        assert!(
+            validate_startup_auth(
+                "192.168.1.69:8080".parse().expect("private bind"),
+                false,
+                false,
+                false,
+                true,
+            )
+            .is_err()
+        );
+        assert!(!is_private_lan_address(
+            "100.64.0.1".parse().expect("shared address")
+        ));
+    }
+
+    #[test]
+    fn startup_auth_requires_an_opt_in_for_unauthenticated_non_loopback_binds() {
+        assert!(
+            validate_startup_auth(
+                "192.168.1.69:8080".parse().expect("private bind"),
+                true,
+                false,
+                false,
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            validate_startup_auth(
+                "127.0.0.1:8080".parse().expect("loopback bind"),
+                false,
+                false,
+                true,
+                false,
+            ),
+            Ok(AuthMode::LoopbackNoAuth)
+        );
+        assert_eq!(
+            validate_startup_auth(
+                "0.0.0.0:8080".parse().expect("wildcard bind"),
+                true,
+                false,
+                true,
+                false,
+            ),
+            Err("OPENSTREAM_ALLOW_NO_AUTH requires a loopback bind")
+        );
+    }
+
+    #[test]
+    fn local_no_auth_requires_no_admin_token_and_is_not_a_role_capability() {
+        assert!(
+            validate_startup_auth(
+                "192.168.1.69:8080".parse().expect("private bind"),
+                true,
+                true,
+                false,
+                true,
+            )
+            .is_err()
+        );
+
+        let mut state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            admin_token: None,
+            allow_no_auth: false,
+            local_no_auth: true,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"test-relay-secret".to_vec(),
+        };
+        let session = test_session();
+        let empty = HeaderMap::new();
+        assert!(admin_allowed(&state, &empty));
+        assert!(!supplied_token_is_host(&empty, &session));
+
+        state.admin_token = Some("admin-secret-012345".into());
+        assert!(!admin_allowed(&state, &empty));
     }
 
     #[test]
@@ -3417,6 +3648,7 @@ mod tests {
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
             admin_token: None,
             allow_no_auth: false,
+            local_no_auth: false,
             relay_address: None,
             turn: None,
             relay_secret: b"test-relay-secret".to_vec(),
@@ -3597,6 +3829,7 @@ mod tests {
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
             admin_token: None,
             allow_no_auth: false,
+            local_no_auth: false,
             relay_address: None,
             turn: None,
             relay_secret: b"test-relay-secret".to_vec(),
@@ -3747,6 +3980,7 @@ mod tests {
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
             admin_token: None,
             allow_no_auth: false,
+            local_no_auth: false,
             relay_address: None,
             turn: None,
             relay_secret: b"test-relay-secret".to_vec(),
@@ -3796,6 +4030,7 @@ mod tests {
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
             admin_token: None,
             allow_no_auth: false,
+            local_no_auth: false,
             relay_address: None,
             turn: None,
             relay_secret: secret.clone(),
@@ -3918,6 +4153,7 @@ mod tests {
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
             admin_token: None,
             allow_no_auth: false,
+            local_no_auth: false,
             relay_address: None,
             turn: None,
             relay_secret: secret.clone(),

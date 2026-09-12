@@ -79,12 +79,12 @@
 - Produces `OPENSTREAM_LOCAL_NO_AUTH=1` configuration behavior and a typed/startup error for invalid binds.
 - Preserves `OPENSTREAM_ALLOW_NO_AUTH=1` loopback-only behavior and all role-token/session-capability checks.
 
-- [ ] Step 1: Add failing tests for private IPv4/IPv6 binds, wildcard/public rejection, missing opt-in rejection, secure-mode rejection, and role capability enforcement in local mode.
-- [ ] Step 2: Run `cargo test -p openstream-signal-server --locked`; verify the new config field/validation is absent.
-- [ ] Step 3: Add explicit config parsing and private-address validation. Reject wildcard/public binds and require no admin token before enabling local mode.
-- [ ] Step 4: Make management authorization bypass apply only to the explicitly scoped local mode; keep WebSocket/relay role bearer checks unchanged.
-- [ ] Step 5: Add a redacted startup warning and docs with a prominent LAN-trust warning and secure-mode migration path.
-- [ ] Step 6: Run focused signal tests, startup-order smoke, full workspace tests, and Clippy.
+- [x] Step 1: Add failing tests for private IPv4/IPv6 binds, wildcard/public rejection, missing opt-in rejection, secure-mode rejection, and role capability enforcement in local mode.
+- [x] Step 2: Run `cargo test -p openstream-signal-server --locked`; verify the new config field/validation is absent.
+- [x] Step 3: Add explicit config parsing and private-address validation. Reject wildcard/public binds and require no admin token before enabling local mode.
+- [x] Step 4: Make management authorization bypass apply only to the explicitly scoped local mode; keep WebSocket/relay role bearer checks unchanged.
+- [x] Step 5: Add a redacted startup warning and docs with a prominent LAN-trust warning and secure-mode migration path.
+- [x] Step 6: Run focused signal tests, startup-order smoke, full workspace tests, and Clippy.
 - [ ] Step 7: Commit `feat: add explicit private-LAN development mode`.
 
 **Expected result:** Local devices can use the product without account login, but an accidental public/wildcard unauthenticated deployment fails closed.

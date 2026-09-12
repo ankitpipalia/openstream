@@ -49,6 +49,25 @@ remain developer/headless overrides; `apply_environment_overrides` validates
 them without persisting them. The current settings schema is independent of
 the application, protocol, and future database versions.
 
+## Private-LAN no-account mode
+
+For a trusted local network, the signal service can disable only the
+administrator/account login flow with an explicit private-address bind:
+
+```sh
+OPENSTREAM_LOCAL_NO_AUTH=1 \
+OPENSTREAM_SIGNAL_BIND=192.168.1.69:8080 \
+target/release/openstream-signal-server
+```
+
+`OPENSTREAM_ADMIN_TOKEN` must be unset for this mode. The service rejects
+wildcard, loopback, public, and shared-CGNAT binds and prints a warning. This
+is not an open media mode: role capabilities and the encrypted peer handshake
+remain mandatory. A client using a private-LAN `http://` origin must set the
+same explicit `OPENSTREAM_LOCAL_NO_AUTH=1` override; secure HTTPS/WSS mode is
+required for anything beyond a trusted LAN. Do not publish this listener via
+port forwarding or a reverse proxy.
+
 The 2026-09-07 verification run passed all five commands above. The dependency
 audit permits only a crate-scoped `CC0-1.0` exception for `hexf-parse`, the
 transitive shader-literal parser used by `wgpu`/`naga`; all other non-approved

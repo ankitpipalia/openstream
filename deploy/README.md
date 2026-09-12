@@ -36,6 +36,25 @@ The administrator token must be at least 16 bytes; use a randomly generated
 value and keep it in the protected environment file rather than in a unit
 file or command-line argument.
 
+For a trusted private LAN without an account flow, use the separate,
+explicitly opt-in mode below. The bind must be one real numeric LAN address;
+wildcard, loopback, public, and shared-CGNAT binds are rejected:
+
+```text
+OPENSTREAM_LOCAL_NO_AUTH=1
+OPENSTREAM_SIGNAL_BIND=192.168.1.69:8080
+# Leave OPENSTREAM_ADMIN_TOKEN and OPENSTREAM_ALLOW_NO_AUTH unset.
+```
+
+This disables only management/admin authentication for devices on that
+trusted LAN. Anyone who can reach the bind can create or revoke sessions, so
+do not expose it through port forwarding, a reverse proxy, or a public
+interface. Role-scoped session capabilities, encrypted peer identity, and
+relay/TURN authorization remain required. Clients using an `http://` origin
+must also set `OPENSTREAM_LOCAL_NO_AUTH=1`; plaintext is accepted there only
+for numeric RFC1918/ULA/link-local origins. Use the admin-token HTTPS/WSS mode
+before leaving a trusted LAN.
+
 For the built-in relay, bind one UDP socket privately and advertise its
 reachable numeric endpoint:
 

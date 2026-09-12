@@ -712,7 +712,8 @@ impl Pairing {
             "wss" => origin.to_string(),
             "http" | "ws" => {
                 let insecure = std::env::var("OPENSTREAM_ALLOW_INSECURE").as_deref() == Ok("1");
-                if !loopback && !insecure {
+                let local_no_auth = std::env::var("OPENSTREAM_LOCAL_NO_AUTH").as_deref() == Ok("1");
+                if !plaintext_origin_allowed(&host, loopback, insecure, local_no_auth) {
                     return Err(Error::InsecureOrigin);
                 }
                 format!("ws://{rest}")
@@ -755,6 +756,37 @@ fn origin_host(origin: &str) -> Option<String> {
         .ok()?
         .host_str()
         .map(ToString::to_string)
+}
+
+/// Allow plaintext signaling only for loopback, the existing explicit lab
+/// override, or an explicitly selected private-LAN numeric origin. The latter
+/// is intentionally narrower than `OPENSTREAM_ALLOW_INSECURE`: hostnames,
+/// shared CGNAT space, and public/documentation addresses remain rejected.
+fn plaintext_origin_allowed(
+    host: &str,
+    loopback: bool,
+    allow_insecure: bool,
+    local_no_auth: bool,
+) -> bool {
+    loopback
+        || allow_insecure
+        || (local_no_auth && host.parse::<IpAddr>().is_ok_and(is_private_lan_address))
+}
+
+fn is_private_lan_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            (octets[0] == 10)
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+        }
+        IpAddr::V6(address) => {
+            let octets = address.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
 }
 
 /// Whether a host literal is a loopback address (numeric IPv4/IPv6 loopback).
@@ -5039,6 +5071,27 @@ mod tests {
         unsafe {
             std::env::remove_var("OPENSTREAM_ALLOW_INSECURE");
         }
+    }
+
+    #[test]
+    fn local_no_auth_plaintext_requires_a_private_numeric_origin() {
+        assert!(plaintext_origin_allowed("192.168.1.69", false, false, true));
+        assert!(plaintext_origin_allowed("fd00::69", false, false, true));
+        assert!(plaintext_origin_allowed("fe80::69", false, false, true));
+        assert!(!plaintext_origin_allowed("100.64.0.1", false, false, true));
+        assert!(!plaintext_origin_allowed(
+            "example.test",
+            false,
+            false,
+            true
+        ));
+        assert!(!plaintext_origin_allowed(
+            "2001:db8::69",
+            false,
+            false,
+            true
+        ));
+        assert!(plaintext_origin_allowed("localhost", true, false, false));
     }
 
     #[test]
