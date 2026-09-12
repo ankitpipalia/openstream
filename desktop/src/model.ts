@@ -37,6 +37,34 @@ export interface ConnectionSnapshot {
   computerId?: string;
 }
 
+export interface PermissionSet {
+  view: boolean;
+  keyboard: boolean;
+  mouse: boolean;
+  gamepad: boolean;
+  clipboard: boolean;
+  microphone: boolean;
+  tablet: boolean;
+  virtual_usb: boolean;
+}
+
+export type RuntimeCommand =
+  | "BeginAuthentication"
+  | "AuthenticationSucceeded"
+  | { Connect: { device_id: string; request_id: string; requested: PermissionSet; now_ms: number } }
+  | { ApproveRequest: { request_id: string; available: PermissionSet; now_ms: number } }
+  | { RejectRequest: { request_id: string; now_ms: number } }
+  | { Tick: { now_ms: number } }
+  | "ConnectionNegotiating"
+  | { ConnectionEstablished: { session_id: string; generation: number } }
+  | { ConnectionLost: { retryable: boolean } }
+  | "Disconnect"
+  | "Disconnected"
+  | "EnableHosting"
+  | "DisableHosting"
+  | "HostReady"
+  | { HostFailed: { retryable: boolean } };
+
 export type PairingState = "not-configured" | "pending" | "ready" | "unavailable";
 
 export interface TrustedDevice {

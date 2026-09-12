@@ -1,0 +1,229 @@
+import { describe, expect, it } from "vitest";
+
+import { createDefaultAdapter, createTauriAdapter } from "./tauriAdapter";
+import type {
+  AppConfig,
+  RuntimeDispatchResult,
+  RuntimeSnapshot,
+  SettingApplyMode,
+  SettingCapability,
+  SettingDescriptor,
+  SettingScope,
+  SettingVisibility,
+} from "./tauriAdapter";
+
+function descriptor(
+  key: string,
+  scope: SettingScope,
+  applyMode: SettingApplyMode,
+  capability: SettingCapability,
+  visibility: SettingVisibility,
+): SettingDescriptor {
+  return { key, scope, apply_mode: applyMode, capability, visibility };
+}
+
+function runtimeDescriptorsFixture(): SettingDescriptor[] {
+  return [
+    descriptor("client.profile", "client", "reconnect", "available", "normal"),
+    descriptor("client.window_mode", "client", "live", "available", "normal"),
+    descriptor("client.renderer", "client", "reconnect", "available", "normal"),
+    descriptor("client.vsync", "client", "live", "available", "normal"),
+    descriptor("client.decoder", "client", "reconnect", "available", "normal"),
+    descriptor("client.codec", "session", "reconnect", "available", "normal"),
+    descriptor("client.chroma", "session", "reconnect", "experimental", "advanced"),
+    descriptor("client.bit_depth", "session", "reconnect", "experimental", "advanced"),
+    descriptor("client.immersive", "client", "live", "available", "normal"),
+    descriptor("host.enabled", "host", "restart_host", "available", "normal"),
+    descriptor("host.name", "host", "live", "available", "normal"),
+    descriptor("host.capture.drm", "host", "restart_host", "experimental", "experimental"),
+    descriptor("host.capture.x11", "host", "restart_host", "available", "normal"),
+    descriptor("host.stay_awake", "host", "live", "available", "normal"),
+    descriptor("input.keyboard", "host", "live", "available", "normal"),
+    descriptor("input.mouse", "host", "live", "available", "normal"),
+    descriptor("input.gamepad", "host", "live", "experimental", "advanced"),
+    descriptor("input.clipboard", "host", "live", "available", "advanced"),
+    descriptor("input.microphone", "host", "live", "available", "advanced"),
+    descriptor("network.client_port", "global", "reconnect", "available", "advanced"),
+    descriptor("network.host_start_port", "host", "restart_host", "available", "advanced"),
+    descriptor("network.upnp", "global", "reconnect", "available", "advanced"),
+    descriptor("network.turn", "global", "reconnect", "available", "advanced"),
+  ];
+}
+
+function runtimeConfigFixture(): AppConfig {
+  return {
+    schema_version: 2,
+    device: { name: "OpenStream device", identity_key: null, control_credential: null },
+    client: {
+      signal_origin: "http://127.0.0.1:8080",
+      profile: "balanced",
+      window_mode: "windowed",
+      renderer: "auto",
+      decoder: "auto",
+      codec: "auto",
+      vsync: "auto",
+      chroma: "auto",
+      bit_depth: "auto",
+      immersive: false,
+      show_warnings: true,
+      bandwidth_cap_mbps: null,
+      overlay: true,
+    },
+    host: {
+      enabled: false,
+      name: "OpenStream host",
+      stay_awake: false,
+      capture: "auto",
+      encoder: "auto",
+      aggregate_bandwidth_cap_mbps: null,
+      approval: "auto",
+      max_guests: 1,
+      selected_display: null,
+    },
+    video: {
+      width: 1920,
+      height: 1080,
+      fps: 60,
+      bitrate_mbps: 10,
+      min_bitrate_mbps: 1,
+      codec: "h264",
+      pixel_format: "auto",
+    },
+    audio: {
+      enabled: false,
+      codec: "opus",
+      bitrate_kbps: 128,
+      latency_mode: "balanced",
+    },
+    input: {
+      enabled: false,
+      keyboard: false,
+      mouse: false,
+      clipboard: false,
+      gamepad: false,
+      microphone: false,
+    },
+    network: {
+      upnp: false,
+      ice: false,
+      turn: false,
+      force_relay: false,
+      local_no_auth: true,
+      udp_port: null,
+      client_port: null,
+      host_start_port: null,
+      congestion: "balanced",
+    },
+    privacy: { redact_diagnostics: true, remember_last_host: false },
+    advanced: { ffmpeg_path: null, ffmpeg_reconfigure: false, max_session_seconds: 3600 },
+  };
+}
+
+function runtimeSnapshotFixture(): RuntimeSnapshot {
+  return {
+    app: {
+      mode: "Local",
+      state: "Ready",
+      host_status: "Disabled",
+      devices: [],
+      pending_request: null,
+      active_device_id: null,
+      active_session_id: null,
+      active_permissions: {
+        view: true,
+        keyboard: false,
+        mouse: false,
+        gamepad: false,
+        clipboard: false,
+        microphone: false,
+        tablet: false,
+        virtual_usb: false,
+      },
+      diagnostics: {
+        signal: "unknown",
+        direct_udp: "unknown",
+        stun: "unknown",
+        relay: "unknown",
+        turn: "unknown",
+        capture_backend: "unknown",
+        encoder: "unknown",
+        decoder: "unknown",
+        renderer: "unknown",
+        audio: "unknown",
+        input: "unknown",
+        virtual_devices: "unknown",
+        last_error: null,
+      },
+    },
+    settings: runtimeConfigFixture(),
+    descriptors: runtimeDescriptorsFixture(),
+  };
+}
+
+describe("tauri adapter", () => {
+  it("loads a Rust snapshot through the Tauri adapter", async () => {
+    const adapter = createTauriAdapter(async (command) => {
+      expect(command).toBe("runtime_snapshot");
+      return runtimeSnapshotFixture();
+    });
+    const snapshot = await adapter.refresh();
+    expect(snapshot.connection.state).toBe("idle");
+    expect(snapshot.settings[0].items[0].value).toBe("balanced");
+  });
+
+  it("keeps the fixture adapter outside Tauri", async () => {
+    const adapter = createDefaultAdapter({ isTauri: false });
+    expect((await adapter.refresh()).product.channel).toBe("Desktop shell");
+  });
+
+  it("detects the Tauri bridge from window.__TAURI_INTERNALS__ when no override is given", () => {
+    const globalWindow = window as unknown as Record<string, unknown>;
+    globalWindow.__TAURI_INTERNALS__ = {};
+    try {
+      expect(() => createDefaultAdapter()).not.toThrow();
+    } finally {
+      delete globalWindow.__TAURI_INTERNALS__;
+    }
+  });
+
+  it("maps a dispatch result back into the product snapshot", async () => {
+    const result: RuntimeDispatchResult = {
+      snapshot: runtimeSnapshotFixture(),
+      events: ["AuthenticationStarted"],
+    };
+
+    const adapter = createTauriAdapter(async (command, args) => {
+      expect(command).toBe("runtime_dispatch");
+      expect(args).toEqual({ command: "BeginAuthentication" });
+      return result;
+    });
+
+    const snapshot = await adapter.dispatch("BeginAuthentication");
+    expect(snapshot.connection.state).toBe("idle");
+  });
+
+  it("maps an updateSettings result back into the product snapshot", async () => {
+    const fixture = runtimeSnapshotFixture();
+    const updated: RuntimeSnapshot = {
+      ...fixture,
+      settings: { ...fixture.settings, client: { ...fixture.settings.client, profile: "performance" } },
+    };
+
+    const adapter = createTauriAdapter(async (command, args) => {
+      expect(command).toBe("runtime_update_settings");
+      expect(args).toEqual({ settings: updated.settings });
+      return updated;
+    });
+
+    const snapshot = await adapter.updateSettings(updated.settings);
+    expect(snapshot.settings[0].items[0].value).toBe("performance");
+  });
+
+  it("propagates a bridge failure instead of fabricating an available snapshot", async () => {
+    const adapter = createTauriAdapter(async () => {
+      throw { command_rejected: { code: "Unavailable", retryable: true } };
+    });
+
+    await expect(adapter.refresh()).rejects.toBeTruthy();
+  });
+});
