@@ -571,12 +571,58 @@ fn migrate_schema_zero(value: &mut Value) -> Result<(), SettingsError> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsError> {
-    #[cfg(windows)]
-    if destination.exists() {
-        fs::remove_file(destination).map_err(|source| io_error(destination, source))?;
-    }
+    windows_replace_file(temporary, destination)
+}
+
+#[cfg(unix)]
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsError> {
+    fs::rename(temporary, destination).map_err(|source| io_error(destination, source))?;
+    fs::File::open(destination.parent().unwrap_or_else(|| Path::new(".")))
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error(destination, source))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsError> {
     fs::rename(temporary, destination).map_err(|source| io_error(destination, source))
+}
+
+#[cfg(windows)]
+fn windows_replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>, SettingsError> {
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io_error(
+                path,
+                io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL character"),
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let temporary_wide = wide_path(temporary)?;
+    let destination_wide = wide_path(destination)?;
+    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain
+    // alive for the call. MoveFileExW does not retain either pointer.
+    let result = unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        return Err(io_error(destination, io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn io_error(path: &Path, source: io::Error) -> SettingsError {
@@ -954,6 +1000,62 @@ mod tests {
             assert_eq!(parent_mode, 0o700);
         }
         cleanup(&path);
+    }
+
+    #[test]
+    fn save_atomic_replaces_an_existing_settings_file() {
+        let root = temp_path("replace-existing");
+        let path = root.join("config.json");
+        let mut replacement = default_config();
+        replacement.device.name = "replacement".to_string();
+
+        save_atomic(&path, &default_config()).expect("initial settings save");
+        save_atomic(&path, &replacement).expect("replacement settings save");
+
+        assert_eq!(
+            load(&path).expect("replacement settings load").config,
+            replacement
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn failed_replace_preserves_existing_destination() {
+        let root = temp_path("failed-replace");
+        fs::create_dir_all(&root).expect("create test directory");
+        let destination = root.join("config.json");
+        let missing_temporary = root.join("missing.tmp");
+        fs::write(&destination, b"old settings").expect("write existing destination");
+
+        let error = super::replace_file(&missing_temporary, &destination)
+            .expect_err("missing replacement must fail");
+
+        assert!(matches!(error, SettingsError::Io { .. }));
+        assert_eq!(
+            fs::read(&destination).expect("existing destination remains"),
+            b"old settings"
+        );
+        cleanup(&destination);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replace_primitive_replaces_an_existing_destination() {
+        let root = temp_path("windows-replace-api");
+        fs::create_dir_all(&root).expect("create test directory");
+        let destination = root.join("config.json");
+        let temporary = root.join("config.tmp");
+        fs::write(&destination, b"old settings").expect("write existing destination");
+        fs::write(&temporary, b"new settings").expect("write replacement");
+
+        super::windows_replace_file(&temporary, &destination).expect("atomic Windows replace");
+
+        assert_eq!(
+            fs::read(&destination).expect("read destination"),
+            b"new settings"
+        );
+        assert!(!temporary.exists());
+        cleanup(&destination);
     }
 
     #[test]
