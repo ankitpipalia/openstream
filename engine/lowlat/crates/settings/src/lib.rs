@@ -1454,9 +1454,9 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_SCHEMA_VERSION, CapabilityState, DecoderMode, EncoderMode,
-        RendererMode, SecretRef, SettingVisibility, SettingsError, StreamProfile, WindowMode,
-        apply_overrides, default_config, effective_config, load, save_atomic, setting_descriptors,
+        CURRENT_SCHEMA_VERSION, CapabilityState, DecoderMode, EncoderMode, RendererMode, SecretRef,
+        SettingVisibility, SettingsError, StreamProfile, WindowMode, apply_overrides,
+        default_config, effective_config, load, save_atomic, setting_descriptors,
     };
     use serde_json::json;
     use std::cell::{Cell, RefCell};
