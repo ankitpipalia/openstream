@@ -146,7 +146,7 @@ impl std::fmt::Display for DecoderSelectionError {
 impl std::error::Error for DecoderSelectionError {}
 
 /// Select a decoder without silently claiming that a native path is usable.
-/// `Auto` follows the product order VideoToolbox → FFmpeg → software; an
+/// `Auto` follows the product order VideoToolbox -> FFmpeg -> software; an
 /// explicit request returns the recorded capability reason instead.
 pub fn resolve_decoder(
     requested: DecoderBackend,
