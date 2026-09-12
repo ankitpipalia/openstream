@@ -102,6 +102,7 @@ git commit -m "feat: add typed desktop runtime commands"
 **Files:**
 - Create: `desktop/src/adapters/tauriAdapter.ts`
 - Create: `desktop/src/adapters/tauriAdapter.test.ts`
+- Modify: `desktop/package-lock.json` to restore a valid lockfile document
 - Modify: `desktop/src/adapters/productAdapter.ts`
 - Modify: `desktop/src/App.tsx`
 - Modify: `desktop/src/pages/ComputersPage.tsx`
@@ -137,11 +138,11 @@ it("keeps the fixture adapter outside Tauri", async () => {
 
 Run: `cd desktop && npm test -- --run src/adapters/tauriAdapter.test.ts`
 
-Expected: failure because no Tauri adapter or runtime snapshot mapper exists.
+Expected: the test fails because no Tauri adapter or runtime snapshot mapper exists; before installing dependencies, `node -e 'JSON.parse(require("fs").readFileSync("package-lock.json"))'` must also fail on the current corrupted lockfile.
 
 - [ ] **Step 3: Implement the adapter and production App wiring**
 
-Use `invoke` from `@tauri-apps/api/core` only inside `tauriAdapter.ts`. Keep Rust command names and JSON field names in one typed mapping. Do not put pairing paths, tokens, or media data in `ProductSnapshot`. Make the Computers refresh action call `adapter.refresh()` and show a typed unavailable state on bridge failure.
+Restore `desktop/package-lock.json` to the valid JSON document represented by the committed dependency graph, and add a JSON-parse check to the frontend verification. Use `invoke` from `@tauri-apps/api/core` only inside `tauriAdapter.ts`. Keep Rust command names and JSON field names in one typed mapping. Do not put pairing paths, tokens, or media data in `ProductSnapshot`. Make the Computers refresh action call `adapter.refresh()` and show a typed unavailable state on bridge failure.
 
 - [ ] **Step 4: Run frontend typecheck, tests, and production build**
 
