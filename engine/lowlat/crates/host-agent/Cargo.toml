@@ -20,5 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+lowlat-host.workspace = true
+
 [lints]
 workspace = true

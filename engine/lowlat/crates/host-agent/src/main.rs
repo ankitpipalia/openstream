@@ -254,7 +254,7 @@ mod unix_main {
         let ffmpeg = env::var_os("OPENSTREAM_FFMPEG");
         let report = run_preflight(
             &settings.host.capture,
-            env_flag("OPENSTREAM_NATIVE_DRM_READY"),
+            native_drm_reachable(),
             env::var_os("DISPLAY").is_some(),
             env::var_os("PIPEWIRE_REMOTE").is_some() || env::var_os("WAYLAND_DISPLAY").is_some(),
             executable_available(ffmpeg.as_ref()),
@@ -292,11 +292,48 @@ mod unix_main {
         Ok((config, report))
     }
 
-    fn env_flag(name: &str) -> bool {
-        matches!(
-            env::var(name).as_deref(),
-            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    fn native_drm_reachable() -> bool {
+        native_drm_reachable_with(
+            cfg!(target_os = "linux"),
+            native_drm_probe_ready(),
+            |name| env::var(name).ok(),
         )
+    }
+
+    fn native_drm_reachable_with(
+        platform_supported: bool,
+        probe_ready: bool,
+        environment: impl Fn(&str) -> Option<String>,
+    ) -> bool {
+        if !platform_supported {
+            return false;
+        }
+        if probe_ready {
+            return true;
+        }
+        let developer_override =
+            environment("OPENSTREAM_DEVELOPER_OVERRIDE").as_deref() == Some("1");
+        let assume_native_drm =
+            environment("OPENSTREAM_DEVELOPER_ASSUME_NATIVE_DRM").as_deref() == Some("1");
+        if developer_override && assume_native_drm {
+            // Unsafe by design: this developer-only escape hatch asserts that
+            // native DRM works even though the real probe could not prove it.
+            eprintln!(
+                "OpenStream host agent warning: unsafe developer assumption is bypassing the native DRM readiness probe"
+            );
+            return true;
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_drm_probe_ready() -> bool {
+        lowlat::display::native_drm_probe().is_ready()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    const fn native_drm_probe_ready() -> bool {
+        false
     }
 
     fn executable_available(program: Option<&OsString>) -> bool {
@@ -325,8 +362,9 @@ mod unix_main {
 
     #[cfg(test)]
     mod tests {
-        use super::error_code;
-        use openstream_host_agent::{AgentError, HostErrorCode};
+        use super::{error_code, native_drm_reachable_with};
+        use openstream_host_agent::{AgentError, HostBackend, HostErrorCode, run_preflight};
+        use openstream_settings::default_config;
 
         #[test]
         fn current_typed_error_wins_over_stale_health_error() {
@@ -337,6 +375,60 @@ mod unix_main {
                 ),
                 HostErrorCode::StopFailed
             );
+        }
+
+        #[test]
+        fn legacy_native_drm_flag_cannot_override_an_unreachable_probe() {
+            let environment =
+                |name: &str| (name == "OPENSTREAM_NATIVE_DRM_READY").then_some("1".to_string());
+            let native_drm_reachable = native_drm_reachable_with(true, false, environment);
+            let settings = default_config();
+            let report = run_preflight(
+                &settings.host.capture,
+                native_drm_reachable,
+                true,
+                false,
+                true,
+            );
+
+            assert!(!native_drm_reachable);
+            assert_eq!(report.selected, HostBackend::FfmpegX11);
+        }
+
+        #[test]
+        fn native_drm_probe_can_select_native_backend() {
+            let settings = default_config();
+            let report = run_preflight(&settings.host.capture, true, true, false, true);
+
+            assert_eq!(report.selected, HostBackend::NativeDrm);
+        }
+
+        #[test]
+        fn developer_native_drm_assumption_requires_override_mode() {
+            let assumption_only = |name: &str| {
+                (name == "OPENSTREAM_DEVELOPER_ASSUME_NATIVE_DRM").then_some("1".to_string())
+            };
+            assert!(!native_drm_reachable_with(true, false, assumption_only));
+
+            let explicit_override = |name: &str| match name {
+                "OPENSTREAM_DEVELOPER_OVERRIDE" | "OPENSTREAM_DEVELOPER_ASSUME_NATIVE_DRM" => {
+                    Some("1".to_string())
+                }
+                _ => None,
+            };
+            assert!(native_drm_reachable_with(true, false, explicit_override));
+        }
+
+        #[test]
+        fn unsupported_platform_rejects_developer_native_drm_assumption() {
+            let explicit_override = |name: &str| match name {
+                "OPENSTREAM_DEVELOPER_OVERRIDE" | "OPENSTREAM_DEVELOPER_ASSUME_NATIVE_DRM" => {
+                    Some("1".to_string())
+                }
+                _ => None,
+            };
+
+            assert!(!native_drm_reachable_with(false, false, explicit_override));
         }
     }
 }

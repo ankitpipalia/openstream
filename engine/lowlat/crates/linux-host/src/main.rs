@@ -601,15 +601,15 @@ fn list_displays() -> Result<(), Box<dyn std::error::Error>> {
 /// acceptance run because encoder/driver compatibility is only fully proven
 /// when a frame is submitted.
 fn preflight() -> Result<(), Box<dyn std::error::Error>> {
-    use lowlat::display::{Capturable, Display};
+    use lowlat::display::{Display, NativeDrmProbe, native_drm_probe};
     use openstream_platform::hwaccel::{EncoderCodec, HwReport};
 
     let outputs = Display::outputs();
-    let capture = Display::capturable();
+    let capture = native_drm_probe();
     let capture_name = match capture {
-        Capturable::Yes => "yes",
-        Capturable::NothingLit => "nothing_lit",
-        Capturable::NotReachable => "not_reachable",
+        NativeDrmProbe::Ready => "yes",
+        NativeDrmProbe::NothingLit => "nothing_lit",
+        NativeDrmProbe::Unreachable => "not_reachable",
     };
     let output_json = outputs
         .iter()
@@ -682,7 +682,7 @@ fn preflight() -> Result<(), Box<dyn std::error::Error>> {
         "native_drm": {
             "capturable": capture_name,
             "outputs": output_json,
-            "host_capture_gate": capture == Capturable::Yes,
+            "host_capture_gate": capture.is_ready(),
         },
         "x11": x11,
         "pipewire": pipewire,
