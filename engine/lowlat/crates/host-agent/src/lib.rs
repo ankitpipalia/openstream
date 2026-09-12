@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
 const MAX_PROGRAM_BYTES: usize = 4096;
 /// Hard upper bound for the agent backend label.
 const MAX_BACKEND_BYTES: usize = 128;
+const MAX_PAIRING_FILE_BYTES: u64 = 64 * 1024;
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(2);
 /// The oldest supported host-agent IPC protocol version.
 pub const HOST_AGENT_PROTOCOL_VERSION: u32 = 1;
@@ -154,15 +156,20 @@ pub struct ChildSpec {
     program: PathBuf,
     args: Vec<OsString>,
     env: BTreeMap<String, String>,
+    pairing_file: Option<String>,
 }
 
 impl fmt::Debug for ChildSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut environment_keys = self.env.keys().map(String::as_str).collect::<Vec<_>>();
+        if self.pairing_file.is_some() {
+            environment_keys.push("OPENSTREAM_PAIRING_FILE");
+        }
         formatter
             .debug_struct("ChildSpec")
             .field("program", &"<configured>")
             .field("argument_count", &self.args.len())
-            .field("environment_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("environment_keys", &environment_keys)
             .finish()
     }
 }
@@ -174,6 +181,7 @@ impl ChildSpec {
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            pairing_file: None,
         };
         spec.validate()?;
         Ok(spec)
@@ -223,7 +231,7 @@ impl ChildSpec {
         for (key, value) in &self.env {
             if key.is_empty()
                 || key.len() > 256
-                || key == "OPENSTREAM_PAIRING_JSON"
+                || is_pairing_environment_key(key)
                 || key.chars().any(|character| {
                     !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
                 })
@@ -232,6 +240,9 @@ impl ChildSpec {
             {
                 return Err(AgentError::InvalidConfig);
             }
+        }
+        if let Some(path) = &self.pairing_file {
+            validate_private_pairing_file(Path::new(path))?;
         }
         Ok(())
     }
@@ -247,6 +258,76 @@ impl ChildSpec {
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.env
     }
+
+    fn set_pairing_file(&mut self, path: String) {
+        self.pairing_file = Some(path);
+    }
+
+    fn pairing_file(&self) -> Option<&str> {
+        self.pairing_file.as_deref()
+    }
+}
+
+fn validate_private_pairing_file(path: &Path) -> Result<String, AgentError> {
+    if !path.is_absolute() {
+        return Err(AgentError::InvalidConfig);
+    }
+    let link_metadata = path
+        .symlink_metadata()
+        .map_err(|_| AgentError::InvalidConfig)?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(AgentError::InvalidConfig);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the final path component without traversing a reparse point.
+        // The metadata check above is retained for a clear fast-fail, while
+        // this handle-level flag closes the check/open race on Windows.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|_| AgentError::InvalidConfig)?;
+    let metadata = file.metadata().map_err(|_| AgentError::InvalidConfig)?;
+    if !metadata.is_file() || metadata.len() > MAX_PAIRING_FILE_BYTES {
+        return Err(AgentError::InvalidConfig);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(AgentError::InvalidConfig);
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid
+            || metadata.mode() & 0o077 != 0
+            || metadata.mode() & 0o400 == 0
+        {
+            return Err(AgentError::InvalidConfig);
+        }
+    }
+
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or(AgentError::InvalidConfig)
+}
+
+fn is_pairing_environment_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("OPENSTREAM_PAIRING_JSON")
+        || key.eq_ignore_ascii_case("OPENSTREAM_PAIRING_FILE")
 }
 
 fn contains_secret_marker(value: &str) -> bool {
@@ -410,6 +491,16 @@ impl HostAgentConfig {
         value: impl Into<String>,
     ) -> Result<Self, AgentError> {
         self.child = self.child.env(key, value)?;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Add the persistent agent's pairing file after validating its secure
+    /// filesystem boundary. Generic runtime environment insertion cannot set
+    /// either pairing variable.
+    pub fn with_pairing_file(mut self, path: impl AsRef<Path>) -> Result<Self, AgentError> {
+        let path = validate_private_pairing_file(path.as_ref())?;
+        self.child.set_pairing_file(path);
         self.validate()?;
         Ok(self)
     }
@@ -667,8 +758,12 @@ impl ChildFactory for TokioChildFactory {
 
 fn configure_child_environment(command: &mut tokio::process::Command, spec: &ChildSpec) {
     command
-        .envs(spec.environment())
-        .env_remove("OPENSTREAM_PAIRING_JSON");
+        .env_remove("OPENSTREAM_PAIRING_JSON")
+        .env_remove("OPENSTREAM_PAIRING_FILE")
+        .envs(spec.environment());
+    if let Some(path) = spec.pairing_file() {
+        command.env("OPENSTREAM_PAIRING_FILE", path);
+    }
 }
 
 #[cfg(unix)]
@@ -1117,6 +1212,8 @@ mod tests {
     use openstream_settings::default_config;
     use std::collections::{BTreeMap, VecDeque};
     use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1815,15 +1912,46 @@ mod tests {
         );
     }
 
+    fn private_pairing_file(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "openstream-host-agent-lib-{label}-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        fs::write(&path, b"{}\n").expect("write pairing fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("protect pairing fixture");
+        }
+        path
+    }
+
     #[test]
-    fn runtime_secret_is_redacted_from_configuration_debug() {
+    fn dedicated_pairing_file_is_redacted_from_configuration_debug() {
+        let path = private_pairing_file("debug-redaction");
         let config = HostAgentConfig::from_settings(&default_config(), "host")
             .expect("config")
-            .with_runtime_env("OPENSTREAM_PAIRING_FILE", "/private/pairing.json")
-            .expect("runtime secret");
+            .with_pairing_file(&path)
+            .expect("validated pairing file");
         let debug = format!("{config:?}");
         assert!(debug.contains("OPENSTREAM_PAIRING_FILE"));
-        assert!(!debug.contains("/private/pairing.json"));
+        assert!(!debug.contains(&path.to_string_lossy().into_owned()));
+        fs::remove_file(path).expect("remove pairing fixture");
+    }
+
+    #[test]
+    fn pairing_file_errors_do_not_echo_path() {
+        let path = std::env::temp_dir().join("openstream-pairing-secret-sentinel");
+        let config = HostAgentConfig::from_settings(&default_config(), "host").expect("config");
+        let error = config
+            .with_pairing_file(&path)
+            .expect_err("missing pairing file must be rejected");
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        assert!(!debug.contains(path.to_string_lossy().as_ref()));
+        assert!(!display.contains(path.to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -1836,14 +1964,35 @@ mod tests {
     }
 
     #[test]
-    fn persistent_child_explicitly_removes_inherited_raw_pairing_json() {
-        let spec = ChildSpec::new("host")
-            .expect("child spec")
-            .env("OPENSTREAM_PAIRING_FILE", "/private/pairing.json")
-            .expect("pairing file environment");
+    fn generic_runtime_environment_rejects_pairing_file() {
+        for key in [
+            "OPENSTREAM_PAIRING_JSON",
+            "OPENSTREAM_PAIRING_FILE",
+            "openstream_pairing_json",
+            "openstream_pairing_file",
+        ] {
+            let child = ChildSpec::new("host")
+                .expect("child spec")
+                .env(key, "/private/pairing.json");
+            assert!(matches!(child, Err(AgentError::InvalidConfig)), "{key}");
+
+            let config = HostAgentConfig::from_settings(&default_config(), "host")
+                .expect("config")
+                .with_runtime_env(key, "/private/pairing.json");
+            assert!(matches!(config, Err(AgentError::InvalidConfig)), "{key}");
+        }
+    }
+
+    #[test]
+    fn persistent_child_removes_inherited_pairing_variables_then_adds_validated_file() {
+        let path = private_pairing_file("spawn-boundary");
+        let config = HostAgentConfig::from_settings(&default_config(), "host")
+            .expect("config")
+            .with_pairing_file(&path)
+            .expect("validated pairing file");
         let mut command = tokio::process::Command::new("host");
 
-        configure_child_environment(&mut command, &spec);
+        configure_child_environment(&mut command, config.child());
 
         let configured = command
             .as_std()
@@ -1856,8 +2005,61 @@ mod tests {
         );
         assert_eq!(
             configured.get(std::ffi::OsStr::new("OPENSTREAM_PAIRING_FILE")),
-            Some(&Some(OsString::from("/private/pairing.json")))
+            Some(&Some(path.as_os_str().to_owned()))
         );
+        fs::remove_file(path).expect("remove pairing fixture");
+    }
+
+    #[test]
+    fn dedicated_pairing_file_rejects_relative_directory_and_oversized_paths() {
+        let base = HostAgentConfig::from_settings(&default_config(), "host").expect("config");
+        assert!(matches!(
+            base.clone().with_pairing_file("relative-pairing.json"),
+            Err(AgentError::InvalidConfig)
+        ));
+        assert!(matches!(
+            base.clone().with_pairing_file(std::env::temp_dir()),
+            Err(AgentError::InvalidConfig)
+        ));
+
+        let path = private_pairing_file("oversized");
+        fs::write(&path, vec![b'x'; 64 * 1024 + 1]).expect("write oversized fixture");
+        assert!(matches!(
+            base.with_pairing_file(&path),
+            Err(AgentError::InvalidConfig)
+        ));
+        fs::remove_file(path).expect("remove pairing fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dedicated_pairing_file_rejects_symlink_and_insecure_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let base = HostAgentConfig::from_settings(&default_config(), "host").expect("config");
+        let target = private_pairing_file("symlink-target");
+        let link = target.with_extension("link");
+        symlink(&target, &link).expect("create pairing symlink");
+        assert!(matches!(
+            base.clone().with_pairing_file(&link),
+            Err(AgentError::InvalidConfig)
+        ));
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("make pairing fixture insecure");
+        assert!(matches!(
+            base.with_pairing_file(&target),
+            Err(AgentError::InvalidConfig)
+        ));
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o000))
+            .expect("remove pairing fixture read permission");
+        let base = HostAgentConfig::from_settings(&default_config(), "host").expect("config");
+        assert!(matches!(
+            base.with_pairing_file(&target),
+            Err(AgentError::InvalidConfig)
+        ));
+        fs::remove_file(link).expect("remove pairing symlink");
+        fs::remove_file(target).expect("remove pairing fixture");
     }
 
     #[test]
