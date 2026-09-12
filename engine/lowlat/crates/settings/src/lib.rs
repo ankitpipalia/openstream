@@ -1454,7 +1454,7 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        CURRENT_SCHEMA_VERSION, CapabilityState, ChromaPreference, DecoderMode, EncoderMode,
+        CURRENT_SCHEMA_VERSION, CapabilityState, DecoderMode, EncoderMode,
         RendererMode, SecretRef, SettingVisibility, SettingsError, StreamProfile, WindowMode,
         apply_overrides, default_config, effective_config, load, save_atomic, setting_descriptors,
     };
@@ -1626,7 +1626,7 @@ mod tests {
         let effective = effective_config(&edited);
         assert_eq!(effective.profile, StreamProfile::Custom);
         assert_eq!(effective.video.fps, 120);
-        assert_eq!(effective.video.bitrate_mbps, 25.0);
+        assert_eq!(effective.video.bitrate_mbps.to_bits(), 25.0_f64.to_bits());
     }
 
     #[test]
