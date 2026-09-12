@@ -578,10 +578,26 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsErro
 
 #[cfg(unix)]
 fn replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsError> {
+    unix_replace_file_with_sync(temporary, destination, |parent| {
+        fs::File::open(parent).and_then(|directory| directory.sync_all())
+    })
+}
+
+#[cfg(unix)]
+fn unix_replace_file_with_sync<F>(
+    temporary: &Path,
+    destination: &Path,
+    sync_parent: F,
+) -> Result<(), SettingsError>
+where
+    F: FnOnce(&Path) -> io::Result<()>,
+{
     fs::rename(temporary, destination).map_err(|source| io_error(destination, source))?;
-    fs::File::open(destination.parent().unwrap_or_else(|| Path::new(".")))
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(destination, source))
+    // The rename is the commit point. Directory fsync improves crash durability,
+    // but failing after commit would falsely tell callers that replacement failed.
+    let _best_effort_durability =
+        sync_parent(destination.parent().unwrap_or_else(|| Path::new(".")));
+    Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -591,38 +607,130 @@ fn replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsErro
 
 #[cfg(windows)]
 fn windows_replace_file(temporary: &Path, destination: &Path) -> Result<(), SettingsError> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
     };
 
-    fn wide_path(path: &Path) -> Result<Vec<u16>, SettingsError> {
-        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(io_error(
-                path,
-                io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL character"),
-            ));
-        }
-        wide.push(0);
-        Ok(wide)
+    let temporary_wide = windows_extended_path(temporary)?;
+    let destination_wide = windows_extended_path(destination)?;
+    replace_existing_or_create(
+        || {
+            // SAFETY: The buffers are NUL-terminated and remain alive for the call.
+            let result = unsafe {
+                ReplaceFileW(
+                    destination_wide.as_ptr(),
+                    temporary_wide.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_WRITE_THROUGH,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            (result != 0)
+                .then_some(())
+                .ok_or_else(io::Error::last_os_error)
+        },
+        || {
+            // No replace flag: a destination created by a racer is never overwritten
+            // through the metadata-losing creation path.
+            let result = unsafe {
+                MoveFileExW(
+                    temporary_wide.as_ptr(),
+                    destination_wide.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            (result != 0)
+                .then_some(())
+                .ok_or_else(io::Error::last_os_error)
+        },
+    )
+    .map_err(|source| io_error(destination, source))
+}
+
+#[cfg(windows)]
+fn windows_extended_path(path: &Path) -> Result<Vec<u16>, SettingsError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
+
+    let mut input: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if input.contains(&0) {
+        return Err(io_error(
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL character"),
+        ));
+    }
+    input.push(0);
+
+    const EXTENDED: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    if input.starts_with(EXTENDED) {
+        return Ok(input);
     }
 
-    let temporary_wide = wide_path(temporary)?;
-    let destination_wide = wide_path(destination)?;
-    // SAFETY: Both pointers reference NUL-terminated UTF-16 buffers that remain
-    // alive for the call. MoveFileExW does not retain either pointer.
-    let result = unsafe {
-        MoveFileExW(
-            temporary_wide.as_ptr(),
-            destination_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+    // GetFullPathNameW safely expands relative, root-relative, and drive-relative
+    // inputs without requiring the destination to exist.
+    let required = unsafe {
+        GetFullPathNameW(
+            input.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
-    if result == 0 {
-        return Err(io_error(destination, io::Error::last_os_error()));
+    if required == 0 {
+        return Err(io_error(path, io::Error::last_os_error()));
     }
-    Ok(())
+    let mut absolute = vec![0; required as usize];
+    let written = unsafe {
+        GetFullPathNameW(
+            input.as_ptr(),
+            required,
+            absolute.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if written == 0 || written >= required {
+        return Err(io_error(path, io::Error::last_os_error()));
+    }
+    absolute.truncate(written as usize);
+
+    let mut extended = Vec::with_capacity(absolute.len() + 8);
+    if absolute.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        extended.extend("\\\\?\\UNC\\".encode_utf16());
+        extended.extend_from_slice(&absolute[2..]);
+    } else {
+        extended.extend("\\\\?\\".encode_utf16());
+        extended.extend_from_slice(&absolute);
+    }
+    extended.push(0);
+    Ok(extended)
+}
+
+#[cfg(any(test, windows))]
+fn replace_existing_or_create<R, M>(mut replace: R, mut move_new: M) -> io::Result<()>
+where
+    R: FnMut() -> io::Result<()>,
+    M: FnMut() -> io::Result<()>,
+{
+    match replace() {
+        Ok(()) => Ok(()),
+        Err(error) if is_windows_missing(&error) => match move_new() {
+            Ok(()) => Ok(()),
+            Err(error) if is_windows_exists(&error) => replace(),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(any(test, windows))]
+fn is_windows_missing(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(2 | 3))
+}
+
+#[cfg(any(test, windows))]
+fn is_windows_exists(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(80 | 183))
 }
 
 fn io_error(path: &Path, source: io::Error) -> SettingsError {
@@ -869,8 +977,10 @@ mod tests {
         apply_overrides, default_config, load, save_atomic,
     };
     use serde_json::json;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1038,6 +1148,92 @@ mod tests {
         cleanup(&destination);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_directory_sync_failure_is_best_effort_after_rename_commits() {
+        let root = temp_path("directory-sync-failure");
+        fs::create_dir_all(&root).expect("create test directory");
+        let destination = root.join("config.json");
+        let temporary = root.join("config.tmp");
+        fs::write(&destination, b"old settings").expect("write existing destination");
+        fs::write(&temporary, b"new settings").expect("write replacement");
+
+        let result = super::unix_replace_file_with_sync(&temporary, &destination, |_| {
+            Err(io::Error::other("simulated directory fsync failure"))
+        });
+
+        result.expect("rename already committed, so durability sync is best effort");
+        assert_eq!(
+            fs::read(&destination).expect("read committed destination"),
+            b"new settings"
+        );
+        assert!(!temporary.exists());
+        cleanup(&destination);
+    }
+
+    #[test]
+    fn windows_replacement_prefers_replace_for_existing_destination() {
+        let calls = RefCell::new(Vec::new());
+
+        super::replace_existing_or_create(
+            || {
+                calls.borrow_mut().push("replace");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("move");
+                Ok(())
+            },
+        )
+        .expect("existing destination replacement");
+
+        assert_eq!(*calls.borrow(), ["replace"]);
+    }
+
+    #[test]
+    fn windows_replacement_creates_only_after_destination_is_missing() {
+        let calls = RefCell::new(Vec::new());
+
+        super::replace_existing_or_create(
+            || {
+                calls.borrow_mut().push("replace");
+                Err(io::Error::from_raw_os_error(2))
+            },
+            || {
+                calls.borrow_mut().push("move");
+                Ok(())
+            },
+        )
+        .expect("new destination creation");
+
+        assert_eq!(*calls.borrow(), ["replace", "move"]);
+    }
+
+    #[test]
+    fn windows_replacement_retries_replace_when_creation_loses_a_race() {
+        let calls = RefCell::new(Vec::new());
+        let replace_attempts = Cell::new(0);
+
+        super::replace_existing_or_create(
+            || {
+                calls.borrow_mut().push("replace");
+                replace_attempts.set(replace_attempts.get() + 1);
+                if replace_attempts.get() == 1 {
+                    Err(io::Error::from_raw_os_error(2))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                calls.borrow_mut().push("move");
+                Err(io::Error::from_raw_os_error(183))
+            },
+        )
+        .expect("racing destination replacement");
+
+        assert_eq!(*calls.borrow(), ["replace", "move", "replace"]);
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_replace_primitive_replaces_an_existing_destination() {
@@ -1056,6 +1252,55 @@ mod tests {
         );
         assert!(!temporary.exists());
         cleanup(&destination);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_absolute_extended_paths_for_drive_relative_and_unc_inputs() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use std::path::Path;
+
+        let relative = super::windows_extended_path(Path::new("relative\\config.json"))
+            .expect("relative path conversion");
+        let drive = super::windows_extended_path(Path::new("C:\\settings\\config.json"))
+            .expect("drive path conversion");
+        let unc =
+            super::windows_extended_path(Path::new("\\\\settings-server\\share\\config.json"))
+                .expect("UNC path conversion");
+
+        let decode = |wide: &[u16]| {
+            OsString::from_wide(&wide[..wide.len() - 1])
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(decode(&relative).starts_with("\\\\?\\"));
+        assert_eq!(decode(&drive), "\\\\?\\C:\\settings\\config.json");
+        assert_eq!(
+            decode(&unc),
+            "\\\\?\\UNC\\settings-server\\share\\config.json"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_conversion_rejects_embedded_nul() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0,
+            b'x' as u16,
+        ]));
+        let error = super::windows_extended_path(&path).expect_err("embedded NUL must fail");
+
+        assert!(matches!(
+            error,
+            SettingsError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
