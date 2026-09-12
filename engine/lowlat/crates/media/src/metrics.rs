@@ -155,9 +155,79 @@ pub fn reconnect_backoff(attempt: u32) -> Duration {
     Duration::from_secs(1_u64.saturating_mul(1 << attempt.min(5)).min(30))
 }
 
+/// Bounded reconnect supervisor over [`reconnect_backoff`].
+///
+/// The schedule existed but nothing consumed it, so every shipped binary ended
+/// its process on the first transport error. This owns the attempt counter so
+/// a caller only has to ask for the next delay and reset after a session that
+/// actually carried traffic.
+#[derive(Debug, Clone)]
+pub struct ReconnectSupervisor {
+    attempt: u32,
+    max_attempts: Option<u32>,
+}
+
+impl ReconnectSupervisor {
+    /// `max_attempts` of `None` retries indefinitely; `Some(0)` never retries
+    /// and preserves the previous fail-fast behaviour for deterministic smokes.
+    pub fn new(max_attempts: Option<u32>) -> Self {
+        Self {
+            attempt: 0,
+            max_attempts,
+        }
+    }
+
+    /// Delay before the next attempt, or `None` once the budget is spent.
+    pub fn next_delay(&mut self) -> Option<Duration> {
+        if self.max_attempts.is_some_and(|max| self.attempt >= max) {
+            return None;
+        }
+        let delay = reconnect_backoff(self.attempt);
+        self.attempt = self.attempt.saturating_add(1);
+        Some(delay)
+    }
+
+    /// Forget past failures after a session that made progress, so a long-lived
+    /// connection does not inherit an exhausted budget from hours earlier.
+    pub fn reset(&mut self) {
+        self.attempt = 0;
+    }
+
+    /// Consecutive failures since the last reset.
+    pub fn attempts(&self) -> u32 {
+        self.attempt
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervisor_follows_the_backoff_schedule_and_respects_its_budget() {
+        let mut supervisor = ReconnectSupervisor::new(Some(3));
+        assert_eq!(supervisor.next_delay(), Some(Duration::from_secs(1)));
+        assert_eq!(supervisor.next_delay(), Some(Duration::from_secs(2)));
+        assert_eq!(supervisor.next_delay(), Some(Duration::from_secs(4)));
+        assert_eq!(supervisor.next_delay(), None, "budget must be bounded");
+        assert_eq!(supervisor.attempts(), 3);
+
+        supervisor.reset();
+        assert_eq!(supervisor.attempts(), 0);
+        assert_eq!(supervisor.next_delay(), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_zero_budget_never_retries_and_none_retries_forever() {
+        assert_eq!(ReconnectSupervisor::new(Some(0)).next_delay(), None);
+
+        let mut forever = ReconnectSupervisor::new(None);
+        for _ in 0..50 {
+            assert!(forever.next_delay().is_some());
+        }
+        // The schedule is capped, so an old session never waits unboundedly.
+        assert_eq!(forever.next_delay(), Some(Duration::from_secs(30)));
+    }
 
     #[test]
     fn empty_reporter_snapshots_zero() {

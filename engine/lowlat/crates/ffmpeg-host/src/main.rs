@@ -56,7 +56,6 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 /// user-visible control action.
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-
 /// Wire pacing must sit above the encoder target, not below it. The scheduler
 /// paces the sealed datagram stream, which carries per-packet headers, AEAD
 /// tags, audio, control and retransmissions on top of the encoded video, and
@@ -1846,7 +1845,7 @@ mod tests {
 
 #[cfg(test)]
 mod pacing_tests {
-    use super::{wire_pacing_rate_for, WIRE_PACING_FLOOR_MBPS};
+    use super::{WIRE_PACING_FLOOR_MBPS, wire_pacing_rate_for};
 
     #[test]
     fn pacing_tracks_the_encoder_target_and_never_drops_below_the_floor() {
@@ -1855,7 +1854,7 @@ mod pacing_tests {
         assert!(wire_pacing_rate_for(100.0) > 100.0);
         assert!(wire_pacing_rate_for(40.0) > 40.0);
         // A low-bitrate profile keeps enough headroom for control and audio.
-        assert_eq!(wire_pacing_rate_for(1.0), WIRE_PACING_FLOOR_MBPS);
-        assert_eq!(wire_pacing_rate_for(0.0), WIRE_PACING_FLOOR_MBPS);
+        assert!((wire_pacing_rate_for(1.0) - WIRE_PACING_FLOOR_MBPS).abs() < f64::EPSILON);
+        assert!((wire_pacing_rate_for(0.0) - WIRE_PACING_FLOOR_MBPS).abs() < f64::EPSILON);
     }
 }
