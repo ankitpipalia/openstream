@@ -850,7 +850,7 @@ mod tests {
             true
         ));
         assert!(!input_event_allowed(
-            InputEvent::pen_motion(0, 100, 100, 0, false),
+            InputEvent::pen_motion(0, 100, 100, 0, false, 0),
             true
         ));
     }
