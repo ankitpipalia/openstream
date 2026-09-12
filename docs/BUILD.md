@@ -10,6 +10,10 @@ cargo check --workspace --locked
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 bash -n scripts/netns-fixtures.sh
+
+cd ..
+scripts/check-release-artifacts.sh
+scripts/secret-scan.sh
 ```
 
 The parser fuzz package is intentionally excluded from the normal workspace
@@ -28,6 +32,11 @@ GPU driver is memory-safe.
 These checks cover the protocol, signaling, simulator, codec framing, and
 platform-independent client logic. Hardware-dependent capture, encoder, audio,
 and `/dev/uinput` tests are ignored or skipped when the device is unavailable.
+
+The release artifact check verifies the operator-facing host, client, signal,
+and agent binaries in the selected Cargo profile. The secret scan requires a
+clean worktree, archives the committed source tree into private temporary
+state, and runs gitleaks without printing matched material.
 
 ## Persistent application settings
 

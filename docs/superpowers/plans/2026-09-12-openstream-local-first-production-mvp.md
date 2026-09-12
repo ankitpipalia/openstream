@@ -166,11 +166,11 @@
 - Produces a typed `DeviceCapability`/`UnavailableReason` surface for input, clipboard, microphone, gamepad, tablet, virtual display, and virtual USB.
 - Existing protocol messages remain backward compatible; unsupported OS adapters return typed results and do not claim readiness.
 
-- [ ] Step 1: Add failing tests that distinguish protocol support, host permission, OS API availability, and hardware validation.
-- [ ] Step 2: Implement capability discovery and strict advertisement from actual adapter availability.
-- [ ] Step 3: Keep Linux uinput implementation enabled behind explicit policy; add safe no-op/error adapters for unimplemented Windows/macOS virtual devices instead of false success.
-- [ ] Step 4: Run workspace tests and update the feature matrix with implementation-versus-tested labels.
-- [ ] Step 5: Commit `feat: make advanced device capabilities truthful`.
+- [x] Step 1: Add failing tests that distinguish protocol support, host permission, OS API availability, and hardware validation.
+- [x] Step 2: Implement capability discovery and strict advertisement from actual adapter availability.
+- [x] Step 3: Keep Linux uinput implementation enabled behind explicit policy; add safe no-op/error adapters for unimplemented Windows/macOS virtual devices instead of false success.
+- [x] Step 4: Run workspace tests and update the feature matrix with implementation-versus-tested labels.
+- [x] Step 5: Commit `feat: make advanced device capabilities truthful`.
 
 **Expected result:** Controller/USB/microphone/tablet/virtual-display features have real implementation seams and honest capability gates, even when hardware tests are deferred.
 
@@ -184,11 +184,11 @@
 **Interfaces:**
 - Produces `DiagnosticBundle`, redaction policy, release manifest, and acceptance-report schema.
 
-- [ ] Step 1: Add failing redaction tests for tokens, keys, pairing JSON, clipboard, and user paths.
-- [ ] Step 2: Implement bounded JSON/text export and artifact checks; no raw log or settings file is copied without redaction.
-- [ ] Step 3: Add CI checks for settings/app-core/local-ipc/agent, C/C++ ABI, cargo-deny, secret scanning, release artifact existence, and Linux/macOS fallback documentation.
-- [ ] Step 4: Run the complete local release gate and record physical Linux NVIDIA→macOS acceptance without claiming native DRM/zero-copy.
-- [ ] Step 5: Commit `chore: add production MVP diagnostics and release gates`.
+- [x] Step 1: Add failing redaction tests for tokens, keys, pairing JSON, clipboard, and user paths.
+- [x] Step 2: Implement bounded JSON/text export and artifact checks; no raw log or settings file is copied without redaction.
+- [x] Step 3: Add CI checks for settings/app-core/local-ipc/agent, C/C++ ABI, cargo-deny, secret scanning, release artifact existence, and Linux/macOS fallback documentation.
+- [x] Step 4: Run the complete local release gate and retain the recorded physical Linux NVIDIA -> macOS acceptance without claiming native DRM/zero-copy.
+- [x] Step 5: Commit `chore: add production MVP diagnostics and release gates`.
 
 **Expected result:** The release artifact is tested as an operator would use it, and support bundles cannot leak credentials or user content.
 

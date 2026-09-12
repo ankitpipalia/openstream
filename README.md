@@ -124,7 +124,8 @@ is diagnostic output, not proof of a live encoder/driver stream.
 The physical Linux-NVIDIA → Apple-Silicon macOS MVP acceptance is recorded in
 [`docs/BUILD.md`](docs/BUILD.md#physical-linux-nvidia--macos-apple-silicon-mvp-acceptance).
 It validates the X11/FFmpeg `h264_nvenc` fallback, direct authenticated UDP,
-the existing FFmpeg decoder, and software/wgpu Metal presentation. Native
+the existing FFmpeg decoder, and software/wgpu Metal presentation. This is
+the X11/FFmpeg/NVENC fallback path only. Native
 DRM/KMS capture, VideoToolbox decode/encode, decoded-frame zero-copy, and
 WAN/TURN acceptance remain separate gates.
 
@@ -162,6 +163,10 @@ cargo test --workspace --all-features --locked -- --test-threads=1
 cargo check --manifest-path fuzz/Cargo.toml --locked
 cargo deny check
 cargo build --workspace --release --locked
+
+cd ..
+scripts/check-release-artifacts.sh
+scripts/secret-scan.sh
 ```
 
 The fuzz package is intentionally outside the normal Cargo workspace. With
@@ -175,6 +180,10 @@ cargo fuzz run openstream-media -- -runs=10000
 Hardware-dependent capture, GPU encoder, sound-server, uinput, Android, and
 iOS tests require their native operating system, SDK, device, or driver and
 are explicitly marked in the test and feature matrix.
+
+The release artifact check verifies the host/client/server binaries produced
+by the locked build. The secret scan uses gitleaks on the committed source
+tree only; it does not scan build output or print matched material.
 
 ## Self-hosting
 

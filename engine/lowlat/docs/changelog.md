@@ -3,6 +3,28 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Production MVP diagnostics and capability gates
+
+Added the dependency-light `openstream-diagnostics` crate with bounded,
+secret-redacted JSON and text support bundles, typed release manifests, and
+safe diagnostic errors. Pairing data, bearer tokens, identity keys, private
+keys, clipboard content, and user paths are redacted before export; callers
+must provide already-collected records, so the bundle does not read logs or
+settings files implicitly.
+
+Advanced device capabilities now have separate protocol, implementation,
+runtime, and hardware-validation states. Linux gamepad support is advertised
+only behind explicit input/gamepad policy and a successful uinput probe.
+Unimplemented Windows/macOS virtual devices, tablets, virtual microphones,
+virtual displays, and USB passthrough are never advertised as ready.
+
+Release validation now checks operator-facing artifacts, required acceptance
+documentation, and the committed source tree with gitleaks. The recorded
+Linux NVIDIA -> Apple Silicon macOS acceptance remains explicitly scoped to
+the X11/FFmpeg/NVENC fallback and current BGRA/wgpu presentation path; it does
+not claim native DRM capture, VideoToolbox media, decoded-frame zero-copy, or
+WAN/TURN readiness.
+
 ## Local-first pairing and session launch
 
 Added a bounded local-session launcher that accepts an absolute private pairing
