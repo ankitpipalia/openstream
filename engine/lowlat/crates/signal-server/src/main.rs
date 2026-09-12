@@ -238,6 +238,11 @@ const RELAY_SLOT_IDLE: Duration = Duration::from_secs(60);
 /// for a session TTL.
 const SIGNAL_PING_INTERVAL: Duration = Duration::from_secs(15);
 const SIGNAL_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Inbound signalling is bursty but tiny: candidate exchange, a key, a
+/// capability round. An authenticated peer that exceeds this is either broken
+/// or abusive, and every frame it sends costs a lock acquisition and a JSON
+/// parse. The idle timeout bounds a silent socket; this bounds a loud one.
+const MAX_INBOUND_MESSAGES_PER_SECOND: u32 = 120;
 /// Expired sessions are reaped even when no client sends another request and
 /// the optional relay is disabled.
 const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(30);
@@ -1479,6 +1484,49 @@ fn new_relay_proof() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// Fixed-window inbound message budget for one socket.
+///
+/// The idle timeout bounds a silent peer; this bounds a loud one. Every
+/// inbound frame costs a lock acquisition and a JSON parse, so an
+/// authenticated peer must not be able to spend the server's time freely.
+#[derive(Debug)]
+struct InboundRateWindow {
+    started: Instant,
+    count: u32,
+}
+
+impl InboundRateWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            started: now,
+            count: 0,
+        }
+    }
+
+    /// Record one frame and report whether the socket stays within budget.
+    fn allow(&mut self, now: Instant) -> bool {
+        if now.duration_since(self.started) >= Duration::from_secs(1) {
+            self.started = now;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        self.count <= MAX_INBOUND_MESSAGES_PER_SECOND
+    }
+}
+
+/// Typed refusal sent before closing a socket that exceeded the inbound rate.
+/// It carries no detail a caller could use to probe the limit precisely.
+fn rate_limited_message() -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "error",
+            "error": "rate_limited",
+        })
+        .to_string()
+        .into(),
+    )
+}
+
 fn relay_proof_message(socket_generation: u64, proof: &str) -> Message {
     Message::Text(
         serde_json::json!({
@@ -2209,6 +2257,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
         SIGNAL_PING_INTERVAL,
     );
     let mut last_activity = Instant::now();
+    let mut inbound_rate = InboundRateWindow::new(Instant::now());
 
     'socket: loop {
         tokio::select! {
@@ -2221,6 +2270,10 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                     Err(_) => break,
                 };
                 last_activity = Instant::now();
+                if !inbound_rate.allow(Instant::now()) {
+                    let _ = out_tx.try_send(rate_limited_message());
+                    break;
+                }
                 let Message::Text(text) = message else {
                     match message {
                         Message::Ping(payload) => {
@@ -3639,6 +3692,24 @@ mod tests {
         assert!(session.client.is_none());
         assert!(host_rx.try_recv().is_ok());
         assert!(client_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn inbound_rate_window_bounds_a_loud_socket_and_refills() {
+        let start = Instant::now();
+        let mut window = super::InboundRateWindow::new(start);
+
+        // Everything inside the budget is allowed.
+        for _ in 0..super::MAX_INBOUND_MESSAGES_PER_SECOND {
+            assert!(window.allow(start));
+        }
+        // The next frame in the same second is refused.
+        assert!(!window.allow(start));
+
+        // A later second starts a fresh budget, so a well-behaved peer that
+        // is merely bursty is never permanently penalised.
+        let later = start + Duration::from_secs(1);
+        assert!(window.allow(later));
     }
 
     #[tokio::test]
