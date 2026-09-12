@@ -107,6 +107,16 @@ fn response_version(response: &AgentIpcResponse) -> u32 {
     }
 }
 
+/// Read the request identifier out of any response variant, the same way
+/// [`response_version`] reads the protocol version.
+fn response_request_id(response: &AgentIpcResponse) -> &RequestId {
+    match response {
+        AgentIpcResponse::Accepted { request_id, .. }
+        | AgentIpcResponse::Health { request_id, .. }
+        | AgentIpcResponse::Error { request_id, .. } => request_id,
+    }
+}
+
 /// Client for the host agent's control socket. Constructing one without an
 /// explicit endpoint always targets the process-default socket; an
 /// explicit endpoint is reachable only from Rust test code, never from a
@@ -163,7 +173,10 @@ impl HostAgentClient {
     }
 
     /// Send one request and validate the response's wire protocol version
-    /// before any caller inspects its contents.
+    /// and request identifier before any caller inspects its contents. The
+    /// identifier check matters as much as the version check: without it, a
+    /// response intended for a different in-flight request would be
+    /// silently accepted as this call's answer.
     async fn call(
         &self,
         command: AgentIpcCommand,
@@ -178,6 +191,9 @@ impl HostAgentClient {
             .map_err(|_| HostAgentBridgeError::Timeout)??;
         if response_version(&response) != HOST_AGENT_PROTOCOL_VERSION {
             return Err(HostAgentBridgeError::ProtocolMismatch);
+        }
+        if response_request_id(&response) != &request.request_id {
+            return Err(HostAgentBridgeError::InvalidResponse);
         }
         Ok(response)
     }

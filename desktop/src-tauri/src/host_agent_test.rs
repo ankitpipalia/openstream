@@ -2,10 +2,14 @@
 //!
 //! `TestAgentServer` is a minimal one-shot stand-in for the real host
 //! agent process: it accepts a single connection, reads exactly one
-//! `AgentIpcRequest`, writes back a canned `AgentIpcResponse`, and cleans
-//! up its private socket. No production code is exercised on the server
-//! side; only the client's framing, timeout, and error-mapping behavior is
-//! under test here.
+//! `AgentIpcRequest`, and writes back an `AgentIpcResponse` built from the
+//! request id it actually read off the wire, then cleans up its private
+//! socket. Echoing the real id (rather than replying with a hardcoded one)
+//! means these tests genuinely exercise the same request/response
+//! correlation the client performs against the real host agent. No
+//! production code is exercised on the server side; only the client's
+//! framing, timeout, correlation, and error-mapping behavior is under test
+//! here.
 
 use super::{HostAgentBridgeError, HostAgentClient};
 use openstream_host_agent::{
@@ -45,21 +49,31 @@ fn sample_health() -> HostHealth {
     }
 }
 
-/// One-shot local IPC double for the host agent's control socket.
+/// One-shot local IPC double for the host agent's control socket. The
+/// response is not supplied ready-made; `build` constructs it from the
+/// request id the server actually reads off the wire, so a happy-path test
+/// exercises real correlation. A test that wants to exercise mismatched
+/// correlation instead passes a `build` that ignores the id it is given.
 struct TestAgentServer {
     endpoint: Endpoint,
     task: JoinHandle<()>,
 }
 
 impl TestAgentServer {
-    async fn spawn(response: AgentIpcResponse) -> Self {
+    async fn spawn<F>(build: F) -> Self
+    where
+        F: FnOnce(RequestId) -> AgentIpcResponse + Send + 'static,
+    {
         let endpoint = Endpoint::new(unique_socket_path()).expect("valid test endpoint path");
         let listener = endpoint.bind().await.expect("bind test endpoint");
         let task = tokio::spawn(async move {
             if let Ok((mut stream, _address)) = listener.accept().await {
-                let _request: Option<AgentIpcRequest> =
+                let request: Option<AgentIpcRequest> =
                     read_frame(&mut stream).await.unwrap_or(None);
-                let _ = write_frame(&mut stream, &response).await;
+                if let Some(request) = request {
+                    let response = build(request.request_id);
+                    let _ = write_frame(&mut stream, &response).await;
+                }
             }
         });
         Self { endpoint, task }
@@ -82,9 +96,9 @@ impl Drop for TestAgentServer {
 
 #[tokio::test]
 async fn health_round_trip_uses_typed_ipc_without_secret_fields() {
-    let server = TestAgentServer::spawn(AgentIpcResponse::Health {
+    let server = TestAgentServer::spawn(|request_id| AgentIpcResponse::Health {
         version: HOST_AGENT_PROTOCOL_VERSION,
-        request_id: RequestId::new("test-health").unwrap(),
+        request_id,
         health: HostHealth {
             state: ChildState::Ready,
             backend: "ffmpeg-fallback".into(),
@@ -106,9 +120,9 @@ async fn health_round_trip_uses_typed_ipc_without_secret_fields() {
 
 #[tokio::test]
 async fn start_returns_typed_events() {
-    let server = TestAgentServer::spawn(AgentIpcResponse::Accepted {
+    let server = TestAgentServer::spawn(|request_id| AgentIpcResponse::Accepted {
         version: HOST_AGENT_PROTOCOL_VERSION,
-        request_id: RequestId::new("test-start").unwrap(),
+        request_id,
         events: vec![
             HostAgentEvent::Started { pid: Some(7) },
             HostAgentEvent::Ready,
@@ -130,9 +144,9 @@ async fn start_returns_typed_events() {
 
 #[tokio::test]
 async fn stop_returns_typed_events() {
-    let server = TestAgentServer::spawn(AgentIpcResponse::Accepted {
+    let server = TestAgentServer::spawn(|request_id| AgentIpcResponse::Accepted {
         version: HOST_AGENT_PROTOCOL_VERSION,
-        request_id: RequestId::new("test-stop").unwrap(),
+        request_id,
         events: vec![HostAgentEvent::Stopped],
     })
     .await;
@@ -145,9 +159,9 @@ async fn stop_returns_typed_events() {
 
 #[tokio::test]
 async fn mismatched_protocol_version_is_a_typed_error() {
-    let server = TestAgentServer::spawn(AgentIpcResponse::Health {
+    let server = TestAgentServer::spawn(|request_id| AgentIpcResponse::Health {
         version: HOST_AGENT_PROTOCOL_VERSION + 1,
-        request_id: RequestId::new("test-version").unwrap(),
+        request_id,
         health: sample_health(),
     })
     .await;
@@ -155,6 +169,23 @@ async fn mismatched_protocol_version_is_a_typed_error() {
         .health()
         .await;
     assert_eq!(result, Err(HostAgentBridgeError::ProtocolMismatch));
+}
+
+/// A response carrying a request id that does not match the request the
+/// client sent must never be accepted as that request's answer, even when
+/// everything else about it looks valid.
+#[tokio::test]
+async fn mismatched_request_id_is_a_typed_error() {
+    let server = TestAgentServer::spawn(|_request_id| AgentIpcResponse::Health {
+        version: HOST_AGENT_PROTOCOL_VERSION,
+        request_id: RequestId::new("unrelated-response-id").unwrap(),
+        health: sample_health(),
+    })
+    .await;
+    let result = HostAgentClient::with_endpoint(server.endpoint())
+        .health()
+        .await;
+    assert_eq!(result, Err(HostAgentBridgeError::InvalidResponse));
 }
 
 #[tokio::test]
@@ -166,9 +197,9 @@ async fn connecting_with_no_listener_is_a_typed_connection_error() {
 
 #[tokio::test]
 async fn agent_error_response_maps_to_typed_agent_failure() {
-    let server = TestAgentServer::spawn(AgentIpcResponse::Error {
+    let server = TestAgentServer::spawn(|request_id| AgentIpcResponse::Error {
         version: HOST_AGENT_PROTOCOL_VERSION,
-        request_id: RequestId::new("test-error").unwrap(),
+        request_id,
         code: HostErrorCode::ChildFailed,
         retryable: true,
     })

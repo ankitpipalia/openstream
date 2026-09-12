@@ -48,22 +48,22 @@ export interface PermissionSet {
   virtual_usb: boolean;
 }
 
+/**
+ * The only commands the WebView may express. Every authoritative outcome --
+ * authentication succeeding, negotiation, a session actually connecting or
+ * dropping, host readiness or failure, and the passage of time -- is
+ * decided in Rust and deliberately has no constructor here. `request_id`
+ * and `now_ms` are likewise Rust-owned: the runtime reads its own clock and
+ * mints its own request ids, so neither is ever supplied by this side.
+ */
 export type RuntimeCommand =
-  | "BeginAuthentication"
-  | "AuthenticationSucceeded"
-  | { Connect: { device_id: string; request_id: string; requested: PermissionSet; now_ms: number } }
-  | { ApproveRequest: { request_id: string; available: PermissionSet; now_ms: number } }
-  | { RejectRequest: { request_id: string; now_ms: number } }
-  | { Tick: { now_ms: number } }
-  | "ConnectionNegotiating"
-  | { ConnectionEstablished: { session_id: string; generation: number } }
-  | { ConnectionLost: { retryable: boolean } }
+  | "SignIn"
+  | { Connect: { device_id: string; requested: PermissionSet } }
+  | { ApproveRequest: { request_id: string; available: PermissionSet } }
+  | { RejectRequest: { request_id: string } }
   | "Disconnect"
-  | "Disconnected"
   | "EnableHosting"
-  | "DisableHosting"
-  | "HostReady"
-  | { HostFailed: { retryable: boolean } };
+  | "DisableHosting";
 
 export type PairingState = "not-configured" | "pending" | "ready" | "unavailable";
 
@@ -123,6 +123,14 @@ export interface ProductSnapshot {
   settings: SettingSection[];
   capabilities: Capability[];
   diagnostics: DiagnosticsSnapshot;
+  /**
+   * Optional because not every adapter (for example the fixture-driven
+   * local adapter) sources these from a runtime snapshot; a Tauri-backed
+   * adapter always sets them.
+   */
+  restartRequired?: boolean;
+  hostRestartRequired?: boolean;
+  pendingSettingKeys?: string[];
 }
 
 export function capabilityLabel(state: CapabilityState): string {
