@@ -916,12 +916,12 @@ mod tests {
     fn redacts_private_and_identity_key_values() {
         let policy = RedactionPolicy::default();
         let output = policy.redact_text(
-            "identity_private_key=ed25519-private-secret public_key=public-is-not-secret\n-----BEGIN PRIVATE KEY-----\nkey-material-secret\n-----END PRIVATE KEY-----",
+            "identity_private_key=ed25519-private-value public_key=public-identity-value\n-----BEGIN PRIVATE KEY-----\nkey-material-value\n-----END PRIVATE KEY-----",
         );
 
-        assert!(!output.contains("ed25519-private-secret"));
-        assert!(!output.contains("key-material-secret"));
-        assert!(output.contains("public-is-not-secret"));
+        assert!(!output.contains("ed25519-private-value"));
+        assert!(!output.contains("key-material-value"));
+        assert!(output.contains("public-identity-value"));
         assert!(output.contains("[REDACTED:key]"));
     }
 
