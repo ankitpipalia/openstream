@@ -1881,6 +1881,7 @@ dependencies = [
 name = "openstream-host-agent"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lowlat-host",
  "openstream-app-core",
  "openstream-local-ipc",

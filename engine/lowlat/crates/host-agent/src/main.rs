@@ -11,7 +11,9 @@ mod unix_main {
     use openstream_settings::{apply_environment_overrides, default_config};
     use std::env;
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -23,6 +25,7 @@ mod unix_main {
     const IPC_READ_TIMEOUT: Duration = Duration::from_secs(30);
     const TICK_INTERVAL: Duration = Duration::from_millis(100);
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_PAIRING_FILE_BYTES: u64 = 64 * 1024;
 
     pub(crate) async fn run() -> Result<(), String> {
         let (config, report) = build_config()?;
@@ -284,12 +287,58 @@ mod unix_main {
                 .with_runtime_env("OPENSTREAM_FFMPEG", value.to_string_lossy())
                 .map_err(|error| error.to_string())?;
         }
-        if let Ok(value) = env::var("OPENSTREAM_PAIRING_JSON") {
+        if let Some(value) = pairing_file_from_environment_with(|name| env::var_os(name))? {
             config = config
-                .with_runtime_env("OPENSTREAM_PAIRING_JSON", value)
+                .with_runtime_env("OPENSTREAM_PAIRING_FILE", value)
                 .map_err(|error| error.to_string())?;
         }
         Ok((config, report))
+    }
+
+    fn pairing_file_from_environment_with(
+        environment: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<String>, String> {
+        let Some(value) = environment("OPENSTREAM_PAIRING_FILE") else {
+            return Ok(None);
+        };
+        let path = Path::new(&value);
+        validate_private_pairing_file(path)?;
+        path.to_str()
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or_else(|| "pairing file path is not valid UTF-8".to_string())
+    }
+
+    fn validate_private_pairing_file(path: &Path) -> Result<(), String> {
+        if !path.is_absolute() {
+            return Err("pairing file path must be absolute".to_string());
+        }
+        let link_metadata = path
+            .symlink_metadata()
+            .map_err(|_| "pairing file is unavailable".to_string())?;
+        if link_metadata.file_type().is_symlink() {
+            return Err("pairing file must not be a symlink".to_string());
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| "pairing file is unavailable".to_string())?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "pairing file is unavailable".to_string())?;
+        let mode = metadata.mode();
+        let current_uid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.uid() != current_uid
+            || mode & 0o077 != 0
+            || mode & 0o400 == 0
+            || metadata.len() > MAX_PAIRING_FILE_BYTES
+        {
+            return Err("pairing file does not satisfy private-file rules".to_string());
+        }
+        Ok(())
     }
 
     fn native_drm_reachable() -> bool {
@@ -362,9 +411,75 @@ mod unix_main {
 
     #[cfg(test)]
     mod tests {
-        use super::{error_code, native_drm_reachable_with};
+        use super::{error_code, native_drm_reachable_with, pairing_file_from_environment_with};
         use openstream_host_agent::{AgentError, HostBackend, HostErrorCode, run_preflight};
         use openstream_settings::default_config;
+        use std::ffi::OsString;
+        use std::fs;
+        use std::path::PathBuf;
+
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        fn private_pairing_file(label: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "openstream-host-agent-{label}-{}-{}.json",
+                std::process::id(),
+                std::thread::current().name().unwrap_or("test")
+            ));
+            fs::write(&path, b"{}\n").expect("write pairing fixture");
+            #[cfg(unix)]
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("protect pairing fixture");
+            path
+        }
+
+        #[test]
+        fn persistent_agent_ignores_raw_pairing_json_and_accepts_private_file_path() {
+            let path = private_pairing_file("environment-boundary");
+            let path_value = path.as_os_str().to_owned();
+            let environment = |name: &str| match name {
+                "OPENSTREAM_PAIRING_FILE" => Some(path_value.clone()),
+                "OPENSTREAM_PAIRING_JSON" => Some(OsString::from("raw-token-sentinel")),
+                _ => None,
+            };
+
+            let projected = pairing_file_from_environment_with(environment)
+                .expect("private absolute pairing path");
+
+            assert_eq!(projected, Some(path.to_string_lossy().into_owned()));
+            assert_ne!(projected.as_deref(), Some("raw-token-sentinel"));
+            fs::remove_file(path).expect("remove pairing fixture");
+        }
+
+        #[test]
+        fn persistent_agent_does_not_project_raw_pairing_json_without_a_file() {
+            let environment = |name: &str| {
+                (name == "OPENSTREAM_PAIRING_JSON").then(|| OsString::from("raw-token-sentinel"))
+            };
+
+            assert_eq!(
+                pairing_file_from_environment_with(environment).expect("raw JSON must be ignored"),
+                None
+            );
+        }
+
+        #[test]
+        fn persistent_agent_rejects_relative_or_non_private_pairing_files() {
+            let relative_environment = |name: &str| {
+                (name == "OPENSTREAM_PAIRING_FILE").then(|| OsString::from("relative-pairing.json"))
+            };
+            assert!(pairing_file_from_environment_with(relative_environment).is_err());
+
+            let path = private_pairing_file("insecure-permissions");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                .expect("make pairing fixture insecure");
+            let path_value = path.as_os_str().to_owned();
+            let permissive_environment =
+                |name: &str| (name == "OPENSTREAM_PAIRING_FILE").then(|| path_value.clone());
+            assert!(pairing_file_from_environment_with(permissive_environment).is_err());
+            fs::remove_file(path).expect("remove pairing fixture");
+        }
 
         #[test]
         fn current_typed_error_wins_over_stale_health_error() {

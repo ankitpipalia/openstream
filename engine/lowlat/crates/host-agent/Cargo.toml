@@ -13,6 +13,7 @@ name = "openstream-host-agent"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 openstream-app-core = { path = "../app-core" }
 openstream-local-ipc = { path = "../local-ipc" }
 openstream-settings = { path = "../settings" }

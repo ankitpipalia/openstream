@@ -223,6 +223,7 @@ impl ChildSpec {
         for (key, value) in &self.env {
             if key.is_empty()
                 || key.len() > 256
+                || key == "OPENSTREAM_PAIRING_JSON"
                 || key.chars().any(|character| {
                     !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
                 })
@@ -646,9 +647,9 @@ impl ChildFactory for TokioChildFactory {
             use std::os::unix::process::CommandExt;
             command.as_std_mut().process_group(0);
         }
+        configure_child_environment(&mut command, spec);
         command
             .args(spec.args())
-            .envs(spec.environment())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -662,6 +663,12 @@ impl ChildFactory for TokioChildFactory {
             process_group,
         }))
     }
+}
+
+fn configure_child_environment(command: &mut tokio::process::Command, spec: &ChildSpec) {
+    command
+        .envs(spec.environment())
+        .env_remove("OPENSTREAM_PAIRING_JSON");
 }
 
 #[cfg(unix)]
@@ -1105,10 +1112,10 @@ impl<F: ChildFactory> HostAgent<F> {
 mod tests {
     use super::{
         AgentError, ChildExit, ChildExitReason, ChildFactory, ChildSpec, ChildState, HostAgent,
-        HostAgentConfig, HostAgentEvent, HostErrorCode, ManagedChild,
+        HostAgentConfig, HostAgentEvent, HostErrorCode, ManagedChild, configure_child_environment,
     };
     use openstream_settings::default_config;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -1812,11 +1819,45 @@ mod tests {
     fn runtime_secret_is_redacted_from_configuration_debug() {
         let config = HostAgentConfig::from_settings(&default_config(), "host")
             .expect("config")
-            .with_runtime_env("OPENSTREAM_PAIRING_JSON", "token-sentinel")
+            .with_runtime_env("OPENSTREAM_PAIRING_FILE", "/private/pairing.json")
             .expect("runtime secret");
         let debug = format!("{config:?}");
-        assert!(debug.contains("OPENSTREAM_PAIRING_JSON"));
-        assert!(!debug.contains("token-sentinel"));
+        assert!(debug.contains("OPENSTREAM_PAIRING_FILE"));
+        assert!(!debug.contains("/private/pairing.json"));
+    }
+
+    #[test]
+    fn raw_pairing_json_runtime_environment_is_rejected() {
+        let result = HostAgentConfig::from_settings(&default_config(), "host")
+            .expect("config")
+            .with_runtime_env("OPENSTREAM_PAIRING_JSON", "raw-token-sentinel");
+
+        assert!(matches!(result, Err(AgentError::InvalidConfig)));
+    }
+
+    #[test]
+    fn persistent_child_explicitly_removes_inherited_raw_pairing_json() {
+        let spec = ChildSpec::new("host")
+            .expect("child spec")
+            .env("OPENSTREAM_PAIRING_FILE", "/private/pairing.json")
+            .expect("pairing file environment");
+        let mut command = tokio::process::Command::new("host");
+
+        configure_child_environment(&mut command, &spec);
+
+        let configured = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsString::from)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            configured.get(std::ffi::OsStr::new("OPENSTREAM_PAIRING_JSON")),
+            Some(&None)
+        );
+        assert_eq!(
+            configured.get(std::ffi::OsStr::new("OPENSTREAM_PAIRING_FILE")),
+            Some(&Some(OsString::from("/private/pairing.json")))
+        );
     }
 
     #[test]
