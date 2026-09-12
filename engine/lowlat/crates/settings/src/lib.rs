@@ -450,7 +450,8 @@ pub fn load(path: impl AsRef<Path>) -> Result<SettingsFile, SettingsError> {
 /// Atomically replace a settings file, creating private parent/file
 /// permissions where the platform exposes them.
 pub fn save_atomic(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), SettingsError> {
-    let path = path.as_ref();
+    let path = resolve_save_path(path.as_ref())?;
+    let path = path.as_path();
     config.validate()?;
     let parent = path
         .parent()
@@ -493,6 +494,21 @@ pub fn save_atomic(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), Set
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(windows)]
+fn resolve_save_path(path: &Path) -> Result<PathBuf, SettingsError> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut extended = windows_extended_path(path)?;
+    extended.pop();
+    Ok(PathBuf::from(OsString::from_wide(&extended)))
+}
+
+#[cfg(not(windows))]
+fn resolve_save_path(path: &Path) -> Result<PathBuf, SettingsError> {
+    Ok(path.to_path_buf())
 }
 
 /// Apply known developer/headless environment overrides without persisting
@@ -651,48 +667,24 @@ fn windows_replace_file(temporary: &Path, destination: &Path) -> Result<(), Sett
 #[cfg(windows)]
 fn windows_extended_path(path: &Path) -> Result<Vec<u16>, SettingsError> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
 
-    let mut input: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let input: Vec<u16> = path.as_os_str().encode_wide().collect();
     if input.contains(&0) {
         return Err(io_error(
             path,
             io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL character"),
         ));
     }
-    input.push(0);
 
     const EXTENDED: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
     if input.starts_with(EXTENDED) {
-        return Ok(input);
+        let mut extended = input;
+        extended.push(0);
+        return Ok(extended);
     }
 
-    // GetFullPathNameW safely expands relative, root-relative, and drive-relative
-    // inputs without requiring the destination to exist.
-    let required = unsafe {
-        GetFullPathNameW(
-            input.as_ptr(),
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if required == 0 {
-        return Err(io_error(path, io::Error::last_os_error()));
-    }
-    let mut absolute = vec![0; required as usize];
-    let written = unsafe {
-        GetFullPathNameW(
-            input.as_ptr(),
-            required,
-            absolute.as_mut_ptr(),
-            std::ptr::null_mut(),
-        )
-    };
-    if written == 0 || written >= required {
-        return Err(io_error(path, io::Error::last_os_error()));
-    }
-    absolute.truncate(written as usize);
+    let absolute_path = windows_absolute_path(path)?;
+    let absolute: Vec<u16> = absolute_path.as_os_str().encode_wide().collect();
 
     let mut extended = Vec::with_capacity(absolute.len() + 8);
     if absolute.starts_with(&[b'\\' as u16, b'\\' as u16]) {
@@ -704,6 +696,69 @@ fn windows_extended_path(path: &Path) -> Result<Vec<u16>, SettingsError> {
     }
     extended.push(0);
     Ok(extended)
+}
+
+#[cfg(windows)]
+fn windows_absolute_path(path: &Path) -> Result<PathBuf, SettingsError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    let encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(io_error(
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL character"),
+        ));
+    }
+    if encoded.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16]) {
+        return Ok(path.to_path_buf());
+    }
+
+    let mut components = path.components();
+    let drive_relative = match components.next() {
+        Some(Component::Prefix(prefix)) if !path.has_root() => match prefix.kind() {
+            Prefix::Disk(drive) => Some(drive),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let joined = if let Some(drive) = drive_relative {
+        // Resolve only the short per-drive base through the standard library.
+        // The caller's potentially long tail never reaches GetFullPathNameW.
+        let drive_base = PathBuf::from(format!("{}:.", char::from(drive)));
+        let mut base = std::path::absolute(&drive_base).map_err(|source| io_error(path, source))?;
+        for component in path.components().skip(1) {
+            base.push(component.as_os_str());
+        }
+        base
+    } else if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let base = std::env::current_dir().map_err(|source| io_error(path, source))?;
+        base.join(path)
+    };
+
+    Ok(lexically_normalize_absolute(&joined))
+}
+
+#[cfg(windows)]
+fn lexically_normalize_absolute(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 #[cfg(any(test, windows))]
@@ -1263,6 +1318,8 @@ mod tests {
 
         let relative = super::windows_extended_path(Path::new("relative\\config.json"))
             .expect("relative path conversion");
+        let drive_relative = super::windows_extended_path(Path::new("C:settings\\config.json"))
+            .expect("drive-relative path conversion");
         let drive = super::windows_extended_path(Path::new("C:\\settings\\config.json"))
             .expect("drive path conversion");
         let unc =
@@ -1275,11 +1332,32 @@ mod tests {
                 .into_owned()
         };
         assert!(decode(&relative).starts_with("\\\\?\\"));
+        assert!(decode(&drive_relative).starts_with("\\\\?\\C:\\"));
+        assert!(decode(&drive_relative).ends_with("\\settings\\config.json"));
         assert_eq!(decode(&drive), "\\\\?\\C:\\settings\\config.json");
         assert_eq!(
             decode(&unc),
             "\\\\?\\UNC\\settings-server\\share\\config.json"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_conversion_accepts_an_unprefixed_path_longer_than_max_path() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        use std::path::Path;
+
+        let path = format!("C:\\{}\\config.json", "segment".repeat(40));
+        assert!(path.encode_utf16().count() > 260);
+
+        let extended = super::windows_extended_path(Path::new(&path))
+            .expect("long unprefixed path conversion");
+        let decoded = OsString::from_wide(&extended[..extended.len() - 1])
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(decoded, format!("\\\\?\\{path}"));
     }
 
     #[cfg(windows)]
