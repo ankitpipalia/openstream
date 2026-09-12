@@ -1,9 +1,12 @@
 use std::sync::Mutex;
 
+use host_agent::{HostAgentBridgeError, HostAgentClient};
+use openstream_host_agent::{HostAgentEvent, HostHealth};
 use openstream_settings::AppConfig;
 use runtime::{RuntimeCommand, RuntimeDispatchResult, RuntimeError, RuntimeSnapshot, RuntimeState};
 use tauri::Manager;
 
+pub mod host_agent;
 pub mod runtime;
 
 #[tauri::command]
@@ -41,6 +44,24 @@ fn runtime_dispatch(
     runtime.dispatch(command)
 }
 
+// The host-agent commands take no frontend-supplied endpoint: the client
+// always derives the process-default socket, so the web UI has no way to
+// redirect these calls elsewhere.
+#[tauri::command]
+async fn host_agent_health() -> Result<HostHealth, HostAgentBridgeError> {
+    HostAgentClient::new()?.health().await
+}
+
+#[tauri::command]
+async fn host_agent_start() -> Result<Vec<HostAgentEvent>, HostAgentBridgeError> {
+    HostAgentClient::new()?.start().await
+}
+
+#[tauri::command]
+async fn host_agent_stop() -> Result<Vec<HostAgentEvent>, HostAgentBridgeError> {
+    HostAgentClient::new()?.stop().await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -58,7 +79,10 @@ pub fn run() {
             runtime_snapshot,
             runtime_settings,
             runtime_update_settings,
-            runtime_dispatch
+            runtime_dispatch,
+            host_agent_health,
+            host_agent_start,
+            host_agent_stop
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenStream desktop shell");
