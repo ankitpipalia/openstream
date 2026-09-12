@@ -108,6 +108,7 @@ export type AppEvent =
   | "HostStartRequested"
   | "HostReady"
   | "HostStopRequested"
+  | "FailureCleared"
   | { HostFailed: { code: AppErrorCode } };
 
 export type SettingScope = "global" | "client" | "host" | "device" | "session";

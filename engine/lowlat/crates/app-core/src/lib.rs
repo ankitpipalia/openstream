@@ -359,6 +359,9 @@ pub enum AppCommand {
         message: String,
         retryable: bool,
     },
+    /// Acknowledge a terminal failure and return to a usable idle state.
+    /// Without this there is no exit from `AppState::Failed`.
+    ClearFailure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +391,7 @@ pub enum AppEvent {
     HostFailed {
         code: AppErrorCode,
     },
+    FailureCleared,
 }
 
 #[derive(Debug, Clone)]
@@ -468,6 +472,16 @@ impl AppModel {
 
     pub const fn active_permissions(&self) -> PermissionSet {
         self.active_permissions
+    }
+
+    /// Drop every trace of an active session. Terminal paths must all go
+    /// through here so none of them can leave a live `active_permissions`
+    /// behind a dead session.
+    fn clear_active_session(&mut self) {
+        self.active_device_id = None;
+        self.active_session_id = None;
+        self.active_permissions = PermissionSet::view_only();
+        self.pending_request = None;
     }
 
     pub fn add_device(&mut self, device: DeviceSummary) {
@@ -594,11 +608,17 @@ impl AppModel {
                 }])
             }
             AppCommand::ConnectionLost { retryable } => {
+                // A reconnect attempt can itself fail, so a loss is accepted
+                // from `Reconnecting` as well as `Connected`.
                 let (device_id, session_id) = match &self.state {
                     AppState::Connected {
                         device_id,
                         session_id,
                         ..
+                    }
+                    | AppState::Reconnecting {
+                        device_id,
+                        session_id,
                     } => (device_id.clone(), session_id.clone()),
                     _ => return Err(invalid_state("connection loss requires an active session")),
                 };
@@ -609,13 +629,29 @@ impl AppModel {
                     };
                     Ok(vec![AppEvent::ReconnectStarted])
                 } else {
+                    // Terminal loss is a teardown. Holding the session id and
+                    // the granted permissions here would leave the model
+                    // advertising the authority of a session that is gone.
+                    self.clear_active_session();
                     self.state = AppState::Failed {
                         code: AppErrorCode::Transport,
                         retryable: false,
                         message: "connection ended and cannot be retried".into(),
                     };
-                    Ok(vec![])
+                    Ok(vec![AppEvent::Disconnected])
                 }
+            }
+            AppCommand::ClearFailure => {
+                if !matches!(self.state, AppState::Failed { .. }) {
+                    return Err(invalid_state("no failure to clear"));
+                }
+                self.clear_active_session();
+                self.state = if self.mode == DeploymentMode::Local {
+                    AppState::Ready
+                } else {
+                    AppState::SignedOut
+                };
+                Ok(vec![AppEvent::FailureCleared])
             }
             AppCommand::Disconnect => {
                 let device_id = match &self.state {
@@ -637,9 +673,7 @@ impl AppModel {
                 if !matches!(self.state, AppState::Disconnecting { .. }) {
                     return Err(invalid_state("disconnect completion is not expected"));
                 }
-                self.active_device_id = None;
-                self.active_session_id = None;
-                self.active_permissions = PermissionSet::view_only();
+                self.clear_active_session();
                 self.state = AppState::Ready;
                 Ok(vec![AppEvent::Disconnected])
             }
@@ -994,6 +1028,96 @@ mod tests {
         model.dispatch(AppCommand::Disconnect).unwrap();
         model.dispatch(AppCommand::Disconnected).unwrap();
         assert!(matches!(model.state(), AppState::Ready));
+    }
+
+    fn connected_model() -> AppModel {
+        let mut model = model();
+        model.add_device(super::DeviceSummary::online("mac-1", "Mac client"));
+        model
+            .dispatch(AppCommand::Connect {
+                device_id: "mac-1".into(),
+                request_id: "request-1".into(),
+                requested: PermissionSet::full(),
+                now_ms: 100,
+            })
+            .unwrap();
+        model
+            .dispatch(AppCommand::ApproveRequest {
+                request_id: "request-1".into(),
+                available: PermissionSet::full(),
+                now_ms: 200,
+            })
+            .unwrap();
+        model
+            .dispatch(AppCommand::ConnectionEstablished {
+                session_id: "session-1".into(),
+                generation: 1,
+            })
+            .unwrap();
+        model
+    }
+
+    #[test]
+    fn terminal_connection_loss_drops_session_identity_and_permissions() {
+        let mut model = connected_model();
+        assert!(
+            model
+                .snapshot(DiagnosticSnapshot::default())
+                .active_session_id
+                .is_some()
+        );
+        assert!(
+            model
+                .snapshot(DiagnosticSnapshot::default())
+                .active_permissions
+                .keyboard
+        );
+
+        let events = model
+            .dispatch(AppCommand::ConnectionLost { retryable: false })
+            .unwrap();
+        assert_eq!(events, vec![AppEvent::Disconnected]);
+
+        let snapshot = model.snapshot(DiagnosticSnapshot::default());
+        assert!(matches!(snapshot.state, AppState::Failed { .. }));
+        // The authority of a dead session must not survive it.
+        assert_eq!(snapshot.active_device_id, None);
+        assert_eq!(snapshot.active_session_id, None);
+        assert_eq!(snapshot.active_permissions, PermissionSet::view_only());
+        assert!(snapshot.pending_request.is_none());
+    }
+
+    #[test]
+    fn a_terminal_failure_can_be_cleared_back_to_a_usable_state() {
+        let mut model = connected_model();
+        model
+            .dispatch(AppCommand::ConnectionLost { retryable: false })
+            .unwrap();
+        assert!(matches!(model.state(), AppState::Failed { .. }));
+
+        let events = model.dispatch(AppCommand::ClearFailure).unwrap();
+        assert_eq!(events, vec![AppEvent::FailureCleared]);
+        assert!(matches!(model.state(), AppState::Ready));
+
+        // Clearing is only valid from a failed state.
+        assert!(model.dispatch(AppCommand::ClearFailure).is_err());
+    }
+
+    #[test]
+    fn a_reconnect_attempt_can_itself_fail_terminally() {
+        let mut model = connected_model();
+        model
+            .dispatch(AppCommand::ConnectionLost { retryable: true })
+            .unwrap();
+        assert!(matches!(model.state(), AppState::Reconnecting { .. }));
+
+        model
+            .dispatch(AppCommand::ConnectionLost { retryable: false })
+            .unwrap();
+        let snapshot = model.snapshot(DiagnosticSnapshot::default());
+        assert!(matches!(snapshot.state, AppState::Failed { .. }));
+        assert_eq!(snapshot.active_session_id, None);
+        assert_eq!(snapshot.active_permissions, PermissionSet::view_only());
     }
 
     #[test]
