@@ -581,6 +581,7 @@ impl HostBackend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreflightReport {
     pub native_drm_reachable: bool,
+    pub native_drm_usable: bool,
     pub x11_available: bool,
     pub pipewire_available: bool,
     pub ffmpeg_available: bool,
@@ -589,22 +590,29 @@ pub struct PreflightReport {
 }
 
 /// Select a backend only from explicit preflight capabilities.
+///
+/// `native_drm_reachable` is a diagnostic scanout result. It is not sufficient
+/// to select the native backend; callers must separately prove and explicitly
+/// enable the native pipeline through `native_drm_usable`.
 pub fn run_preflight(
     requested: &CaptureMode,
     native_drm_reachable: bool,
+    native_drm_usable: bool,
     x11_available: bool,
     pipewire_available: bool,
     ffmpeg_available: bool,
 ) -> PreflightReport {
+    let native_drm_usable = native_drm_reachable && native_drm_usable;
     let selected = match requested {
-        CaptureMode::Drm if native_drm_reachable => HostBackend::NativeDrm,
+        CaptureMode::Drm if native_drm_usable => HostBackend::NativeDrm,
+        CaptureMode::Drm => HostBackend::Unavailable,
         CaptureMode::Pipewire if pipewire_available && ffmpeg_available => {
             HostBackend::FfmpegPipewire
         }
         CaptureMode::X11 if x11_available && ffmpeg_available => HostBackend::FfmpegX11,
-        CaptureMode::Auto if native_drm_reachable => HostBackend::NativeDrm,
-        CaptureMode::Auto if pipewire_available && ffmpeg_available => HostBackend::FfmpegPipewire,
+        CaptureMode::Auto if native_drm_usable => HostBackend::NativeDrm,
         CaptureMode::Auto if x11_available && ffmpeg_available => HostBackend::FfmpegX11,
+        CaptureMode::Auto if pipewire_available && ffmpeg_available => HostBackend::FfmpegPipewire,
         _ if x11_available && ffmpeg_available => HostBackend::FfmpegX11,
         _ if pipewire_available && ffmpeg_available => HostBackend::FfmpegPipewire,
         _ if ffmpeg_available => HostBackend::FfmpegFallback,
@@ -612,6 +620,7 @@ pub fn run_preflight(
     };
     PreflightReport {
         native_drm_reachable,
+        native_drm_usable,
         x11_available,
         pipewire_available,
         ffmpeg_available,
@@ -2070,8 +2079,89 @@ mod tests {
     #[test]
     fn preflight_never_selects_native_drm_without_positive_probe() {
         let settings = default_config();
-        let report = super::run_preflight(&settings.host.capture, false, true, false, true);
+        let report = super::run_preflight(&settings.host.capture, false, false, true, false, true);
         assert_eq!(report.selected, super::HostBackend::FfmpegX11);
         assert!(!report.native_drm_reachable);
+        assert!(!report.native_drm_usable);
+    }
+
+    #[test]
+    fn explicit_drm_does_not_silently_fall_back_when_native_is_unusable() {
+        let report = super::run_preflight(
+            &openstream_settings::CaptureMode::Drm,
+            false,
+            false,
+            true,
+            true,
+            true,
+        );
+
+        assert_eq!(report.selected, super::HostBackend::Unavailable);
+        assert_eq!(
+            report.reason,
+            Some(super::HostErrorCode::PreflightUnavailable)
+        );
+    }
+
+    #[test]
+    fn auto_uses_x11_when_drm_is_reachable_but_not_usable() {
+        let report = super::run_preflight(
+            &openstream_settings::CaptureMode::Auto,
+            true,
+            false,
+            true,
+            false,
+            true,
+        );
+
+        assert_eq!(report.selected, super::HostBackend::FfmpegX11);
+        assert!(report.native_drm_reachable);
+        assert!(!report.native_drm_usable);
+    }
+
+    #[test]
+    fn auto_uses_native_drm_only_when_the_pipeline_is_usable() {
+        let report = super::run_preflight(
+            &openstream_settings::CaptureMode::Auto,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+
+        assert_eq!(report.selected, super::HostBackend::NativeDrm);
+    }
+
+    #[test]
+    fn auto_prefers_pipewire_when_x11_is_unavailable() {
+        let report = super::run_preflight(
+            &openstream_settings::CaptureMode::Auto,
+            false,
+            false,
+            false,
+            true,
+            true,
+        );
+
+        assert_eq!(report.selected, super::HostBackend::FfmpegPipewire);
+    }
+
+    #[test]
+    fn auto_reports_unavailable_without_a_usable_capture_backend() {
+        let report = super::run_preflight(
+            &openstream_settings::CaptureMode::Auto,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(report.selected, super::HostBackend::Unavailable);
+        assert_eq!(
+            report.reason,
+            Some(super::HostErrorCode::PreflightUnavailable)
+        );
     }
 }

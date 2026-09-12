@@ -147,8 +147,14 @@ environment is reserved for the explicitly marked
 OPENSTREAM_DEVELOPER_OVERRIDE=1 developer/reference flows and is not accepted
 or propagated by the persistent agent.
 The current agent manages the tested X11/PipeWire plus external-FFmpeg
-fallback. Native DRM is only eligible after a positive preflight result and
-still has its own Linux hardware acceptance gate.
+fallback. The DRM framebuffer probe is diagnostic reachability, not proof that
+the native import/conversion/encoder pipeline works. In `Auto`, native DRM is
+selected only when the probe is positive, a native child is configured with
+`OPENSTREAM_HOST_CHILD`, and `OPENSTREAM_EXPERIMENTAL_NATIVE_DRM=1` is set
+explicitly. Otherwise the agent prefers X11/FFmpeg, then PipeWire/FFmpeg. An
+explicit DRM request fails preflight when that native gate is not satisfied;
+it never silently falls back to another capture backend. Native DRM still has
+its own Linux hardware acceptance gate.
 
 The same host/client demo was rerun with `OPENSTREAM_UPNP=1`; it completed and
 produced valid 1920x1080 H.264 while treating the router mapping as

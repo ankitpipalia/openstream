@@ -8,7 +8,7 @@ mod unix_main {
         run_preflight,
     };
     use openstream_local_ipc::{Endpoint, IpcError, read_frame, write_frame};
-    use openstream_settings::{apply_environment_overrides, default_config};
+    use openstream_settings::{CaptureMode, apply_environment_overrides, default_config};
     use std::env;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -252,16 +252,24 @@ mod unix_main {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("openstream-ffmpeg-host"));
         let ffmpeg = env::var_os("OPENSTREAM_FFMPEG");
+        let native_drm_reachable = native_drm_reachable();
+        let native_drm_usable =
+            native_drm_usable_with(native_drm_reachable, explicit_child.is_some(), |name| {
+                env::var(name).ok()
+            });
         let report = run_preflight(
             &settings.host.capture,
-            native_drm_reachable(),
+            native_drm_reachable,
+            native_drm_usable,
             env::var_os("DISPLAY").is_some(),
             env::var_os("PIPEWIRE_REMOTE").is_some() || env::var_os("WAYLAND_DISPLAY").is_some(),
             executable_available(ffmpeg.as_ref()),
         );
-        if report.selected == HostBackend::NativeDrm && explicit_child.is_none() {
+        if matches!(settings.host.capture, CaptureMode::Drm)
+            && report.selected == HostBackend::Unavailable
+        {
             return Err(
-                "native DRM preflight is positive but the persistent agent has no native child configured"
+                "requested native DRM capture is unavailable; the probe, a native child, and OPENSTREAM_EXPERIMENTAL_NATIVE_DRM=1 are required"
                     .to_string(),
             );
         }
@@ -332,6 +340,16 @@ mod unix_main {
         false
     }
 
+    fn native_drm_usable_with(
+        native_drm_reachable: bool,
+        native_child_configured: bool,
+        environment: impl Fn(&str) -> Option<String>,
+    ) -> bool {
+        native_drm_reachable
+            && native_child_configured
+            && environment("OPENSTREAM_EXPERIMENTAL_NATIVE_DRM").as_deref() == Some("1")
+    }
+
     #[cfg(target_os = "linux")]
     fn native_drm_probe_ready() -> bool {
         lowlat::display::native_drm_probe().is_ready()
@@ -368,7 +386,10 @@ mod unix_main {
 
     #[cfg(test)]
     mod tests {
-        use super::{error_code, native_drm_reachable_with, pairing_file_from_environment_with};
+        use super::{
+            error_code, native_drm_reachable_with, native_drm_usable_with,
+            pairing_file_from_environment_with,
+        };
         use openstream_host_agent::{
             AgentError, HostAgentConfig, HostBackend, HostErrorCode, run_preflight,
         };
@@ -472,6 +493,7 @@ mod unix_main {
             let report = run_preflight(
                 &settings.host.capture,
                 native_drm_reachable,
+                false,
                 true,
                 false,
                 true,
@@ -484,9 +506,23 @@ mod unix_main {
         #[test]
         fn native_drm_probe_can_select_native_backend() {
             let settings = default_config();
-            let report = run_preflight(&settings.host.capture, true, true, false, true);
+            let report = run_preflight(&settings.host.capture, true, true, true, false, true);
 
             assert_eq!(report.selected, HostBackend::NativeDrm);
+        }
+
+        #[test]
+        fn native_drm_requires_explicit_pipeline_enablement_and_child() {
+            let no_enablement = |_: &str| None;
+            assert!(!native_drm_usable_with(true, true, no_enablement));
+
+            let enablement_only = |name: &str| {
+                (name == "OPENSTREAM_EXPERIMENTAL_NATIVE_DRM").then_some("1".to_string())
+            };
+            assert!(!native_drm_usable_with(false, true, enablement_only));
+            assert!(!native_drm_usable_with(true, false, enablement_only));
+
+            assert!(native_drm_usable_with(true, true, enablement_only));
         }
 
         #[test]

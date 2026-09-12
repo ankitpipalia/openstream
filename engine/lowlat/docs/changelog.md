@@ -17,8 +17,12 @@ best effort after the atomic rename.
 Linux native-DRM readiness is now obtained from one shared library-level probe
 used by both host preflight and the persistent agent. The legacy readiness
 environment flag cannot select a backend; the known-good X11/FFmpeg/NVENC
-fallback remains the truthful choice when the probe is unavailable. The
-persistent agent accepts only a validated `OPENSTREAM_PAIRING_FILE` path,
+fallback remains the truthful choice when the native pipeline is not explicitly
+enabled and usable. Backend selection now distinguishes DRM framebuffer
+reachability from native pipeline usability: `Auto` does not select native DRM
+from reachability alone, while an explicit DRM request fails instead of
+silently falling back. The persistent agent accepts only a validated
+`OPENSTREAM_PAIRING_FILE` path,
 removes inherited pairing variables, and does not accept or propagate raw
 `OPENSTREAM_PAIRING_JSON`. Windows pairing-file consumption also rejects
 reparse points, and diagnostic/configuration debug output remains secret-free.
