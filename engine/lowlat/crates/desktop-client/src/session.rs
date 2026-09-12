@@ -298,7 +298,10 @@ mod tests {
         assert_eq!(WindowMode::parse("windowed"), WindowMode::Windowed);
         assert_eq!(WindowMode::parse("BORDERLESS"), WindowMode::Borderless);
         assert_eq!(WindowMode::parse("fullscreen"), WindowMode::Fullscreen);
-        assert_eq!(WindowMode::parse("native-fullscreen"), WindowMode::Fullscreen);
+        assert_eq!(
+            WindowMode::parse("native-fullscreen"),
+            WindowMode::Fullscreen
+        );
         assert_eq!(WindowMode::parse("unknown"), WindowMode::Windowed);
         assert_eq!(WindowMode::parse(""), WindowMode::Windowed);
     }
@@ -309,9 +312,11 @@ mod tests {
 
         assert!(hotkeys.contains(HotkeyAction::Disconnect));
         assert_eq!(hotkeys.release_input(), RESERVED_RELEASE_INPUT);
-        assert!(hotkeys
-            .iter()
-            .any(|hotkey| hotkey.action == HotkeyAction::ReleaseInput));
+        assert!(
+            hotkeys
+                .iter()
+                .any(|hotkey| hotkey.action == HotkeyAction::ReleaseInput)
+        );
     }
 
     #[test]
@@ -319,9 +324,11 @@ mod tests {
         let hotkeys = HotkeySet::parse("release=shift+f1");
 
         assert_eq!(hotkeys.release_input(), RESERVED_RELEASE_INPUT);
-        assert!(!hotkeys.iter().any(|hotkey| {
-            hotkey.action == HotkeyAction::ReleaseInput && hotkey.key == "f1"
-        }));
+        assert!(
+            !hotkeys.iter().any(|hotkey| {
+                hotkey.action == HotkeyAction::ReleaseInput && hotkey.key == "f1"
+            })
+        );
     }
 
     #[test]
@@ -379,7 +386,10 @@ mod tests {
 
         assert_eq!(runner.enqueue(SessionCommand::Stop), Ok(()));
         assert_eq!(runner.enqueue(SessionCommand::Stop), Ok(()));
-        assert_eq!(runner.enqueue(SessionCommand::Stop), Err(SessionError::QueueFull));
+        assert_eq!(
+            runner.enqueue(SessionCommand::Stop),
+            Err(SessionError::QueueFull)
+        );
         assert_eq!(runner.pending_len(), 2);
     }
 

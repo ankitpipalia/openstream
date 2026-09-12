@@ -945,10 +945,7 @@ fn apply_input_payload(
             eprintln!("OpenStream rejected an input event without a local adapter");
             return;
         }
-        if matches!(
-            event.kind,
-            openstream_media::input::InputKind::Release
-        ) {
+        if matches!(event.kind, openstream_media::input::InputKind::Release) {
             input_lease.disarm();
         } else {
             input_lease.renew(now_us);

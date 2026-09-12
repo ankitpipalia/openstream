@@ -862,18 +862,12 @@ mod tests {
         assert_eq!(lease.poll_expiry(0), None);
         lease.renew(10);
         assert_eq!(lease.poll_expiry(109), None);
-        assert_eq!(
-            lease.poll_expiry(110),
-            Some(InputEvent::release_all(110))
-        );
+        assert_eq!(lease.poll_expiry(110), Some(InputEvent::release_all(110)));
         assert_eq!(lease.poll_expiry(111), None);
 
         lease.renew(200);
         assert_eq!(lease.poll_expiry(299), None);
-        assert_eq!(
-            lease.poll_expiry(300),
-            Some(InputEvent::release_all(300))
-        );
+        assert_eq!(lease.poll_expiry(300), Some(InputEvent::release_all(300)));
     }
 
     #[test]
@@ -881,18 +875,12 @@ mod tests {
         let mut lease = InputLease::new(1_000);
         lease.renew(10);
 
-        assert_eq!(
-            lease.focus_lost(20),
-            Some(InputEvent::release_all(20))
-        );
+        assert_eq!(lease.focus_lost(20), Some(InputEvent::release_all(20)));
         assert_eq!(lease.focus_lost(21), None);
         assert_eq!(lease.poll_expiry(2_000), None);
 
         lease.renew(30);
-        assert_eq!(
-            lease.focus_lost(31),
-            Some(InputEvent::release_all(31))
-        );
+        assert_eq!(lease.focus_lost(31), Some(InputEvent::release_all(31)));
     }
 
     #[test]

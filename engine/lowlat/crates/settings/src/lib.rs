@@ -476,7 +476,11 @@ impl AppConfig {
             return invalid("client.signal_origin", "must not contain whitespace");
         }
         validate_mode("client.profile", &self.client.profile, is_profile_known)?;
-        validate_mode("client.window_mode", &self.client.window_mode, is_window_known)?;
+        validate_mode(
+            "client.window_mode",
+            &self.client.window_mode,
+            is_window_known,
+        )?;
         validate_mode("client.renderer", &self.client.renderer, is_renderer_known)?;
         validate_mode("client.decoder", &self.client.decoder, is_decoder_known)?;
         validate_mode("client.codec", &self.client.codec, is_codec_known)?;
@@ -1463,9 +1467,9 @@ impl Default for AdvancedConfig {
 #[cfg(test)]
 mod tests {
     use super::{
+        CURRENT_SCHEMA_VERSION, CapabilityState, ChromaPreference, DecoderMode, EncoderMode,
+        RendererMode, SecretRef, SettingVisibility, SettingsError, StreamProfile, WindowMode,
         apply_overrides, default_config, effective_config, load, save_atomic, setting_descriptors,
-        CapabilityState, ChromaPreference, CURRENT_SCHEMA_VERSION, DecoderMode, EncoderMode,
-        RendererMode, SecretRef, SettingVisibility, StreamProfile, WindowMode, SettingsError,
     };
     use serde_json::json;
     use std::cell::{Cell, RefCell};
