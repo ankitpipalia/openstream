@@ -157,6 +157,9 @@ function runtimeSnapshotFixture(): RuntimeSnapshot {
     },
     settings: runtimeConfigFixture(),
     descriptors: runtimeDescriptorsFixture(),
+    restart_required: false,
+    host_restart_required: false,
+    pending_settings: [],
   };
 }
 
@@ -194,12 +197,56 @@ describe("tauri adapter", () => {
 
     const adapter = createTauriAdapter(async (command, args) => {
       expect(command).toBe("runtime_dispatch");
-      expect(args).toEqual({ command: "BeginAuthentication" });
+      expect(args).toEqual({ command: "SignIn" });
       return result;
     });
 
-    const snapshot = await adapter.dispatch("BeginAuthentication");
+    const snapshot = await adapter.dispatch("SignIn");
     expect(snapshot.connection.state).toBe("idle");
+  });
+
+  it("dispatches a Connect command carrying only user intent, with no request id or timestamp", async () => {
+    const result: RuntimeDispatchResult = {
+      snapshot: runtimeSnapshotFixture(),
+      events: [],
+    };
+    const permissions = {
+      view: true,
+      keyboard: false,
+      mouse: false,
+      gamepad: false,
+      clipboard: false,
+      microphone: false,
+      tablet: false,
+      virtual_usb: false,
+    };
+
+    const adapter = createTauriAdapter(async (command, args) => {
+      expect(command).toBe("runtime_dispatch");
+      expect(args).toEqual({
+        command: { Connect: { device_id: "mac-1", requested: permissions } },
+      });
+      return result;
+    });
+
+    await adapter.dispatch({ Connect: { device_id: "mac-1", requested: permissions } });
+  });
+
+  it("surfaces restart_required and pending settings from the runtime snapshot", async () => {
+    const fixture = runtimeSnapshotFixture();
+    const pending: RuntimeSnapshot = {
+      ...fixture,
+      restart_required: true,
+      host_restart_required: true,
+      pending_settings: ["network.local_no_auth", "host.enabled"],
+    };
+
+    const adapter = createTauriAdapter(async () => pending);
+    const snapshot = await adapter.refresh();
+
+    expect(snapshot.restartRequired).toBe(true);
+    expect(snapshot.hostRestartRequired).toBe(true);
+    expect(snapshot.pendingSettingKeys).toEqual(["network.local_no_auth", "host.enabled"]);
   });
 
   it("maps an updateSettings result back into the product snapshot", async () => {

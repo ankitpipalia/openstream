@@ -223,6 +223,12 @@ export interface RuntimeSnapshot {
   app: AppSnapshot;
   settings: AppConfig;
   descriptors: SettingDescriptor[];
+  /** True once a change requires an application restart to take effect. */
+  restart_required: boolean;
+  /** True once a change requires only the host to restart to take effect. */
+  host_restart_required: boolean;
+  /** Setting keys whose persisted value is not yet reflected in the running application. */
+  pending_settings: string[];
 }
 
 export interface RuntimeDispatchResult {
@@ -653,6 +659,9 @@ export function mapRuntimeSnapshot(snapshot: RuntimeSnapshot): ProductSnapshot {
     settings: mapSettings(snapshot.settings, snapshot.descriptors),
     capabilities: mapCapabilities(app, access.controlPlane),
     diagnostics: mapDiagnostics(app),
+    restartRequired: snapshot.restart_required,
+    hostRestartRequired: snapshot.host_restart_required,
+    pendingSettingKeys: snapshot.pending_settings,
   };
 }
 
@@ -674,6 +683,9 @@ function unresolvedSnapshot(): ProductSnapshot {
       checks: [],
       transport: [],
     },
+    restartRequired: false,
+    hostRestartRequired: false,
+    pendingSettingKeys: [],
   };
 }
 
