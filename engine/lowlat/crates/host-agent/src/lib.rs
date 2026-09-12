@@ -263,8 +263,13 @@ impl ChildSpec {
         self.pairing_file = Some(path);
     }
 
-    fn pairing_file(&self) -> Option<&str> {
-        self.pairing_file.as_deref()
+    /// Return the validated pairing-file path, if one was configured.
+    ///
+    /// The path is not secret material; the file contents are. Custom child
+    /// factories should use this accessor to propagate the dedicated pairing
+    /// file without exposing the raw pairing JSON environment escape hatch.
+    pub fn pairing_file(&self) -> Option<&Path> {
+        self.pairing_file.as_deref().map(Path::new)
     }
 }
 

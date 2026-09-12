@@ -619,6 +619,16 @@ pub struct Pairing {
 /// JSON parser runs.
 pub const MAX_PAIRING_FILE_BYTES: usize = 64 * 1024;
 
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+#[cfg(windows)]
+fn has_reparse_point_attribute(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 /// Load pairing material from a private runtime file.
 ///
 /// The path must be absolute, must name a regular file owned by the effective
@@ -644,12 +654,27 @@ pub fn load_pairing_from_file(path: impl AsRef<Path>) -> Result<Pairing, Error> 
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open the final path component without traversing a reparse point.
+        // The metadata check above remains a clear fast-fail, while this
+        // handle-level flag closes the check/open race on Windows.
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options
         .open(path)
         .map_err(|_| Error::PairingFileUnavailable)?;
     let metadata = file.metadata().map_err(|_| Error::PairingFileUnavailable)?;
     if !metadata.is_file() {
         return Err(Error::PairingFileInsecure);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if has_reparse_point_attribute(metadata.file_attributes()) {
+            return Err(Error::PairingFileInsecure);
+        }
     }
     #[cfg(unix)]
     {
@@ -5243,6 +5268,16 @@ mod tests {
         assert!(!format!("{}", error).contains("not pairing json"));
         std::fs::remove_dir_all(path.parent().expect("test directory"))
             .expect("remove pairing test directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_pairing_file_reparse_attribute_guard_is_exact() {
+        assert!(!has_reparse_point_attribute(0));
+        assert!(has_reparse_point_attribute(FILE_ATTRIBUTE_REPARSE_POINT));
+        assert!(has_reparse_point_attribute(
+            FILE_ATTRIBUTE_REPARSE_POINT | 0x20
+        ));
     }
 
     #[test]
