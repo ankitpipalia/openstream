@@ -20,6 +20,12 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Liveness bound for loopback socket steps in these tests.
+/// These were hard 100ms deadlines, which flake on a loaded CI runner:
+/// the assertion is that the step completes at all, not that it
+/// completes within a tenth of a second.
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct LoopbackIceEnv {
     previous: Option<String>,
 }
@@ -1275,7 +1281,7 @@ async fn history_backpressure_keeps_receive_path_alive() {
 
     if video_sent_before_ack_drain {
         assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
-        tokio::time::timeout(Duration::from_millis(100), receiver.recv_step())
+        tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv_step())
             .await
             .expect("receiver emits the delayed transport ACK")
             .expect("receiver transport ACK is valid");
@@ -1290,7 +1296,7 @@ async fn history_backpressure_keeps_receive_path_alive() {
         {
             break;
         }
-        tokio::time::timeout(Duration::from_millis(100), sender.recv_step())
+        tokio::time::timeout(LIVENESS_TIMEOUT, sender.recv_step())
             .await
             .expect("sender receives a transport ACK")
             .expect("transport ACK is valid");
@@ -1542,7 +1548,7 @@ async fn authenticated_relay_drops_first_ack_and_delays_timer_recovery() {
     );
 
     tokio::time::sleep(Duration::from_millis(5)).await;
-    tokio::time::timeout(Duration::from_millis(100), receiver.recv_step())
+    tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv_step())
         .await
         .expect("first ACK timer fires")
         .expect("first ACK timer remains healthy");
@@ -1565,7 +1571,7 @@ async fn authenticated_relay_drops_first_ack_and_delays_timer_recovery() {
     sender.flush_outbound().await.unwrap();
     assert_eq!(receiver.recv().await.unwrap().kind, Kind::Video);
     tokio::time::sleep(Duration::from_millis(5)).await;
-    tokio::time::timeout(Duration::from_millis(100), receiver.recv_step())
+    tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv_step())
         .await
         .expect("recovery ACK timer fires")
         .expect("recovery ACK timer remains healthy");
@@ -1578,7 +1584,7 @@ async fn authenticated_relay_drops_first_ack_and_delays_timer_recovery() {
         {
             break;
         }
-        tokio::time::timeout(Duration::from_millis(100), sender.recv_step())
+        tokio::time::timeout(LIVENESS_TIMEOUT, sender.recv_step())
             .await
             .expect("delayed recovery ACK arrives")
             .expect("delayed recovery ACK is authenticated");
@@ -1622,13 +1628,13 @@ async fn authenticated_relay_reorders_first_packet_behind_sixty_four_followers()
 
     let mut counters = Vec::with_capacity(64);
     for _ in 0..64 {
-        let packet = tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+        let packet = tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv())
             .await
             .expect("reordered packet arrives")
             .expect("reordered packet is authenticated");
         counters.push(packet.counter);
     }
-    let late = tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+    let late = tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv())
         .await
         .expect("late reordered packet reaches the session");
     assert!(matches!(
@@ -1649,7 +1655,7 @@ async fn authenticated_relay_reorders_first_packet_behind_sixty_four_followers()
         {
             break;
         }
-        tokio::time::timeout(Duration::from_millis(100), sender.recv_step())
+        tokio::time::timeout(LIVENESS_TIMEOUT, sender.recv_step())
             .await
             .expect("reordering ACK arrives")
             .expect("reordering ACK is authenticated");
@@ -1690,7 +1696,7 @@ async fn authenticated_relay_duplicates_ack_without_ack_of_ack() {
     let mut replay_rejected = false;
     let mut after_first = sender.transport_delivery_snapshot(Instant::now());
     for _ in 0..32 {
-        let result = tokio::time::timeout(Duration::from_millis(100), sender.recv_step())
+        let result = tokio::time::timeout(LIVENESS_TIMEOUT, sender.recv_step())
             .await
             .expect("second duplicate ACK arrives");
         match result {
@@ -1779,7 +1785,7 @@ async fn authenticated_relay_holds_old_ack_across_migration_and_preserves_frame_
         .unwrap();
     sender.flush_outbound().await.unwrap();
     let before = receiver.recv().await.unwrap();
-    tokio::time::timeout(Duration::from_millis(100), receiver.recv_step())
+    tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv_step())
         .await
         .expect("old-generation ACK timer fires")
         .expect("old-generation ACK remains authenticated");
@@ -1830,7 +1836,7 @@ async fn authenticated_relay_holds_old_ack_across_migration_and_preserves_frame_
     assert_eq!(reset_snapshot.aggregate.acknowledged_packets, 0);
 
     relay.release_held(RelayDirection::ClientToHost).await;
-    tokio::time::timeout(Duration::from_millis(100), sender.recv_step())
+    tokio::time::timeout(LIVENESS_TIMEOUT, sender.recv_step())
         .await
         .expect("late old-generation ACK reaches the draining path")
         .expect("late old-generation ACK remains authenticated");
@@ -1841,7 +1847,7 @@ async fn authenticated_relay_holds_old_ack_across_migration_and_preserves_frame_
 
     sender.queue(Kind::Input, 1, 0, b"after-migration").unwrap();
     sender.flush_outbound().await.unwrap();
-    let after = tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+    let after = tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv())
         .await
         .expect("post-migration packet arrives")
         .expect("post-migration packet is authenticated");
@@ -1861,7 +1867,7 @@ async fn authenticated_relay_holds_old_ack_across_migration_and_preserves_frame_
         .send(&mut receiver, &frame_ack)
         .await
         .expect("post-migration FrameAck sends");
-    let packet = tokio::time::timeout(Duration::from_millis(100), sender.recv())
+    let packet = tokio::time::timeout(LIVENESS_TIMEOUT, sender.recv())
         .await
         .expect("post-migration FrameAck arrives")
         .expect("post-migration FrameAck outer packet authenticates");
@@ -1878,7 +1884,7 @@ async fn authenticated_relay_holds_old_ack_across_migration_and_preserves_frame_
     assert_eq!(telemetry.pending_frames(), 0);
 
     while client_control.outstanding() != 0 {
-        let packet = tokio::time::timeout(Duration::from_millis(100), receiver.recv())
+        let packet = tokio::time::timeout(LIVENESS_TIMEOUT, receiver.recv())
             .await
             .expect("FrameAck reliable acknowledgement arrives")
             .expect("FrameAck reliable acknowledgement authenticates");
