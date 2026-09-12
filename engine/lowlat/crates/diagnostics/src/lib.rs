@@ -382,9 +382,16 @@ impl DiagnosticBundle {
         name: impl AsRef<str>,
         value: impl AsRef<str>,
     ) -> Result<(), DiagnosticError> {
+        let name = name.as_ref();
+        let value = value.as_ref();
+        let redacted_value = match field_redaction_class(name) {
+            Some(class) => self.policy.redact_class(class, value),
+            None => self.policy.redact_text(value),
+        };
+
         self.push(DiagnosticRecord::Setting {
-            name: bounded_label(&self.policy, name.as_ref()),
-            value: self.policy.redact_text(value.as_ref()),
+            name: bounded_label(&self.policy, name),
+            value: redacted_value,
         })
     }
 
@@ -942,6 +949,53 @@ mod tests {
         assert!(json.contains("session-1"));
         assert!(json.contains("[REDACTED:token]"));
         assert!(json.contains("[REDACTED:key]"));
+    }
+
+    #[test]
+    fn named_sensitive_settings_are_redacted_in_all_exports() {
+        let settings = [
+            ("host_token", "sentinel-host-token", "[REDACTED:token]"),
+            ("client_token", "sentinel-client-token", "[REDACTED:token]"),
+            (
+                "turn_password",
+                "sentinel-turn-password",
+                "[REDACTED:token]",
+            ),
+            ("relay_ticket", "sentinel-relay-ticket", "[REDACTED:token]"),
+            (
+                "identity_private_key",
+                "sentinel-identity-private-key",
+                "[REDACTED:key]",
+            ),
+            (
+                "authorization",
+                "sentinel-authorization",
+                "[REDACTED:token]",
+            ),
+            (
+                "clipboard_text",
+                "sentinel-clipboard-text",
+                "[REDACTED:clipboard]",
+            ),
+            ("file_path", "sentinel-file-path", "[REDACTED:user-path]"),
+        ];
+        let mut bundle = DiagnosticBundle::new(manifest(), RedactionPolicy::default());
+
+        for (name, value, _) in settings {
+            bundle
+                .add_setting(name, value)
+                .expect("named setting is accepted");
+        }
+
+        let json = bundle.export_json().expect("diagnostic JSON is valid");
+        let text = bundle.export_text().expect("diagnostic text is valid");
+
+        for (name, value, marker) in settings {
+            assert!(!json.contains(value), "raw {name} value leaked into JSON");
+            assert!(!text.contains(value), "raw {name} value leaked into text");
+            assert!(json.contains(marker), "JSON is missing marker for {name}");
+            assert!(text.contains(marker), "text is missing marker for {name}");
+        }
     }
 
     #[test]
