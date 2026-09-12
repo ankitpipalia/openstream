@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { App } from "./App";
@@ -16,9 +16,10 @@ describe("OpenStream desktop shell", () => {
 
   it("navigates to every product area without a transport dependency", () => {
     render(<App adapter={createLocalAdapter(createEmptySnapshot())} />);
+    const primaryNav = screen.getByRole("navigation", { name: "Primary" });
 
     for (const page of ["Access", "Settings", "Diagnostics", "About"]) {
-      fireEvent.click(screen.getByRole("button", { name: page }));
+      fireEvent.click(within(primaryNav).getByRole("button", { name: page }));
       expect(screen.getByRole("heading", { name: page })).toBeInTheDocument();
     }
   });
@@ -30,7 +31,9 @@ describe("OpenStream desktop shell", () => {
     render(<App adapter={createLocalAdapter(snapshot)} initialPage="settings" />);
 
     expect(screen.getByRole("heading", { name: "Settings" })).toBeInTheDocument();
-    expect(screen.getByText("Unavailable", { exact: true })).toBeInTheDocument();
-    expect(screen.getByText("This setting is visible, but its backend capability is not available yet.")).toBeInTheDocument();
+    expect(screen.getAllByText("Unavailable", { exact: true }).length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("This setting is visible, but its backend capability is not available yet.").length,
+    ).toBeGreaterThan(0);
   });
 });
