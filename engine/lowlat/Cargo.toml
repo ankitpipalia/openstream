@@ -30,6 +30,7 @@ members = [
     "crates/tray",
     "crates/settings",
     "crates/app-core",
+    "crates/local-ipc",
 ]
 exclude = ["fuzz"]
 

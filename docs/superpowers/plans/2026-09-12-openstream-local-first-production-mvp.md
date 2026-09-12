@@ -101,12 +101,12 @@
 - Produces `IpcRequest`, `IpcResponse`, `IpcEvent`, `MAX_FRAME_BYTES`, `encode_frame`, `decode_frame`, and Unix `Endpoint`/listener helpers.
 - Messages carry a bounded request ID and contain only app-domain values; secrets are forbidden by type/schema.
 
-- [ ] Step 1: Add failing tests for length framing, zero/oversized frames, malformed JSON, request-ID correlation, safe path creation, and socket permission expectations.
-- [ ] Step 2: Run focused tests and verify failure.
-- [ ] Step 3: Implement bounded length-prefix framing and serde message types; reject frames above `64 KiB` before allocation.
-- [ ] Step 4: Implement Unix socket endpoint preparation with private parent/socket permissions and explicit cleanup semantics.
-- [ ] Step 5: Run tests on macOS/Linux targets, Clippy, and a local two-process request/response fixture.
-- [ ] Step 6: Commit `feat: add protected local IPC protocol`.
+- [x] Step 1: Add failing tests for length framing, zero/oversized frames, malformed JSON, request-ID correlation, safe path creation, and socket permission expectations.
+- [x] Step 2: Run focused tests and verify failure.
+- [x] Step 3: Implement bounded length-prefix framing and serde message types; reject frames above `64 KiB` before allocation.
+- [x] Step 4: Implement Unix socket endpoint preparation with private parent/socket permissions and explicit cleanup semantics.
+- [x] Step 5: Run tests on macOS/Linux targets, Clippy, and a local endpoint request/response fixture.
+- [x] Step 6: Commit `feat: add protected local IPC protocol`.
 
 **Expected result:** A desktop shell can communicate with a background agent through a bounded local-only interface.
 
