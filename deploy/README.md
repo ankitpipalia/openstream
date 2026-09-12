@@ -28,9 +28,11 @@ Build release binaries from `engine/lowlat`, install
 unit directory. The agent unit is the persistent entrypoint; the direct
 FFmpeg unit remains useful for compatibility and diagnostics. Create
 `%h/.config/openstream/host.env` with mode `0600` and put only short-lived
-runtime values there; do not commit it. Pairing JSON is passed to the child
-through the protected environment boundary and is never placed in an
-`ExecStart` argument or ordinary settings.
+runtime values there; do not commit it. Pairing material is passed to the
+child only through a validated `OPENSTREAM_PAIRING_FILE` path and is never
+placed in an `ExecStart` argument or ordinary settings. The persistent agent
+does not accept or propagate raw `OPENSTREAM_PAIRING_JSON`; that variable is
+reserved for explicitly marked developer/reference flows.
 
 For a user service, enable the persistent agent with:
 
@@ -60,7 +62,7 @@ The administrator token must be at least 16 bytes; use a randomly generated
 value and keep it in the protected environment file rather than in a unit
 file or command-line argument.
 
-For a trusted private LAN without an account flow, use the separate,
+For Trusted LAN mode - no account authentication, use the separate,
 explicitly opt-in mode below. The bind must be one real numeric LAN address;
 wildcard, loopback, public, and shared-CGNAT binds are rejected:
 
@@ -71,13 +73,14 @@ OPENSTREAM_SIGNAL_BIND=192.168.1.69:8080
 ```
 
 This disables only management/admin authentication for devices on that
-trusted LAN. Anyone who can reach the bind can create or revoke sessions, so
-do not expose it through port forwarding, a reverse proxy, or a public
-interface. Role-scoped session capabilities, encrypted peer identity, and
-relay/TURN authorization remain required. Clients using an `http://` origin
-must also set `OPENSTREAM_LOCAL_NO_AUTH=1`; plaintext is accepted there only
-for numeric RFC1918/ULA/link-local origins. Use the admin-token HTTPS/WSS mode
-before leaving a trusted LAN.
+trusted LAN. RFC1918/private addressing is not an identity or authentication
+boundary: anyone who can reach the bind can create or revoke sessions. Do not
+expose it through port forwarding, a reverse proxy, or a public interface.
+Role-scoped session capabilities, encrypted peer identity, and relay/TURN
+authorization remain required. Clients using an `http://` origin must also
+set `OPENSTREAM_LOCAL_NO_AUTH=1`; plaintext is accepted there only for numeric
+RFC1918/ULA/link-local origins. Use the admin-token HTTPS/WSS mode before
+leaving a trusted LAN.
 
 For the built-in relay, bind one UDP socket privately and advertise its
 reachable numeric endpoint:

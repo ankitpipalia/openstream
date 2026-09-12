@@ -33,10 +33,13 @@ These checks cover the protocol, signaling, simulator, codec framing, and
 platform-independent client logic. Hardware-dependent capture, encoder, audio,
 and `/dev/uinput` tests are ignored or skipped when the device is unavailable.
 
-The release artifact check verifies the operator-facing host, client, signal,
-and agent binaries in the selected Cargo profile. The secret scan requires a
-clean worktree, archives the committed source tree into private temporary
-state, and runs gitleaks without printing matched material.
+The release check performs artifact manifest/presence validation for the
+operator-facing host, client, signal, and agent binaries in the selected Cargo
+profile. It is not full release validation: package signatures/notarization,
+checksums/SBOM, package launch, upgrade/rollback, and package-integrity checks
+remain deferred. The secret scan requires a clean worktree, archives the
+committed source tree into private temporary state, and runs gitleaks without
+printing matched material.
 
 ## Persistent application settings
 
@@ -83,11 +86,13 @@ start a signaling service unless an explicit --signal-command is supplied;
 the pairing's signal origin remains the operator's choice.
 
 The Rust entrypoints validate the file again: the path must be absolute,
-regular, owner-only, and no larger than 64 KiB. OPENSTREAM_PAIRING_JSON is
-accepted only with OPENSTREAM_DEVELOPER_OVERRIDE=1 for deliberately
-ephemeral developer shells; it is not a service configuration mechanism.
+regular, owner-only, and no larger than 64 KiB. The persistent host agent
+accepts and propagates only the validated `OPENSTREAM_PAIRING_FILE` path.
+`OPENSTREAM_PAIRING_JSON` is accepted only with
+`OPENSTREAM_DEVELOPER_OVERRIDE=1` for deliberately ephemeral developer or
+reference shells; it is not accepted or propagated by the persistent agent.
 
-## Private-LAN no-account mode
+## Trusted LAN mode - no account authentication
 
 For a trusted local network, the signal service can disable only the
 administrator/account login flow with an explicit private-address bind:
@@ -101,10 +106,12 @@ target/release/openstream-signal-server
 `OPENSTREAM_ADMIN_TOKEN` must be unset for this mode. The service rejects
 wildcard, loopback, public, and shared-CGNAT binds and prints a warning. This
 is not an open media mode: role capabilities and the encrypted peer handshake
-remain mandatory. A client using a private-LAN `http://` origin must set the
-same explicit `OPENSTREAM_LOCAL_NO_AUTH=1` override; secure HTTPS/WSS mode is
-required for anything beyond a trusted LAN. Do not publish this listener via
-port forwarding or a reverse proxy.
+remain mandatory. RFC1918/private addressing is not an identity or
+authentication boundary; any device that can reach the bind may attempt
+management operations. A client using a private-LAN `http://` origin must set
+the same explicit `OPENSTREAM_LOCAL_NO_AUTH=1` override; secure HTTPS/WSS mode
+is required for anything beyond a trusted LAN. Do not publish this listener
+via port forwarding or a reverse proxy.
 
 The 2026-09-07 verification run passed all five commands above. The dependency
 audit permits only a crate-scoped `CC0-1.0` exception for `hexf-parse`, the
@@ -134,9 +141,11 @@ Pairing material, when needed by the current developer/headless flow, is
 provided through an absolute private runtime file with mode 0600 via
 OPENSTREAM_PAIRING_FILE; it is never persisted by application settings or
 put in an ExecStart argument. Child diagnostics are intentionally
-typed/redacted. The raw OPENSTREAM_PAIRING_JSON environment is accepted only
-with the explicitly marked OPENSTREAM_DEVELOPER_OVERRIDE=1 developer
-override.
+typed/redacted. The persistent agent removes inherited pairing variables and
+propagates only the validated file path. The raw OPENSTREAM_PAIRING_JSON
+environment is reserved for the explicitly marked
+OPENSTREAM_DEVELOPER_OVERRIDE=1 developer/reference flows and is not accepted
+or propagated by the persistent agent.
 The current agent manages the tested X11/PipeWire plus external-FFmpeg
 fallback. Native DRM is only eligible after a positive preflight result and
 still has its own Linux hardware acceptance gate.

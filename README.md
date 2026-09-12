@@ -90,8 +90,10 @@ OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:8080 \
 For two machines, copy the private pairing file through a secure channel and
 run the helper separately with --role host and --role client. The helper
 captures child output, enforces a finite duration, and never prints pairing
-contents. The raw OPENSTREAM_PAIRING_JSON environment is reserved for an
-explicit developer override using OPENSTREAM_DEVELOPER_OVERRIDE=1.
+contents. The normal persistent-agent boundary is the protected
+OPENSTREAM_PAIRING_FILE path. The raw OPENSTREAM_PAIRING_JSON environment is a
+developer-only override using OPENSTREAM_DEVELOPER_OVERRIDE=1; it is not
+accepted or propagated by the persistent host agent.
 
 Run the authenticated full-ICE loopback smoke separately:
 
@@ -181,9 +183,12 @@ Hardware-dependent capture, GPU encoder, sound-server, uinput, Android, and
 iOS tests require their native operating system, SDK, device, or driver and
 are explicitly marked in the test and feature matrix.
 
-The release artifact check verifies the host/client/server binaries produced
-by the locked build. The secret scan uses gitleaks on the committed source
-tree only; it does not scan build output or print matched material.
+The release check is an artifact manifest/presence validation for the
+host/client/server binaries produced by the locked build. It is not full
+release validation: package signatures/notarization, checksums/SBOM, package
+launch, upgrade/rollback, and package-integrity checks remain deferred. The
+secret scan uses gitleaks on the committed source tree only; it does not scan
+build output or print matched material.
 
 ## Self-hosting
 
@@ -193,12 +198,15 @@ non-loopback deployment. Set a strong `OPENSTREAM_ADMIN_TOKEN`; without it,
 session-management endpoints refuse requests unless the server is explicitly
 run in loopback-only development mode with `OPENSTREAM_ALLOW_NO_AUTH=1`.
 
-For the local-first MVP, an explicit trusted-LAN mode is available with
-`OPENSTREAM_LOCAL_NO_AUTH=1` plus a numeric RFC1918/ULA/link-local
+For the local-first MVP, an explicit Trusted LAN mode - no account
+authentication - is available with `OPENSTREAM_LOCAL_NO_AUTH=1` plus a
+numeric RFC1918/ULA/link-local
 `OPENSTREAM_SIGNAL_BIND` (for example `192.168.1.69:8080`). It rejects
 wildcard/public binds and requires no admin token. This removes only the
 account/admin flow; role-scoped capabilities and encrypted peer sessions stay
-enabled. Clients using a private-LAN `http://` origin must opt in with the
+enabled. RFC1918/private addressing is not an identity or authentication
+boundary: any device that can reach the bind may attempt management
+operations. Clients using a private-LAN `http://` origin must opt in with the
 same variable. Treat the LAN as trusted and switch to admin-token HTTPS/WSS
 before exposing the service beyond it.
 
@@ -216,6 +224,10 @@ separately and are never placed in pairing JSON or URLs.
 
 Pairing JSON contains role bearer capabilities. Treat it as a secret and never
 commit it, put it in a public issue, or include it in logs.
+Persistent host-agent launches use the validated `OPENSTREAM_PAIRING_FILE`
+boundary. Raw `OPENSTREAM_PAIRING_JSON` is not accepted or propagated by the
+persistent agent and is reserved for explicitly marked developer/reference
+flows.
 
 ## Current status
 

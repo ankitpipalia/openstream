@@ -1,7 +1,7 @@
 # OpenStream Local-First Production MVP Design
 
-**Status:** implementation in progress; requirements adopted from the
-production-MVP review on 2026-09-12.
+**Status:** implementation complete locally; review hardening complete;
+protected PR CI pending as of 2026-09-12.
 
 ## Goal
 
@@ -52,7 +52,7 @@ operations, and the existing constant-time token checks remain authoritative.
 Device identity keys and session capabilities are never written to ordinary
 settings or logs.
 
-### Explicit private-LAN mode
+### Trusted LAN mode - no account authentication
 
 For the user's local-network MVP, `OPENSTREAM_LOCAL_NO_AUTH=1` may disable the
 *administrator/account authentication flow* only when all of these are true:
@@ -63,10 +63,16 @@ For the user's local-network MVP, `OPENSTREAM_LOCAL_NO_AUTH=1` may disable the
 - the bind address is in IPv4 RFC1918 or IPv6 ULA/link-local space;
 - the service prints a warning naming the mode and bind address;
 - the role-scoped session capabilities and encrypted peer handshake remain in
-  force; “no account auth” must not mean unauthenticated media datagrams.
+  force; no account authentication must not mean unauthenticated media
+  datagrams.
+
+Private or RFC1918 addressing is a network-location constraint, not an identity
+or authentication boundary. Any device that can reach the explicit bind may
+attempt management operations, so this mode is for a trusted LAN only and must
+not be exposed through port forwarding, a public interface, or a reverse proxy.
 
 The existing `OPENSTREAM_ALLOW_NO_AUTH=1` loopback-only mode remains available
-for tests. It is not widened by this design. Private-LAN mode is opt-in and
+for tests. It is not widened by this design. Trusted LAN mode is opt-in and
 must fail closed if the bind is missing, wildcard, public, or malformed.
 
 The normal product UI may hide account screens in private-LAN mode, but the
@@ -126,6 +132,9 @@ returns a recoverable error.
 
 Environment variables remain developer/headless overrides. Overrides are
 parsed through the same validators and are never persisted back to the file.
+The persistent host agent accepts only a validated `OPENSTREAM_PAIRING_FILE`
+path. `OPENSTREAM_PAIRING_JSON` is not accepted or propagated by that agent;
+it remains a developer-only override for separate one-shot/reference flows.
 
 ## Domain state and commands
 

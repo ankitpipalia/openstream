@@ -1,10 +1,13 @@
 # OpenStream Local-First Production MVP Implementation Plan
 
+> **Status:** implementation complete locally; production review hardening
+> complete; protected PR CI pending as of 2026-09-12.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Productize the tested Linux-host/Apple-Silicon-client path with persistent local-first control, a background host agent, typed diagnostics, and secure-mode compatibility.
 
-**Architecture:** Keep transport/media crates independent. Add dependency-light settings and domain crates above them, expose a bounded Unix-socket IPC protocol, and make a host agent supervise the proven FFmpeg fallback. Private-LAN no-account mode is explicit and constrained; encrypted session capabilities and secure bearer-token mode remain intact.
+**Architecture:** Keep transport/media crates independent. Add dependency-light settings and domain crates above them, expose a bounded Unix-socket IPC protocol, and make a host agent supervise the proven FFmpeg fallback. Trusted LAN mode - no account authentication - is explicit and constrained; encrypted session capabilities and secure bearer-token mode remain intact.
 
 **Tech Stack:** Rust 2024, serde/JSON, Tokio, Unix-domain sockets on Linux/macOS, existing `openstream-client-core`, `openstream-ffmpeg-host`, `openstream-platform`, systemd units, shell acceptance fixtures.
 
@@ -13,7 +16,7 @@
 ## Global Constraints
 
 - Keep the existing OpenStream wire format and `PeerSession` transport boundary unchanged unless a task explicitly requires a compatible extension.
-- `OPENSTREAM_ALLOW_NO_AUTH=1` remains loopback-only; private-LAN no-account mode requires `OPENSTREAM_LOCAL_NO_AUTH=1` and one explicit RFC1918/ULA/link-local bind.
+- `OPENSTREAM_ALLOW_NO_AUTH=1` remains loopback-only; Trusted LAN mode - no account authentication - requires `OPENSTREAM_LOCAL_NO_AUTH=1` and one explicit RFC1918/ULA/link-local bind. Private addressing is not an identity or authentication boundary.
 - Role-scoped session capabilities and encrypted peer identity remain required even when account/admin authentication is disabled.
 - Settings files contain no bearer tokens, pairing JSON, private keys, TURN passwords, relay tickets, clipboard content, audio, or frame data.
 - Environment variables are validated developer/headless overrides and are never persisted automatically.
@@ -67,7 +70,7 @@
 
 **Expected result:** UI, agent, and future control-server adapters can share one state model without embedding transport logic in the frontend.
 
-### Task 3: Add explicit private-LAN no-account signaling mode
+### Task 3: Add explicit Trusted LAN mode - no account authentication
 
 **Files:**
 - Modify: `engine/lowlat/crates/signal-server/src/main.rs`
@@ -186,16 +189,16 @@
 
 - [x] Step 1: Add failing redaction tests for tokens, keys, pairing JSON, clipboard, and user paths.
 - [x] Step 2: Implement bounded JSON/text export and artifact checks; no raw log or settings file is copied without redaction.
-- [x] Step 3: Add CI checks for settings/app-core/local-ipc/agent, C/C++ ABI, cargo-deny, secret scanning, release artifact existence, and Linux/macOS fallback documentation.
-- [x] Step 4: Run the complete local release gate and retain the recorded physical Linux NVIDIA -> macOS acceptance without claiming native DRM/zero-copy.
+- [x] Step 3: Add CI checks for settings/app-core/local-ipc/agent, C/C++ ABI, cargo-deny, secret scanning, artifact manifest/presence validation, and Linux/macOS fallback documentation.
+- [x] Step 4: Run the complete local release gate and retain the recorded physical Linux NVIDIA -> macOS acceptance without claiming native DRM/zero-copy. Package signatures, notarization, checksums/SBOM, package launch, upgrade/rollback, and package-integrity gates remain deferred.
 - [x] Step 5: Commit `chore: add production MVP diagnostics and release gates`.
 
-**Expected result:** The release artifact is tested as an operator would use it, and support bundles cannot leak credentials or user content.
+**Expected result:** The release artifact manifest/presence checks identify the operator-facing outputs, and support bundles cannot leak credentials or user content. Full signed-package validation remains a later release gate.
 
 ## Self-review checklist
 
 - [x] Scope is decomposed into independently testable settings, domain, auth, IPC, agent, launch, device, and release tasks.
-- [x] Private-LAN no-account mode is explicit, private-address constrained, and does not remove encrypted session capabilities.
+- [x] Trusted LAN mode - no account authentication is explicit, private-address constrained, and does not remove encrypted session capabilities.
 - [x] Secure deployment mode remains the default outside explicit local/test binds.
 - [x] Native DRM/VideoToolbox/zero-copy and WAN claims remain separate acceptance gates.
 - [x] Each task has concrete files, interfaces, tests, commands, and a commit boundary.

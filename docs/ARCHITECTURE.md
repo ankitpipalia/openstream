@@ -136,15 +136,16 @@ orchestration, and supplies packet evidence to the policy. The portable
 `PeerSession` now uses the same policy boundary without depending on lowlat
 I/O or `webrtc-ice` details.
 
-Portable `PeerSession` owns a bounded class-aware outbound scheduler and a
-channel-254 transport-meta ACK path. A fixed delivery-history ring records
-authenticated sent-packet evidence and exposes aggregate plus video/audio/
-critical snapshots with generation-scoped SRTT, delivery rate, in-flight,
-stale, and retry observations. ACKs are coalesced and non-ack-eliciting;
-application `send()` routes established media/control traffic through the
-scheduler, while only typed setup/path-control operations use immediate I/O.
-All four portable consumers (FFmpeg host, reference peer, client, and desktop
-client) use the queue/flush/wake API.
+Portable `PeerSession` owns the common bounded class-aware outbound scheduler
+and a channel-254 transport-meta ACK path. A fixed delivery-history ring
+records authenticated sent-packet evidence and exposes aggregate plus
+video/audio/critical snapshots with generation-scoped SRTT, delivery rate,
+in-flight, stale, and retry observations. ACKs are coalesced and
+non-ack-eliciting; application `send()` routes established media/control
+traffic through the scheduler, while only typed setup/path-control operations
+use immediate I/O. All four portable consumers (FFmpeg host, reference peer,
+client, and desktop client) use the queue/flush/wake API, so the portable path
+is scheduled and paced rather than an unpaced fixed-rate socket path.
 
 These packet observations are local diagnostics and path-pressure evidence,
 not fabricated peer delivery claims. The portable encoder remains driven by
@@ -153,7 +154,9 @@ themselves change its bitrate. Portable transport starts at the 1200-byte
 sealed-datagram ceiling and does not yet implement portable DPLPMTUD. The
 lowlat and portable backends therefore share policy semantics and scheduling
 contracts, while their path I/O and remaining PMTU/media capabilities stay
-separate.
+separate. The portable FFmpeg encoder has no live-rate ABI; its bounded
+rolling restart remains opt-in through
+`OPENSTREAM_FFMPEG_RECONFIGURE=restart` and starts with a fresh IDR.
 
 `openstream-ffmpeg-host` is the first real cross-platform source adapter. It
 invokes FFmpeg as an external process, using the explicit `x11grab` or

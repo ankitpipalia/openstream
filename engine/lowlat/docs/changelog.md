@@ -3,6 +3,35 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## 2026-09-12 - Production MVP hardening status
+
+The production-MVP review hardening is complete locally. Named diagnostic
+settings now use field-aware redaction in both JSON and text exports, including
+tokens, credentials, private keys, clipboard content, and user paths. The
+host-agent lifecycle now keeps a child in `Stopping` until termination is
+observed and reaped, escalates after a bounded grace period, and contains Unix
+process-group descendants. Windows settings replacement preserves the existing
+destination while using a replacement primitive; Unix directory durability is
+best effort after the atomic rename.
+
+Linux native-DRM readiness is now obtained from one shared library-level probe
+used by both host preflight and the persistent agent. The legacy readiness
+environment flag cannot select a backend; the known-good X11/FFmpeg/NVENC
+fallback remains the truthful choice when the probe is unavailable. The
+persistent agent accepts only a validated `OPENSTREAM_PAIRING_FILE` path,
+removes inherited pairing variables, and does not accept or propagate raw
+`OPENSTREAM_PAIRING_JSON`. Windows pairing-file consumption also rejects
+reparse points, and diagnostic/configuration debug output remains secret-free.
+
+Task-level verification included focused diagnostics, host-agent, settings,
+host/preflight, client-core, IPC, formatting, Clippy, target checks, and
+diff checks. Repository documentation checks and the exact protected PR CI
+run remain the final remote gate for this status. The current release script
+is only artifact manifest/presence validation; package signatures,
+notarization, checksums/SBOM, package launch, upgrade/rollback, and full
+package-integrity checks remain deferred, along with native DRM hardware
+acceptance, native zero-copy media, WAN/TURN, durable accounts, and product UI.
+
 ## Production MVP diagnostics and capability gates
 
 Added the dependency-light `openstream-diagnostics` crate with bounded,
@@ -18,8 +47,9 @@ only behind explicit input/gamepad policy and a successful uinput probe.
 Unimplemented Windows/macOS virtual devices, tablets, virtual microphones,
 virtual displays, and USB passthrough are never advertised as ready.
 
-Release validation now checks operator-facing artifacts, required acceptance
-documentation, and the committed source tree with gitleaks. The recorded
+Repository/release checks validate the operator-facing artifact manifest and
+required acceptance documentation, and scan the committed source tree with
+gitleaks. The recorded
 Linux NVIDIA -> Apple Silicon macOS acceptance remains explicitly scoped to
 the X11/FFmpeg/NVENC fallback and current BGRA/wgpu presentation path; it does
 not claim native DRM capture, VideoToolbox media, decoded-frame zero-copy, or
