@@ -215,26 +215,26 @@ mod unix_main {
                     events,
                 }
             }
-            Err(error) => AgentIpcResponse::Error {
-                version: HOST_AGENT_PROTOCOL_VERSION,
-                request_id,
-                code: error_code(&guard, error),
-                retryable: error_code(&guard, error).retryable(),
-            },
+            Err(error) => {
+                let code = error_code(guard.health(Instant::now()).last_error, error);
+                AgentIpcResponse::Error {
+                    version: HOST_AGENT_PROTOCOL_VERSION,
+                    request_id,
+                    code,
+                    retryable: code.retryable(),
+                }
+            }
         }
     }
 
-    fn error_code(agent: &HostAgent, error: AgentError) -> HostErrorCode {
-        agent
-            .health(Instant::now())
-            .last_error
-            .unwrap_or(match error {
-                AgentError::InvalidConfig => HostErrorCode::InvalidConfig,
-                AgentError::SpawnFailed => HostErrorCode::SpawnFailed,
-                AgentError::ChildIo(_) => HostErrorCode::ChildFailed,
-                AgentError::StopFailed => HostErrorCode::StopFailed,
-                AgentError::UnsupportedPlatform => HostErrorCode::InvalidConfig,
-            })
+    fn error_code(_last_error: Option<HostErrorCode>, error: AgentError) -> HostErrorCode {
+        match error {
+            AgentError::InvalidConfig => HostErrorCode::InvalidConfig,
+            AgentError::SpawnFailed => HostErrorCode::SpawnFailed,
+            AgentError::ChildIo(_) => HostErrorCode::ChildFailed,
+            AgentError::StopFailed => HostErrorCode::StopFailed,
+            AgentError::UnsupportedPlatform => HostErrorCode::InvalidConfig,
+        }
     }
 
     fn log_events(events: &[openstream_host_agent::HostAgentEvent]) {
@@ -321,6 +321,23 @@ mod unix_main {
             .unwrap_or_else(|| OsString::from("/tmp"));
         let base = PathBuf::from(base);
         Ok(base.join("openstream").join("host-agent.sock"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::error_code;
+        use openstream_host_agent::{AgentError, HostErrorCode};
+
+        #[test]
+        fn current_typed_error_wins_over_stale_health_error() {
+            assert_eq!(
+                error_code(
+                    Some(HostErrorCode::LifetimeExceeded),
+                    AgentError::StopFailed,
+                ),
+                HostErrorCode::StopFailed
+            );
+        }
     }
 }
 
