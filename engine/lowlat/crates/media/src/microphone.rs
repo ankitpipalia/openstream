@@ -39,6 +39,14 @@ pub struct GuestMicSink {
 }
 
 impl GuestMicSink {
+    /// Whether the built-in bounded Opus decoder can be constructed.
+    ///
+    /// This reports the implemented guest-microphone transport sink only; it
+    /// does not claim that an OS-level virtual microphone endpoint exists.
+    pub fn decoder_available() -> bool {
+        lowlat_audio::Decoder::new().is_ok()
+    }
+
     /// Build the intake from the negotiated/policy decision and the optional
     /// `OPENSTREAM_MIC_SINK` path. A sink path is opened only after the
     /// microphone grant is true.

@@ -10,8 +10,8 @@ clients.
 
 | Platform | Host | Client | Initial backend |
 |---|---:|---:|---|
-| Linux x86-64 | yes | yes | Native lowlat path plus FFmpeg X11/PipeWire profiles; uinput |
-| Linux arm64 | yes | yes | Native lowlat path plus FFmpeg X11/PipeWire profiles; uinput |
+| Linux x86-64 | yes | yes | Native lowlat path plus FFmpeg X11/PipeWire profiles; uinput with explicit policy and runtime probe |
+| Linux arm64 | yes | yes | Native lowlat path plus FFmpeg X11/PipeWire profiles; uinput with explicit policy and runtime probe |
 | Windows x86-64 | yes | yes | FFmpeg GDI profile now; Desktop Duplication/encoders next |
 | Windows arm64 | yes | yes | FFmpeg GDI profile now; Windows capture APIs next |
 | macOS x86-64 | yes | yes | FFmpeg AVFoundation profile now; ScreenCaptureKit/VideoToolbox next |
@@ -20,8 +20,15 @@ clients.
 | Android x86-64 | no | yes | MediaCodec, native transport; emulator/desktop ABI |
 | iOS arm64 | no | yes | VideoToolbox, native transport |
 
-“Host” and “client” are separate capabilities. A mobile build never exposes
+"Host" and "client" are separate capabilities. A mobile build never exposes
 host capture or input-injection privileges.
+
+Device capability truth is tracked locally in a separate catalog from the
+coarse wire capability booleans. Each entry records protocol support,
+implementation status, runtime availability, and hardware validation. A host
+advertises a device feature only when protocol support, a real adapter, and a
+successful bounded runtime probe are all present. Hardware-tested is reported
+separately and is never inferred from a unit test, compile check, or API link.
 
 ## Control plane
 
@@ -46,9 +53,11 @@ desktop and mobile front ends.
 
 Its `PeerSession` owns candidate exchange, role-scoped key exchange, and the
 encrypted UDP socket. After transport setup it runs the versioned capability
-handshake and returns the negotiated codec, audio, dimensions, FPS, input,
-video-depth/chroma, clipboard, microphone, multi-monitor, pen, and rumble
-policy. `PeerSession::connection_path()` exposes redacted local diagnostics
+handshake and returns the negotiated codec, audio, dimensions, FPS, basic
+input, video-depth/chroma, clipboard, guest microphone, multi-monitor, pen,
+and rumble policy. The `input` bit means only the basic keyboard, pointer, and
+wheel path; it is not a promise that gamepad or tablet events are supported.
+`PeerSession::connection_path()` exposes redacted local diagnostics
 for whether direct UDP, a project relay, or full ICE was selected. The Linux
 host and FFmpeg host log that value without logging addresses or credentials.
 The Linux host adapter and headless client consume that same session object,
@@ -158,10 +167,20 @@ keyboard, pointer, wheel, and gamepad events through the shared `OI` envelope.
 `openstream-ffmpeg-host` consumes those authenticated `OI` events through the
 reliable control channel and translates basic keyboard, pointer, and wheel
 input using Linux `uinput`, Windows `SendInput`, or macOS CoreGraphics HID
-events when `OPENSTREAM_ENABLE_INPUT=1`. Native capture, hardware encoding,
-exact Direct3D11 semantics, and platform audio sinks remain separate open
-adapters; an optional `OPENSTREAM_AUDIO_PLAYER` process provides a portable
-desktop PCM sink during development.
+events. Basic input is negotiated only after `OPENSTREAM_ENABLE_INPUT=1` and
+the host adapter's runtime probe succeed. Linux gamepad injection additionally
+requires `OPENSTREAM_GAMEPAD=1`; the Linux injector permissions are set from
+both grants, while unsupported gamepad and tablet events are rejected before
+they reach an OS API. Windows and macOS have no virtual gamepad or full tablet
+adapter in this build, so those features are not advertised. The
+`microphone` capability is guest microphone transport and contained decode,
+not an OS virtual microphone endpoint. Existing-monitor selection is not
+virtual-display creation. Virtual microphones, virtual displays, USB
+passthrough, and other privileged device adapters remain unimplemented and
+are not advertised. Native capture, hardware encoding, exact Direct3D11
+semantics, and platform audio sinks remain separate open adapters; an
+optional `OPENSTREAM_AUDIO_PLAYER` process provides a portable desktop PCM
+sink during development.
 
 ## Optional mature backend
 
@@ -239,10 +258,19 @@ adapters are selected at compile time and reported at runtime:
   Duplication first and Windows Graphics Capture later are the native path.
 - macOS capture: the current external backend supports AVFoundation;
   ScreenCaptureKit, VideoToolbox encode, and Metal render are the native path.
-- Linux input: `/dev/uinput` and libevdev; XTest is only an X11 fallback.
-- Windows input: SendInput first; virtual gamepads are isolated behind an
-  optional driver adapter.
-- macOS input: CGEvent with explicit Accessibility permission.
+- Linux input: `/dev/uinput` is opened only after the explicit input policy is
+  enabled and the runtime probe succeeds; gamepads also require the explicit
+  gamepad policy. A failed probe withholds the basic input and gamepad
+  capability from negotiation.
+- Windows input: SendInput provides basic keyboard and pointer events. There
+  is no virtual gamepad, tablet, virtual microphone, virtual display, or USB
+  adapter to advertise in this build.
+- macOS input: CGEvent provides basic keyboard and pointer events after the
+  host OS permits them. There is no virtual gamepad, tablet, virtual
+  microphone, virtual display, or USB adapter to advertise in this build.
+- Multi-monitor: the capability covers discovery and selection of existing
+  outputs only. OS-level virtual monitor creation is a separate, unsupported
+  adapter.
 - Android/iOS: native decoder and input clients only.
 
 ## Security boundaries

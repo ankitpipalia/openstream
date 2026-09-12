@@ -41,6 +41,35 @@ pub enum InputKind {
     PenProximity = 11,
 }
 
+/// The local adapter family required by an input event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputCapability {
+    /// Keyboard, pointer, and wheel events use the basic input adapter.
+    BasicInput,
+    /// Gamepad events require a host-side virtual-controller adapter.
+    Gamepad,
+    /// Pen events require an adapter that preserves tablet semantics.
+    Tablet,
+}
+
+impl InputKind {
+    /// Identify the adapter family before an event reaches an OS API.
+    #[must_use]
+    pub const fn capability(self) -> InputCapability {
+        match self {
+            Self::GamepadButton | Self::GamepadAxis | Self::GamepadUnplug => {
+                InputCapability::Gamepad
+            }
+            Self::PenMotion | Self::PenButton | Self::PenProximity => InputCapability::Tablet,
+            Self::Keyboard
+            | Self::PointerMotion
+            | Self::PointerButton
+            | Self::Wheel
+            | Self::Release => InputCapability::BasicInput,
+        }
+    }
+}
+
 impl TryFrom<u8> for InputKind {
     type Error = Error;
 
@@ -442,7 +471,20 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FLAG_RELATIVE, InputEvent, InputKind, RumbleEvent};
+    use super::{FLAG_RELATIVE, InputCapability, InputEvent, InputKind, RumbleEvent};
+
+    #[test]
+    fn input_kinds_select_the_required_device_adapter() {
+        assert_eq!(
+            InputKind::Keyboard.capability(),
+            InputCapability::BasicInput
+        );
+        assert_eq!(
+            InputKind::GamepadAxis.capability(),
+            InputCapability::Gamepad
+        );
+        assert_eq!(InputKind::PenMotion.capability(), InputCapability::Tablet);
+    }
 
     #[test]
     fn all_event_fields_round_trip_in_the_fixed_envelope() {

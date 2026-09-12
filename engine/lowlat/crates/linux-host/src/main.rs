@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     use lowlat::display::Display as NativeDisplay;
     use lowlat::stream::{Backend, Codec, Config, Quality, Stream};
-    use lowlat_inject::event::{Extents, Injector};
+    use lowlat_inject::event::{Extents, Injector, Permissions};
     use lowlat_inject::uinput::Devices;
     use openstream_client_core::{
         Capabilities, PeerSession, ReliableControl, Role, VideoCodec,
@@ -41,6 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     use openstream_platform::clipboard as platform_clipboard;
     use openstream_platform::clipboard_policy::ClipboardPolicy;
+    use openstream_platform::policy::{
+        HostCapabilityProbes, HostDeviceCapabilities, RuntimeAvailability, UnavailableReason,
+    };
     use openstream_protocol::Kind;
 
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
@@ -75,9 +78,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{}", host_policy.log_line());
     let clipboard_policy = ClipboardPolicy::from_env();
     eprintln!("{}", clipboard_policy.log_line());
-    let input_enabled = host_policy.input;
+    let input_probe = if host_policy.input {
+        match Devices::probe() {
+            Ok(()) => RuntimeAvailability::Available,
+            Err(error) => RuntimeAvailability::Unavailable(match error {
+                lowlat_inject::uinput::Error::NoModule => UnavailableReason::DeviceUnavailable,
+                lowlat_inject::uinput::Error::NotPermitted => UnavailableReason::PermissionDenied,
+                lowlat_inject::uinput::Error::Confined(_)
+                | lowlat_inject::uinput::Error::Failed(_) => UnavailableReason::OsApiUnavailable,
+            }),
+        }
+    } else {
+        RuntimeAvailability::Unavailable(UnavailableReason::DisabledByPolicy)
+    };
+    let device_capabilities = HostDeviceCapabilities::discover(
+        host_policy,
+        HostCapabilityProbes {
+            input: input_probe,
+            clipboard: if platform_clipboard::available() {
+                RuntimeAvailability::Available
+            } else {
+                RuntimeAvailability::Unavailable(UnavailableReason::DeviceUnavailable)
+            },
+            microphone: if GuestMicSink::decoder_available() {
+                RuntimeAvailability::Available
+            } else {
+                RuntimeAvailability::Unavailable(UnavailableReason::OsApiUnavailable)
+            },
+        },
+    );
+    eprintln!("{}", device_capabilities.log_line());
+    let input_enabled = device_capabilities.input.can_advertise();
+    let gamepad_enabled = device_capabilities.gamepad.can_advertise();
+    let microphone_enabled = device_capabilities.microphone.can_advertise();
     let audio_requested = env::var("OPENSTREAM_AUDIO").as_deref() == Ok("1");
-    let clipboard_requested = host_policy.clipboard;
+    let clipboard_enabled = device_capabilities.clipboard.can_advertise();
     let native_outputs = NativeDisplay::outputs();
     let output = env::var("LOWLAT_OUTPUT").ok();
     if let Some(requested) = output.as_deref()
@@ -93,9 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut host_capabilities = Capabilities::host_with_limits(1920, 1080, 60);
     host_capabilities.video_codecs = vec![VideoCodec::H264];
     host_capabilities.input = input_enabled;
-    host_capabilities.rumble = host_policy.gamepad;
-    host_capabilities.clipboard = clipboard_requested && platform_clipboard::available();
-    host_capabilities.microphone = host_policy.microphone;
+    host_capabilities.rumble = gamepad_enabled;
+    host_capabilities.pen = device_capabilities.tablet.can_advertise();
+    host_capabilities.clipboard = clipboard_enabled;
+    host_capabilities.microphone = microphone_enabled;
     host_capabilities.multi_monitor = native_outputs.len() > 1;
     if !audio_requested {
         host_capabilities.audio_codecs.clear();
@@ -111,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // as the external FFmpeg adapter. With no sink path this still validates
     // and counts decoded frames, which makes the negotiated capability honest
     // without silently injecting audio into an OS device.
-    let mut mic_sink = GuestMicSink::from_env(negotiated.microphone && host_policy.microphone);
+    let mut mic_sink = GuestMicSink::from_env(negotiated.microphone && microphone_enabled);
     if mic_sink.accepting() {
         eprintln!("OpenStream native guest microphone intake enabled");
     }
@@ -160,7 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_on: audio_enabled,
         // The native seat takes the guest microphone only when negotiated
         // and explicitly allowed by host policy.
-        accept_microphone: negotiated.microphone && host_policy.microphone,
+        accept_microphone: negotiated.microphone && microphone_enabled,
         audio_kbps,
         allow_raw_audio: false,
         output: output.clone(),
@@ -194,13 +230,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut input = if input_enabled {
-        Some((
-            Injector::new(Extents::alone(
-                u32::from(negotiated.width),
-                u32::from(negotiated.height),
-            )),
-            Devices::create("openstream")?,
-        ))
+        let mut injector = Injector::new(Extents::alone(
+            u32::from(negotiated.width),
+            u32::from(negotiated.height),
+        ));
+        let mut devices = Devices::create("openstream")?;
+        injector.set_permissions(
+            Permissions::from_host_grants(input_enabled, gamepad_enabled),
+            &mut devices,
+        );
+        Some((injector, devices))
     } else {
         None
     };
@@ -275,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 && payload != b"openstream/end"
                                 && let Some((injector, devices)) = input.as_mut()
                             {
-                                apply_input_payload(&payload, injector, devices);
+                                apply_input_payload(&payload, injector, devices, gamepad_enabled);
                             }
                         }
                         continue;
@@ -729,8 +768,9 @@ fn command_probe(program: &str, args: &[&str]) -> serde_json::Value {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{command_probe, decode_output_selection, native_topology};
+    use super::{command_probe, decode_output_selection, input_event_allowed, native_topology};
     use lowlat::display::Selectable;
+    use openstream_media::input::InputEvent;
 
     #[test]
     fn command_probe_reports_a_fixed_successful_command() {
@@ -794,6 +834,26 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn native_input_rejects_unimplemented_advanced_events() {
+        assert!(input_event_allowed(
+            InputEvent::keyboard(4, 0, true, 0),
+            false
+        ));
+        assert!(!input_event_allowed(
+            InputEvent::gamepad_button(0, 0, true, 0),
+            false
+        ));
+        assert!(input_event_allowed(
+            InputEvent::gamepad_button(0, 0, true, 0),
+            true
+        ));
+        assert!(!input_event_allowed(
+            InputEvent::pen_motion(0, 100, 100, 0, false),
+            true
+        ));
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -852,8 +912,13 @@ fn apply_input_payload(
     payload: &[u8],
     injector: &mut lowlat_inject::event::Injector,
     devices: &mut lowlat_inject::uinput::Devices,
+    gamepad_enabled: bool,
 ) {
     if let Ok(event) = openstream_media::input::InputEvent::decode(payload) {
+        if !input_event_allowed(event, gamepad_enabled) {
+            eprintln!("OpenStream rejected an input event without a local adapter");
+            return;
+        }
         let fields = event.lowlat_fields();
         if fields.opcode == lowlat_core::control::op::RELEASE {
             injector.release_all(devices);
@@ -879,5 +944,14 @@ fn apply_input_payload(
     // clients migrate to the project-owned OI envelope.
     if let Ok(control) = lowlat_core::control::parse(payload) {
         injector.on_control(&control, devices);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn input_event_allowed(event: openstream_media::input::InputEvent, gamepad_enabled: bool) -> bool {
+    match event.kind.capability() {
+        openstream_media::input::InputCapability::BasicInput => true,
+        openstream_media::input::InputCapability::Gamepad => gamepad_enabled,
+        openstream_media::input::InputCapability::Tablet => false,
     }
 }
