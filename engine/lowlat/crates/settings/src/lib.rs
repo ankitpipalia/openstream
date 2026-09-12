@@ -336,7 +336,7 @@ pub struct AudioConfig {
     pub latency_mode: AudioLatencyMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct InputConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -685,10 +685,10 @@ fn apply_profile_policy(
     if source.video.fps == baseline.video.fps {
         effective.video.fps = policy.video.fps;
     }
-    if source.video.bitrate_mbps == baseline.video.bitrate_mbps {
+    if source.video.bitrate_mbps.to_bits() == baseline.video.bitrate_mbps.to_bits() {
         effective.video.bitrate_mbps = policy.video.bitrate_mbps;
     }
-    if source.video.min_bitrate_mbps == baseline.video.min_bitrate_mbps {
+    if source.video.min_bitrate_mbps.to_bits() == baseline.video.min_bitrate_mbps.to_bits() {
         effective.video.min_bitrate_mbps = policy.video.min_bitrate_mbps;
     }
     if source.video.codec == baseline.video.codec {
@@ -1425,19 +1425,6 @@ impl Default for PrivacyConfig {
         }
     }
 }
-impl Default for InputConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            keyboard: false,
-            mouse: false,
-            clipboard: false,
-            gamepad: false,
-            microphone: false,
-        }
-    }
-}
-
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
