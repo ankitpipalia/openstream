@@ -1,0 +1,24 @@
+[package]
+name = "openstream-host-agent"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "openstream-host-agent"
+path = "src/main.rs"
+
+[dependencies]
+openstream-app-core = { path = "../app-core" }
+openstream-local-ipc = { path = "../local-ipc" }
+openstream-settings = { path = "../settings" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

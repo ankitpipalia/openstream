@@ -6,6 +6,9 @@ These templates are intentionally explicit about the current boundary:
   signaling process behind a TLS reverse proxy;
 - `openstream-ffmpeg-host.service` runs the desktop host adapter as a user
   service, where it can access the graphical session and FFmpeg capture source;
+- `openstream-host-agent.service` owns and supervises the FFmpeg host child,
+  exposes bounded health/lifecycle IPC, and survives a desktop-shell restart;
+  use this unit for persistent hosting;
 - `openstream-linux-host.service` runs the native Linux display/encoder and
   optional uinput adapter as a user service inside the graphical session;
   `openstream-linux-host-system.service` is the unattended variant that runs
@@ -19,10 +22,31 @@ These templates are intentionally explicit about the current boundary:
 - `turnserver.conf.example` provides a coturn deployment profile for the
   optional full-ICE/TURN client path in `openstream-client-core`.
 
-Build release binaries from `engine/lowlat`, install them as
-`openstream-signal-server` and `openstream-ffmpeg-host`, then copy the units
-into the appropriate systemd unit directory. Put only short-lived pairing
-material in `%h/.config/openstream/host.env`; do not commit it.
+Build release binaries from `engine/lowlat`, install
+`openstream-signal-server`, `openstream-ffmpeg-host`, and
+`openstream-host-agent`, then copy the units into the appropriate systemd
+unit directory. The agent unit is the persistent entrypoint; the direct
+FFmpeg unit remains useful for compatibility and diagnostics. Create
+`%h/.config/openstream/host.env` with mode `0600` and put only short-lived
+runtime values there; do not commit it. Pairing JSON is passed to the child
+through the protected environment boundary and is never placed in an
+`ExecStart` argument or ordinary settings.
+
+For a user service, enable the persistent agent with:
+
+```sh
+install -m 0755 target/release/openstream-host-agent ~/.local/bin/
+install -m 0755 target/release/openstream-ffmpeg-host ~/.local/bin/
+install -m 0644 deploy/openstream-host-agent.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now openstream-host-agent.service
+```
+
+The agent socket defaults to `%t/openstream/host-agent.sock`; override it
+with `OPENSTREAM_HOST_AGENT_SOCKET` only when the parent directory remains
+private. The agent rejects an active endpoint and safely removes only a
+refused stale socket after a crash; it never unlinks an active or unrelated
+path.
 
 Set `OPENSTREAM_ADMIN_TOKEN` in `/etc/openstream/signal.env` for any deployment
 that is reachable beyond a trusted local development machine. Send

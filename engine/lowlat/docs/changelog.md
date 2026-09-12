@@ -3,6 +3,22 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Persistent host-agent supervision
+
+Added `openstream-host-agent`, a bounded Tokio supervisor for the proven
+external-FFmpeg host. It owns a validated argv/environment specification,
+classifies child exits, applies deterministic exponential restart backoff,
+enforces an optional child lifetime, and exposes redacted typed health rather
+than raw process output.
+
+The agent serves lifecycle and health commands over a private Unix-domain
+socket using the bounded `openstream-local-ipc` framing layer. It performs a
+safe active-endpoint probe before removing only a refused stale socket, keeps
+the desktop shell independent from host lifetime, and shuts down the managed
+child on SIGINT/SIGTERM or an IPC shutdown command. Native DRM is never
+reported as selected without an explicit positive preflight result; the
+current persistent child path remains the X11/PipeWire/FFmpeg fallback.
+
 ## Linux NVIDIA host to Apple Silicon macOS client acceptance
 
 The documented fallback MVP now has a physical Linux-host/macOS-client

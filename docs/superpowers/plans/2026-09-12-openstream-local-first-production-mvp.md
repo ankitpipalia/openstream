@@ -63,7 +63,7 @@
 - [x] Step 3: Implement the bounded state machine and command/event types with serde-safe data that excludes credentials and user content.
 - [x] Step 4: Implement permission intersection so requested grants can only reduce to host policy/capability, never escalate; reject expired or duplicate request IDs.
 - [x] Step 5: Run focused tests, Clippy, and a serde round-trip test suite.
-- [ ] Step 6: Commit `feat: add OpenStream application domain state`.
+- [x] Step 6: Commit `feat: add OpenStream application domain state`.
 
 **Expected result:** UI, agent, and future control-server adapters can share one state model without embedding transport logic in the frontend.
 
@@ -85,7 +85,7 @@
 - [x] Step 4: Make management authorization bypass apply only to the explicitly scoped local mode; keep WebSocket/relay role bearer checks unchanged.
 - [x] Step 5: Add a redacted startup warning and docs with a prominent LAN-trust warning and secure-mode migration path.
 - [x] Step 6: Run focused signal tests, startup-order smoke, full workspace tests, and Clippy.
-- [ ] Step 7: Commit `feat: add explicit private-LAN development mode`.
+- [x] Step 7: Commit `feat: add explicit private-LAN development mode`.
 
 **Expected result:** Local devices can use the product without account login, but an accidental public/wildcard unauthenticated deployment fails closed.
 
@@ -124,14 +124,14 @@
 - Produces `HostAgent`, `HostAgentCommand`, `HostAgentEvent`, `HostAgentConfig`, `ChildPolicy`, and `HostHealth`.
 - Uses `openstream-settings`, `openstream-app-core`, `local-ipc`, and a typed child-command builder; it never concatenates shell commands.
 
-- [ ] Step 1: Add failing tests for start/stop idempotence, child exit classification, bounded restart backoff, stop-before-restart, status snapshots, and secret-redacted diagnostics.
-- [ ] Step 2: Run focused tests and verify failure.
-- [ ] Step 3: Implement the supervisor around the existing `openstream-ffmpeg-host` executable with validated environment/config projection and bounded child lifetime.
-- [ ] Step 4: Add `run_preflight` and fallback reporting: native DRM is selected only when preflight says reachable; otherwise X11/PipeWire/FFmpeg is explicit.
-- [ ] Step 5: Add Unix IPC serving for lifecycle/status commands and graceful SIGTERM handling; keep UI closure independent from child hosting.
-- [ ] Step 6: Add/update systemd user unit with the agent as `ExecStart`, documented environment-file permissions, restart limits, and no secret command-line arguments.
-- [ ] Step 7: Run unit tests, a two-process local agent fixture, shell syntax, and the documented Linux→macOS hardware fallback check.
-- [ ] Step 8: Commit `feat: add persistent host-agent supervision`.
+- [x] Step 1: Add failing tests for start/stop idempotence, child exit classification, bounded restart backoff, stop-before-restart, status snapshots, and secret-redacted diagnostics.
+- [x] Step 2: Run focused tests and verify failure.
+- [x] Step 3: Implement the supervisor around the existing `openstream-ffmpeg-host` executable with validated environment/config projection and bounded child lifetime.
+- [x] Step 4: Add `run_preflight` and fallback reporting: native DRM is selected only when preflight says reachable; otherwise X11/PipeWire/FFmpeg is explicit.
+- [x] Step 5: Add Unix IPC serving for lifecycle/status commands and graceful SIGTERM handling; keep UI closure independent from child hosting.
+- [x] Step 6: Add/update systemd user unit with the agent as `ExecStart`, documented environment-file permissions, restart limits, and no secret command-line arguments.
+- [x] Step 7: Run unit tests and a two-process local agent fixture. The systemd syntax check is environment-dependent and was unavailable on macOS; the Linux→macOS fallback check remains the physical acceptance gate.
+- [x] Step 8: Commit `feat: add persistent host-agent supervision`.
 
 **Expected result:** Hosting continues when the desktop shell exits, and operator-visible health/fallback state is available through local IPC.
 

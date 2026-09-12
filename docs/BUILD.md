@@ -81,6 +81,25 @@ client reassembled all 164, and the optional audio path produced a valid
 48 kHz stereo `s16le` output file of 1,044,480 bytes. This is a loopback
 acceptance test, not the Linux 1080p60 hardware gate.
 
+## Persistent host agent
+
+For a host that must continue running after the desktop shell closes, install
+and enable `openstream-host-agent.service`. The agent supervises
+`openstream-ffmpeg-host`, polls it without blocking the event loop, applies
+bounded restart backoff, and exposes typed health/lifecycle commands through
+`%t/openstream/host-agent.sock`. The service creates that runtime directory
+with mode `0700`; do not move the socket below a shared or world-writable
+directory.
+
+The agent's child command is an argv vector and never a shell command.
+Pairing material, when needed by the current developer/headless flow, may be
+injected through the protected `host.env` environment file with mode
+`0600`; it is never persisted by application settings or put in an
+`ExecStart` argument. Child diagnostics are intentionally typed/redacted.
+The current agent manages the tested X11/PipeWire plus external-FFmpeg
+fallback. Native DRM is only eligible after a positive preflight result and
+still has its own Linux hardware acceptance gate.
+
 The same host/client demo was rerun with `OPENSTREAM_UPNP=1`; it completed and
 produced valid 1920×1080 H.264 while treating the router mapping as
 best-effort. This verifies the application fallback path on a machine without
