@@ -42,7 +42,10 @@ else
         "openstream-desktop-client"
         "openstream-host-agent"
     )
-    if [[ -z "$target" || "$target" == *linux* ]]; then
+    # An empty target means the host triple, which is only a Linux host on
+    # Linux. Asking a macOS or Windows checkout for the Linux-only host binary
+    # fails a build that was correct.
+    if [[ "$target" == *linux* || ( -z "$target" && "$(uname -s)" == "Linux" ) ]]; then
         required+=("openstream-linux-host")
     fi
 fi
