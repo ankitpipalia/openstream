@@ -151,12 +151,12 @@ fallback. Native DRM is only eligible after a positive preflight result and
 still has its own Linux hardware acceptance gate.
 
 The same host/client demo was rerun with `OPENSTREAM_UPNP=1`; it completed and
-produced valid 1920×1080 H.264 while treating the router mapping as
+produced valid 1920x1080 H.264 while treating the router mapping as
 best-effort. This verifies the application fallback path on a machine without
 a controlled test IGD; it is not evidence of successful physical-router
 mapping.
 
-## Physical Linux NVIDIA → macOS Apple Silicon MVP acceptance
+## Physical Linux NVIDIA -> macOS Apple Silicon MVP acceptance
 
 On 2026-09-12, commit `b407d5474f799ca4b5bca4a50c90eca1454b5763` was tested
 between a SteamOS Linux host and an Apple Silicon macOS client on the same
@@ -201,9 +201,9 @@ Observed environment and results:
 | Linux host | SteamOS Holo, x86_64, kernel `6.16.12-valve24.5-1-neptune-616-gb2f7cfe85e45` |
 | Linux GPU | NVIDIA GeForce GTX 970, driver `580.178.04` |
 | Linux FFmpeg | `n7.1.1`; direct `h264_nvenc` encode smoke passed |
-| Capture/encode | X11 `:0.0` → FFmpeg `h264_nvenc`, 1920×1080, 60 fps, 8 Mbps |
+| Capture/encode | X11 `:0.0` -> FFmpeg `h264_nvenc`, 1920x1080, 60 fps, 8 Mbps |
 | macOS client | macOS `26.6.2`, Apple M1 Max, FFmpeg `9.0.1` |
-| Transport | authenticated direct UDP; H.264 negotiated at 1920×1080/60; audio and input disabled |
+| Transport | authenticated direct UDP; H.264 negotiated at 1920x1080/60; audio and input disabled |
 | Headless media run | 15 seconds; Linux sent 894 encoded chunks and macOS wrote 894 decoded access units |
 | Client transport counters | 908 sent packets / 51,127 sent wire bytes; 1,841 received packets / 104,831 received payload bytes |
 | Host transport counters | 1,841 sent packets / 163,743 sent wire bytes; 908 received packets / 22,071 received payload bytes |
@@ -223,7 +223,7 @@ The macOS application firewall must allow the actual packaged desktop client
 executable to receive the direct UDP response. An unapproved development
 worktree binary failed with `NoReachableCandidate`; the same build ran from an
 allow-listed application path. Do not disable the firewall or use a raw UDP
-preflight as a product workaround—sign/package the client or approve its path
+preflight as a product workaround--sign/package the client or approve its path
 in the normal macOS firewall controls.
 
 This acceptance does not claim native DRM capture, ScreenCaptureKit,
@@ -240,7 +240,7 @@ client-only mobile bridge. The script uses `--locked` and never includes the
 supplied Parsec artifacts.
 
 A separate H.265 loopback selection also passed: the host negotiated H.265,
-sent 112 access units, and `ffprobe` identified the output as 320×240 HEVC at
+sent 112 access units, and `ffprobe` identified the output as 320x240 HEVC at
 25 fps. Native hardware decode/render acceptance remains platform-specific.
 
 The release signaling binary's admin mode was also checked over HTTP: session
@@ -461,15 +461,15 @@ forwards opaque datagrams and does not possess the peer encryption key.
 
 The high-rate release FFmpeg smoke also exercised the bounded-control
 backpressure path: 17,530 encoded H.264 access units were sent and
-reassembled, and `ffprobe` confirmed 320×240 at 25 fps. Capability negotiation
-also reported the actual configured 320×240 stream dimensions to the client.
+reassembled, and `ffprobe` confirmed 320x240 at 25 fps. Capability negotiation
+also reported the actual configured 320x240 stream dimensions to the client.
 Redundant per-frame ACKs now yield to the bounded window instead of turning a
 fast producer into a fatal control error; strict input, keyframe, and session
 controls remain reliable/error-reporting.
 
 After adding the negotiated-size FFmpeg filter, a fresh four-second real-time
 `lavfi` loopback sent 112 H.264 access units from the host and reassembled 111
-on the client; `ffprobe` confirmed the output dimensions remained 320×240.
+on the client; `ffprobe` confirmed the output dimensions remained 320x240.
 The raw Annex-B output has no presentation timestamps, so its guessed frame
 rate is not used as a timing assertion.
 

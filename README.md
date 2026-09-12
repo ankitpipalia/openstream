@@ -30,7 +30,7 @@ deployed with infrastructure that you control.
 - Bounded queues, fuzz targets, CI checks, deployment templates, and detailed
   architecture/protocol documentation.
 - Generation-scoped transport telemetry, a shared frame-feedback adapter, and
-  host-authoritative direct ↔ opaque-relay ↔ direct migration over one
+  host-authoritative direct <-> opaque-relay <-> direct migration over one
   encrypted session. ICE migration reports the typed unsupported result on the
   current `webrtc-ice` boundary.
 
@@ -123,7 +123,7 @@ The report distinguishes DRM/KMS framebuffer reachability, X11/PipeWire
 availability, FFmpeg and hardware candidates, and `/dev/uinput` presence. It
 is diagnostic output, not proof of a live encoder/driver stream.
 
-The physical Linux-NVIDIA → Apple-Silicon macOS MVP acceptance is recorded in
+The physical Linux-NVIDIA -> Apple-Silicon macOS MVP acceptance is recorded in
 [`docs/BUILD.md`](docs/BUILD.md#physical-linux-nvidia--macos-apple-silicon-mvp-acceptance).
 It validates the X11/FFmpeg `h264_nvenc` fallback, direct authenticated UDP,
 the existing FFmpeg decoder, and software/wgpu Metal presentation. This is
@@ -149,7 +149,7 @@ Run the one-session, three-generation migration acceptance:
 ./scripts/ice-migration-capability.sh
 ```
 
-The first command proves direct → application-owned opaque relay → direct;
+The first command proves direct -> application-owned opaque relay -> direct;
 the second reports `UnsupportedIceRestart` for the current
 `webrtc-ice 0.17.2` boundary. Neither command claims external coturn,
 public-NAT, native zero-copy media, or stock Parsec compatibility.
@@ -233,7 +233,7 @@ flows.
 
 The local development path is functional and validated through direct UDP,
 forced relay, authenticated loopback ICE, startup-order-independent direct-v2
-establishment, and a real SteamOS/NVIDIA Linux-host → Apple-Silicon macOS-client
+establishment, and a real SteamOS/NVIDIA Linux-host -> Apple-Silicon macOS-client
 fallback stream. The GitHub workflow also runs the full-ICE loopback, a short
 encrypted FFmpeg media loopback, and the host-checkable mobile acceptance
 harness on Ubuntu. The implementation is not yet a finished product:

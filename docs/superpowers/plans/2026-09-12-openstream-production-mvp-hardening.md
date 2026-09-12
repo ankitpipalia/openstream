@@ -130,7 +130,7 @@
 **Implementation:**
 
 1. Add/update documentation tests or repository checks where practical before editing claims.
-2. Mark the MVP design/plan status as completed locally with review hardening complete/pending protected PR CI, not "implementation in progress," once Tasks 1–5 pass.
+2. Mark the MVP design/plan status as completed locally with review hardening complete/pending protected PR CI, not "implementation in progress," once Tasks 1-5 pass.
 3. Label private-LAN no-account mode as "Trusted LAN mode - no account authentication" and retain a prominent warning that RFC1918/private addressing is not an identity boundary.
 4. Rename/rephrase the current release check as artifact manifest/presence validation; list signing, checksums/SBOM, package launch, upgrade/rollback, and notarization as later release gates rather than claiming they are implemented.
 5. Record the hardening changes, test commands, and known deferred work in the changelog. Keep changed documentation ASCII-clean.

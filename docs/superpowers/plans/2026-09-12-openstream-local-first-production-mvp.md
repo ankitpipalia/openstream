@@ -133,7 +133,7 @@
 - [x] Step 4: Add `run_preflight` and fallback reporting: native DRM is selected only when preflight says reachable; otherwise X11/PipeWire/FFmpeg is explicit.
 - [x] Step 5: Add Unix IPC serving for lifecycle/status commands and graceful SIGTERM handling; keep UI closure independent from child hosting.
 - [x] Step 6: Add/update systemd user unit with the agent as `ExecStart`, documented environment-file permissions, restart limits, and no secret command-line arguments.
-- [x] Step 7: Run unit tests and a two-process local agent fixture. The systemd syntax check is environment-dependent and was unavailable on macOS; the Linux→macOS fallback check remains the physical acceptance gate.
+- [x] Step 7: Run unit tests and a two-process local agent fixture. The systemd syntax check is environment-dependent and was unavailable on macOS; the Linux->macOS fallback check remains the physical acceptance gate.
 - [x] Step 8: Commit `feat: add persistent host-agent supervision`.
 
 **Expected result:** Hosting continues when the desktop shell exits, and operator-visible health/fallback state is available through local IPC.

@@ -83,16 +83,16 @@ remain implemented rather than deleted.
 
 ```text
 signal server / relay
-        │ HTTPS/WSS or explicit private-LAN HTTP/WSS
-        │
-desktop shell ── protected local IPC ── host agent
-        │                                  │
-        │                                  ├─ preflight/capabilities
-        │                                  ├─ capture selection
-        │                                  ├─ FFmpeg fallback host
-        │                                  └─ active host sessions
-        │
-        └──────── session runner / desktop client window
+        | HTTPS/WSS or explicit private-LAN HTTP/WSS
+        |
+desktop shell -- protected local IPC -- host agent
+        |                                  |
+        |                                  +- preflight/capabilities
+        |                                  +- capture selection
+        |                                  +- FFmpeg fallback host
+        |                                  +- active host sessions
+        |
+        +-------- session runner / desktop client window
                  current PeerSession + decoder + presenter
 ```
 
@@ -141,12 +141,12 @@ it remains a developer-only override for separate one-shot/reference flows.
 `openstream-app-core` owns a pure state machine and command/event vocabulary:
 
 ```text
-SignedOut → Authenticating → Ready
-Ready → RequestingConnection → WaitingForApproval → Connecting
-Connecting → Negotiating → Connected
-Connected → Reconnecting → Connected
-Connected → Disconnecting → Ready
-any state → Failed { typed code, retryability }
+SignedOut -> Authenticating -> Ready
+Ready -> RequestingConnection -> WaitingForApproval -> Connecting
+Connecting -> Negotiating -> Connected
+Connected -> Reconnecting -> Connected
+Connected -> Disconnecting -> Ready
+any state -> Failed { typed code, retryability }
 ```
 
 Local mode starts at `Ready` without an account login but still creates a
@@ -187,7 +187,7 @@ Auto encoder selection
   explicit validated NVENC/VAAPI/software profile
 
 agent stop requested
-  stop admission → stop child → release devices → report Ready
+  stop admission -> stop child -> release devices -> report Ready
 ```
 
 On Linux it can run as a systemd user service and, where the operator grants
@@ -233,7 +233,7 @@ The local MVP is accepted only when:
 2. Explicit private-LAN mode works only on a private explicit bind; secure
    mode still rejects missing authorization on non-loopback deployments.
 3. The host agent survives shell exit and reports child/preflight failures.
-4. Linux X11/FFmpeg/NVENC host → Apple-Silicon macOS client streams H.264 over
+4. Linux X11/FFmpeg/NVENC host -> Apple-Silicon macOS client streams H.264 over
    direct LAN UDP with software and Metal presentation, as recorded in
    `docs/BUILD.md`.
 5. Host-first startup, reconnect, session teardown, and permission defaults
