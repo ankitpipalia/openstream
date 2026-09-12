@@ -24,6 +24,7 @@ const MAX_ENV_VALUE_BYTES: usize = 16 * 1024;
 const MAX_PROGRAM_BYTES: usize = 4096;
 /// Hard upper bound for the agent backend label.
 const MAX_BACKEND_BYTES: usize = 128;
+const STOP_GRACE_PERIOD: Duration = Duration::from_secs(2);
 /// The oldest supported host-agent IPC protocol version.
 pub const HOST_AGENT_PROTOCOL_VERSION: u32 = 1;
 
@@ -136,6 +137,7 @@ pub enum ChildState {
     Stopped,
     Starting,
     Ready,
+    Stopping,
     Backoff,
     Failed,
 }
@@ -552,6 +554,9 @@ pub trait ManagedChild: Send {
     fn pid(&self) -> Option<u32>;
     fn try_wait(&mut self) -> Result<Option<ChildExit>, AgentError>;
     fn terminate(&mut self) -> Result<(), AgentError>;
+    fn force_kill(&mut self) -> Result<(), AgentError> {
+        self.terminate()
+    }
 }
 
 /// Factory seam used by tests and future platform-specific launchers.
@@ -581,7 +586,39 @@ impl ManagedChild for TokioManagedChild {
     }
 
     fn terminate(&mut self) -> Result<(), AgentError> {
-        self.child.start_kill().map_err(|_| AgentError::StopFailed)
+        #[cfg(unix)]
+        {
+            signal_process_group(self.child.id(), 15)
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.start_kill().map_err(|_| AgentError::StopFailed)
+        }
+    }
+
+    fn force_kill(&mut self) -> Result<(), AgentError> {
+        #[cfg(unix)]
+        {
+            signal_process_group(self.child.id(), 9)
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.start_kill().map_err(|_| AgentError::StopFailed)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: Option<u32>, signal: i32) -> Result<(), AgentError> {
+    let pid = pid.ok_or(AgentError::StopFailed)?;
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let result = unsafe { kill(-(pid as i32), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(AgentError::StopFailed)
     }
 }
 
@@ -589,6 +626,11 @@ impl ChildFactory for TokioChildFactory {
     fn spawn(&self, spec: &ChildSpec) -> Result<Box<dyn ManagedChild>, AgentError> {
         use std::process::Stdio;
         let mut command = tokio::process::Command::new(spec.program());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
         command
             .args(spec.args())
             .envs(spec.environment())
@@ -713,6 +755,9 @@ pub struct HostAgent<F: ChildFactory = TokioChildFactory> {
     last_exit: Option<ChildExitReason>,
     last_error: Option<HostErrorCode>,
     stop_requested: bool,
+    stop_deadline: Option<Instant>,
+    pending_termination: Option<ChildExitReason>,
+    force_kill_sent: bool,
 }
 
 impl<F: ChildFactory> fmt::Debug for HostAgent<F> {
@@ -749,6 +794,9 @@ impl<F: ChildFactory> HostAgent<F> {
             last_exit: None,
             last_error: None,
             stop_requested: false,
+            stop_deadline: None,
+            pending_termination: None,
+            force_kill_sent: false,
         })
     }
 
@@ -767,7 +815,7 @@ impl<F: ChildFactory> HostAgent<F> {
     pub fn start(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
         if matches!(
             self.state,
-            ChildState::Starting | ChildState::Ready | ChildState::Backoff
+            ChildState::Starting | ChildState::Ready | ChildState::Stopping | ChildState::Backoff
         ) {
             return Ok(Vec::new());
         }
@@ -777,7 +825,7 @@ impl<F: ChildFactory> HostAgent<F> {
         self.spawn(now)
     }
 
-    pub fn stop(&mut self, _now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
+    pub fn stop(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
         if self.state == ChildState::Stopped
             && self.child.is_none()
             && self.next_restart_at.is_none()
@@ -786,24 +834,28 @@ impl<F: ChildFactory> HostAgent<F> {
         }
         self.stop_requested = true;
         self.next_restart_at = None;
-        self.started_at = None;
-        let termination = self
-            .child
-            .as_mut()
-            .map(|child| child.terminate())
-            .transpose();
-        self.child = None;
-        self.state = ChildState::Stopped;
-        match termination {
-            Err(error) => {
-                self.last_error = Some(HostErrorCode::StopFailed);
-                Err(error)
-            }
-            Ok(Some(())) | Ok(None) => Ok(vec![HostAgentEvent::Stopped]),
+        if self.child.is_none() {
+            self.started_at = None;
+            self.state = ChildState::Stopped;
+            return Ok(vec![HostAgentEvent::Stopped]);
         }
+        if self.state != ChildState::Stopping {
+            self.child
+                .as_mut()
+                .expect("child checked above")
+                .terminate()?;
+            self.state = ChildState::Stopping;
+            self.stop_deadline = Some(now + STOP_GRACE_PERIOD);
+            self.pending_termination = None;
+            self.force_kill_sent = false;
+        }
+        Ok(Vec::new())
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
+        if self.state == ChildState::Stopping {
+            return self.tick_stopping(now);
+        }
         if self.state == ChildState::Backoff {
             if self.next_restart_at.is_some_and(|deadline| now >= deadline) {
                 self.next_restart_at = None;
@@ -840,6 +892,9 @@ impl<F: ChildFactory> HostAgent<F> {
     }
 
     fn spawn(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
+        if self.child.is_some() || self.state == ChildState::Stopping {
+            return Ok(Vec::new());
+        }
         let child = match self.factory.spawn(&self.config.child) {
             Ok(child) => child,
             Err(error) => {
@@ -854,6 +909,9 @@ impl<F: ChildFactory> HostAgent<F> {
         self.state = ChildState::Starting;
         self.started_at = Some(now);
         self.next_restart_at = None;
+        self.stop_deadline = None;
+        self.pending_termination = None;
+        self.force_kill_sent = false;
         Ok(vec![HostAgentEvent::Started { pid }])
     }
 
@@ -885,23 +943,51 @@ impl<F: ChildFactory> HostAgent<F> {
     }
 
     fn handle_lifetime(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
-        let termination = self
+        self.child
+            .as_mut()
+            .expect("lifetime requires child")
+            .terminate()?;
+        self.state = ChildState::Stopping;
+        self.stop_deadline = Some(now + STOP_GRACE_PERIOD);
+        self.pending_termination = Some(ChildExitReason::LifetimeExceeded);
+        self.force_kill_sent = false;
+        Ok(Vec::new())
+    }
+
+    fn tick_stopping(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
+        let exit = self
             .child
             .as_mut()
-            .map(|child| child.terminate())
-            .transpose();
-        self.child = None;
-        self.started_at = None;
-        self.last_exit = Some(ChildExitReason::LifetimeExceeded);
-        let mut events = vec![HostAgentEvent::ChildExited {
-            reason: ChildExitReason::LifetimeExceeded,
-        }];
-        if let Err(error) = termination {
-            self.last_error = Some(HostErrorCode::StopFailed);
-            return Err(error);
+            .expect("stopping retains child")
+            .try_wait()?;
+        if exit.is_some() {
+            let pending = self.pending_termination.take();
+            self.child = None;
+            self.started_at = None;
+            self.stop_deadline = None;
+            self.force_kill_sent = false;
+            if let Some(reason) = pending {
+                self.last_exit = Some(reason);
+                let mut events = vec![HostAgentEvent::ChildExited { reason }];
+                self.schedule_restart(now, HostErrorCode::LifetimeExceeded, &mut events);
+                return Ok(events);
+            }
+            self.state = ChildState::Stopped;
+            return Ok(vec![HostAgentEvent::Stopped]);
         }
-        self.schedule_restart(now, HostErrorCode::LifetimeExceeded, &mut events);
-        Ok(events)
+        if !self.force_kill_sent && self.stop_deadline.is_some_and(|deadline| now >= deadline) {
+            if let Err(error) = self
+                .child
+                .as_mut()
+                .expect("stopping retains child")
+                .force_kill()
+            {
+                self.last_error = Some(HostErrorCode::StopFailed);
+                return Err(error);
+            }
+            self.force_kill_sent = true;
+        }
+        Ok(Vec::new())
     }
 
     fn schedule_restart(
@@ -996,6 +1082,66 @@ mod tests {
     struct FakeChild {
         pid: u32,
         exit: Option<ChildExit>,
+        graceful_exit: Option<ChildExit>,
+        force_exit: Option<ChildExit>,
+        force_error: bool,
+        signals: Arc<Mutex<FakeChildSignals>>,
+    }
+
+    #[derive(Default)]
+    struct FakeChildSignals {
+        terminate_calls: usize,
+        force_kill_calls: usize,
+    }
+
+    impl FakeChild {
+        fn running(pid: u32) -> Self {
+            Self {
+                pid,
+                exit: None,
+                graceful_exit: None,
+                force_exit: Some(ChildExit::terminated()),
+                force_error: false,
+                signals: Arc::new(Mutex::new(FakeChildSignals::default())),
+            }
+        }
+
+        fn exits_after_graceful(pid: u32) -> Self {
+            Self {
+                graceful_exit: Some(ChildExit::terminated()),
+                ..Self::running(pid)
+            }
+        }
+
+        fn stubborn(pid: u32) -> (Self, Arc<Mutex<FakeChildSignals>>) {
+            let signals = Arc::new(Mutex::new(FakeChildSignals::default()));
+            (
+                Self {
+                    pid,
+                    exit: None,
+                    graceful_exit: None,
+                    force_exit: Some(ChildExit::terminated()),
+                    force_error: false,
+                    signals: Arc::clone(&signals),
+                },
+                signals,
+            )
+        }
+
+        fn force_kill_fails(pid: u32) -> (Self, Arc<Mutex<FakeChildSignals>>) {
+            let signals = Arc::new(Mutex::new(FakeChildSignals::default()));
+            (
+                Self {
+                    pid,
+                    exit: None,
+                    graceful_exit: None,
+                    force_exit: None,
+                    force_error: true,
+                    signals: Arc::clone(&signals),
+                },
+                signals,
+            )
+        }
     }
 
     impl ManagedChild for FakeChild {
@@ -1008,7 +1154,17 @@ mod tests {
         }
 
         fn terminate(&mut self) -> Result<(), AgentError> {
-            self.exit = Some(ChildExit::terminated());
+            self.signals.lock().expect("signals lock").terminate_calls += 1;
+            self.exit = self.graceful_exit;
+            Ok(())
+        }
+
+        fn force_kill(&mut self) -> Result<(), AgentError> {
+            self.signals.lock().expect("signals lock").force_kill_calls += 1;
+            if self.force_error {
+                return Err(AgentError::StopFailed);
+            }
+            self.exit = self.force_exit;
             Ok(())
         }
     }
@@ -1051,7 +1207,7 @@ mod tests {
             .outcomes
             .lock()
             .expect("outcome lock")
-            .push_back(FakeSpawnOutcome::Child(FakeChild { pid: 7, exit: None }));
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(7)));
         let now = instant();
         let mut agent = HostAgent::with_factory(config(), factory.clone()).expect("agent");
 
@@ -1077,8 +1233,9 @@ mod tests {
             outcomes.push_back(FakeSpawnOutcome::Child(FakeChild {
                 pid: 1,
                 exit: Some(ChildExit::code(9)),
+                ..FakeChild::running(1)
             }));
-            outcomes.push_back(FakeSpawnOutcome::Child(FakeChild { pid: 2, exit: None }));
+            outcomes.push_back(FakeSpawnOutcome::Child(FakeChild::running(2)));
         }
         let now = instant();
         let mut agent = HostAgent::with_factory(config(), factory.clone()).expect("agent");
@@ -1119,7 +1276,7 @@ mod tests {
         {
             let mut outcomes = factory.outcomes.lock().expect("outcome lock");
             outcomes.push_back(FakeSpawnOutcome::Error);
-            outcomes.push_back(FakeSpawnOutcome::Child(FakeChild { pid: 8, exit: None }));
+            outcomes.push_back(FakeSpawnOutcome::Child(FakeChild::running(8)));
         }
         let now = instant();
         let mut agent = HostAgent::with_factory(config(), factory.clone()).expect("agent");
@@ -1134,23 +1291,24 @@ mod tests {
     }
 
     #[test]
-    fn stop_before_restart_cancels_backoff_and_is_idempotent() {
+    fn stop_waits_for_child_reap_before_reporting_stopped() {
         let factory = FakeFactory::default();
         factory
             .outcomes
             .lock()
             .expect("outcome lock")
-            .push_back(FakeSpawnOutcome::Child(FakeChild {
-                pid: 1,
-                exit: Some(ChildExit::code(1)),
-            }));
+            .push_back(FakeSpawnOutcome::Child(FakeChild::exits_after_graceful(1)));
         let now = instant();
         let mut agent = HostAgent::with_factory(config(), factory.clone()).expect("agent");
         agent.start(now).expect("start");
-        agent.tick(now).expect("failure");
-        assert_eq!(
-            agent.stop(now).expect("stop"),
-            vec![HostAgentEvent::Stopped]
+        assert!(agent.stop(now).expect("stop").is_empty());
+        assert_eq!(agent.health(now).pid, Some(1));
+        assert_eq!(format!("{:?}", agent.health(now).state), "Stopping");
+        assert!(
+            agent
+                .tick(now + Duration::from_millis(1))
+                .expect("reap tick")
+                .contains(&HostAgentEvent::Stopped)
         );
         assert!(agent.stop(now).expect("idempotent stop").is_empty());
         agent
@@ -1169,6 +1327,7 @@ mod tests {
                 outcomes.push_back(FakeSpawnOutcome::Child(FakeChild {
                     pid,
                     exit: Some(ChildExit::code(pid as i32)),
+                    ..FakeChild::running(pid)
                 }));
             }
         }
@@ -1208,7 +1367,7 @@ mod tests {
             .outcomes
             .lock()
             .expect("outcome lock")
-            .push_back(FakeSpawnOutcome::Child(FakeChild { pid: 3, exit: None }));
+            .push_back(FakeSpawnOutcome::Child(FakeChild::stubborn(3).0));
         let now = instant();
         let cfg = config()
             .with_max_child_lifetime(Some(Duration::from_millis(5)))
@@ -1218,6 +1377,142 @@ mod tests {
         let events = agent
             .tick(now + Duration::from_millis(5))
             .expect("lifetime tick");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HostAgentEvent::RestartScheduled { .. }))
+        );
+        assert_eq!(agent.health(now).pid, Some(3));
+    }
+
+    #[test]
+    fn prompt_graceful_termination_is_reaped_before_stopped() {
+        let factory = FakeFactory::default();
+        let child = FakeChild::exits_after_graceful(9);
+        let signals = Arc::clone(&child.signals);
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(child));
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config(), factory).expect("agent");
+        agent.start(now).expect("start");
+
+        assert!(agent.stop(now).expect("stop").is_empty());
+        assert_eq!(format!("{:?}", agent.health(now).state), "Stopping");
+        assert!(
+            agent
+                .tick(now + Duration::from_millis(1))
+                .expect("reap")
+                .contains(&HostAgentEvent::Stopped)
+        );
+        let signals = signals.lock().expect("signals lock");
+        assert_eq!(signals.terminate_calls, 1);
+        assert_eq!(signals.force_kill_calls, 0);
+    }
+
+    #[test]
+    fn ignored_graceful_termination_is_force_killed_then_reaped() {
+        let factory = FakeFactory::default();
+        let (child, signals) = FakeChild::stubborn(10);
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(child));
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config(), factory).expect("agent");
+        agent.start(now).expect("start");
+        agent.stop(now).expect("stop");
+
+        agent
+            .tick(now + Duration::from_millis(1_999))
+            .expect("grace period tick");
+        assert_eq!(signals.lock().expect("signals lock").force_kill_calls, 0);
+
+        assert!(
+            agent
+                .tick(now + Duration::from_secs(2))
+                .expect("force-kill tick")
+                .is_empty()
+        );
+        assert_eq!(format!("{:?}", agent.health(now).state), "Stopping");
+        assert_eq!(agent.health(now).pid, Some(10));
+        assert_eq!(signals.lock().expect("signals lock").force_kill_calls, 1);
+
+        assert!(
+            agent
+                .tick(now + Duration::from_secs(2) + Duration::from_millis(1))
+                .expect("reap after force-kill")
+                .contains(&HostAgentEvent::Stopped)
+        );
+        assert_eq!(agent.health(now).state, ChildState::Stopped);
+    }
+
+    #[test]
+    fn force_kill_failure_keeps_child_owned_and_reports_typed_error() {
+        let factory = FakeFactory::default();
+        let (child, signals) = FakeChild::force_kill_fails(11);
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(child));
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config(), factory).expect("agent");
+        agent.start(now).expect("start");
+        agent.stop(now).expect("stop");
+
+        assert_eq!(
+            agent.tick(now + Duration::from_secs(2)),
+            Err(AgentError::StopFailed)
+        );
+        assert_eq!(format!("{:?}", agent.health(now).state), "Stopping");
+        assert_eq!(agent.health(now).pid, Some(11));
+        assert_eq!(signals.lock().expect("signals lock").force_kill_calls, 1);
+    }
+
+    #[test]
+    fn lifetime_restart_waits_until_force_kill_is_reaped() {
+        let factory = FakeFactory::default();
+        let (child, signals) = FakeChild::stubborn(12);
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(child));
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(13)));
+        let now = instant();
+        let cfg = config()
+            .with_max_child_lifetime(Some(Duration::from_millis(5)))
+            .expect("lifetime");
+        let mut agent = HostAgent::with_factory(cfg, factory.clone()).expect("agent");
+        agent.start(now).expect("start");
+
+        assert!(
+            !agent
+                .tick(now + Duration::from_millis(5))
+                .expect("lifetime request")
+                .iter()
+                .any(|event| matches!(event, HostAgentEvent::RestartScheduled { .. }))
+        );
+        assert_eq!(format!("{:?}", agent.health(now).state), "Stopping");
+        assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 1);
+
+        agent
+            .tick(now + Duration::from_secs(2) + Duration::from_millis(5))
+            .expect("force-kill lifetime child");
+        assert_eq!(signals.lock().expect("signals lock").force_kill_calls, 1);
+        assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 1);
+
+        let events = agent
+            .tick(now + Duration::from_secs(2) + Duration::from_millis(6))
+            .expect("reap lifetime child");
         assert!(events.contains(&HostAgentEvent::ChildExited {
             reason: ChildExitReason::LifetimeExceeded
         }));
@@ -1225,6 +1520,64 @@ mod tests {
             delay_ms: 20,
             attempt: 1
         }));
+        assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 1);
+
+        agent
+            .tick(now + Duration::from_secs(2) + Duration::from_millis(26))
+            .expect("replacement spawn");
+        assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 2);
+    }
+
+    #[test]
+    fn shutdown_during_restart_backoff_cancels_without_child() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild {
+                exit: Some(ChildExit::code(1)),
+                ..FakeChild::running(14)
+            }));
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config(), factory.clone()).expect("agent");
+        agent.start(now).expect("start");
+        agent.tick(now).expect("child exit");
+        assert_eq!(agent.health(now).state, ChildState::Backoff);
+
+        assert_eq!(
+            agent.stop(now).expect("shutdown").as_slice(),
+            [HostAgentEvent::Stopped]
+        );
+        assert_eq!(agent.health(now).state, ChildState::Stopped);
+        agent
+            .tick(now + Duration::from_secs(1))
+            .expect("post-shutdown tick");
+        assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 1);
+    }
+
+    #[test]
+    fn shutdown_while_starting_waits_for_reap_before_stopped() {
+        let factory = FakeFactory::default();
+        let child = FakeChild::exits_after_graceful(15);
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(child));
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config(), factory).expect("agent");
+        agent.start(now).expect("start");
+        assert_eq!(agent.health(now).state, ChildState::Starting);
+
+        assert!(agent.stop(now).expect("shutdown").is_empty());
+        assert_eq!(format!("{:?}", agent.health(now).state), "Stopping");
+        assert!(
+            agent
+                .tick(now + Duration::from_millis(1))
+                .expect("reap starting child")
+                .contains(&HostAgentEvent::Stopped)
+        );
     }
 
     #[test]

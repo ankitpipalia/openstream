@@ -22,6 +22,7 @@ mod unix_main {
 
     const IPC_READ_TIMEOUT: Duration = Duration::from_secs(30);
     const TICK_INTERVAL: Duration = Duration::from_millis(100);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub(crate) async fn run() -> Result<(), String> {
         let (config, report) = build_config()?;
@@ -101,6 +102,25 @@ mod unix_main {
             if let Err(error) = guard.stop(Instant::now()) {
                 eprintln!("OpenStream host agent shutdown failed: {error}");
             }
+        }
+        let shutdown_deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        loop {
+            let stopped = {
+                let mut guard = agent.lock().await;
+                match guard.tick(Instant::now()) {
+                    Ok(events) => log_events(&events),
+                    Err(error) => eprintln!("OpenStream host agent shutdown tick failed: {error}"),
+                }
+                guard.state() == openstream_host_agent::ChildState::Stopped
+            };
+            if stopped {
+                break;
+            }
+            if Instant::now() >= shutdown_deadline {
+                eprintln!("OpenStream host agent shutdown failed: child reap deadline exceeded");
+                break;
+            }
+            tokio::time::sleep(TICK_INTERVAL).await;
         }
         connections.abort_all();
         while connections.join_next().await.is_some() {}
