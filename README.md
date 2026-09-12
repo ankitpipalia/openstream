@@ -124,7 +124,7 @@ availability, FFmpeg and hardware candidates, and `/dev/uinput` presence. It
 is diagnostic output, not proof of a live encoder/driver stream.
 
 The physical Linux-NVIDIA -> Apple-Silicon macOS MVP acceptance is recorded in
-[`docs/BUILD.md`](docs/BUILD.md#physical-linux-nvidia--macos-apple-silicon-mvp-acceptance).
+[`docs/BUILD.md`](docs/BUILD.md#physical-linux-nvidia---macos-apple-silicon-mvp-acceptance).
 It validates the X11/FFmpeg `h264_nvenc` fallback, direct authenticated UDP,
 the existing FFmpeg decoder, and software/wgpu Metal presentation. This is
 the X11/FFmpeg/NVENC fallback path only. Native
