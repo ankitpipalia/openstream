@@ -5,7 +5,7 @@
 #
 #   ./scripts/virtual-display.sh        # prints e.g. :99
 #   DISPLAY=:99 OPENSTREAM_FFMPEG_INPUT=:99.0 \
-#     OPENSTREAM_PAIRING_JSON="$(./scripts/create-session.sh)" \
+#     OPENSTREAM_PAIRING_FILE=/absolute/path/pairing.json \
 #     ./target/release/openstream-ffmpeg-host
 set -eu
 

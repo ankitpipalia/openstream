@@ -13,8 +13,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
-    Capabilities, FlushOutcome, Pairing, PeerSession, QueueOutcome, ReliableControl, Role,
-    VideoCodec, parse_stun_servers,
+    Capabilities, FlushOutcome, PeerSession, QueueOutcome, ReliableControl, Role, VideoCodec,
+    load_pairing_from_environment, parse_stun_servers,
 };
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
@@ -77,10 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let origin =
         env::var("OPENSTREAM_SIGNAL_ORIGIN").unwrap_or_else(|_| DEFAULT_SIGNAL_ORIGIN.to_string());
-    let pairing: Pairing = serde_json::from_str(
-        &env::var("OPENSTREAM_PAIRING_JSON")
-            .map_err(|_| "OPENSTREAM_PAIRING_JSON must contain the create-session response")?,
-    )?;
+    let pairing = load_pairing_from_environment()?;
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| DEFAULT_UDP_BIND.to_string())
         .parse::<SocketAddr>()?;

@@ -12,6 +12,7 @@ futures-util.workspace = true
 getrandom.workspace = true
 hex = "0.4"
 if-addrs.workspace = true
+libc.workspace = true
 openstream-protocol = { path = "../protocol" }
 openstream-transport-policy.workspace = true
 openstream-transport = { path = "../transport" }

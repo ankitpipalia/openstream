@@ -72,6 +72,27 @@ ports, output path, or FFmpeg input with `OPENSTREAM_DEMO_SECONDS`,
 `OPENSTREAM_DEMO_PORT`, `OPENSTREAM_DEMO_OUTPUT`, and
 `OPENSTREAM_FFMPEG_ARGS`.
 
+For a normal local-first role launch, keep the pairing response in a private
+file and pass only its path to the launcher. Start the signal server
+separately, then run the helper on one or both roles:
+
+```sh
+umask 077
+pairing_file="$(mktemp "${TMPDIR:-/tmp}/openstream-pairing.XXXXXX")"
+trap 'rm -f "$pairing_file"' EXIT
+OPENSTREAM_FETCH_TURN=0 ./scripts/create-session.sh >"$pairing_file"
+chmod 600 "$pairing_file"
+OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:8080 \
+  ./scripts/openstream-local-session.sh \
+  --role both --pairing-file "$pairing_file" --duration 60
+```
+
+For two machines, copy the private pairing file through a secure channel and
+run the helper separately with --role host and --role client. The helper
+captures child output, enforces a finite duration, and never prints pairing
+contents. The raw OPENSTREAM_PAIRING_JSON environment is reserved for an
+explicit developer override using OPENSTREAM_DEVELOPER_OVERRIDE=1.
+
 Run the authenticated full-ICE loopback smoke separately:
 
 ```sh

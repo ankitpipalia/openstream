@@ -30,7 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use lowlat_inject::event::{Extents, Injector};
     use lowlat_inject::uinput::Devices;
     use openstream_client_core::{
-        Capabilities, Pairing, PeerSession, ReliableControl, Role, VideoCodec, parse_stun_servers,
+        Capabilities, PeerSession, ReliableControl, Role, VideoCodec,
+        load_pairing_from_environment, parse_stun_servers,
     };
     use openstream_media::clipboard::{Assembler as ClipboardAssembler, fragment_text};
     use openstream_media::input::RumbleEvent;
@@ -55,10 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return preflight();
     }
-    let pairing: Pairing = serde_json::from_str(
-        &env::var("OPENSTREAM_PAIRING_JSON")
-            .map_err(|_| "OPENSTREAM_PAIRING_JSON must contain the create-session response")?,
-    )?;
+    let pairing = load_pairing_from_environment()?;
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| "0.0.0.0:0".to_string())
         .parse::<SocketAddr>()?;

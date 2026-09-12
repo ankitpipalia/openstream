@@ -5,7 +5,10 @@
 //! used by a desktop GUI, an Android JNI bridge, or an iOS Swift bridge.
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -609,6 +612,92 @@ pub struct Pairing {
     pub relay_client_ticket: Option<String>,
 }
 
+/// Maximum pairing-file size accepted by the process boundary.
+///
+/// Pairing responses are small, but this limit prevents a malformed or
+/// attacker-controlled path from causing an unbounded allocation before the
+/// JSON parser runs.
+pub const MAX_PAIRING_FILE_BYTES: usize = 64 * 1024;
+
+/// Load pairing material from a private runtime file.
+///
+/// The path must be absolute, must name a regular file owned by the effective
+/// user, and must not grant group/other permissions. Symlinks are rejected so
+/// a path supplied by a launcher cannot silently redirect the client to
+/// another file. The contents are bounded before JSON parsing.
+pub fn load_pairing_from_file(path: impl AsRef<Path>) -> Result<Pairing, Error> {
+    let path = path.as_ref();
+    if !path.is_absolute() {
+        return Err(Error::PairingFilePathNotAbsolute);
+    }
+
+    let link_metadata =
+        std::fs::symlink_metadata(path).map_err(|_| Error::PairingFileUnavailable)?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(Error::PairingFileInsecure);
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| Error::PairingFileUnavailable)?;
+    let metadata = file.metadata().map_err(|_| Error::PairingFileUnavailable)?;
+    if !metadata.is_file() {
+        return Err(Error::PairingFileInsecure);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = metadata.mode();
+        let current_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != current_uid || mode & 0o077 != 0 || mode & 0o400 == 0 {
+            return Err(Error::PairingFileInsecure);
+        }
+    }
+    if metadata.len() > MAX_PAIRING_FILE_BYTES as u64 {
+        return Err(Error::PairingFileTooLarge);
+    }
+
+    let mut contents = Vec::new();
+    let read_limit = u64::try_from(MAX_PAIRING_FILE_BYTES)
+        .expect("pairing-file byte limit fits in u64")
+        .saturating_add(1);
+    file.take(read_limit)
+        .read_to_end(&mut contents)
+        .map_err(|_| Error::PairingFileUnavailable)?;
+    if contents.len() > MAX_PAIRING_FILE_BYTES {
+        return Err(Error::PairingFileTooLarge);
+    }
+    serde_json::from_slice(&contents).map_err(Error::Deserialize)
+}
+
+/// Resolve pairing material for a headless/native entrypoint.
+///
+/// OPENSTREAM_PAIRING_FILE is the normal runtime boundary. The historical
+/// OPENSTREAM_PAIRING_JSON escape hatch is accepted only with the explicit
+/// OPENSTREAM_DEVELOPER_OVERRIDE=1 marker so ordinary launchers do not place
+/// bearer capabilities in process environments by accident.
+pub fn load_pairing_from_environment() -> Result<Pairing, Error> {
+    if let Some(path) = std::env::var_os("OPENSTREAM_PAIRING_FILE") {
+        let path = path.to_str().ok_or(Error::PairingEnvironmentInvalid)?;
+        return load_pairing_from_file(path);
+    }
+    if let Some(json) = std::env::var_os("OPENSTREAM_PAIRING_JSON") {
+        if std::env::var("OPENSTREAM_DEVELOPER_OVERRIDE").as_deref() != Ok("1") {
+            return Err(Error::DeveloperOverrideRequired);
+        }
+        let json = json.to_str().ok_or(Error::PairingEnvironmentInvalid)?;
+        return serde_json::from_str(json).map_err(Error::Deserialize);
+    }
+    Err(Error::PairingRequired)
+}
+
 /// Session-scoped TURN credentials minted by the signaling service.
 ///
 /// Mirrors the service's `TurnIssued` JSON so pairing files stay portable.
@@ -919,6 +1008,21 @@ pub enum Error {
     PeerIdentityRequired,
     /// The peer's signed ephemeral key was not produced by its identity key.
     PeerIdentityRejected,
+    /// No pairing file or explicit developer pairing override was provided.
+    PairingRequired,
+    /// The pairing path is not an absolute runtime path.
+    PairingFilePathNotAbsolute,
+    /// The pairing path could not be opened or read.
+    PairingFileUnavailable,
+    /// The pairing path is a symlink, non-regular file, wrong owner, or
+    /// exposes its contents to group/other users.
+    PairingFileInsecure,
+    /// The pairing file exceeded the bounded runtime input size.
+    PairingFileTooLarge,
+    /// A pairing environment value was not valid UTF-8.
+    PairingEnvironmentInvalid,
+    /// The raw JSON environment escape hatch requires an explicit marker.
+    DeveloperOverrideRequired,
     /// The peer sent more candidates than `MAX_REMOTE_CANDIDATES`.
     TooManyCandidates,
     /// The bounded critical outbound queue cannot accept another packet.
@@ -971,6 +1075,27 @@ impl fmt::Display for Error {
             Self::PeerIdentityRejected => {
                 f.write_str("peer identity signature does not authenticate its ephemeral key")
             }
+            Self::PairingRequired => {
+                f.write_str("pairing file is required for normal launches")
+            }
+            Self::PairingFilePathNotAbsolute => {
+                f.write_str("pairing file path must be absolute")
+            }
+            Self::PairingFileUnavailable => {
+                f.write_str("pairing file could not be opened or read")
+            }
+            Self::PairingFileInsecure => {
+                f.write_str("pairing file is not a private regular file owned by this user")
+            }
+            Self::PairingFileTooLarge => {
+                write!(f, "pairing file exceeds {MAX_PAIRING_FILE_BYTES} bytes")
+            }
+            Self::PairingEnvironmentInvalid => {
+                f.write_str("pairing environment value is not valid UTF-8")
+            }
+            Self::DeveloperOverrideRequired => f.write_str(
+                "OPENSTREAM_PAIRING_JSON requires OPENSTREAM_DEVELOPER_OVERRIDE=1",
+            ),
             Self::TooManyCandidates => {
                 write!(f, "peer sent more than {MAX_REMOTE_CANDIDATES} candidates")
             }
@@ -5013,6 +5138,189 @@ mod tests {
             turn_client: None,
             relay_host_ticket: None,
             relay_client_ticket: None,
+        }
+    }
+
+    fn pairing_file_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        static NEXT_PAIRING_FILE: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_PAIRING_FILE.fetch_add(1, AtomicOrdering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "openstream-client-core-pairing-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create pairing test directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("make pairing test directory private");
+        }
+        directory.join(format!("{label}.json"))
+    }
+
+    #[test]
+    fn pairing_file_loader_requires_a_private_absolute_regular_file() {
+        let path = pairing_file_path("valid");
+        let json = serde_json::to_vec(&pairing()).expect("encode pairing");
+        std::fs::write(&path, json).expect("write pairing file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("make pairing file private");
+        }
+
+        let decoded = load_pairing_from_file(&path).expect("load private pairing file");
+        assert_eq!(decoded, pairing());
+        assert!(matches!(
+            load_pairing_from_file(std::path::Path::new("pairing.json")),
+            Err(Error::PairingFilePathNotAbsolute)
+        ));
+        assert!(matches!(
+            load_pairing_from_file(path.with_extension("missing")),
+            Err(Error::PairingFileUnavailable)
+        ));
+        std::fs::remove_dir_all(path.parent().expect("test directory"))
+            .expect("remove pairing test directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pairing_file_loader_rejects_insecure_permissions_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = pairing_file_path("permissions");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&pairing()).expect("encode pairing"),
+        )
+        .expect("write pairing file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("make pairing file group-readable");
+        assert!(matches!(
+            load_pairing_from_file(&path),
+            Err(Error::PairingFileInsecure)
+        ));
+
+        let target = path.with_file_name("target.json");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&pairing()).expect("encode pairing"),
+        )
+        .expect("write pairing target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("make pairing target private");
+        let link = path.with_file_name("link.json");
+        std::os::unix::fs::symlink(&target, &link).expect("create pairing symlink");
+        assert!(matches!(
+            load_pairing_from_file(&link),
+            Err(Error::PairingFileInsecure)
+        ));
+        std::fs::remove_dir_all(path.parent().expect("test directory"))
+            .expect("remove pairing test directory");
+    }
+
+    #[test]
+    fn pairing_file_loader_rejects_oversized_or_invalid_material_without_echoing_it() {
+        let path = pairing_file_path("oversized");
+        std::fs::write(&path, vec![b'x'; MAX_PAIRING_FILE_BYTES + 1])
+            .expect("write oversized pairing file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("make oversized pairing file private");
+        }
+        let error = load_pairing_from_file(&path).expect_err("oversized pairing accepted");
+        assert!(matches!(error, Error::PairingFileTooLarge));
+        assert!(!format!("{:?}", error).contains('x'));
+
+        std::fs::write(&path, b"not pairing json").expect("write invalid pairing file");
+        let error = load_pairing_from_file(&path).expect_err("invalid pairing accepted");
+        assert!(matches!(error, Error::Deserialize(_)));
+        assert!(!format!("{}", error).contains("not pairing json"));
+        std::fs::remove_dir_all(path.parent().expect("test directory"))
+            .expect("remove pairing test directory");
+    }
+
+    #[test]
+    fn pairing_environment_requires_a_file_or_an_explicit_developer_override() {
+        use std::sync::Mutex;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().expect("pairing environment lock");
+        let old_file = std::env::var_os("OPENSTREAM_PAIRING_FILE");
+        let old_json = std::env::var_os("OPENSTREAM_PAIRING_JSON");
+        let old_override = std::env::var_os("OPENSTREAM_DEVELOPER_OVERRIDE");
+        unsafe {
+            std::env::remove_var("OPENSTREAM_PAIRING_FILE");
+            std::env::remove_var("OPENSTREAM_PAIRING_JSON");
+            std::env::remove_var("OPENSTREAM_DEVELOPER_OVERRIDE");
+        }
+        assert!(matches!(
+            load_pairing_from_environment(),
+            Err(Error::PairingRequired)
+        ));
+
+        let path = pairing_file_path("environment");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&pairing()).expect("encode pairing"),
+        )
+        .expect("write environment pairing");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("make environment pairing private");
+        }
+        unsafe {
+            std::env::set_var("OPENSTREAM_PAIRING_FILE", &path);
+            std::env::set_var("OPENSTREAM_PAIRING_JSON", "this-json-must-not-be-consumed");
+            std::env::remove_var("OPENSTREAM_DEVELOPER_OVERRIDE");
+        }
+        assert_eq!(
+            load_pairing_from_environment().expect("private file has precedence"),
+            pairing()
+        );
+        std::fs::remove_dir_all(path.parent().expect("test directory"))
+            .expect("remove environment pairing directory");
+
+        unsafe {
+            std::env::remove_var("OPENSTREAM_PAIRING_FILE");
+            std::env::set_var(
+                "OPENSTREAM_PAIRING_JSON",
+                serde_json::to_string(&pairing()).expect("encode pairing"),
+            );
+        }
+        assert!(matches!(
+            load_pairing_from_environment(),
+            Err(Error::DeveloperOverrideRequired)
+        ));
+
+        unsafe {
+            std::env::set_var("OPENSTREAM_DEVELOPER_OVERRIDE", "1");
+        }
+        assert_eq!(
+            load_pairing_from_environment().expect("explicit developer override"),
+            pairing()
+        );
+
+        unsafe {
+            match old_file {
+                Some(value) => std::env::set_var("OPENSTREAM_PAIRING_FILE", value),
+                None => std::env::remove_var("OPENSTREAM_PAIRING_FILE"),
+            }
+            match old_json {
+                Some(value) => std::env::set_var("OPENSTREAM_PAIRING_JSON", value),
+                None => std::env::remove_var("OPENSTREAM_PAIRING_JSON"),
+            }
+            match old_override {
+                Some(value) => std::env::set_var("OPENSTREAM_DEVELOPER_OVERRIDE", value),
+                None => std::env::remove_var("OPENSTREAM_DEVELOPER_OVERRIDE"),
+            }
         }
     }
 

@@ -99,7 +99,7 @@ The host environment normally contains:
 
 ```text
 OPENSTREAM_SIGNAL_ORIGIN=https://signal.example.invalid
-OPENSTREAM_PAIRING_JSON={...}
+OPENSTREAM_PAIRING_FILE=/run/user/1000/openstream/pairing.json
 OPENSTREAM_UDP_BIND=0.0.0.0:0
 OPENSTREAM_FFMPEG=/usr/bin/ffmpeg
 # Optional direct-path router mapping. This changes local router state and is
@@ -145,6 +145,13 @@ OPENSTREAM_GAMEPAD=0
 OPENSTREAM_MIC=0
 OPENSTREAM_APPROVAL=auto
 ```
+
+Pairing JSON contains role bearer capabilities. Treat it as a secret and never
+commit it, put it in a public issue, or include it in logs. The normal
+launcher/client boundary reads the JSON from the private file named by
+OPENSTREAM_PAIRING_FILE and requires an absolute, owner-only path. For
+developer-only compatibility, OPENSTREAM_PAIRING_JSON requires
+OPENSTREAM_DEVELOPER_OVERRIDE=1; do not use that override in a service unit.
 
 For Wayland, use the PipeWire/portal native adapter once enabled rather than
 passing an X11 display. The external FFmpeg service is a development backend;

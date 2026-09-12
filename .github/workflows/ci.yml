@@ -47,6 +47,12 @@ jobs:
       - name: Alpine/musl helper syntax
         run: sh -n scripts/alpine-musl-ci.sh
 
+      - name: Local session launcher smoke
+        run: |
+          bash -n scripts/openstream-local-session.sh scripts/test-openstream-local-session.sh
+          bash scripts/test-openstream-local-session.sh
+        working-directory: .
+
       - name: Format
         run: cargo fmt --all --check
 

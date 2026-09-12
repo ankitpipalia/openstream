@@ -1,6 +1,6 @@
 # Start the self-hosted signal service, a real FFmpeg test-pattern host, and a
-# headless OpenStream client on native Windows. Pairing JSON stays in the
-# process environment and diagnostic logs do not contain it.
+# headless OpenStream client on native Windows. Pairing JSON stays in a
+# private temporary file and diagnostic logs do not contain it.
 $ErrorActionPreference = "Stop"
 
 $repoDir = Split-Path -Parent $PSScriptRoot
@@ -29,6 +29,7 @@ $hostLog = Join-Path $tempDir "host.log"
 $hostError = Join-Path $tempDir "host-error.log"
 $clientLog = Join-Path $tempDir "client.log"
 $clientError = Join-Path $tempDir "client-error.log"
+$pairingFile = Join-Path $tempDir "pairing.json"
 $serverProcess = $null
 $hostProcess = $null
 $clientProcess = $null
@@ -38,7 +39,9 @@ $trackedEnvironment = @(
     "OPENSTREAM_SIGNAL_BIND",
     "OPENSTREAM_ALLOW_NO_AUTH",
     "OPENSTREAM_SIGNAL_ORIGIN",
+    "OPENSTREAM_PAIRING_FILE",
     "OPENSTREAM_PAIRING_JSON",
+    "OPENSTREAM_DEVELOPER_OVERRIDE",
     "OPENSTREAM_UDP_BIND",
     "OPENSTREAM_HOST_SECONDS",
     "OPENSTREAM_CLIENT_SECONDS",
@@ -59,6 +62,8 @@ try {
     # The demo is intentionally loopback-only, so it may opt into the
     # signal service's development mode without weakening production defaults.
     $env:OPENSTREAM_ALLOW_NO_AUTH = "1"
+    Remove-Item Env:OPENSTREAM_PAIRING_JSON -ErrorAction SilentlyContinue
+    Remove-Item Env:OPENSTREAM_DEVELOPER_OVERRIDE -ErrorAction SilentlyContinue
     $serverProcess = Start-Process -FilePath (Join-Path $engineDir "target\debug\openstream-signal-server.exe") `
         -WorkingDirectory $engineDir -RedirectStandardOutput $serverLog `
         -RedirectStandardError $serverError -PassThru
@@ -79,7 +84,13 @@ try {
     $pairing = Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$port/v1/session" `
         -ContentType "application/json" -Body '{"ttl_seconds":120}'
     $env:OPENSTREAM_SIGNAL_ORIGIN = "http://127.0.0.1:$port"
-    $env:OPENSTREAM_PAIRING_JSON = $pairing | ConvertTo-Json -Compress
+    $pairingJson = $pairing | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText(
+        $pairingFile,
+        $pairingJson,
+        [Text.UTF8Encoding]::new($false)
+    )
+    $env:OPENSTREAM_PAIRING_FILE = $pairingFile
     $env:OPENSTREAM_HOST_SECONDS = $secondsValue.ToString()
     $env:OPENSTREAM_CLIENT_SECONDS = $secondsValue.ToString()
     $env:OPENSTREAM_UDP_BIND = "127.0.0.1:0"

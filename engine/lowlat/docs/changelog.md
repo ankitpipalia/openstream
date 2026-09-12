@@ -3,6 +3,21 @@
 Newest first. One entry per phase; approach changes and gate revisions go in
 [impl-plan.md](impl-plan.md) instead.
 
+## Local-first pairing and session launch
+
+Added a bounded local-session launcher that accepts an absolute private pairing
+file or one-shot stdin, captures child output in private temporary state, and
+terminates host/client/session children after a finite duration. The launcher
+uses explicit role selection, shell-free command arguments, cleanup traps, and
+bounded graceful shutdown with a forced fallback.
+
+All Rust host/client/reference entrypoints now share a pairing loader that
+rejects relative paths, symlinks, non-regular files, non-owner-only Unix
+permissions, wrong ownership, oversized input, and invalid JSON without
+printing pairing contents. The historical raw JSON environment is retained
+only behind OPENSTREAM_DEVELOPER_OVERRIDE=1. Existing local, ICE, migration,
+and Windows demo paths now pass a private pairing-file path instead.
+
 ## Persistent host-agent supervision
 
 Added `openstream-host-agent`, a bounded Tokio supervisor for the proven

@@ -49,6 +49,35 @@ remain developer/headless overrides; `apply_environment_overrides` validates
 them without persisting them. The current settings schema is independent of
 the application, protocol, and future database versions.
 
+## Local-first session launcher
+
+The normal headless/native boundary is a private pairing file rather than a
+raw bearer response in an environment value. Start the signal service
+separately, provision a session into a mode-0600 file, and use the bounded
+launcher:
+
+```sh
+umask 077
+pairing_file="$(mktemp "${TMPDIR:-/tmp}/openstream-pairing.XXXXXX")"
+trap 'rm -f "$pairing_file"' EXIT
+OPENSTREAM_FETCH_TURN=0 ./scripts/create-session.sh >"$pairing_file"
+chmod 600 "$pairing_file"
+./scripts/openstream-local-session.sh \
+  --role both --pairing-file "$pairing_file" --duration 60
+```
+
+Use --role host or --role client on separate machines. The helper may also
+read a one-shot pairing from --pairing-stdin; it stores that input in a
+private temporary file, passes only the path to child processes, captures
+child output, and terminates children after the bounded duration. It does not
+start a signaling service unless an explicit --signal-command is supplied;
+the pairing's signal origin remains the operator's choice.
+
+The Rust entrypoints validate the file again: the path must be absolute,
+regular, owner-only, and no larger than 64 KiB. OPENSTREAM_PAIRING_JSON is
+accepted only with OPENSTREAM_DEVELOPER_OVERRIDE=1 for deliberately
+ephemeral developer shells; it is not a service configuration mechanism.
+
 ## Private-LAN no-account mode
 
 For a trusted local network, the signal service can disable only the
@@ -92,10 +121,13 @@ with mode `0700`; do not move the socket below a shared or world-writable
 directory.
 
 The agent's child command is an argv vector and never a shell command.
-Pairing material, when needed by the current developer/headless flow, may be
-injected through the protected `host.env` environment file with mode
-`0600`; it is never persisted by application settings or put in an
-`ExecStart` argument. Child diagnostics are intentionally typed/redacted.
+Pairing material, when needed by the current developer/headless flow, is
+provided through an absolute private runtime file with mode 0600 via
+OPENSTREAM_PAIRING_FILE; it is never persisted by application settings or
+put in an ExecStart argument. Child diagnostics are intentionally
+typed/redacted. The raw OPENSTREAM_PAIRING_JSON environment is accepted only
+with the explicitly marked OPENSTREAM_DEVELOPER_OVERRIDE=1 developer
+override.
 The current agent manages the tested X11/PipeWire plus external-FFmpeg
 fallback. Native DRM is only eligible after a positive preflight result and
 still has its own Linux hardware acceptance gate.
@@ -122,7 +154,7 @@ DISPLAY=:0 \
 XDG_RUNTIME_DIR=/run/user/1000 \
 WAYLAND_DISPLAY=wayland-0 \
 OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:18080 \
-OPENSTREAM_PAIRING_JSON="$(cat /tmp/openstream-pairing.json)" \
+OPENSTREAM_PAIRING_FILE=/tmp/openstream-pairing.json \
 OPENSTREAM_UDP_BIND=<linux-lan-address>:40001 \
 OPENSTREAM_VIDEO_MBPS=8 \
 OPENSTREAM_VIDEO_ENCODER=h264_nvenc \
@@ -136,7 +168,7 @@ wgpu Metal presenter:
 
 ```sh
 OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:18080 \
-OPENSTREAM_PAIRING_JSON="$(cat /tmp/openstream-pairing.json)" \
+OPENSTREAM_PAIRING_FILE=/tmp/openstream-pairing.json \
 OPENSTREAM_UDP_BIND=<mac-lan-address>:40002 \
 OPENSTREAM_RENDERER=software \
 target/release/openstream-desktop-client

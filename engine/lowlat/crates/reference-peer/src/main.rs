@@ -5,10 +5,13 @@
 //! Start the signal server, create one pairing, then run this binary twice:
 //!
 //! ```text
-//! OPENSTREAM_PAIRING_JSON='{"session_id":...}' \
+//! OPENSTREAM_PAIRING_FILE=/absolute/path/pairing.json \
 //!   cargo run -p openstream-reference-peer -- host
-//! OPENSTREAM_PAIRING_JSON='{"session_id":...}' \
+//! OPENSTREAM_PAIRING_FILE=/absolute/path/pairing.json \
 //!   cargo run -p openstream-reference-peer -- client
+//!
+//! For a deliberately ephemeral developer shell only, set
+//! OPENSTREAM_DEVELOPER_OVERRIDE=1 alongside OPENSTREAM_PAIRING_JSON.
 //! ```
 
 use std::env;
@@ -16,8 +19,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use openstream_client_core::{
-    CandidateKind, Capabilities, ConnectionPath, FlushOutcome, MigrationTarget, Pairing,
-    PeerSession, QueueOutcome, Role, parse_stun_servers,
+    CandidateKind, Capabilities, ConnectionPath, FlushOutcome, MigrationTarget, PeerSession,
+    QueueOutcome, Role, load_pairing_from_environment, parse_stun_servers,
 };
 use openstream_media::{Assembler, Fragment, FrameAck, MAX_FRAGMENT_BYTES, fragment_frame};
 use openstream_protocol::Kind;
@@ -48,10 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let origin =
         env::var("OPENSTREAM_SIGNAL_ORIGIN").unwrap_or_else(|_| DEFAULT_SIGNAL_ORIGIN.to_string());
-    let pairing: Pairing = serde_json::from_str(
-        &env::var("OPENSTREAM_PAIRING_JSON")
-            .map_err(|_| "OPENSTREAM_PAIRING_JSON must contain the create-session response")?,
-    )?;
+    let pairing = load_pairing_from_environment()?;
 
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| DEFAULT_UDP_BIND.to_string())

@@ -146,11 +146,11 @@
 **Interfaces:**
 - Produces a developer/headless launch path that reads pairing material from a private runtime file or stdin, never from committed config; normal app-core commands receive only opaque session IDs.
 
-- [ ] Step 1: Add failing tests for missing/over-permissive pairing-file permissions, no secret echo, bounded session duration, and graceful child shutdown.
-- [ ] Step 2: Implement a local launch helper that starts the signal service/agent/session runner with private temporary state and cleanup traps; retain explicit local-mode warning.
-- [ ] Step 3: Replace normal documentation examples that paste pairing JSON into environment variables with the helper/config flow while retaining an explicitly marked developer override.
-- [ ] Step 4: Run startup-order, portable-transport, and physical fallback acceptance commands; redact all output.
-- [ ] Step 5: Commit `feat: add local-first session launch flow`.
+- [x] Step 1: Add failing tests for missing/over-permissive pairing-file permissions, no secret echo, bounded session duration, and graceful child shutdown.
+- [x] Step 2: Implement a local launch helper and shared pairing-file loader with private temporary state, cleanup traps, and an explicit developer-only JSON override.
+- [x] Step 3: Replace normal documentation and smoke examples that paste pairing JSON into environment variables with the helper/config flow while retaining an explicitly marked developer override.
+- [x] Step 4: Run startup-order and portable-transport acceptance plus the local FFmpeg fallback smoke; retain the previously recorded Linux NVIDIA -> macOS hardware run as the physical acceptance gate, with all output redacted.
+- [x] Step 5: Commit `feat: add local-first session launch flow`.
 
 **Expected result:** The tested host/client path is repeatable without making raw bearer/pairing data part of ordinary user workflow.
 

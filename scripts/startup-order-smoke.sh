@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+unset OPENSTREAM_PAIRING_JSON OPENSTREAM_DEVELOPER_OVERRIDE
+
 # Prove that direct-v2 establishment is independent of startup order. The host
 # is started first and must remain alive while the client is deliberately held
 # back for more than the historical 15-second candidate deadline. This is a
@@ -158,15 +160,14 @@ curl -fsS --connect-timeout 5 --max-time 10 \
     -X POST "http://127.0.0.1:$signal_port/v1/session" \
     -H 'content-type: application/json' \
     -d '{"ttl_seconds":120}' >"$pairing_file"
-pairing_json="$(<"$pairing_file")"
-if [[ -z "$pairing_json" ]]; then
+if [[ ! -s "$pairing_file" ]]; then
     echo "signal server returned an empty pairing" >&2
     exit 1
 fi
 
 common_env=(
     "OPENSTREAM_SIGNAL_ORIGIN=http://127.0.0.1:$signal_port"
-    "OPENSTREAM_PAIRING_JSON=$pairing_json"
+    "OPENSTREAM_PAIRING_FILE=$pairing_file"
     "OPENSTREAM_UDP_BIND=127.0.0.1:0"
 )
 
