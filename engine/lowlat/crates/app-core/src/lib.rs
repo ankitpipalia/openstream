@@ -821,7 +821,8 @@ fn invalid_state(message: &str) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppCommand, AppErrorCode, AppEvent, AppModel, AppState, HostStatus, PermissionSet,
+        AppCommand, AppErrorCode, AppEvent, AppModel, AppState, DiagnosticSnapshot, HostStatus,
+        PermissionSet,
     };
     use openstream_settings::{CapabilityState, SettingVisibility, setting_descriptors};
 
