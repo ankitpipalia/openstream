@@ -258,15 +258,34 @@ impl Histogram {
         (self.count > 0).then(|| self.total_us / self.count)
     }
 
-    /// Approximate percentile, in microseconds.
-    ///
-    /// The answer is a bucket's upper edge, so it is an upper bound rather
-    /// than an interpolation: reporting "at most this" is honest about the
-    /// resolution, where interpolating between edges would invent precision
-    /// the buckets do not have. `None` when nothing has been recorded; the
-    /// tail beyond the last edge reports [`Self::max_us`].
+    /// Upper bound on the median. See [`Self::percentile_upper_bound_us`].
     #[must_use]
-    pub fn percentile_us(&self, percentile: f64) -> Option<u64> {
+    pub fn p50_upper_bound_us(&self) -> Option<u64> {
+        self.percentile_upper_bound_us(50.0)
+    }
+
+    /// Upper bound on the 95th percentile.
+    #[must_use]
+    pub fn p95_upper_bound_us(&self) -> Option<u64> {
+        self.percentile_upper_bound_us(95.0)
+    }
+
+    /// Upper bound on the 99th percentile.
+    #[must_use]
+    pub fn p99_upper_bound_us(&self) -> Option<u64> {
+        self.percentile_upper_bound_us(99.0)
+    }
+
+    /// Upper bound on a percentile, in microseconds.
+    ///
+    /// The answer is a bucket's upper edge: the true value is at most this,
+    /// and the name says so. Interpolating between edges would invent
+    /// precision the buckets do not have, and a caller reading `p95()` would
+    /// reasonably present it as an exact percentile. `None` when nothing has
+    /// been recorded; the tail beyond the last edge reports
+    /// [`Self::max_us`].
+    #[must_use]
+    pub fn percentile_upper_bound_us(&self, percentile: f64) -> Option<u64> {
         if self.count == 0 {
             return None;
         }
@@ -295,10 +314,49 @@ impl Histogram {
 /// which is enough to catch a stall after noticing one.
 pub const TRACE_CAPACITY: usize = 256;
 
+/// Why a frame's timeline stopped.
+///
+/// An incomplete trace on its own says only "the frame stopped here", which
+/// cannot distinguish a genuine stall from instrumentation housekeeping.
+/// Recording the reason makes that difference legible without having to
+/// reconstruct it from surrounding state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceEnd {
+    /// Reached the last stage.
+    Completed,
+    /// A newer frame began while this one was still in flight. Common and
+    /// benign at the head of a pipeline; repeated at the tail it is a stall.
+    Superseded,
+    /// Dropped to keep the ring bounded. Says nothing about the frame.
+    TraceRingEvicted,
+    /// The session ended before the frame did.
+    SessionEnded,
+    /// No further capture progress within the liveness deadline.
+    CaptureStalled,
+    /// The decoder accepted the frame and produced nothing.
+    DecoderStalled,
+    /// The frame was decoded and never presented.
+    PresenterStalled,
+}
+
+impl TraceEnd {
+    /// Whether this ending indicates the pipeline failed, as opposed to the
+    /// instrumentation tidying up after itself.
+    #[must_use]
+    pub const fn is_stall(self) -> bool {
+        matches!(
+            self,
+            Self::CaptureStalled | Self::DecoderStalled | Self::PresenterStalled
+        )
+    }
+}
+
 /// One frame's stage timings within a single clock domain.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameTrace<S, D: ClockDomain> {
     pub frame_id: u32,
+    /// Why the timeline stopped; `None` while the frame is still in flight.
+    pub ended: Option<TraceEnd>,
     stages: [Option<Stamp<D>>; 8],
     kinds: [Option<S>; 8],
     used: usize,
@@ -309,6 +367,7 @@ impl<S: Copy + PartialEq, D: ClockDomain> FrameTrace<S, D> {
     pub fn new(frame_id: u32) -> Self {
         Self {
             frame_id,
+            ended: None,
             stages: [None; 8],
             kinds: [None; 8],
             used: 0,
@@ -361,6 +420,8 @@ pub struct StageRecorder<S: Copy + PartialEq + Ord + 'static, D: ClockDomain> {
     tracing: bool,
     traces: std::collections::VecDeque<FrameTrace<S, D>>,
     in_flight: Option<FrameTrace<S, D>>,
+    evicted: u64,
+    stalls: u64,
 }
 
 impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageRecorder<S, D> {
@@ -374,6 +435,8 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
             tracing: false,
             traces: std::collections::VecDeque::new(),
             in_flight: None,
+            evicted: 0,
+            stalls: 0,
         }
     }
 
@@ -399,7 +462,7 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
     /// discarding it would hide the case the ring exists for.
     pub fn begin(&mut self, frame_id: u32, at: Stamp<D>) {
         if let Some(previous) = self.in_flight.take() {
-            self.retire(previous);
+            self.retire(previous, TraceEnd::Superseded);
         }
         let mut trace = FrameTrace::new(frame_id);
         trace.mark(self.order[0], at);
@@ -428,11 +491,23 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
             return;
         }
         let trace = self.in_flight.take().expect("checked above");
-        self.retire(trace);
+        self.retire(trace, TraceEnd::Completed);
     }
 
-    fn retire(&mut self, trace: FrameTrace<S, D>) {
+    /// End the frame in flight for a reason other than completing, such as
+    /// a stall observed by a watchdog or the session shutting down.
+    pub fn abandon(&mut self, reason: TraceEnd) {
+        if let Some(trace) = self.in_flight.take() {
+            self.retire(trace, reason);
+        }
+    }
+
+    fn retire(&mut self, mut trace: FrameTrace<S, D>, reason: TraceEnd) {
+        trace.ended = Some(reason);
         self.frames = self.frames.saturating_add(1);
+        if reason.is_stall() {
+            self.stalls = self.stalls.saturating_add(1);
+        }
         for (index, pair) in self.order.windows(2).enumerate() {
             if let Some(span) = trace.span(pair[0], pair[1])
                 && let Some(histogram) = self.spans.get_mut(index)
@@ -441,8 +516,14 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
             }
         }
         if self.tracing {
-            if self.traces.len() >= TRACE_CAPACITY {
-                self.traces.pop_front();
+            if self.traces.len() >= TRACE_CAPACITY && self.traces.pop_front().is_some() {
+                // Only counted. Marking the evicted copy would be writing to
+                // a value on its way out; what a reader needs is to know the
+                // retained window is shorter than the session, which the
+                // count says. `TraceEnd::TraceRingEvicted` exists for an
+                // exporter that streams traces out rather than retaining
+                // them.
+                self.evicted = self.evicted.saturating_add(1);
             }
             self.traces.push_back(trace);
         }
@@ -464,6 +545,22 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
         self.frames
     }
 
+    /// Frames whose timeline ended in a stall rather than completing.
+    ///
+    /// Always counted, including when tracing is off: the count is the cheap
+    /// signal, the timeline is the expensive one.
+    #[must_use]
+    pub const fn stalls(&self) -> u64 {
+        self.stalls
+    }
+
+    /// Traces dropped to keep the ring bounded. A non-zero value means the
+    /// retained window is shorter than the session.
+    #[must_use]
+    pub const fn evicted_traces(&self) -> u64 {
+        self.evicted
+    }
+
     /// Retained per-frame timelines, oldest first. Empty unless tracing.
     pub fn traces(&self) -> impl Iterator<Item = &FrameTrace<S, D>> {
         self.traces.iter()
@@ -480,14 +577,14 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
                 let value =
                     |v: Option<u64>| v.map_or_else(|| "-".to_string(), |us| format!("{us}"));
                 format!(
-                    "{} {:?} -> {:?}  n={} p50={}us p95={}us p99={}us max={}us",
+                    "{} {:?} -> {:?}  n={} p50<={}us p95<={}us p99<={}us max={}us",
                     D::NAME,
                     pair[0],
                     pair[1],
                     histogram.count(),
-                    value(histogram.percentile_us(50.0)),
-                    value(histogram.percentile_us(95.0)),
-                    value(histogram.percentile_us(99.0)),
+                    value(histogram.p50_upper_bound_us()),
+                    value(histogram.p95_upper_bound_us()),
+                    value(histogram.p99_upper_bound_us()),
                     histogram.max_us(),
                 )
             })
@@ -538,7 +635,7 @@ mod tests {
     #[test]
     fn a_histogram_summarises_without_allocating_per_sample() {
         let mut histogram = Histogram::new();
-        assert_eq!(histogram.percentile_us(50.0), None, "empty has no median");
+        assert_eq!(histogram.p50_upper_bound_us(), None, "empty has no median");
 
         for _ in 0..90 {
             histogram.record(Duration::from_micros(900));
@@ -549,10 +646,10 @@ mod tests {
 
         assert_eq!(histogram.count(), 100);
         // 90% sit in the <=1000us bucket, so the median is its upper edge.
-        assert_eq!(histogram.percentile_us(50.0), Some(1_000));
+        assert_eq!(histogram.p50_upper_bound_us(), Some(1_000));
         // The tail is reported at the bucket that contains it, not averaged
         // away by the bulk.
-        assert_eq!(histogram.percentile_us(99.0), Some(150_000));
+        assert_eq!(histogram.p99_upper_bound_us(), Some(150_000));
         assert_eq!(histogram.max_us(), 120_000);
     }
 
@@ -564,7 +661,7 @@ mod tests {
         histogram.record(Duration::from_micros(500));
         histogram.record(Duration::from_secs(4));
         assert_eq!(histogram.max_us(), 4_000_000);
-        assert_eq!(histogram.percentile_us(100.0), Some(4_000_000));
+        assert_eq!(histogram.percentile_upper_bound_us(100.0), Some(4_000_000));
     }
 
     #[test]
@@ -718,5 +815,560 @@ mod tests {
 
         let client = ClientRecorder::new(&ClientStage::ORDER);
         assert!(client.report()[0].starts_with("client "));
+    }
+}
+
+#[cfg(test)]
+mod trace_end_tests {
+    use super::{Client, ClientRecorder, ClientStage, Stamp, TRACE_CAPACITY, TraceEnd};
+    use std::time::{Duration, Instant};
+
+    fn at(base: Instant, ms: u64) -> Stamp<Client> {
+        Stamp::from_instant(base + Duration::from_millis(ms))
+    }
+
+    /// An incomplete timeline must say why it stopped. "The frame stopped
+    /// here" cannot distinguish a pipeline stall from the instrumentation
+    /// tidying up, and those call for opposite responses.
+    #[test]
+    fn a_timeline_records_why_it_ended() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::new(&ClientStage::ORDER);
+        recorder.set_tracing(true);
+
+        // Completed normally.
+        recorder.begin(1, at(base, 0));
+        recorder.finish(1);
+
+        // Superseded: a newer frame arrived first.
+        recorder.begin(2, at(base, 10));
+        recorder.begin(3, at(base, 20));
+        recorder.finish(3);
+
+        // Abandoned by a watchdog.
+        recorder.begin(4, at(base, 30));
+        recorder.abandon(TraceEnd::DecoderStalled);
+
+        let ends: Vec<(u32, Option<TraceEnd>)> = recorder
+            .traces()
+            .map(|trace| (trace.frame_id, trace.ended))
+            .collect();
+        assert_eq!(
+            ends,
+            vec![
+                (1, Some(TraceEnd::Completed)),
+                (2, Some(TraceEnd::Superseded)),
+                (3, Some(TraceEnd::Completed)),
+                (4, Some(TraceEnd::DecoderStalled)),
+            ]
+        );
+    }
+
+    /// Housekeeping is not a stall, and a stall is not housekeeping.
+    #[test]
+    fn only_real_stalls_count_as_stalls() {
+        assert!(!TraceEnd::Completed.is_stall());
+        assert!(!TraceEnd::Superseded.is_stall());
+        assert!(!TraceEnd::TraceRingEvicted.is_stall());
+        assert!(!TraceEnd::SessionEnded.is_stall());
+        assert!(TraceEnd::CaptureStalled.is_stall());
+        assert!(TraceEnd::DecoderStalled.is_stall());
+        assert!(TraceEnd::PresenterStalled.is_stall());
+    }
+
+    /// The stall count is always on. Tracing is the expensive half; knowing
+    /// that something stalled is the half every session should pay for.
+    #[test]
+    fn stalls_are_counted_even_with_tracing_off() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::new(&ClientStage::ORDER);
+        assert!(!recorder.tracing());
+
+        recorder.begin(1, at(base, 0));
+        recorder.abandon(TraceEnd::PresenterStalled);
+        recorder.begin(2, at(base, 5));
+        recorder.finish(2);
+
+        assert_eq!(recorder.stalls(), 1);
+        assert_eq!(recorder.frames(), 2);
+        assert_eq!(recorder.traces().count(), 0, "still no traces retained");
+    }
+
+    /// A non-zero eviction count is how a reader knows the retained window
+    /// is shorter than the session, rather than silently seeing a partial
+    /// history.
+    #[test]
+    fn evictions_are_counted_so_a_truncated_history_is_visible() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::new(&ClientStage::ORDER);
+        recorder.set_tracing(true);
+        let capacity = u32::try_from(TRACE_CAPACITY).expect("capacity fits a frame id");
+
+        for frame in 0..capacity {
+            recorder.begin(frame, at(base, 0));
+            recorder.finish(frame);
+        }
+        assert_eq!(recorder.evicted_traces(), 0, "nothing dropped yet");
+
+        for frame in capacity..(capacity + 10) {
+            recorder.begin(frame, at(base, 0));
+            recorder.finish(frame);
+        }
+        assert_eq!(recorder.evicted_traces(), 10);
+        assert_eq!(recorder.traces().count(), TRACE_CAPACITY);
+    }
+}
+
+/// A point in the pipeline whose forward progress is worth watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Milestone {
+    FrameEntered,
+    AccessUnitBoundary,
+    PacketSent,
+    PacketReceived,
+    FrameDecoded,
+    FramePresented,
+}
+
+impl Milestone {
+    pub const ORDER: [Self; 6] = [
+        Self::FrameEntered,
+        Self::AccessUnitBoundary,
+        Self::PacketSent,
+        Self::PacketReceived,
+        Self::FrameDecoded,
+        Self::FramePresented,
+    ];
+}
+
+/// Always-on forward-progress counters, one per milestone.
+///
+/// This exists because the trace ring cannot help in the case that matters
+/// most. The ring is indexed by frame, so a pipeline that has stopped
+/// producing frames produces no further evidence -- the history freezes at
+/// whatever was happening before the stall and then says nothing, for as
+/// long as the stall lasts.
+///
+/// These counters answer the question the ring cannot: *is anything still
+/// moving, and where did it stop moving?* They are also the concrete form of
+/// the rule that a process being alive, a socket being open, a portal grant
+/// being held and a PipeWire node reporting `running` are all consistent
+/// with a completely dead capture:
+///
+/// > liveness is frame progress, not the health of the things that are
+/// > supposed to produce frames.
+///
+/// Costs one counter increment and one clock read per event, so it stays on
+/// in production.
+#[derive(Debug, Clone)]
+pub struct Liveness<D: ClockDomain> {
+    counts: [u64; Milestone::ORDER.len()],
+    last: [Option<Stamp<D>>; Milestone::ORDER.len()],
+    started: Stamp<D>,
+}
+
+impl<D: ClockDomain> Liveness<D> {
+    #[must_use]
+    pub fn new(now: Stamp<D>) -> Self {
+        Self {
+            counts: [0; Milestone::ORDER.len()],
+            last: [None; Milestone::ORDER.len()],
+            started: now,
+        }
+    }
+
+    fn index(milestone: Milestone) -> usize {
+        Milestone::ORDER
+            .iter()
+            .position(|candidate| *candidate == milestone)
+            .expect("every milestone is in ORDER")
+    }
+
+    /// Record forward progress past one milestone.
+    pub fn advance(&mut self, milestone: Milestone, at: Stamp<D>) {
+        let index = Self::index(milestone);
+        self.counts[index] = self.counts[index].saturating_add(1);
+        self.last[index] = Some(at);
+    }
+
+    #[must_use]
+    pub fn count(&self, milestone: Milestone) -> u64 {
+        self.counts[Self::index(milestone)]
+    }
+
+    /// How long since this milestone last advanced. `None` if it never has.
+    #[must_use]
+    pub fn since_last(&self, milestone: Milestone, now: Stamp<D>) -> Option<Duration> {
+        self.last[Self::index(milestone)].map(|last| now.since(last))
+    }
+
+    /// Rate in events per second over the whole session.
+    ///
+    /// A session average, not an instantaneous rate: it answers "has this
+    /// been running at roughly the right speed", and deliberately does not
+    /// pretend to detect a momentary dip. Use [`Self::since_last`] for that.
+    #[must_use]
+    pub fn rate_per_second(&self, milestone: Milestone, now: Stamp<D>) -> Option<f64> {
+        let elapsed = now.since(self.started).as_secs_f64();
+        (elapsed > 0.0).then(|| {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a frame count large enough to lose precision is decades of streaming"
+            )]
+            let count = self.count(milestone) as f64;
+            count / elapsed
+        })
+    }
+
+    /// The first milestone that has fallen behind the one before it by more
+    /// than `deadline`, which is where the pipeline stopped.
+    ///
+    /// A stage that has never advanced at all is reported only when the
+    /// stage before it has, so a session that has not started yet is not
+    /// mistaken for one that died at the first step.
+    #[must_use]
+    pub fn stalled_at(&self, deadline: Duration, now: Stamp<D>) -> Option<Milestone> {
+        for pair in Milestone::ORDER.windows(2) {
+            let (upstream, downstream) = (pair[0], pair[1]);
+            if self.count(upstream) == 0 {
+                continue;
+            }
+            let upstream_moved = self.since_last(upstream, now)?;
+            match self.since_last(downstream, now) {
+                // Downstream has never moved although upstream has, and
+                // enough time has passed that it should have.
+                None if upstream_moved >= deadline => return Some(downstream),
+                None => {}
+                Some(downstream_moved) if downstream_moved >= deadline => {
+                    return Some(downstream);
+                }
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
+    /// One line per milestone: count, rate, and time since it last moved.
+    #[must_use]
+    pub fn report(&self, now: Stamp<D>) -> Vec<String> {
+        Milestone::ORDER
+            .iter()
+            .map(|milestone| {
+                let rate = self
+                    .rate_per_second(*milestone, now)
+                    .map_or_else(|| "-".to_string(), |value| format!("{value:.1}/s"));
+                let idle = self.since_last(*milestone, now).map_or_else(
+                    || "never".to_string(),
+                    |since| format!("{}ms ago", since.as_millis()),
+                );
+                format!(
+                    "{} {:?}  n={} {} last={}",
+                    D::NAME,
+                    milestone,
+                    self.count(*milestone),
+                    rate,
+                    idle
+                )
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::{Client, Liveness, Milestone, Stamp};
+    use std::time::{Duration, Instant};
+
+    fn at(base: Instant, ms: u64) -> Stamp<Client> {
+        Stamp::from_instant(base + Duration::from_millis(ms))
+    }
+
+    /// The case the trace ring cannot cover: everything stops, so no new
+    /// frame begins, so no new timeline is recorded, and the frame history
+    /// simply freezes. These counters still show where it froze.
+    #[test]
+    fn a_total_stall_is_located_even_though_no_new_frames_arrive() {
+        let base = Instant::now();
+        let mut liveness = Liveness::<Client>::new(at(base, 0));
+
+        // Packets keep arriving and being decoded; presentation stops.
+        for tick in 0..30 {
+            let now = at(base, tick * 33);
+            liveness.advance(Milestone::PacketReceived, now);
+            liveness.advance(Milestone::FrameDecoded, now);
+            if tick < 10 {
+                liveness.advance(Milestone::FramePresented, now);
+            }
+        }
+
+        let now = at(base, 30 * 33);
+        assert_eq!(
+            liveness.stalled_at(Duration::from_millis(200), now),
+            Some(Milestone::FramePresented),
+            "the stage that stopped moving is named, not merely 'something is wrong'"
+        );
+        assert_eq!(liveness.count(Milestone::FrameDecoded), 30);
+        assert_eq!(liveness.count(Milestone::FramePresented), 10);
+    }
+
+    /// A healthy pipeline reports no stall.
+    #[test]
+    fn a_pipeline_that_is_moving_is_not_a_stall() {
+        let base = Instant::now();
+        let mut liveness = Liveness::<Client>::new(at(base, 0));
+        for tick in 0..20 {
+            let now = at(base, tick * 33);
+            for milestone in Milestone::ORDER {
+                liveness.advance(milestone, now);
+            }
+        }
+        let now = at(base, 20 * 33);
+        assert_eq!(liveness.stalled_at(Duration::from_millis(200), now), None);
+    }
+
+    /// A session that has not started is not a session that died at the
+    /// first step.
+    #[test]
+    fn a_pipeline_that_never_started_is_not_reported_as_stalled() {
+        let base = Instant::now();
+        let liveness = Liveness::<Client>::new(at(base, 0));
+        let now = at(base, 10_000);
+        assert_eq!(
+            liveness.stalled_at(Duration::from_millis(200), now),
+            None,
+            "nothing upstream has moved, so nothing downstream is late"
+        );
+    }
+
+    #[test]
+    fn rates_and_idle_time_are_reported_per_milestone() {
+        let base = Instant::now();
+        let mut liveness = Liveness::<Client>::new(at(base, 0));
+        for tick in 0..60 {
+            liveness.advance(Milestone::FrameDecoded, at(base, tick * 16));
+        }
+        let now = at(base, 1_000);
+
+        let rate = liveness
+            .rate_per_second(Milestone::FrameDecoded, now)
+            .expect("elapsed time is non-zero");
+        assert!((rate - 60.0).abs() < 1.0, "about 60/s, got {rate}");
+
+        // The last decode was at 59*16 = 944ms, so ~56ms ago.
+        let idle = liveness
+            .since_last(Milestone::FrameDecoded, now)
+            .expect("it has advanced");
+        assert_eq!(idle, Duration::from_millis(56));
+
+        assert!(
+            liveness
+                .since_last(Milestone::FramePresented, now)
+                .is_none()
+        );
+
+        let lines = liveness.report(now);
+        assert_eq!(lines.len(), Milestone::ORDER.len());
+        assert!(lines[0].starts_with("client "), "{}", lines[0]);
+        assert!(
+            lines.iter().any(|line| line.contains("last=never")),
+            "a milestone that never moved says so: {lines:?}"
+        );
+    }
+}
+
+/// What OpenStream can actually observe about a frame on this host.
+///
+/// The stages a backend can time are a property of the backend, not of the
+/// telemetry, and the difference is not cosmetic. With an external encoder,
+/// OpenStream hands a capture source to a child process and reads an encoded
+/// byte stream back: it never sees an individual frame go in, so there is no
+/// identity to correlate between "a frame arrived" and "an access unit came
+/// out". Reporting those spans as zero, or inventing a correlation to fill
+/// them, would both be worse than saying they are not observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostObservability {
+    /// An external encoder process owns capture and encode. Only the
+    /// encoded stream is visible, so timing begins at
+    /// [`HostStage::EncoderFirstByte`].
+    EncodedStreamOnly,
+    /// Capture and encode happen in-process, so every stage is observable
+    /// and carries the same frame identity.
+    Full,
+}
+
+impl HostObservability {
+    /// The first stage this backend can time. Stages before it are not
+    /// measured and must not be reported as fast.
+    #[must_use]
+    pub const fn first_observable_stage(self) -> HostStage {
+        match self {
+            Self::EncodedStreamOnly => HostStage::EncoderFirstByte,
+            Self::Full => HostStage::FrameEnteredOpenStream,
+        }
+    }
+
+    /// Stages this backend times, in order.
+    #[must_use]
+    pub fn observable_stages(self) -> &'static [HostStage] {
+        match self {
+            Self::EncodedStreamOnly => &[
+                HostStage::EncoderFirstByte,
+                HostStage::AccessUnitBoundaryKnown,
+                HostStage::FirstFragmentSent,
+                HostStage::LastFragmentSent,
+            ],
+            Self::Full => &HostStage::ORDER,
+        }
+    }
+
+    /// A sentence for a report, naming what is missing and why.
+    #[must_use]
+    pub const fn unobserved_note(self) -> Option<&'static str> {
+        match self {
+            Self::EncodedStreamOnly => Some(
+                "capture and encode run in an external process; the time before \
+                 the first encoded byte is not measured and is not zero",
+            ),
+            Self::Full => None,
+        }
+    }
+}
+
+/// Everything needed to compare one measurement run with another.
+///
+/// A stage table without this is close to unreadable after the fact: a
+/// "decode P95 <= 4ms" line means nothing without knowing the resolution,
+/// the codec, which decoder, and what the code was. Recorded alongside every
+/// export so a number found in six months can still be placed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunContext {
+    pub commit: String,
+    pub codec: String,
+    pub width: u16,
+    pub height: u16,
+    pub fps: u16,
+    pub bitrate_mbps: String,
+    pub capture_backend: String,
+    pub encoder: String,
+    pub decoder: String,
+    pub presenter: String,
+    /// `direct` or `relay`.
+    pub path: String,
+    pub vsync: String,
+    pub profile: String,
+    pub host_observability: HostObservability,
+}
+
+impl RunContext {
+    /// One line per field, stable order, safe to log.
+    ///
+    /// Carries no addresses, tokens, or user content: every field is a
+    /// configuration choice, not a session secret.
+    #[must_use]
+    pub fn report(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("commit={}", self.commit),
+            format!("codec={}", self.codec),
+            format!("size={}x{}", self.width, self.height),
+            format!("fps={}", self.fps),
+            format!("bitrate_mbps={}", self.bitrate_mbps),
+            format!("capture={}", self.capture_backend),
+            format!("encoder={}", self.encoder),
+            format!("decoder={}", self.decoder),
+            format!("presenter={}", self.presenter),
+            format!("path={}", self.path),
+            format!("vsync={}", self.vsync),
+            format!("profile={}", self.profile),
+            format!("host_observability={:?}", self.host_observability),
+        ];
+        if let Some(note) = self.host_observability.unobserved_note() {
+            lines.push(format!("unobserved={note}"));
+        }
+        lines
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::{HostObservability, HostStage, RunContext};
+
+    /// The external-encoder path cannot time capture, and must say so
+    /// rather than reporting those stages as instant.
+    #[test]
+    fn an_external_encoder_reports_what_it_cannot_see() {
+        let external = HostObservability::EncodedStreamOnly;
+        assert_eq!(
+            external.first_observable_stage(),
+            HostStage::EncoderFirstByte
+        );
+        assert!(
+            !external
+                .observable_stages()
+                .contains(&HostStage::FrameEnteredOpenStream),
+            "a stage that cannot be timed is not offered"
+        );
+        let note = external
+            .unobserved_note()
+            .expect("there is something missing");
+        assert!(note.contains("is not zero"), "{note}");
+
+        let native = HostObservability::Full;
+        assert_eq!(
+            native.first_observable_stage(),
+            HostStage::FrameEnteredOpenStream
+        );
+        assert_eq!(native.observable_stages().len(), HostStage::ORDER.len());
+        assert!(native.unobserved_note().is_none());
+    }
+
+    /// A stage table is uninterpretable later without the configuration it
+    /// was taken under.
+    #[test]
+    fn a_run_records_enough_to_be_compared_with_another() {
+        let context = RunContext {
+            commit: "bd90b04".into(),
+            codec: "H264".into(),
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_mbps: "10.00".into(),
+            capture_backend: "portal-pipewire".into(),
+            encoder: "h264_nvenc".into(),
+            decoder: "ffmpeg".into(),
+            presenter: "minifb-software".into(),
+            path: "direct".into(),
+            vsync: "off".into(),
+            profile: "balanced".into(),
+            host_observability: HostObservability::EncodedStreamOnly,
+        };
+
+        let report = context.report();
+        for field in [
+            "commit=",
+            "codec=",
+            "size=1920x1080",
+            "fps=30",
+            "encoder=",
+            "decoder=",
+            "presenter=",
+            "path=",
+            "vsync=",
+            "profile=",
+        ] {
+            assert!(
+                report.iter().any(|line| line.contains(field)),
+                "missing {field} in {report:?}"
+            );
+        }
+        assert!(
+            report.iter().any(|line| line.starts_with("unobserved=")),
+            "the gap is stated in the export, not left to be remembered"
+        );
+
+        // Nothing here is a secret: these are configuration choices.
+        let joined = report.join(" ");
+        for forbidden in ["token", "Bearer", "192.168", "pairing"] {
+            assert!(!joined.contains(forbidden), "leaked {forbidden}");
+        }
     }
 }
