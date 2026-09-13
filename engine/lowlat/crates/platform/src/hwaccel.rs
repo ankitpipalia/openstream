@@ -48,17 +48,42 @@ impl HwReport {
         // Ask each encoder whether it works, in the environment the host
         // child will inherit. Nothing here is inferred from a file existing:
         // a library path and a render node are both evidence that userspace
-        // is installed, neither is evidence that a codec encodes. Four
-        // bounded one-frame probes at host startup answer the question that
-        // actually decides the session.
+        // is installed, neither is evidence that a codec encodes.
+        //
+        // The probes run concurrently. Each spawns its own FFmpeg and they
+        // share nothing, so running them in sequence only meant that a host
+        // with one wedged driver paid every timeout one after another --
+        // five bounded waits is a long startup when the whole point of the
+        // bound is that something is already broken. Concurrently the worst
+        // case is one timeout, not the sum of them.
         let render_node = vaapi_render_node();
+        let node = render_node.as_deref();
+        let (vaapi_h264, vaapi_hevc, nvenc_h264, nvenc_hevc, nvidia_smi) =
+            std::thread::scope(|scope| {
+                let vaapi_h264 = scope.spawn(|| vaapi_encoder_usable("h264_vaapi", node));
+                let vaapi_hevc = scope.spawn(|| vaapi_encoder_usable("hevc_vaapi", node));
+                let nvenc_h264 = scope.spawn(|| ffmpeg_encoder_usable("h264_nvenc"));
+                let nvenc_hevc = scope.spawn(|| ffmpeg_encoder_usable("hevc_nvenc"));
+                let nvidia_smi = scope.spawn(|| command_exists("nvidia-smi"));
+                // A probe thread only panics if the probe itself does, which
+                // would be a bug here rather than a property of the machine;
+                // treat it as "not available" rather than taking the host
+                // down during startup.
+                (
+                    vaapi_h264.join().unwrap_or(false),
+                    vaapi_hevc.join().unwrap_or(false),
+                    nvenc_h264.join().unwrap_or(false),
+                    nvenc_hevc.join().unwrap_or(false),
+                    nvidia_smi.join().unwrap_or(false),
+                )
+            });
         Self {
             vaapi_node: render_node.is_some(),
-            vaapi_h264: vaapi_encoder_usable("h264_vaapi", render_node.as_deref()),
-            vaapi_hevc: vaapi_encoder_usable("hevc_vaapi", render_node.as_deref()),
-            nvenc_h264: ffmpeg_encoder_usable("h264_nvenc"),
-            nvenc_hevc: ffmpeg_encoder_usable("hevc_nvenc"),
-            nvidia_smi: command_exists("nvidia-smi"),
+            vaapi_h264,
+            vaapi_hevc,
+            nvenc_h264,
+            nvenc_hevc,
+            nvidia_smi,
         }
     }
 
@@ -299,6 +324,13 @@ fn nvenc_library_location() -> Option<String> {
 /// inherit, by encoding a single tiny frame.
 ///
 /// It spawns a process, so it is not free; callers probe once at startup.
+/// How long one encoder probe may take.
+///
+/// Encoding a single 64x64 frame is sub-second work everywhere it works at
+/// all; this bound is for a driver that has wedged, not a slow one. Probes
+/// run concurrently, so this is also the worst case for the whole report.
+const ENCODER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Whether FFmpeg can actually open a VAAPI encoder session here.
 ///
 /// A VAAPI encode needs more than the encoder name: it needs the device and
@@ -338,7 +370,7 @@ fn vaapi_encoder_usable(encoder: &str, render_node: Option<&str>) -> bool {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
-        std::time::Duration::from_secs(10),
+        ENCODER_PROBE_TIMEOUT,
     )
 }
 
@@ -365,7 +397,7 @@ fn ffmpeg_encoder_usable(encoder: &str) -> bool {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
-        std::time::Duration::from_secs(10),
+        ENCODER_PROBE_TIMEOUT,
     )
 }
 
@@ -737,6 +769,74 @@ mod tests {
             report.preferred_encoder(EncoderCodec::H265),
             Some("hevc_vaapi")
         );
+    }
+
+    /// A probe that will not finish is abandoned, promptly, and reaped.
+    ///
+    /// The bound exists for a wedged driver, and it runs during host
+    /// startup, so it has to return within the limit rather than when the
+    /// child feels like it, and must not leave the child behind.
+    ///
+    /// What this does *not* check is that the wait yields the core between
+    /// polls: a spin loop would satisfy every assertion below while burning
+    /// a CPU for the whole timeout, on precisely the machine already in
+    /// trouble. That property is held by the `sleep` in `run_bounded` and
+    /// is verified by reading it, not by this test.
+    #[test]
+    fn a_probe_that_never_finishes_is_bounded_and_reaped() {
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let started = std::time::Instant::now();
+        let usable = run_bounded(&mut command, std::time::Duration::from_millis(200));
+        let elapsed = started.elapsed();
+
+        assert!(!usable, "a child that never exits is not a working encoder");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(200),
+            "returned before the limit: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "waited far past the limit: {elapsed:?}"
+        );
+        // `run_bounded` kills and then waits, so the child is reaped rather
+        // than left as a zombie. If it had not been waited on, this test
+        // process would accumulate one per run.
+    }
+
+    /// A probe that exits reports its status, and does not wait out the
+    /// limit to do it.
+    #[test]
+    fn a_probe_that_finishes_is_answered_immediately() {
+        let mut ok = std::process::Command::new("true");
+        ok.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        assert!(run_bounded(&mut ok, std::time::Duration::from_secs(5)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a child that exits at once must not wait out the limit"
+        );
+
+        let mut fails = std::process::Command::new("false");
+        fails
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        assert!(!run_bounded(&mut fails, std::time::Duration::from_secs(5)));
+
+        // A program that does not exist is not a working encoder either.
+        let mut missing = std::process::Command::new("openstream-no-such-binary");
+        assert!(!run_bounded(
+            &mut missing,
+            std::time::Duration::from_secs(5)
+        ));
     }
 
     /// A render node is a device, not an encoder.
