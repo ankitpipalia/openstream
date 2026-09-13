@@ -72,19 +72,36 @@ const PULSE_OFF: u32 = 0x0030_3040;
 /// and the loop does no work in that time beyond pumping events.
 const IDLE_FRAME: Duration = Duration::from_millis(2);
 
-/// How often to re-upload an unchanged surface.
+/// Default interval between re-uploads of an unchanged surface, in
+/// milliseconds. Overridden by `OPENSTREAM_PROBE_HEARTBEAT_MS`.
 ///
-/// A portal screencast only emits a buffer when something on the screen
-/// changed. A helper that drew once and then went still would stop the
-/// capture entirely: the client would decode nothing, never read the
-/// marker, and so never learn which id to send -- the probe would deadlock
-/// before its first measurement. Ten hertz is enough to keep the stream
-/// alive and cheap enough not to become the load being measured.
-const HEARTBEAT: Duration = Duration::from_millis(100);
+/// This setting decides what the probe is measuring, so it is worth being
+/// explicit about both directions.
+///
+/// A portal screencast is damage driven: it emits a buffer when something on
+/// the screen changed. A helper that drew once and went still would stop the
+/// capture entirely -- the client would decode nothing, never read the
+/// marker, and never learn which id to send, so the probe would deadlock
+/// before its first measurement. Worse, a heartbeat that is merely *slow*
+/// does not deadlock, it quietly produces a slow stream: a first rig run at
+/// ten hertz measured a session running at 8.6 fps, and an interaction
+/// latency drawn from that says nothing about an interactive desktop.
+///
+/// So the default matches a typical stream rate, and the helper is the thing
+/// keeping the capture busy, the way a desktop someone is using would be.
+/// The cost is real -- each upload is the whole surface -- which is why it
+/// is a knob: a slower heartbeat lowers the helper's own load at the price
+/// of measuring a stream nobody would stream.
+const DEFAULT_HEARTBEAT_MS: u64 = 16;
+
+/// Largest accepted heartbeat. Beyond about a third of a second the capture
+/// is no longer a video stream in any useful sense.
+const MAX_HEARTBEAT_MS: u64 = 250;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = surface_size()?;
     let origin = marker_origin()?;
+    let heartbeat = heartbeat_interval()?;
     if origin.0 + marker_width() > width || origin.1 + marker_height() > height {
         return Err(format!(
             "marker at {origin:?} sized {}x{} does not fit in {width}x{height}",
@@ -119,6 +136,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         marker_width(),
         marker_height()
     );
+    println!(
+        "OpenStream probe helper: heartbeat {}ms -- the capture runs no faster than this",
+        heartbeat.as_millis()
+    );
     println!("OpenStream probe helper: give the client the same origin; Escape quits");
 
     let mut buffer = vec![BACKGROUND; width * height];
@@ -129,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buttons_down = [false; 3];
     let mut last_report = Instant::now();
     // Zero elapsed at the start would skip the first upload; force one.
-    let mut last_upload = Instant::now() - HEARTBEAT;
+    let mut last_upload = Instant::now() - heartbeat;
     draw(&mut buffer, width, height, origin, probe_id);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
@@ -175,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // id to send next -- a probe that deadlocks itself before the first
         // measurement. The heartbeat keeps the stream alive at a rate that
         // costs a few percent of one core.
-        let heartbeat_due = last_upload.elapsed() >= HEARTBEAT;
+        let heartbeat_due = last_upload.elapsed() >= heartbeat;
         if advanced || heartbeat_due {
             window.update_with_buffer(&buffer, width, height)?;
             last_upload = Instant::now();
@@ -243,6 +264,24 @@ fn parse_size(spec: &str) -> Result<(usize, usize), Box<dyn std::error::Error>> 
     Ok((width, height))
 }
 
+fn heartbeat_interval() -> Result<Duration, Box<dyn std::error::Error>> {
+    match env::var("OPENSTREAM_PROBE_HEARTBEAT_MS") {
+        Ok(spec) => parse_heartbeat(&spec),
+        Err(_) => Ok(Duration::from_millis(DEFAULT_HEARTBEAT_MS)),
+    }
+}
+
+fn parse_heartbeat(spec: &str) -> Result<Duration, Box<dyn std::error::Error>> {
+    let millis: u64 = spec.trim().parse()?;
+    if millis == 0 || millis > MAX_HEARTBEAT_MS {
+        return Err(format!(
+            "OPENSTREAM_PROBE_HEARTBEAT_MS must be 1..={MAX_HEARTBEAT_MS}, got {spec}"
+        )
+        .into());
+    }
+    Ok(Duration::from_millis(millis))
+}
+
 fn marker_origin() -> Result<(usize, usize), Box<dyn std::error::Error>> {
     match env::var("OPENSTREAM_PROBE_ORIGIN") {
         Ok(spec) => parse_origin(&spec),
@@ -259,7 +298,7 @@ fn parse_origin(spec: &str) -> Result<(usize, usize), Box<dyn std::error::Error>
 
 #[cfg(test)]
 mod tests {
-    use super::{BACKGROUND, draw, parse_origin, parse_size};
+    use super::{BACKGROUND, MAX_HEARTBEAT_MS, draw, parse_heartbeat, parse_origin, parse_size};
     use openstream_media::probe::{detect, marker_height, marker_width};
 
     /// What the helper draws is what the client reads. If this ever stops
@@ -326,6 +365,23 @@ mod tests {
             parse_size("999999x1080").is_err(),
             "a mistyped size must not ask for a multi-gigabyte buffer"
         );
+    }
+
+    /// A heartbeat slower than the stream makes the probe measure a stream
+    /// nobody would run, and a zero heartbeat stops the capture entirely.
+    #[test]
+    fn a_heartbeat_is_parsed_or_refused() {
+        assert_eq!(
+            parse_heartbeat("16").expect("valid").as_millis(),
+            16,
+            "a 60Hz heartbeat is the default shape"
+        );
+        assert!(
+            parse_heartbeat("0").is_err(),
+            "a still helper stops capture"
+        );
+        assert!(parse_heartbeat(&(MAX_HEARTBEAT_MS + 1).to_string()).is_err());
+        assert!(parse_heartbeat("fast").is_err());
     }
 
     #[test]
