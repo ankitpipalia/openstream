@@ -38,8 +38,8 @@ use openstream_media::latency::{
 use openstream_media::metrics::ReconnectSupervisor;
 use openstream_media::probe::{InteractionProbe, detect as probe_detect};
 use openstream_media::{
-    Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
-    metrics::MetricsReporter,
+    Assembler, AudioEvent, AudioFrame, Fragment, FragmentOutcome, FrameAck, JitterBuffer,
+    KEYFRAME_REQUEST, metrics::MetricsReporter,
 };
 use openstream_platform::clipboard as platform_clipboard;
 use openstream_platform::clipboard_policy::ClipboardPolicy;
@@ -1554,35 +1554,55 @@ async fn network_session(
                 };
                 let fragment_at = Stamp::<ClientClock>::now();
                 let frame_id = fragment.frame_id;
-                // Fragments arrive in any order, so "first" means the first
-                // one seen for this frame rather than index zero, and "last"
-                // means the fragment that completed the count rather than
-                // the highest index. `begin` stamps the first stage and is a
-                // no-op for a frame already being timed, so a later fragment
-                // cannot restart the timeline.
-                stages.begin(frame_id, fragment_at);
-                match assembler.push(fragment) {
-                    Ok(Some(frame)) => {
-                        // The assembler returns a frame exactly when the
-                        // fragment just pushed completed it, so this
-                        // fragment is the last one received -- whatever its
-                        // index was.
-                        stages.mark(frame_id, ClientStage::LastFragmentReceived, fragment_at);
-                        ready_frames.push(frame);
-                    }
-                    Ok(None) => {}
+                // Telemetry follows the assembler's lifecycle rather than
+                // reconstructing it. Every branch below comes from what the
+                // assembler says it did with this fragment, because the two
+                // used to diverge in both directions: a retransmission of an
+                // already-assembled frame opened a timeline that could never
+                // finish, and a frame that completed while an older one was
+                // missing never got its completion stamp at all.
+                let outcome = match assembler.push(fragment) {
+                    Ok(outcome) => outcome,
                     Err(error) => {
+                        // The fragment was rejected and any partial frame
+                        // discarded with it. Close the timeline rather than
+                        // leaving it open to be retired later as a stall
+                        // that never happened.
+                        stages.abandon_frame(frame_id, TraceEnd::Superseded);
                         let _ = ui_tx.send(UiMessage::Error(format!(
                             "video frame dropped: {error}"
                         )));
                         continue;
                     }
+                };
+                match outcome.fragment {
+                    // The assembler ignored it, so nothing began or
+                    // advanced. Opening a timeline here is what produced
+                    // ghost traces for frames that had already finished.
+                    FragmentOutcome::Duplicate => {}
+                    FragmentOutcome::AcceptedIncomplete | FragmentOutcome::Completed => {
+                        // "First" means the first fragment seen for this
+                        // frame, not index zero. `begin` is a no-op for a
+                        // frame already being timed, so a later fragment
+                        // cannot restart the timeline.
+                        stages.begin(frame_id, fragment_at);
+                    }
                 }
+                if let Some(completed) = outcome.completed {
+                    // The frame whose last missing fragment this was -- not
+                    // necessarily the frame released below, which is
+                    // whichever one became next in presentation order. The
+                    // gap between the two is the reorder wait, and keying
+                    // this stamp off the released frame is what hid it.
+                    stages.mark(completed, ClientStage::LastFragmentReceived, fragment_at);
+                }
+                for dropped in &outcome.dropped {
+                    // Evicted to stay bounded, or completed too late to
+                    // decode in order. Nothing more will arrive for it.
+                    stages.abandon_frame(*dropped, TraceEnd::Superseded);
+                }
+                ready_frames.extend(outcome.ready);
                 while let Some(frame) = assembler.pop_ready() {
-                    // Completed earlier and held back while an older frame
-                    // was still missing; it was marked when it completed.
-                    // The span from there to `Reassembled` is the time the
-                    // reorder buffer kept it.
                     ready_frames.push(frame);
                 }
                 if assembler.take_keyframe_request() {

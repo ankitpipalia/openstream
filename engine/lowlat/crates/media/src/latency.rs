@@ -321,14 +321,18 @@ impl Histogram {
 
 /// How many frames may be timed at once.
 ///
-/// A frame is several fragments, and both the link and the reassembler can
-/// have two frames' worth in hand at the same time. Twice the client
-/// assembler's default reorder window, so frames arriving now cannot push
-/// out ones it is still holding back; bounded all the same, because a
-/// timeline whose frame never completes must retire rather than accumulate,
-/// and it does so as [`TraceEnd::Superseded`] once this many newer frames
-/// have started.
-pub const IN_FLIGHT_CAPACITY: usize = 16;
+/// This is a backstop, not the mechanism. Timelines are meant to retire
+/// because the thing that owns the frame said so -- the assembler reports
+/// what it completed, released and gave up on, and the caller retires each
+/// timeline against those facts. The bound only catches a frame nobody ever
+/// spoke for again.
+///
+/// Sized so the backstop cannot fire while the assembler still owns the
+/// frame, which would let the two disagree under exactly the loss and
+/// reordering this exists to measure: the client assembler holds up to
+/// `max_inflight` incomplete frames and four times that many completed ones
+/// waiting to be released, so 64 covers both with headroom.
+pub const IN_FLIGHT_CAPACITY: usize = 64;
 
 /// How many frame timelines the opt-in trace ring retains.
 ///

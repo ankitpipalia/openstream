@@ -276,8 +276,7 @@ async fn receive_legacy_frames(
         };
         let mut ready_frames = Vec::new();
         match assembler.push(fragment) {
-            Ok(Some(frame)) => ready_frames.push(frame),
-            Ok(None) => {}
+            Ok(outcome) => ready_frames.extend(outcome.into_ready()),
             Err(error) => {
                 eprintln!("reference peer dropped malformed video frame: {error}");
                 continue;
@@ -316,9 +315,7 @@ async fn receive_migration_frames(
         }
         let fragment = Fragment::decode(&packet.payload)?;
         let mut ready_frames = Vec::new();
-        if let Some(frame) = assembler.push(fragment)? {
-            ready_frames.push(frame);
-        }
+        ready_frames.extend(assembler.push(fragment)?.into_ready());
         while let Some(frame) = assembler.pop_ready() {
             ready_frames.push(frame);
         }

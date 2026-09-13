@@ -570,8 +570,7 @@ async fn run_client(
                 };
                 let mut ready_frames = Vec::new();
                 match assembler.push(fragment) {
-                    Ok(Some(frame)) => ready_frames.push(frame),
-                    Ok(None) => {}
+                    Ok(outcome) => ready_frames.extend(outcome.into_ready()),
                     Err(_) => continue,
                 }
                 while let Some(frame) = assembler.pop_ready() {
