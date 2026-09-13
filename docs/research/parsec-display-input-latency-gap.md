@@ -42,6 +42,16 @@ and a separate event-driven input pipeline. OpenStream passes decoded pixels
 and input through several queues whose semantics favour boundedness and
 reliability over freshness. The highest-value next step is not another fix:
 it is stage-level instrumentation, so the step after it can be attributed.
+## Evidence
+
+The artifacts are not in this repository: `analysis/` is gitignored because it
+holds vendor binaries and multi-megabyte string tables, and they are never
+executed, published, or shipped. Every citation below therefore points at
+[`evidence/parsec-artifact-manifest.md`](evidence/parsec-artifact-manifest.md),
+which records each artifact's SHA-256 and the specific symbols and
+configuration keys the conclusions rest on — so the reasoning stays checkable
+from a clean clone without redistributing anything.
+
 ## Evidence confidence
 
 | Confidence | Meaning |
@@ -479,10 +489,10 @@ build the missing behavior cleanly.
 
 ## Sources
 
-[^parsec-arm64]: Supplied Parsec macOS arm64 artifact and retained filtered evidence: [`analysis/strings_arm64.txt`](../../analysis/strings_arm64.txt), especially the VideoToolbox/CoreVideo/Metal imports and configuration/latency fields. Access: authorized local artifact, static inspection only.
-[^parsec-cursor]: Retained Parsec macOS/Windows strings: [`analysis/strings_arm64.txt`](../../analysis/strings_arm64.txt) and [`analysis/strings_win_dll.txt`](../../analysis/strings_win_dll.txt), including `client_png_cursor`, `_cache_cursor`, relative-mode and detach-mouse indicators. Access: authorized local artifacts, static inspection only.
-[^parsec-windows]: Supplied Windows payload and retained imports in [`analysis/strings_win_dll.txt`](../../analysis/strings_win_dll.txt), including Windows Raw Input APIs. Access: authorized local artifact, static inspection only.
-[^parsec-input]: Disassembly of the supplied arm64 payload around the serializer referencing `keyboardTime`, `mouseTime`, `gamepadTime`, and `penTime`; retained strings in [`analysis/strings_arm64.txt`](../../analysis/strings_arm64.txt). Access: authorized local artifact, static inspection only.
+[^parsec-arm64]: Supplied Parsec macOS arm64 artifact and retained filtered evidence: [`analysis/strings_arm64.txt`](evidence/parsec-artifact-manifest.md), especially the VideoToolbox/CoreVideo/Metal imports and configuration/latency fields. Access: authorized local artifact, static inspection only.
+[^parsec-cursor]: Retained Parsec macOS/Windows strings: [`analysis/strings_arm64.txt`](evidence/parsec-artifact-manifest.md) and [`analysis/strings_win_dll.txt`](evidence/parsec-artifact-manifest.md), including `client_png_cursor`, `_cache_cursor`, relative-mode and detach-mouse indicators. Access: authorized local artifacts, static inspection only.
+[^parsec-windows]: Supplied Windows payload and retained imports in [`analysis/strings_win_dll.txt`](evidence/parsec-artifact-manifest.md), including Windows Raw Input APIs. Access: authorized local artifact, static inspection only.
+[^parsec-input]: Disassembly of the supplied arm64 payload around the serializer referencing `keyboardTime`, `mouseTime`, `gamepadTime`, and `penTime`; retained strings in [`analysis/strings_arm64.txt`](evidence/parsec-artifact-manifest.md). Access: authorized local artifact, static inspection only.
 [^openstream-client]: OpenStream desktop runtime: [`engine/lowlat/crates/desktop-client/src/main.rs`](../../engine/lowlat/crates/desktop-client/src/main.rs).
 [^openstream-render]: OpenStream BGRA texture-upload presenter: [`engine/lowlat/crates/desktop-client/src/render.rs`](../../engine/lowlat/crates/desktop-client/src/render.rs).
 [^openstream-input]: OpenStream input protocol and currently unused freshness-aware queue: [`engine/lowlat/crates/media/src/input.rs`](../../engine/lowlat/crates/media/src/input.rs); reliable control and scheduler: [`engine/lowlat/crates/client-core/src/lib.rs`](../../engine/lowlat/crates/client-core/src/lib.rs).
