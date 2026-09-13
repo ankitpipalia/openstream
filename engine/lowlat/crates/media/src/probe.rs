@@ -415,12 +415,16 @@ impl InteractionProbe {
             return None;
         }
         entry.decoded = Some(at);
-        let to_decoded = at.since(entry.sent);
-        self.to_decoded.record(to_decoded);
+        let sent = entry.sent;
+        let to_decoded = at.since(sent);
+        // `record_span` counts an out-of-order pair as invalid rather than
+        // as a zero-microsecond interaction. The probe is still retired --
+        // a marker seen is a marker seen -- but it contributes no sample.
+        self.to_decoded.record_span(to_decoded);
         self.decoded = self.decoded.saturating_add(1);
         Some(Completion {
             probe_id,
-            to_decoded,
+            to_decoded: to_decoded?,
             to_present_submit: None,
         })
     }
@@ -440,12 +444,12 @@ impl InteractionProbe {
         let decoded = entry.decoded?;
         self.outstanding.remove(index);
         let to_present = at.since(entry.sent);
-        self.to_present_submit.record(to_present);
+        self.to_present_submit.record_span(to_present);
         self.present_submitted = self.present_submitted.saturating_add(1);
         Some(Completion {
             probe_id,
-            to_decoded: decoded.since(entry.sent),
-            to_present_submit: Some(to_present),
+            to_decoded: decoded.since(entry.sent)?,
+            to_present_submit: Some(to_present?),
         })
     }
 

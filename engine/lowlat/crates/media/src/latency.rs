@@ -89,16 +89,25 @@ impl<D: ClockDomain> Stamp<D> {
         }
     }
 
-    /// Time from `earlier` to this stamp, saturating at zero.
+    /// Time from `earlier` to this stamp, or `None` if `earlier` is not
+    /// earlier.
     ///
-    /// Only same-domain stamps can be passed, so the result is always a
-    /// duration one clock actually measured:
+    /// It used to saturate at zero. That is the same mistake as rendering an
+    /// empty histogram as `max=0us`: a bug in the caller's ordering became a
+    /// fast-looking sample, indistinguishable from a real one and pulling
+    /// every statistic it entered towards zero. Out-of-order stamps mean the
+    /// instrumentation is wrong, so they are counted as invalid and excluded
+    /// rather than averaged in. Absence and invalidity must never become a
+    /// number.
+    ///
+    /// Only same-domain stamps can be passed, so a result that is `Some` is
+    /// always a duration one clock actually measured:
     ///
     /// ```
     /// use openstream_media::latency::{Host, Stamp};
     /// let start: Stamp<Host> = Stamp::now();
     /// let end: Stamp<Host> = Stamp::now();
-    /// let _elapsed = end.since(start);
+    /// let _elapsed = end.since(start).expect("monotonic");
     /// ```
     ///
     /// Mixing clocks does not compile. This is the mistake that produced a
@@ -113,8 +122,8 @@ impl<D: ClockDomain> Stamp<D> {
     /// let _nonsense = client.since(host);
     /// ```
     #[must_use]
-    pub fn since(self, earlier: Self) -> Duration {
-        self.at.saturating_duration_since(earlier.at)
+    pub fn since(self, earlier: Self) -> Option<Duration> {
+        self.at.checked_duration_since(earlier.at)
     }
 }
 
@@ -209,6 +218,9 @@ pub struct Histogram {
     count: u64,
     total_us: u64,
     max_us: u64,
+    /// Attempts whose two stamps were out of order. Never folded into
+    /// `count`: they are not samples, they are evidence of a bug.
+    invalid: u64,
 }
 
 impl Default for Histogram {
@@ -223,6 +235,7 @@ impl Histogram {
         Self {
             buckets: [0; BUCKET_EDGES_US.len()],
             overflow: 0,
+            invalid: 0,
             count: 0,
             total_us: 0,
             max_us: 0,
@@ -242,6 +255,25 @@ impl Histogram {
             }
         }
         self.overflow = self.overflow.saturating_add(1);
+    }
+
+    /// Record a span that may not have been measurable.
+    ///
+    /// `None` means the two stamps were out of order, which is an
+    /// instrumentation bug rather than a fast frame. It is counted so a
+    /// reader can see the histogram is not describing every attempt, and
+    /// excluded from every statistic so it cannot look like zero latency.
+    pub fn record_span(&mut self, span: Option<Duration>) {
+        match span {
+            Some(span) => self.record(span),
+            None => self.invalid = self.invalid.saturating_add(1),
+        }
+    }
+
+    /// Attempts rejected because their stamps were out of order.
+    #[must_use]
+    pub const fn invalid(&self) -> u64 {
+        self.invalid
     }
 
     /// Samples that landed past the last bucket edge.
@@ -378,6 +410,19 @@ impl TraceEnd {
     }
 }
 
+/// What a trace can say about the interval between two stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceSpan {
+    /// At least one of the two stages was never reached by this frame.
+    /// Nothing to record, and nothing wrong.
+    Incomplete,
+    /// Both stages were stamped, and the later one is earlier. That is an
+    /// instrumentation bug, never a fast frame.
+    OutOfOrder,
+    /// Measured.
+    Measured(Duration),
+}
+
 /// One frame's stage timings within a single clock domain.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameTrace<S, D: ClockDomain> {
@@ -422,12 +467,28 @@ impl<S: Copy + PartialEq, D: ClockDomain> FrameTrace<S, D> {
             .and_then(|index| self.stages[index])
     }
 
-    /// Duration between two stages, when both were recorded.
+    /// What this trace can say about one span.
+    ///
+    /// Three outcomes, kept apart for the same reason [`SpanValue`] keeps
+    /// its three apart: a stage the frame never reached and a pair of
+    /// stamps in the wrong order are different facts, and neither is a
+    /// duration. Folding them together is how an ordering bug becomes a
+    /// zero-microsecond sample.
+    #[must_use]
+    pub fn span_of(&self, from: S, to: S) -> TraceSpan {
+        let (Some(start), Some(end)) = (self.stamp_of(from), self.stamp_of(to)) else {
+            return TraceSpan::Incomplete;
+        };
+        end.since(start)
+            .map_or(TraceSpan::OutOfOrder, TraceSpan::Measured)
+    }
+
+    /// Duration between two stages, when both were recorded in order.
     #[must_use]
     pub fn span(&self, from: S, to: S) -> Option<Duration> {
         let start = self.stamp_of(from)?;
         let end = self.stamp_of(to)?;
-        Some(end.since(start))
+        end.since(start)
     }
 }
 
@@ -595,10 +656,16 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
             self.stalls = self.stalls.saturating_add(1);
         }
         for (index, pair) in self.order.windows(2).enumerate() {
-            if let Some(span) = trace.span(pair[0], pair[1])
-                && let Some(histogram) = self.spans.get_mut(index)
-            {
-                histogram.record(span);
+            let Some(histogram) = self.spans.get_mut(index) else {
+                continue;
+            };
+            match trace.span_of(pair[0], pair[1]) {
+                TraceSpan::Measured(span) => histogram.record(span),
+                // Counted, not silently skipped: a frame that reached both
+                // stages in the wrong order means the stamps are wrong, and
+                // a reader has to be able to see that happened.
+                TraceSpan::OutOfOrder => histogram.record_span(None),
+                TraceSpan::Incomplete => {}
             }
         }
         if self.tracing {
@@ -851,7 +918,7 @@ impl ClientObservability {
 mod tests {
     use super::{
         Client, ClientRecorder, ClientStage, Histogram, Host, HostRecorder, HostStage,
-        IN_FLIGHT_CAPACITY, Stamp, TRACE_CAPACITY, TraceEnd,
+        IN_FLIGHT_CAPACITY, SpanValue, Stamp, TRACE_CAPACITY, TraceEnd, TraceSpan,
     };
     use std::time::{Duration, Instant};
 
@@ -875,11 +942,73 @@ mod tests {
         let base = Instant::now();
         assert_eq!(
             host_at(base, 40).since(host_at(base, 10)),
-            Duration::from_millis(30)
+            Some(Duration::from_millis(30))
         );
-        // Out-of-order stamps saturate rather than wrapping into an
-        // enormous duration.
-        assert_eq!(host_at(base, 10).since(host_at(base, 40)), Duration::ZERO);
+        // Out-of-order stamps are not a fast frame. They used to saturate to
+        // zero, which is the same error as rendering an empty histogram as
+        // `max=0us`: a bug in the caller became an indistinguishable
+        // zero-latency sample that pulled every statistic it entered
+        // towards zero.
+        assert_eq!(host_at(base, 10).since(host_at(base, 40)), None);
+    }
+
+    /// An out-of-order pair is counted as invalid and kept out of the
+    /// statistics, and the count is published so it cannot hide.
+    #[test]
+    fn an_out_of_order_span_is_invalid_rather_than_zero() {
+        let mut histogram = Histogram::new();
+        histogram.record_span(Some(Duration::from_millis(8)));
+        histogram.record_span(None);
+        histogram.record_span(None);
+
+        assert_eq!(histogram.count(), 1, "one real sample");
+        assert_eq!(histogram.invalid(), 2);
+        assert_eq!(histogram.mean_us(), Some(8_000), "the mean is undragged");
+        let rendered = SpanValue::from_histogram(&histogram).render();
+        assert!(rendered.contains("n=1"), "{rendered}");
+        assert!(rendered.contains("invalid=2"), "{rendered}");
+
+        // Nothing measurable and something rejected is not an idle stage.
+        let mut broken = Histogram::new();
+        broken.record_span(None);
+        assert_eq!(
+            SpanValue::from_histogram(&broken).render(),
+            "no-samples invalid=1"
+        );
+    }
+
+    /// A trace keeps "never reached that stage" apart from "reached both in
+    /// the wrong order".
+    #[test]
+    fn a_trace_separates_an_unreached_stage_from_a_bad_ordering() {
+        let base = Instant::now();
+        let mut recorder = HostRecorder::new(&HostStage::ORDER);
+        recorder.set_tracing(true);
+        recorder.begin(1, host_at(base, 10));
+        // Stamped before the stage that precedes it.
+        recorder.mark(1, HostStage::EncodeSubmitted, host_at(base, 4));
+        recorder.finish(1);
+
+        let trace = recorder.traces().next().expect("one trace");
+        assert_eq!(
+            trace.span_of(
+                HostStage::FrameEnteredOpenStream,
+                HostStage::EncodeSubmitted
+            ),
+            TraceSpan::OutOfOrder
+        );
+        assert_eq!(
+            trace.span_of(HostStage::EncodeSubmitted, HostStage::EncoderFirstByte),
+            TraceSpan::Incomplete,
+            "a stage the frame never reached is not an ordering bug"
+        );
+        assert_eq!(
+            recorder.span_value(
+                HostStage::FrameEnteredOpenStream,
+                HostStage::EncodeSubmitted
+            ),
+            SpanValue::NoSamples { invalid: 1 }
+        );
     }
 
     #[test]
@@ -1273,8 +1402,11 @@ pub enum SpanValue {
     /// This backend cannot observe one or both endpoints. The elapsed time
     /// is real and unknown; it is emphatically not zero.
     NotObservable,
-    /// Observable, but no frame has crossed it yet.
-    NoSamples,
+    /// Observable, but no frame has crossed it yet. `invalid` counts
+    /// attempts rejected for out-of-order stamps; when it is non-zero and
+    /// there are still no samples, the instrumentation is broken rather
+    /// than merely unexercised.
+    NoSamples { invalid: u64 },
     /// Measured. Percentiles are bucket upper bounds; `mean_us` and
     /// `max_us` are exact. See [`Histogram`].
     Measured {
@@ -1289,6 +1421,9 @@ pub enum SpanValue {
         /// Samples past the last bucket edge. When this equals `count`,
         /// every percentile above is just the maximum.
         overflow: u64,
+        /// Attempts rejected because their two stamps were out of order.
+        /// Not part of `count`: they are evidence of a bug, not fast frames.
+        invalid: u64,
     },
 }
 
@@ -1303,7 +1438,9 @@ impl SpanValue {
     #[must_use]
     pub fn from_histogram(histogram: &Histogram) -> Self {
         if histogram.count() == 0 {
-            return Self::NoSamples;
+            return Self::NoSamples {
+                invalid: histogram.invalid(),
+            };
         }
         Self::Measured {
             count: histogram.count(),
@@ -1313,6 +1450,7 @@ impl SpanValue {
             max_us: histogram.max_us(),
             mean_us: histogram.mean_us().unwrap_or_default(),
             overflow: histogram.overflow(),
+            invalid: histogram.invalid(),
         }
     }
 
@@ -1322,7 +1460,10 @@ impl SpanValue {
     pub fn render(self) -> String {
         match self {
             Self::NotObservable => "not-observable".to_string(),
-            Self::NoSamples => "no-samples".to_string(),
+            Self::NoSamples { invalid: 0 } => "no-samples".to_string(),
+            // Nothing measurable and something rejected is not the same as
+            // an idle stage, and a reader must not have to guess which.
+            Self::NoSamples { invalid } => format!("no-samples invalid={invalid}"),
             Self::Measured {
                 count,
                 p50_upper_us,
@@ -1331,6 +1472,7 @@ impl SpanValue {
                 max_us,
                 mean_us,
                 overflow,
+                invalid,
             } => {
                 let mut line = String::with_capacity(112);
                 line.push_str(&format!("n={count}"));
@@ -1350,6 +1492,13 @@ impl SpanValue {
                 // number worth quoting.
                 if overflow > 0 {
                     line.push_str(&format!(" overflow={overflow}"));
+                }
+                // Out-of-order stamps mean this span's instrumentation is
+                // wrong somewhere. Publishing the count is the difference
+                // between a number worth acting on and one that quietly
+                // describes only the attempts that happened to work.
+                if invalid > 0 {
+                    line.push_str(&format!(" invalid={invalid}"));
                 }
                 line
             }
@@ -1463,7 +1612,7 @@ impl<D: ClockDomain> Liveness<D> {
     /// touched. The gap between the two is exactly a stage repeating itself.
     #[must_use]
     pub fn since_advance(&self, milestone: Milestone, now: Stamp<D>) -> Option<Duration> {
-        self.last_advance[Self::index(milestone)].map(|last| now.since(last))
+        self.last_advance[Self::index(milestone)].and_then(|last| now.since(last))
     }
 
     #[must_use]
@@ -1474,7 +1623,7 @@ impl<D: ClockDomain> Liveness<D> {
     /// How long since this milestone last advanced. `None` if it never has.
     #[must_use]
     pub fn since_last(&self, milestone: Milestone, now: Stamp<D>) -> Option<Duration> {
-        self.last[Self::index(milestone)].map(|last| now.since(last))
+        self.last[Self::index(milestone)].and_then(|last| now.since(last))
     }
 
     /// Rate in events per second over the whole session.
@@ -1484,7 +1633,7 @@ impl<D: ClockDomain> Liveness<D> {
     /// pretend to detect a momentary dip. Use [`Self::since_last`] for that.
     #[must_use]
     pub fn rate_per_second(&self, milestone: Milestone, now: Stamp<D>) -> Option<f64> {
-        let elapsed = now.since(self.started).as_secs_f64();
+        let elapsed = now.since(self.started)?.as_secs_f64();
         (elapsed > 0.0).then(|| {
             #[allow(
                 clippy::cast_precision_loss,
@@ -2014,7 +2163,7 @@ mod observability_tests {
                 HostStage::EncoderFirstByte,
                 HostStage::AccessUnitBoundaryKnown
             ),
-            SpanValue::NoSamples,
+            SpanValue::NoSamples { invalid: 0 },
             "observable, just not exercised yet"
         );
         assert_eq!(
@@ -2167,7 +2316,7 @@ mod observability_tests {
         let recorder = ClientRecorder::for_decoder(ClientObservability::Full);
         assert_eq!(
             recorder.span_value(ClientStage::DecodedReady, ClientStage::HandedToWindow),
-            SpanValue::NoSamples,
+            SpanValue::NoSamples { invalid: 0 },
             "observable but unexercised is not the same as unobservable"
         );
     }

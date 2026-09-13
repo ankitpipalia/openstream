@@ -304,7 +304,8 @@ impl FrameAgeRecord {
 
     /// The session loop took a frame off the decoder queue.
     pub fn decoder_queue_consumed(&mut self, frame: &DecodedFrame, at: Stamp<Client>) {
-        self.decoder_queue_wait.record(at.since(frame.decoded_at()));
+        self.decoder_queue_wait
+            .record_span(at.since(frame.decoded_at()));
     }
 
     /// Outcome of offering a frame to the window's queue.
@@ -321,10 +322,10 @@ impl FrameAgeRecord {
     pub fn ui_queue_consumed(&mut self, frame: &DecodedFrame, at: Stamp<Client>) {
         self.ui_frames_consumed = self.ui_frames_consumed.saturating_add(1);
         if let Some(queued_at) = frame.ui_queued_at() {
-            self.ui_queue_wait.record(at.since(queued_at));
+            self.ui_queue_wait.record_span(at.since(queued_at));
         }
         self.decoded_to_ui_consume
-            .record(at.since(frame.decoded_at()));
+            .record_span(at.since(frame.decoded_at()));
         if self.pending.len() >= PENDING_CAPACITY {
             self.pending.pop_front();
             self.pending_frames_replaced = self.pending_frames_replaced.saturating_add(1);
@@ -366,7 +367,8 @@ impl FrameAgeRecord {
         }
         self.last_present_submitted = Some(seq);
         self.new_frames_present_submitted = self.new_frames_present_submitted.saturating_add(1);
-        self.decoded_to_present_submit.record(at.since(decoded_at));
+        self.decoded_to_present_submit
+            .record_span(at.since(decoded_at));
     }
 
     /// The session ended. Frames still waiting to be submitted were never
@@ -568,7 +570,7 @@ mod tests {
     fn an_unexercised_span_reads_as_no_samples_not_zero() {
         let record = FrameAgeRecord::new();
         for (name, value) in record.spans() {
-            assert_eq!(value, SpanValue::NoSamples, "{name}");
+            assert_eq!(value, SpanValue::NoSamples { invalid: 0 }, "{name}");
             assert_eq!(value.render(), "no-samples", "{name}");
         }
     }
@@ -662,7 +664,7 @@ mod tests {
         assert_eq!(record.ui_queue_wait().count(), 0);
         assert_eq!(
             SpanValue::from_histogram(record.ui_queue_wait()),
-            SpanValue::NoSamples
+            SpanValue::NoSamples { invalid: 0 }
         );
         // The decode-relative span is still measurable and is recorded.
         assert_eq!(record.decoded_to_ui_consume().count(), 1);
