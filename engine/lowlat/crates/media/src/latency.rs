@@ -35,6 +35,7 @@
 //!   frame's delimiter arrives, so this is the moment the boundary became
 //!   *knowable*, which trails encoder completion by up to a frame interval.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
@@ -307,6 +308,17 @@ impl Histogram {
     }
 }
 
+/// How many frames may be timed at once.
+///
+/// A frame is several fragments, and both the link and the reassembler can
+/// have two frames' worth in hand at the same time. Twice the client
+/// assembler's default reorder window, so frames arriving now cannot push
+/// out ones it is still holding back; bounded all the same, because a
+/// timeline whose frame never completes must retire rather than accumulate,
+/// and it does so as [`TraceEnd::Superseded`] once this many newer frames
+/// have started.
+pub const IN_FLIGHT_CAPACITY: usize = 16;
+
 /// How many frame timelines the opt-in trace ring retains.
 ///
 /// Bounded because tracing must never become a memory leak on a session
@@ -420,7 +432,7 @@ pub struct StageRecorder<S: Copy + PartialEq + Ord + 'static, D: ClockDomain> {
     frames: u64,
     tracing: bool,
     traces: std::collections::VecDeque<FrameTrace<S, D>>,
-    in_flight: Option<FrameTrace<S, D>>,
+    in_flight: VecDeque<FrameTrace<S, D>>,
     evicted: u64,
     stalls: u64,
 }
@@ -446,7 +458,7 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
             frames: 0,
             tracing: false,
             traces: std::collections::VecDeque::new(),
-            in_flight: None,
+            in_flight: VecDeque::new(),
             evicted: 0,
             stalls: 0,
         }
@@ -467,51 +479,98 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
         self.tracing
     }
 
-    /// Begin timing a frame, retiring whichever was in flight.
+    /// Begin timing a frame, stamping the first stage this backend can
+    /// observe.
     ///
-    /// A frame that never finished is still worth keeping when tracing: an
-    /// unfinished timeline is precisely the evidence of a stall, and
-    /// discarding it would hide the case the ring exists for.
+    /// Calling this again for a frame already being timed is a no-op: a
+    /// frame arrives as several fragments, and restarting its timeline on
+    /// each one would report only the span of its last fragment.
+    ///
+    /// Several frames are timed at once, up to [`IN_FLIGHT_CAPACITY`].
+    /// Fragments of consecutive frames interleave on a lossy link, and the
+    /// assembler holds a completed frame back while an earlier one is still
+    /// missing, so a single timeline would be restarted by the next frame's
+    /// first fragment and would lose every stage the held-back frame reached
+    /// afterwards -- silently, as a shorter span rather than a missing one.
+    ///
+    /// When the window is full the oldest unfinished timeline retires as
+    /// [`TraceEnd::Superseded`]. It is kept rather than dropped when
+    /// tracing: an unfinished timeline is precisely the evidence of a stall.
+    ///
+    /// The stamp goes on the first *observable* stage, not the first stage
+    /// in the order. On a backend that cannot see the earlier ones, writing
+    /// `at` to the first of them would put a real timestamp on a stage that
+    /// never happened at that moment -- invisible in a report, which gates
+    /// on observability, and misleading in an exported trace, which does
+    /// not.
     pub fn begin(&mut self, frame_id: u32, at: Stamp<D>) {
-        if let Some(previous) = self.in_flight.take() {
-            self.retire(previous, TraceEnd::Superseded);
+        if self
+            .in_flight
+            .iter()
+            .any(|trace| trace.frame_id == frame_id)
+        {
+            return;
+        }
+        if self.in_flight.len() >= IN_FLIGHT_CAPACITY
+            && let Some(oldest) = self.in_flight.pop_front()
+        {
+            self.retire(oldest, TraceEnd::Superseded);
         }
         let mut trace = FrameTrace::new(frame_id);
-        trace.mark(self.order[0], at);
-        self.in_flight = Some(trace);
+        trace.mark(*self.observable.first().unwrap_or(&self.order[0]), at);
+        self.in_flight.push_back(trace);
     }
 
-    /// Record a stage for the frame in flight. Ignored when the frame id
-    /// does not match, so a late fragment from an abandoned frame cannot
-    /// contaminate the current one's timings.
+    /// Record a stage for a frame in flight. Ignored when no timeline is
+    /// open for that frame id, so a late fragment from a frame that has
+    /// already retired cannot contaminate another one's timings.
     pub fn mark(&mut self, frame_id: u32, stage: S, at: Stamp<D>) {
-        let Some(trace) = self.in_flight.as_mut() else {
-            return;
-        };
-        if trace.frame_id != frame_id {
-            return;
+        if let Some(trace) = self
+            .in_flight
+            .iter_mut()
+            .find(|trace| trace.frame_id == frame_id)
+        {
+            trace.mark(stage, at);
         }
-        trace.mark(stage, at);
     }
 
-    /// Finish the frame in flight and fold it into the aggregates.
+    /// Finish a frame in flight and fold it into the aggregates.
     pub fn finish(&mut self, frame_id: u32) {
-        let Some(trace) = self.in_flight.as_ref() else {
-            return;
-        };
-        if trace.frame_id != frame_id {
-            return;
-        }
-        let trace = self.in_flight.take().expect("checked above");
-        self.retire(trace, TraceEnd::Completed);
+        self.retire_frame(frame_id, TraceEnd::Completed);
     }
 
-    /// End the frame in flight for a reason other than completing, such as
-    /// a stall observed by a watchdog or the session shutting down.
-    pub fn abandon(&mut self, reason: TraceEnd) {
-        if let Some(trace) = self.in_flight.take() {
+    /// End one frame for a reason other than completing -- a frame dropped
+    /// before it ever reached the decoder, say.
+    pub fn abandon_frame(&mut self, frame_id: u32, reason: TraceEnd) {
+        self.retire_frame(frame_id, reason);
+    }
+
+    fn retire_frame(&mut self, frame_id: u32, reason: TraceEnd) {
+        let Some(index) = self
+            .in_flight
+            .iter()
+            .position(|trace| trace.frame_id == frame_id)
+        else {
+            return;
+        };
+        if let Some(trace) = self.in_flight.remove(index) {
             self.retire(trace, reason);
         }
+    }
+
+    /// End every frame still in flight, such as on a stall observed by a
+    /// watchdog or at session shutdown. Oldest first, so retained traces
+    /// stay in the order the frames arrived.
+    pub fn abandon(&mut self, reason: TraceEnd) {
+        while let Some(trace) = self.in_flight.pop_front() {
+            self.retire(trace, reason);
+        }
+    }
+
+    /// Frames currently being timed.
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
     }
 
     fn retire(&mut self, mut trace: FrameTrace<S, D>, reason: TraceEnd) {
@@ -614,6 +673,81 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
     }
 }
 
+/// A stage recorder that prints its table however the session ends.
+///
+/// A session loop leaves by `?` from a dozen places -- a transport error, a
+/// decoder that died, a terminal configuration fault. A report written after
+/// the loop is printed only on the paths that return normally, which are the
+/// least interesting ones; a run that ended badly is exactly the run whose
+/// stage table someone wants. Frames still open when it ends retire as
+/// [`TraceEnd::SessionEnded`] rather than staying in flight, so they are not
+/// later mistaken for evidence of a stall.
+///
+/// Derefs to the recorder, so it is used exactly like one.
+#[derive(Debug)]
+pub struct ReportOnDrop<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> {
+    recorder: StageRecorder<S, D>,
+    note: Option<&'static str>,
+}
+
+impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> ReportOnDrop<S, D> {
+    /// Wrap a recorder, with the sentence naming what this backend cannot
+    /// see -- from [`HostObservability::unobserved_note`] or
+    /// [`ClientObservability::unobserved_note`].
+    #[must_use]
+    pub const fn new(recorder: StageRecorder<S, D>, note: Option<&'static str>) -> Self {
+        Self { recorder, note }
+    }
+
+    /// The lines this would print, without printing them. Separated so the
+    /// content can be tested without capturing stderr.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        if self.recorder.frames() == 0 {
+            return Vec::new();
+        }
+        let mut lines = self.recorder.report();
+        lines.push(format!(
+            "{} frames={} stalls={} in_flight_at_end={}",
+            D::NAME,
+            self.recorder.frames(),
+            self.recorder.stalls(),
+            self.recorder.in_flight(),
+        ));
+        if let Some(note) = self.note {
+            lines.push(format!("{} note: {note}", D::NAME));
+        }
+        lines
+    }
+}
+
+impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> std::ops::Deref
+    for ReportOnDrop<S, D>
+{
+    type Target = StageRecorder<S, D>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.recorder
+    }
+}
+
+impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> std::ops::DerefMut
+    for ReportOnDrop<S, D>
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.recorder
+    }
+}
+
+impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> Drop for ReportOnDrop<S, D> {
+    fn drop(&mut self) {
+        self.recorder.abandon(TraceEnd::SessionEnded);
+        for line in self.lines() {
+            eprintln!("OpenStream stage {line}");
+        }
+    }
+}
+
 /// Host-side stage recorder.
 pub type HostRecorder = StageRecorder<HostStage, Host>;
 
@@ -627,11 +761,82 @@ impl HostRecorder {
 /// Client-side stage recorder.
 pub type ClientRecorder = StageRecorder<ClientStage, Client>;
 
+impl ClientRecorder {
+    /// Build a recorder that only times what this client can attribute to a
+    /// host frame id.
+    #[must_use]
+    pub fn for_decoder(observability: ClientObservability) -> Self {
+        Self::with_observable(&ClientStage::ORDER, observability.observable_stages())
+    }
+}
+
+/// How far a host frame id survives on this client.
+///
+/// The client's stage recorder is keyed by the frame id in the fragment
+/// header, and that identity does not come back out of an external decoder.
+/// FFmpeg is handed access units and returns raw pictures; it may drop a
+/// damaged one, reorder, or restart its output after a keyframe request, and
+/// it reports none of that per picture. Anything the client stamps after the
+/// decoder therefore belongs to a picture it cannot name, so attaching it to
+/// the frame id that went in would invent a correspondence rather than
+/// measure one.
+///
+/// The stages past that boundary are still enumerated in [`ClientStage`],
+/// because the shape of the path is worth stating, and they report
+/// `not-observable` rather than a number. What actually happens there is
+/// measured by [`crate::frame_age`], which keys on a sequence number the
+/// client assigns to the pictures it receives -- an identity it can prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientObservability {
+    /// An external decoder process. Frame identity ends at submission.
+    ExternalDecoder,
+    /// An in-process decoder that returns the identity it was given, so
+    /// every stage carries the same frame id.
+    Full,
+}
+
+impl ClientObservability {
+    /// The last stage this client can attribute to a host frame id.
+    #[must_use]
+    pub const fn last_observable_stage(self) -> ClientStage {
+        match self {
+            Self::ExternalDecoder => ClientStage::DecoderSubmitted,
+            Self::Full => ClientStage::PresentSubmitted,
+        }
+    }
+
+    /// Stages this client times, in order.
+    #[must_use]
+    pub fn observable_stages(self) -> &'static [ClientStage] {
+        match self {
+            Self::ExternalDecoder => &[
+                ClientStage::FirstFragmentReceived,
+                ClientStage::LastFragmentReceived,
+                ClientStage::Reassembled,
+                ClientStage::DecoderSubmitted,
+            ],
+            Self::Full => &ClientStage::ORDER,
+        }
+    }
+
+    /// A sentence for a report, naming what is missing and where to look
+    /// for it instead.
+    #[must_use]
+    pub const fn unobserved_note(self) -> Option<&'static str> {
+        match self {
+            Self::ExternalDecoder => Some(
+                "an external decoder does not return the frame id it was given;                  everything after submission is measured by sequence number in                  the frame-age record, not reported as zero here",
+            ),
+            Self::Full => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Client, ClientRecorder, ClientStage, Histogram, Host, HostRecorder, HostStage, Stamp,
-        TRACE_CAPACITY,
+        Client, ClientRecorder, ClientStage, Histogram, Host, HostRecorder, HostStage,
+        IN_FLIGHT_CAPACITY, Stamp, TRACE_CAPACITY, TraceEnd,
     };
     use std::time::{Duration, Instant};
 
@@ -811,23 +1016,79 @@ mod tests {
 
     /// A frame that never finished is evidence of a stall, so tracing keeps
     /// its partial timeline rather than discarding it.
+    /// A frame that never finishes is retired once the in-flight window
+    /// has moved past it, with its partial timeline intact.
     #[test]
-    fn an_unfinished_frame_is_retired_when_the_next_one_starts() {
+    fn an_unfinished_frame_is_retired_when_the_window_moves_past_it() {
         let base = Instant::now();
         let mut recorder = HostRecorder::new(&HostStage::ORDER);
         recorder.set_tracing(true);
 
         recorder.begin(1, host_at(base, 0));
         recorder.mark(1, HostStage::EncodeSubmitted, host_at(base, 2));
-        // Frame 1 never reaches the wire; frame 2 begins.
-        recorder.begin(2, host_at(base, 100));
-        recorder.finish(2);
+        // Frame 1 never reaches the wire. It stays in flight while the
+        // window has room, because a later fragment of it could still
+        // arrive; it retires only once enough newer frames have started.
+        let capacity = u32::try_from(IN_FLIGHT_CAPACITY).expect("capacity fits a frame id");
+        for frame in 2..=capacity {
+            recorder.begin(frame, host_at(base, u64::from(frame)));
+        }
+        assert_eq!(recorder.traces().count(), 0, "frame 1 is still open");
+
+        recorder.begin(capacity + 1, host_at(base, 100));
 
         let ids: Vec<u32> = recorder.traces().map(|trace| trace.frame_id).collect();
-        assert_eq!(ids, vec![1, 2], "the stalled frame is kept, not dropped");
+        assert_eq!(ids, vec![1], "the stalled frame is kept, not dropped");
         let stalled = recorder.traces().next().expect("frame 1 retained");
+        assert_eq!(stalled.ended, Some(TraceEnd::Superseded));
         assert!(stalled.stamp_of(HostStage::LastFragmentSent).is_none());
         assert!(stalled.stamp_of(HostStage::EncodeSubmitted).is_some());
+    }
+
+    /// The reason the recorder times more than one frame at a time.
+    ///
+    /// A frame is several fragments, and the fragments of two consecutive
+    /// frames interleave. With a single timeline, frame 1's first fragment
+    /// would be superseded by frame 2's, and frame 1's remaining stages
+    /// would be silently discarded -- producing a *shorter* span for the
+    /// frames that did complete rather than an obviously missing one.
+    #[test]
+    fn interleaved_fragments_do_not_destroy_each_other_s_timelines() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::new(&ClientStage::ORDER);
+        recorder.set_tracing(true);
+
+        recorder.begin(1, client_at(base, 0));
+        recorder.begin(2, client_at(base, 1));
+        // Frame 1's remaining fragments arrive after frame 2 has started.
+        recorder.mark(1, ClientStage::LastFragmentReceived, client_at(base, 4));
+        recorder.mark(2, ClientStage::LastFragmentReceived, client_at(base, 6));
+        // ...and the assembler releases them in order.
+        recorder.mark(1, ClientStage::Reassembled, client_at(base, 7));
+        recorder.finish(1);
+        recorder.mark(2, ClientStage::Reassembled, client_at(base, 8));
+        recorder.finish(2);
+
+        let ends: Vec<(u32, Option<TraceEnd>)> = recorder
+            .traces()
+            .map(|trace| (trace.frame_id, trace.ended))
+            .collect();
+        assert_eq!(
+            ends,
+            vec![
+                (1, Some(TraceEnd::Completed)),
+                (2, Some(TraceEnd::Completed))
+            ]
+        );
+        let span = recorder
+            .span_histogram(
+                ClientStage::FirstFragmentReceived,
+                ClientStage::LastFragmentReceived,
+            )
+            .expect("histogram exists");
+        assert_eq!(span.count(), 2, "both frames measured, neither discarded");
+        assert_eq!(span.max_us(), 5_000);
+        assert_eq!(recorder.in_flight(), 0);
     }
 
     #[test]
@@ -850,7 +1111,9 @@ mod tests {
 
 #[cfg(test)]
 mod trace_end_tests {
-    use super::{Client, ClientRecorder, ClientStage, Stamp, TRACE_CAPACITY, TraceEnd};
+    use super::{
+        Client, ClientRecorder, ClientStage, IN_FLIGHT_CAPACITY, Stamp, TRACE_CAPACITY, TraceEnd,
+    };
     use std::time::{Duration, Instant};
 
     fn at(base: Instant, ms: u64) -> Stamp<Client> {
@@ -870,14 +1133,48 @@ mod trace_end_tests {
         recorder.begin(1, at(base, 0));
         recorder.finish(1);
 
-        // Superseded: a newer frame arrived first.
+        // Superseded: frame 2 never completes and the in-flight window
+        // eventually moves past it.
         recorder.begin(2, at(base, 10));
-        recorder.begin(3, at(base, 20));
+        let capacity = u32::try_from(IN_FLIGHT_CAPACITY).expect("capacity fits a frame id");
+        for frame in 3..=(capacity + 2) {
+            recorder.begin(frame, at(base, 20));
+        }
         recorder.finish(3);
 
-        // Abandoned by a watchdog.
-        recorder.begin(4, at(base, 30));
+        // Abandoned by a watchdog: every open timeline ends, oldest first.
         recorder.abandon(TraceEnd::DecoderStalled);
+
+        let ends: Vec<(u32, Option<TraceEnd>)> = recorder
+            .traces()
+            .map(|trace| (trace.frame_id, trace.ended))
+            .collect();
+        let mut expected = vec![
+            (1, Some(TraceEnd::Completed)),
+            (2, Some(TraceEnd::Superseded)),
+            (3, Some(TraceEnd::Completed)),
+        ];
+        expected.extend((4..=(capacity + 2)).map(|frame| (frame, Some(TraceEnd::DecoderStalled))));
+        assert_eq!(ends, expected);
+    }
+
+    /// One frame can end early without disturbing the others in flight.
+    #[test]
+    fn abandoning_one_frame_leaves_the_rest_timing() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::new(&ClientStage::ORDER);
+        recorder.set_tracing(true);
+
+        recorder.begin(1, at(base, 0));
+        recorder.begin(2, at(base, 1));
+        recorder.begin(3, at(base, 2));
+        // Frame 2 is discarded while the client waits for a keyframe.
+        recorder.abandon_frame(2, TraceEnd::Superseded);
+        assert_eq!(recorder.in_flight(), 2);
+
+        recorder.mark(3, ClientStage::Reassembled, at(base, 5));
+        recorder.finish(3);
+        recorder.finish(1);
 
         let ends: Vec<(u32, Option<TraceEnd>)> = recorder
             .traces()
@@ -886,10 +1183,9 @@ mod trace_end_tests {
         assert_eq!(
             ends,
             vec![
-                (1, Some(TraceEnd::Completed)),
                 (2, Some(TraceEnd::Superseded)),
                 (3, Some(TraceEnd::Completed)),
-                (4, Some(TraceEnd::DecoderStalled)),
+                (1, Some(TraceEnd::Completed)),
             ]
         );
     }
@@ -1593,10 +1889,17 @@ mod progress_tests {
 
 #[cfg(test)]
 mod observability_tests {
-    use super::{Host, HostObservability, HostRecorder, HostStage, SpanValue, Stamp};
+    use super::{
+        Client, ClientObservability, ClientRecorder, ClientStage, Host, HostObservability,
+        HostRecorder, HostStage, ReportOnDrop, SpanValue, Stamp,
+    };
     use std::time::{Duration, Instant};
 
     fn at(base: Instant, ms: u64) -> Stamp<Host> {
+        Stamp::from_instant(base + Duration::from_millis(ms))
+    }
+
+    fn client_at(base: Instant, ms: u64) -> Stamp<Client> {
         Stamp::from_instant(base + Duration::from_millis(ms))
     }
 
@@ -1704,5 +2007,132 @@ mod observability_tests {
             "{report:?}"
         );
         assert!(report.iter().all(|line| line.contains("n=1")), "{report:?}");
+    }
+
+    /// On a backend that cannot see the earlier stages, `begin` must stamp
+    /// the first stage it *can* see.
+    ///
+    /// Writing the stamp to `FrameEnteredOpenStream` instead would put a
+    /// real timestamp on a moment that was never observed. A report would
+    /// hide it, because it gates on observability -- but an exported trace
+    /// would not, and it would read as a capture time the host never
+    /// measured.
+    #[test]
+    fn timing_starts_at_the_first_stage_the_backend_can_see() {
+        let base = Instant::now();
+        let mut recorder = HostRecorder::for_backend(HostObservability::EncodedStreamOnly);
+        recorder.set_tracing(true);
+        recorder.begin(1, at(base, 0));
+        recorder.mark(1, HostStage::AccessUnitBoundaryKnown, at(base, 8));
+        recorder.mark(1, HostStage::FirstFragmentSent, at(base, 9));
+        recorder.mark(1, HostStage::LastFragmentSent, at(base, 10));
+        recorder.finish(1);
+
+        let trace = recorder.traces().next().expect("one trace retained");
+        assert!(
+            trace.stamp_of(HostStage::FrameEnteredOpenStream).is_none(),
+            "a stage this host never observed must carry no timestamp"
+        );
+        assert!(trace.stamp_of(HostStage::EncoderFirstByte).is_some());
+        let span = recorder.span_value(
+            HostStage::EncoderFirstByte,
+            HostStage::AccessUnitBoundaryKnown,
+        );
+        assert!(span.is_measured(), "{span:?}");
+        assert_eq!(
+            recorder.span_value(
+                HostStage::FrameEnteredOpenStream,
+                HostStage::EncodeSubmitted
+            ),
+            SpanValue::NotObservable
+        );
+    }
+
+    /// The report that gets printed when a session ends badly.
+    #[test]
+    fn the_drop_report_carries_the_counts_and_the_note() {
+        let base = Instant::now();
+        let mut guard = ReportOnDrop::new(
+            HostRecorder::for_backend(HostObservability::EncodedStreamOnly),
+            HostObservability::EncodedStreamOnly.unobserved_note(),
+        );
+        guard.begin(1, at(base, 0));
+        guard.mark(1, HostStage::AccessUnitBoundaryKnown, at(base, 8));
+        guard.finish(1);
+        // Frame 2 is still open when the session ends.
+        guard.begin(2, at(base, 20));
+
+        let lines = guard.lines().join("\n");
+        assert!(lines.contains("frames=1"), "{lines}");
+        assert!(lines.contains("in_flight_at_end=1"), "{lines}");
+        assert!(lines.contains("not-observable"), "{lines}");
+        assert!(
+            lines.contains("is not measured and is not zero"),
+            "the note has to say why the hole is there: {lines}"
+        );
+    }
+
+    /// A session that never carried a frame prints nothing rather than a
+    /// table of empty rows.
+    #[test]
+    fn a_session_with_no_frames_has_nothing_to_report() {
+        let guard = ReportOnDrop::new(
+            HostRecorder::for_backend(HostObservability::EncodedStreamOnly),
+            None,
+        );
+        assert!(guard.lines().is_empty());
+    }
+
+    /// The client's frame id does not survive an external decoder, and the
+    /// stages past it must say so rather than report a number.
+    ///
+    /// This is the client-side twin of the host's encoded-stream-only case.
+    /// Stamping `DecodedReady` against the frame id that was submitted would
+    /// produce a plausible decode span for a picture nobody can prove is the
+    /// same one -- the shape of the error that made an earlier end-to-end
+    /// figure unreproducible.
+    #[test]
+    fn an_external_decoder_ends_the_frame_identity_at_submission() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::for_decoder(ClientObservability::ExternalDecoder);
+        recorder.begin(7, client_at(base, 0));
+        recorder.mark(7, ClientStage::LastFragmentReceived, client_at(base, 1));
+        recorder.mark(7, ClientStage::Reassembled, client_at(base, 2));
+        recorder.mark(7, ClientStage::DecoderSubmitted, client_at(base, 3));
+        recorder.finish(7);
+
+        assert!(
+            recorder
+                .span_value(ClientStage::Reassembled, ClientStage::DecoderSubmitted)
+                .is_measured()
+        );
+        assert_eq!(
+            recorder.span_value(ClientStage::DecoderSubmitted, ClientStage::DecodedReady),
+            SpanValue::NotObservable
+        );
+        assert_eq!(
+            recorder.span_value(ClientStage::TakenByWindow, ClientStage::PresentSubmitted),
+            SpanValue::NotObservable
+        );
+        assert_eq!(
+            ClientObservability::ExternalDecoder.last_observable_stage(),
+            ClientStage::DecoderSubmitted
+        );
+        // The note points at where the missing measurement actually lives.
+        let note = ClientObservability::ExternalDecoder
+            .unobserved_note()
+            .expect("an external decoder has an unobserved tail");
+        assert!(note.contains("frame-age"), "{note}");
+        assert!(ClientObservability::Full.unobserved_note().is_none());
+    }
+
+    #[test]
+    fn an_in_process_decoder_observes_every_client_stage() {
+        let recorder = ClientRecorder::for_decoder(ClientObservability::Full);
+        assert_eq!(
+            recorder.span_value(ClientStage::DecodedReady, ClientStage::HandedToWindow),
+            SpanValue::NoSamples,
+            "observable but unexercised is not the same as unobservable"
+        );
     }
 }

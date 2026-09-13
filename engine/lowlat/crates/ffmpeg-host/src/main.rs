@@ -19,6 +19,9 @@ use openstream_client_core::{
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
 };
+use openstream_media::latency::{
+    Host as HostClock, HostObservability, HostRecorder, HostStage, ReportOnDrop, Stamp,
+};
 use openstream_media::{
     AdaptiveBitrate, AudioFrame, BitrateDecision, KEYFRAME_REQUEST, MAX_FRAGMENT_BYTES,
     PeerTelemetryAdapter, fragment_frame,
@@ -296,6 +299,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut audio_read = vec![0_u8; lowlat_audio::FRAME_BYTES * 2];
     let mut audio_pcm = Vec::with_capacity(lowlat_audio::FRAME_BYTES * 2);
     let mut access_units = AccessUnitizer::for_codec(negotiated.video);
+    // This host hands a capture source to FFmpeg and reads an encoded byte
+    // stream back. It never sees a frame go in, so there is no identity to
+    // correlate between "a frame was captured" and "an access unit came
+    // out": the stages before the first encoded byte report
+    // `not-observable`, which is the truth, rather than zero.
+    let observability = HostObservability::EncodedStreamOnly;
+    let mut stages = ReportOnDrop::new(
+        HostRecorder::for_backend(observability),
+        observability.unobserved_note(),
+    );
+    // When the first byte of the access unit being assembled arrived. The
+    // encoder writes into a pipe, so this is read granularity: the earliest
+    // moment OpenStream could have known about those bytes, not the moment
+    // the encoder produced them.
+    let mut unit_first_byte: Option<Stamp<HostClock>> = None;
     let mut frame_id = 0_u32;
     let mut audio_sequence = 0_u32;
     let mut chunks = 0_u64;
@@ -439,7 +457,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if length == 0 {
                     break;
                 }
+                let read_at = Stamp::<HostClock>::now();
+                let mut first_byte = *unit_first_byte.get_or_insert(read_at);
                 for payload in access_units.push(&buffer[..length])? {
+                    // `begin` stamps the first stage this backend can
+                    // observe, which here is `EncoderFirstByte`: everything
+                    // before it belongs to FFmpeg and is not measured.
+                    stages.begin(frame_id, first_byte);
+                    // `AccessUnitBoundaryKnown`, not "the encoder finished":
+                    // an Annex-B stream marks a boundary only when the next
+                    // delimiter arrives, so this trails completion by up to
+                    // a frame interval. That delay is structural and belongs
+                    // inside the span rather than beside it.
+                    stages.mark(frame_id, HostStage::AccessUnitBoundaryKnown, read_at);
+                    stages.mark(frame_id, HostStage::FirstFragmentSent, Stamp::now());
                     send_access_unit(
                         &mut session,
                         frame_id,
@@ -448,6 +479,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         negotiated.video,
                     )
                     .await?;
+                    stages.mark(frame_id, HostStage::LastFragmentSent, Stamp::now());
+                    stages.finish(frame_id);
                     telemetry.frame_sent(
                         frame_id,
                         payload.len(),
@@ -455,6 +488,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     frame_id = frame_id.wrapping_add(1);
                     chunks += 1;
+                    // Whatever is left in the unitizer is the next access
+                    // unit, and its bytes arrived in this read. Two units
+                    // emitted from one read therefore share a first-byte
+                    // stamp, which is as fine-grained as a pipe allows.
+                    first_byte = read_at;
+                    unit_first_byte = Some(read_at);
                 }
             }
             result = read_optional(&mut audio_stdout, &mut audio_read) => {

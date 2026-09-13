@@ -31,7 +31,10 @@ use openstream_media::clipboard::{
 use openstream_media::displays::Display as RemoteDisplay;
 use openstream_media::frame_age::{DecodedFrame, FrameAgeRecord, FrameOffer};
 use openstream_media::input::{InputEvent, RumbleEvent};
-use openstream_media::latency::{Client as ClientClock, Stamp};
+use openstream_media::latency::{
+    Client as ClientClock, ClientObservability, ClientRecorder, ClientStage, ReportOnDrop, Stamp,
+    TraceEnd,
+};
 use openstream_media::metrics::ReconnectSupervisor;
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
@@ -1322,6 +1325,15 @@ async fn network_session(
     });
 
     let mut assembler = Assembler::default();
+    // Timing stops at decoder submission: FFmpeg does not return the frame
+    // id it was given, so nothing after that can be attributed to a host
+    // frame. The stages past it report `not-observable`, and what actually
+    // happens there is measured by decoded sequence number in `frame_age`.
+    let observability = ClientObservability::ExternalDecoder;
+    let mut stages = ReportOnDrop::new(
+        ClientRecorder::for_decoder(observability),
+        observability.unobserved_note(),
+    );
     let mut metrics = MetricsReporter::default();
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(2));
     let mut clipboard_assembler = ClipboardAssembler::default();
@@ -1524,8 +1536,24 @@ async fn network_session(
                         continue;
                     }
                 };
+                let fragment_at = Stamp::<ClientClock>::now();
+                let frame_id = fragment.frame_id;
+                // Fragments arrive in any order, so "first" means the first
+                // one seen for this frame rather than index zero, and "last"
+                // means the fragment that completed the count rather than
+                // the highest index. `begin` stamps the first stage and is a
+                // no-op for a frame already being timed, so a later fragment
+                // cannot restart the timeline.
+                stages.begin(frame_id, fragment_at);
                 match assembler.push(fragment) {
-                    Ok(Some(frame)) => ready_frames.push(frame),
+                    Ok(Some(frame)) => {
+                        // The assembler returns a frame exactly when the
+                        // fragment just pushed completed it, so this
+                        // fragment is the last one received -- whatever its
+                        // index was.
+                        stages.mark(frame_id, ClientStage::LastFragmentReceived, fragment_at);
+                        ready_frames.push(frame);
+                    }
                     Ok(None) => {}
                     Err(error) => {
                         let _ = ui_tx.send(UiMessage::Error(format!(
@@ -1535,6 +1563,10 @@ async fn network_session(
                     }
                 }
                 while let Some(frame) = assembler.pop_ready() {
+                    // Completed earlier and held back while an older frame
+                    // was still missing; it was marked when it completed.
+                    // The span from there to `Reassembled` is the time the
+                    // reorder buffer kept it.
                     ready_frames.push(frame);
                 }
                 if assembler.take_keyframe_request() {
@@ -1542,11 +1574,19 @@ async fn network_session(
                     reliable_control.send(&mut session, KEYFRAME_REQUEST).await?;
                 }
                 for frame in ready_frames {
+                    stages.mark(frame.frame_id, ClientStage::Reassembled, Stamp::now());
                     if frame.keyframe {
                         waiting_for_keyframe = false;
                     }
                     if !waiting_for_keyframe {
                         decoder_stdin.write_all(&frame.payload).await?;
+                        stages.mark(frame.frame_id, ClientStage::DecoderSubmitted, Stamp::now());
+                        // The last stage this client can attribute to a
+                        // host frame id: FFmpeg does not hand the id back
+                        // with the picture. What happens after this is
+                        // measured by decoded sequence number instead --
+                        // see `openstream_media::frame_age`.
+                        stages.finish(frame.frame_id);
                         metrics.frame_received(frame.frame_id);
                         let ack = FrameAck {
                             frame_id: frame.frame_id,
@@ -1556,6 +1596,12 @@ async fn network_session(
                         let _ = reliable_control
                             .send_if_available(&mut session, &ack)
                             .await?;
+                    } else {
+                        // Discarded while waiting for a keyframe. It has a
+                        // beginning and no end, and leaving it in the ring
+                        // would let it be evicted later and counted as a
+                        // stall that never happened.
+                        stages.abandon_frame(frame.frame_id, TraceEnd::Superseded);
                     }
                 }
             }
