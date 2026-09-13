@@ -784,6 +784,7 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
 pub struct ReportOnDrop<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> {
     recorder: StageRecorder<S, D>,
     note: Option<&'static str>,
+    started: Stamp<D>,
 }
 
 impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> ReportOnDrop<S, D> {
@@ -791,8 +792,12 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> ReportOnD
     /// see -- from [`HostObservability::unobserved_note`] or
     /// [`ClientObservability::unobserved_note`].
     #[must_use]
-    pub const fn new(recorder: StageRecorder<S, D>, note: Option<&'static str>) -> Self {
-        Self { recorder, note }
+    pub fn new(recorder: StageRecorder<S, D>, note: Option<&'static str>) -> Self {
+        Self {
+            recorder,
+            note,
+            started: Stamp::now(),
+        }
     }
 
     /// The lines this would print, without printing them. Separated so the
@@ -808,8 +813,23 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> ReportOnD
             return Vec::new();
         }
         let mut lines = self.recorder.report();
+        // The rate, not just the total. Two runs of the same build that
+        // differ by a factor of two in frame rate are two different
+        // experiments, and a table of spans alone does not say so.
+        let rate = Stamp::now()
+            .since(self.started)
+            .map(|elapsed| elapsed.as_secs_f64())
+            .filter(|elapsed| *elapsed > 0.0)
+            .map_or_else(
+                || "-".to_string(),
+                |elapsed| {
+                    #[allow(clippy::cast_precision_loss)]
+                    let frames = self.recorder.frames() as f64;
+                    format!("{:.1}/s", frames / elapsed)
+                },
+            );
         lines.push(format!(
-            "{} frames={} stalls_observed={} in_flight_at_end={}",
+            "{} frames={} rate={rate} stalls_observed={} in_flight_at_end={}",
             D::NAME,
             self.recorder.frames(),
             self.recorder.stalls(),

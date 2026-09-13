@@ -147,6 +147,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // confirm it is reading the right place before it measures anything.
     let mut probe_id: u16 = 0;
     let mut events: u64 = 0;
+    // The requested heartbeat is not proof of what the helper achieved.
+    // When two runs of the same build differ two-to-one in frame rate, the
+    // first question is which boundary slowed down, and the helper is the
+    // first boundary: if it did not upload, nothing downstream could.
+    let mut uploads: u64 = 0;
+    let mut upload_total = Duration::ZERO;
+    let mut upload_max = Duration::ZERO;
+    let started = Instant::now();
     let mut buttons_down = [false; 3];
     let mut last_report = Instant::now();
     // Zero elapsed at the start would skip the first upload; force one.
@@ -198,21 +206,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // costs a few percent of one core.
         let heartbeat_due = last_upload.elapsed() >= heartbeat;
         if advanced || heartbeat_due {
+            let began = Instant::now();
             window.update_with_buffer(&buffer, width, height)?;
+            let took = began.elapsed();
+            uploads += 1;
+            upload_total += took;
+            upload_max = upload_max.max(took);
             last_upload = Instant::now();
         } else {
             window.update();
         }
         if last_report.elapsed() >= Duration::from_secs(5) {
-            println!("OpenStream probe helper: {events} events, marker now {probe_id}");
+            println!(
+                "OpenStream probe helper: {events} events, marker now {probe_id}, {}",
+                upload_summary(started, uploads, upload_total, upload_max)
+            );
             last_report = Instant::now();
         }
         if !advanced {
             std::thread::sleep(IDLE_FRAME);
         }
     }
-    println!("OpenStream probe helper: {events} events total");
+    println!(
+        "OpenStream probe helper: {events} events total, {}",
+        upload_summary(started, uploads, upload_total, upload_max)
+    );
     Ok(())
+}
+
+/// What the helper actually achieved, as opposed to what it asked for.
+fn upload_summary(started: Instant, uploads: u64, total: Duration, max: Duration) -> String {
+    let elapsed = started.elapsed().as_secs_f64();
+    #[allow(clippy::cast_precision_loss)]
+    let count = uploads as f64;
+    let rate = if elapsed > 0.0 { count / elapsed } else { 0.0 };
+    let mean_us = if uploads > 0 {
+        u64::try_from(total.as_micros() / u128::from(uploads)).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    format!(
+        "uploads={uploads} {rate:.1}/s mean={mean_us}us max={}us",
+        max.as_micros()
+    )
 }
 
 /// Paint the background, the marker, and a bar a human can watch.
