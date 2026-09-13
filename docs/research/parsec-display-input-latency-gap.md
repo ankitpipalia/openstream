@@ -3,9 +3,11 @@
 ## Executive finding
 
 **The remaining display latency is not yet decomposed.** OpenStream's fall
-from roughly 1,000 ms to 217-254 ms is supported by the measured decoder and
-NVENC changes in PR #15, and each of those two steps was measured separately.
-Nothing has yet measured where the remaining ~230 ms goes.
+from roughly 1,000 ms to **220-240 ms P50** is supported by the measured
+decoder and NVENC changes in #15, and each of those two steps was measured
+separately. Nothing has yet measured where the remaining time goes. See
+[Post-merge validation](#post-merge-validation-on-f6896c4) for the figures
+and for why this measurement technique cannot attribute it.
 
 Source inspection identifies four concrete candidates, in no proven order:
 
@@ -42,6 +44,69 @@ and a separate event-driven input pipeline. OpenStream passes decoded pixels
 and input through several queues whose semantics favour boundedness and
 reliability over freshness. The highest-value next step is not another fix:
 it is stage-level instrumentation, so the step after it can be attributed.
+## Post-merge validation on f6896c4
+
+Measured after #13-#15 landed, with both host and client built from `main`,
+against a live KDE Wayland desktop over the portal, NVENC, direct UDP, at
+1920x1080 / 30 fps.
+
+```text
+Run A -- integration tree
+  P50 165 ms, range 153-222 ms
+  estimated host/client offset +137 ms
+
+Run B -- merged main
+  P50 221 ms, range 203-275 ms
+  offset +98 ms
+
+Run C -- merged main
+  P50 237 ms, range 222-240 ms
+  offset +103/+104 ms, measured before and after the sample set
+```
+
+Interpretation:
+
+- B and C reproduce one another.
+- A does not.
+- **The discrepancy has not been explained.** The estimated clock offset
+  differed by about 35 ms between A and B/C, which is enough to account for
+  it arithmetically, but nothing here establishes that as the cause.
+- Cross-host clock-offset estimation and screenshot timing make this
+  technique unsuitable for precise stage attribution. Three samples in one
+  set captured the wrong window entirely, which is a further reason it does
+  not scale to a P50/P90/P99 campaign.
+- The current defensible display-latency result is approximately
+  **220-240 ms P50** on this hardware and configuration, with roughly
+  +/-30 ms screenshot measurement uncertainty. The earlier single-sample
+  figure of 217-254 ms, and run A's 165 ms, should not be quoted as
+  results.
+
+Against the ~1,000 ms baseline this is around a quarter of the original
+latency, with no catastrophic regression from integrating the three
+changes. That is what the experiment establishes; it does not establish
+where the remaining time goes, and it is not precise enough to attribute a
+future change of tens of milliseconds.
+
+### Why the next measurement must not work this way
+
+Two endpoints on two machines cannot be compared to better than the
+synchronisation between them. The replacement is to keep every measurement
+inside one clock domain:
+
+- **Host-local** spans (`capture -> encode`, `encode -> access unit`,
+  `access unit -> socket`) and **client-local** spans (`receive ->
+  reassemble`, `reassemble -> decode`, `decode -> UI`, `UI -> present`)
+  need no synchronisation at all, and already separate a capture/encode
+  problem from a decode/present one.
+- **Interaction latency** is measurable end to end on the client's clock
+  alone: send a probe, have the host render a deterministic marker for it,
+  stop the timer when that marker is presented. No NTP, no SSH offset, no
+  cross-run discrepancy.
+
+Never subtract a host `Instant` from a client `Instant`. If a one-way
+network figure is genuinely needed, use a four-timestamp exchange and
+report the synchronisation uncertainty alongside it.
+
 ## Evidence
 
 The artifacts are not in this repository: `analysis/` is gitignored because it
