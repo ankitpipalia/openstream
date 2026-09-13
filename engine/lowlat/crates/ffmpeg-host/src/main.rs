@@ -787,6 +787,23 @@ struct SpawnRequest {
 
 const MAX_VIDEO_FILTER_BYTES: usize = 4096;
 
+/// Whether a custom input argument list names a generated source that has
+/// no natural frame clock and therefore needs `-re`.
+///
+/// Only `lavfi` qualifies today: it is the source used by the demo and
+/// acceptance scripts. A real capture device paces itself, and an explicit
+/// `-re` or `-readrate` already in the caller's arguments is left alone.
+fn custom_input_needs_pacing(args: &[String]) -> bool {
+    if args
+        .iter()
+        .any(|arg| arg == "-re" || arg == "-readrate" || arg.starts_with("-readrate"))
+    {
+        return false;
+    }
+    args.windows(2)
+        .any(|pair| pair[0] == "-f" && pair[1] == "lavfi")
+}
+
 fn configured_video_filter(width: &str, height: &str) -> Result<String, String> {
     let filter = env::var("OPENSTREAM_VIDEO_FILTER")
         .unwrap_or_else(|_| format!("scale={width}:{height}:flags=fast_bilinear"));
@@ -847,7 +864,22 @@ fn spawn_ffmpeg(
     let mut command = Command::new(executable);
     command.args(["-hide_banner", "-loglevel", "error"]);
     if let Ok(args) = env::var("OPENSTREAM_FFMPEG_ARGS") {
-        command.args(validate_custom_ffmpeg_args(&split_command_line(&args)?)?);
+        let parsed = split_command_line(&args)?;
+        let custom = validate_custom_ffmpeg_args(&parsed)?;
+        // A generated source runs as fast as the machine allows. Left
+        // unpaced, `lavfi` fills the link with several times the configured
+        // bitrate -- measured at 29 Mbps for a 10 Mbps profile -- and the
+        // client loses whole frames to the flood. `-re` reads the input at
+        // its native rate, which is what a real capture device does by
+        // construction.
+        //
+        // It is added for generated sources only. FFmpeg documents `-re` as
+        // unsuitable for actual capture devices, where it causes packet
+        // loss, so `x11grab`, PipeWire, and friends must never get it.
+        if custom_input_needs_pacing(custom) {
+            command.arg("-re");
+        }
+        command.args(custom);
     } else {
         let backend = env::var("OPENSTREAM_CAPTURE_BACKEND").unwrap_or_else(|_| {
             match env::consts::OS {
@@ -868,6 +900,13 @@ fn spawn_ffmpeg(
         )?;
         command.args(arguments);
     }
+    // A hardware-frame encoder needs the software frames uploaded first;
+    // `encoder_filter_suffix` says so per encoder rather than leaving each
+    // adapter to remember it.
+    let video_filter = match openstream_platform::hwaccel::encoder_filter_suffix(&profile.encoder) {
+        Some(suffix) => format!("{video_filter},{suffix}"),
+        None => video_filter,
+    };
     command.args([
         "-an",
         "-vf",
@@ -1845,7 +1884,7 @@ mod tests {
 
 #[cfg(test)]
 mod pacing_tests {
-    use super::{WIRE_PACING_FLOOR_MBPS, wire_pacing_rate_for};
+    use super::{WIRE_PACING_FLOOR_MBPS, custom_input_needs_pacing, wire_pacing_rate_for};
 
     #[test]
     fn pacing_tracks_the_encoder_target_and_never_drops_below_the_floor() {
@@ -1856,5 +1895,63 @@ mod pacing_tests {
         // A low-bitrate profile keeps enough headroom for control and audio.
         assert!((wire_pacing_rate_for(1.0) - WIRE_PACING_FLOOR_MBPS).abs() < f64::EPSILON);
         assert!((wire_pacing_rate_for(0.0) - WIRE_PACING_FLOOR_MBPS).abs() < f64::EPSILON);
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// A generated source has no frame clock and floods the link: measured
+    /// at 29 Mbps out of a 10 Mbps profile, which costs the client whole
+    /// frames. It gets `-re`.
+    #[test]
+    fn a_generated_source_is_paced() {
+        assert!(custom_input_needs_pacing(&args(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1920x1080:rate=60",
+        ])));
+    }
+
+    /// A real capture device paces itself. FFmpeg documents `-re` as
+    /// unsuitable there -- it causes packet loss -- so it must never be
+    /// added to one.
+    #[test]
+    fn a_real_capture_device_is_never_paced() {
+        assert!(!custom_input_needs_pacing(&args(&[
+            "-f",
+            "x11grab",
+            "-framerate",
+            "60",
+            "-i",
+            ":0.0",
+        ])));
+        assert!(!custom_input_needs_pacing(&args(&[
+            "-f",
+            "avfoundation",
+            "-i",
+            "1:none",
+        ])));
+        assert!(!custom_input_needs_pacing(&args(&[
+            "-f", "gdigrab", "-i", "desktop",
+        ])));
+    }
+
+    /// An operator who already chose a read rate keeps it; pacing is not
+    /// applied twice.
+    #[test]
+    fn an_explicit_read_rate_is_left_alone() {
+        assert!(!custom_input_needs_pacing(&args(&[
+            "-re", "-f", "lavfi", "-i", "testsrc2",
+        ])));
+        assert!(!custom_input_needs_pacing(&args(&[
+            "-readrate",
+            "2",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2",
+        ])));
     }
 }

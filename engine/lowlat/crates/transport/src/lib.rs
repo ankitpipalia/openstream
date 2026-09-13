@@ -257,15 +257,69 @@ impl Drop for RelayRegistration {
     }
 }
 
+/// Receive buffer requested for every media socket.
+///
+/// The OS default is sized for ordinary datagram traffic, not for a video
+/// stream that arrives as a burst of fragments per frame. At 1440p the
+/// default overflowed and the kernel discarded thousands of datagrams --
+/// measured at 16,547 in one run -- which costs a fragment from most frames
+/// and so costs most frames entirely. A few MiB absorbs a scheduling hiccup
+/// without hiding a genuinely slow reader for long.
+///
+/// This is a request, not a guarantee: every platform clamps it to its own
+/// maximum (`net.core.rmem_max`, `kern.ipc.maxsockbuf`). What was actually
+/// granted is reported by [`UdpTransport::receive_buffer_bytes`] so a
+/// too-small ceiling shows up in diagnostics instead of as mystery loss.
+pub const REQUESTED_RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+// A "tuning" value below a couple of frames of burst would be tuning in
+// name only; fail the build rather than ship one.
+const _: () = assert!(REQUESTED_RECEIVE_BUFFER_BYTES >= 1024 * 1024);
+
+/// Ask the OS for a larger receive buffer, ignoring refusal.
+///
+/// A socket that keeps its default buffer still works; it just loses more
+/// under burst. Failing the bind over a tuning request would be worse than
+/// the problem it solves.
+fn request_receive_buffer(socket: &UdpSocket, bytes: usize) {
+    let borrowed = socket2::SockRef::from(socket);
+    if borrowed.set_recv_buffer_size(bytes).is_err() {
+        // Halve until the OS accepts, so a low ceiling still gets the
+        // largest buffer it will grant rather than none of the increase.
+        let mut candidate = bytes / 2;
+        while candidate > 64 * 1024 {
+            if borrowed.set_recv_buffer_size(candidate).is_ok() {
+                return;
+            }
+            candidate /= 2;
+        }
+    }
+}
+
+fn receive_buffer_bytes(socket: &UdpSocket) -> Option<usize> {
+    socket2::SockRef::from(socket).recv_buffer_size().ok()
+}
+
 impl UdpTransport {
     /// Bind one local UDP socket. Port `0` asks the OS to choose a free port.
     pub async fn bind(local: SocketAddr) -> Result<Self, Error> {
+        let socket = UdpSocket::bind(local).await?;
+        request_receive_buffer(&socket, REQUESTED_RECEIVE_BUFFER_BYTES);
         Ok(Self {
-            socket: Arc::new(UdpSocket::bind(local).await?),
+            socket: Arc::new(socket),
             peer: None,
             upnp_mapping: None,
             telemetry: TransportTelemetry::new(),
         })
+    }
+
+    /// The receive buffer the OS actually granted, in bytes.
+    ///
+    /// Reported for diagnostics: a value far below
+    /// [`REQUESTED_RECEIVE_BUFFER_BYTES`] means the host caps socket buffers
+    /// and is one raise away from losing frames under load.
+    pub fn receive_buffer_bytes(&self) -> Option<usize> {
+        receive_buffer_bytes(&self.socket)
     }
 
     /// Return the OS-assigned local address.
@@ -631,6 +685,67 @@ mod tests {
             socket.send(&mut session, Kind::Audio, 0, 0, b"audio").await,
             Err(Error::NotConnected)
         ));
+    }
+
+    /// A media socket must never end up with a smaller receive buffer than
+    /// an untuned one, and its effective size must be reportable.
+    ///
+    /// A video frame arrives as a burst of fragments, and the default
+    /// buffer overflowed under a 1440p stream -- 16,547 datagrams discarded
+    /// by the kernel in one run, which costs a fragment from most frames
+    /// and therefore most frames outright.
+    ///
+    /// The absolute size cannot be asserted portably: every platform clamps
+    /// the request to its own ceiling (`net.core.rmem_max`,
+    /// `kern.ipc.maxsockbuf`), and on a host whose ceiling is already the
+    /// default the tuned and untuned sockets are legitimately identical.
+    /// What is always true is that asking for more never yields less, and
+    /// that diagnostics can see what was granted -- so a host that silently
+    /// caps its sockets is visible rather than showing up later as mystery
+    /// loss.
+    #[tokio::test]
+    async fn a_media_socket_never_has_a_smaller_receive_buffer_than_an_untuned_one() {
+        let untuned = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .expect("bind an untuned socket");
+        let baseline =
+            receive_buffer_bytes(&untuned).expect("an untuned socket reports its buffer");
+
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind a local media socket");
+        let granted = transport
+            .receive_buffer_bytes()
+            .expect("the effective receive buffer is reportable for diagnostics");
+
+        assert!(
+            granted >= baseline,
+            "tuning shrank the receive buffer: {granted} < {baseline}"
+        );
+    }
+
+    /// On a host that permits it, the request is actually granted. Skipped
+    /// where the OS ceiling is lower, which is a property of the host and
+    /// not a defect.
+    #[tokio::test]
+    async fn the_requested_receive_buffer_is_granted_where_the_os_allows_it() {
+        let transport = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind a local media socket");
+        let granted = transport.receive_buffer_bytes().expect("reportable");
+
+        let untuned = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .expect("bind an untuned socket");
+        let baseline = receive_buffer_bytes(&untuned).expect("reportable");
+        if baseline >= REQUESTED_RECEIVE_BUFFER_BYTES {
+            return;
+        }
+        assert!(
+            granted > baseline,
+            "this host allows larger buffers but the request had no effect: \
+             granted {granted}, untuned {baseline}"
+        );
     }
 
     #[tokio::test]

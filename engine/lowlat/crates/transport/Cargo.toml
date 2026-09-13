@@ -11,6 +11,7 @@ authors = ["OpenStream contributors"]
 getrandom.workspace = true
 openstream-protocol = { path = "../protocol" }
 serde.workspace = true
+socket2 = "0.5"
 tokio.workspace = true
 url.workspace = true
 
