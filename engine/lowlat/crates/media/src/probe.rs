@@ -39,6 +39,44 @@
 //! desktop, so it could not draw there anyway. The marker is therefore
 //! produced by a host-side helper window on the captured output. That makes
 //! the probe a test and benchmark facility, not a production path.
+//!
+//! # The helper is fullscreen, and it reacts to real input
+//!
+//! Two properties the helper needs, both of which follow from what is being
+//! measured rather than from convenience.
+//!
+//! **Fullscreen**, because [`detect`] reads the marker at an agreed
+//! coordinate rather than searching for it, and under Wayland a client
+//! cannot place a window at an absolute desktop position -- `xdg_toplevel`
+//! offers fullscreen, maximise and interactive move, not arbitrary
+//! placement. A fullscreen helper on the captured output makes the
+//! surface-local coordinate a known desktop coordinate. For a benchmark,
+//! owning the screen is acceptable, and it settles keyboard focus too.
+//!
+//! **Driven by a real injected event**, because a probe id delivered over a
+//! side channel would skip the host half of the path. The sequence is:
+//!
+//! ```text
+//! helper displays marker 0
+//! client sees marker 0                  -- synchronised
+//!
+//! client: probe.sent(1)
+//! client: send an ordinary key or button event
+//!     -> OpenStream input
+//!     -> network
+//!     -> host uinput injection
+//!     -> the helper receives it as an application event
+//!     -> helper advances its marker to 1
+//!     -> compositor redraws
+//!     -> portal / PipeWire / encode / network / decode
+//! client: sees marker 1                 -- interaction_to_decoded
+//! client: that frame is submitted        -- interaction_to_present_submit
+//! ```
+//!
+//! So the probe id is a counter the helper increments on each event, and
+//! nothing about the measurement travels outside the ordinary input and
+//! video paths. A benchmark message carrying the id would have measured a
+//! shorter path than the one being reported.
 
 /// Cells across the marker grid.
 pub const GRID_COLUMNS: usize = 7;
@@ -173,6 +211,11 @@ fn cell_luma(
 /// client agree on rather than searching for: scanning a 1080p frame for a
 /// pattern on every decode would cost more than the thing being measured.
 ///
+/// That agreement is why the helper is fullscreen. A Wayland client cannot
+/// ask to be placed at an absolute desktop coordinate, so the only way a
+/// surface-local position is also a known capture position is for the
+/// surface to cover the output.
+///
 /// Returns `None` for any frame that does not carry an intact marker --
 /// wrong magic, failed checksum, calibration cells that did not separate.
 /// A miss is expected and cheap; the probe simply completes on a later
@@ -302,9 +345,10 @@ pub struct InteractionProbe {
     to_decoded: Histogram,
     to_present_submit: Histogram,
     sent: u64,
-    completed: u64,
+    decoded: u64,
+    present_submitted: u64,
     abandoned: u64,
-    duplicate_sightings: u64,
+    repeat_sightings: u64,
 }
 
 impl Default for InteractionProbe {
@@ -321,17 +365,27 @@ impl InteractionProbe {
             to_decoded: Histogram::new(),
             to_present_submit: Histogram::new(),
             sent: 0,
-            completed: 0,
+            decoded: 0,
+            present_submitted: 0,
             abandoned: 0,
-            duplicate_sightings: 0,
+            repeat_sightings: 0,
         }
     }
 
-    /// Record that a probe was sent. The oldest outstanding probe is dropped
-    /// once the bound is reached, and counted as abandoned.
+    /// Record that a probe was sent.
+    ///
+    /// Call this immediately before sending the *real* input event that
+    /// will make the helper advance its marker to `probe_id`. Nothing about
+    /// the probe travels outside the ordinary input path, so the span
+    /// includes host injection and the application's own response.
+    ///
+    /// The oldest outstanding probe is dropped once the bound is reached,
+    /// and counted as abandoned.
     pub fn sent(&mut self, probe_id: u16, at: Stamp<Client>) {
-        if self.outstanding.len() >= MAX_OUTSTANDING {
-            self.outstanding.pop_front();
+        if self.outstanding.len() >= MAX_OUTSTANDING && self.outstanding.pop_front().is_some() {
+            // Evicted before reaching presentation, whether or not it was
+            // decoded. A probe that was seen and never presented is not a
+            // completed measurement of the span it was sent to measure.
             self.abandoned = self.abandoned.saturating_add(1);
         }
         self.sent = self.sent.saturating_add(1);
@@ -357,13 +411,13 @@ impl InteractionProbe {
             .iter_mut()
             .find(|entry| entry.probe_id == probe_id)?;
         if entry.decoded.is_some() {
-            self.duplicate_sightings = self.duplicate_sightings.saturating_add(1);
+            self.repeat_sightings = self.repeat_sightings.saturating_add(1);
             return None;
         }
         entry.decoded = Some(at);
         let to_decoded = at.since(entry.sent);
         self.to_decoded.record(to_decoded);
-        self.completed = self.completed.saturating_add(1);
+        self.decoded = self.decoded.saturating_add(1);
         Some(Completion {
             probe_id,
             to_decoded,
@@ -387,6 +441,7 @@ impl InteractionProbe {
         self.outstanding.remove(index);
         let to_present = at.since(entry.sent);
         self.to_present_submit.record(to_present);
+        self.present_submitted = self.present_submitted.saturating_add(1);
         Some(Completion {
             probe_id,
             to_decoded: decoded.since(entry.sent),
@@ -409,12 +464,24 @@ impl InteractionProbe {
         self.sent
     }
 
+    /// Probes whose marker was seen in a decoded frame.
+    ///
+    /// Deliberately not called "completed": a decoded marker is half the
+    /// measurement, and a probe can be decoded and then evicted without ever
+    /// reaching presentation. Each counter names one stage so the summary
+    /// agrees with the two histograms rather than implying more than either.
     #[must_use]
-    pub const fn completed_count(&self) -> u64 {
-        self.completed
+    pub const fn decoded_count(&self) -> u64 {
+        self.decoded
     }
 
-    /// Probes whose marker never came back before the bound evicted them.
+    /// Probes whose marked frame reached the presenter.
+    #[must_use]
+    pub const fn present_submitted_count(&self) -> u64 {
+        self.present_submitted
+    }
+
+    /// Probes retired without reaching presentation, decoded or not.
     #[must_use]
     pub const fn abandoned_count(&self) -> u64 {
         self.abandoned
@@ -422,8 +489,8 @@ impl InteractionProbe {
 
     /// Repeat sightings of an already-measured marker.
     #[must_use]
-    pub const fn duplicate_sightings(&self) -> u64 {
-        self.duplicate_sightings
+    pub const fn repeat_sightings(&self) -> u64 {
+        self.repeat_sightings
     }
 
     /// Two lines, named for what they actually measure.
@@ -444,8 +511,13 @@ impl InteractionProbe {
             line("interaction_to_decoded       ", &self.to_decoded),
             line("interaction_to_present_submit", &self.to_present_submit),
             format!(
-                "probes sent={} completed={} abandoned={} repeat_sightings={}",
-                self.sent, self.completed, self.abandoned, self.duplicate_sightings
+                "probes sent={} decoded={} present_submitted={} abandoned={} \
+                 repeat_sightings={}",
+                self.sent,
+                self.decoded,
+                self.present_submitted,
+                self.abandoned,
+                self.repeat_sightings
             ),
         ]
     }
@@ -621,7 +693,7 @@ mod tests {
             );
         }
         assert_eq!(probe.to_decoded().count(), 1);
-        assert_eq!(probe.duplicate_sightings(), 19);
+        assert_eq!(probe.repeat_sightings(), 19);
         assert_eq!(probe.to_decoded().max_us(), 40_000);
     }
 
@@ -671,6 +743,53 @@ mod tests {
         // The oldest are gone; the newest still measure.
         assert_eq!(probe.marker_decoded(0, at(base, 500)), None);
         assert!(probe.marker_decoded(overflow - 1, at(base, 500)).is_some());
+    }
+
+    /// A probe can be seen and never presented. The counters must say so.
+    ///
+    /// A single "completed" counter incremented at decode made this state
+    /// read as `completed=1 abandoned=1`, which is individually explainable
+    /// and collectively misleading: the probe completed nothing, it was
+    /// decoded and then thrown away. Each counter names one stage instead.
+    #[test]
+    fn a_decoded_probe_that_never_presents_is_not_counted_as_complete() {
+        let base = Instant::now();
+        let mut probe = InteractionProbe::new();
+
+        probe.sent(1, at(base, 0));
+        probe.marker_decoded(1, at(base, 30));
+        // ...and presentation never happens for it. Fill the bound so it is
+        // evicted.
+        let overflow = u16::try_from(MAX_OUTSTANDING).expect("small") + 1;
+        for id in 2..=overflow {
+            probe.sent(id, at(base, u64::from(id)));
+        }
+
+        assert_eq!(probe.decoded_count(), 1, "it was seen");
+        assert_eq!(
+            probe.present_submitted_count(),
+            0,
+            "and never reached the presenter"
+        );
+        assert_eq!(probe.abandoned_count(), 1, "so it was abandoned");
+        // The histograms agree with the counters.
+        assert_eq!(probe.to_decoded().count(), 1);
+        assert_eq!(probe.to_present_submit().count(), 0);
+    }
+
+    /// A full measurement increments decode and presentation, not abandon.
+    #[test]
+    fn a_probe_that_reaches_the_presenter_is_counted_at_both_stages() {
+        let base = Instant::now();
+        let mut probe = InteractionProbe::new();
+        probe.sent(1, at(base, 0));
+        probe.marker_decoded(1, at(base, 22));
+        probe.marker_present_submitted(1, at(base, 38));
+
+        assert_eq!(probe.sent_count(), 1);
+        assert_eq!(probe.decoded_count(), 1);
+        assert_eq!(probe.present_submitted_count(), 1);
+        assert_eq!(probe.abandoned_count(), 0);
     }
 
     #[test]
