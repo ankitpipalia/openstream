@@ -14,6 +14,7 @@ pub mod input;
 pub mod latency;
 pub mod metrics;
 pub mod microphone;
+pub mod probe;
 pub mod telemetry;
 
 use openstream_protocol::MAX_PLAINTEXT;
