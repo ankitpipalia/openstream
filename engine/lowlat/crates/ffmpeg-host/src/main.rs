@@ -1505,8 +1505,20 @@ fn validate_custom_ffmpeg_args(args: &[String]) -> Result<&[String], String> {
             "an FFmpeg argument exceeds {MAX_FFMPEG_ARG_BYTES} bytes"
         ));
     }
+    // `pipe:1` is the host's own output: FFmpeg writes the encoded stream
+    // there and the host reads it, so letting an operator name it would
+    // redirect the stream out from under the session. `file:`/`tcp:`/`udp:`
+    // are likewise destinations.
+    //
+    // `pipe:0` is not. It is stdin -- an input, which is what these
+    // arguments are required to describe, and it cannot redirect anything.
+    // Refusing it blocked the only way to feed the host a source FFmpeg
+    // cannot open itself, which is how a KDE/GNOME Wayland desktop has to
+    // be captured: the xdg-desktop-portal grant yields a PipeWire node, and
+    // FFmpeg has no PipeWire demuxer, so the frames arrive on stdin from a
+    // bridge. Blocking that made Wayland capture impossible.
     if args.iter().any(|argument| {
-        matches!(argument.as_str(), "pipe:0" | "pipe:1")
+        argument == "pipe:1"
             || argument.starts_with("file:")
             || argument.starts_with("tcp:")
             || argument.starts_with("udp:")
@@ -1884,7 +1896,10 @@ mod tests {
 
 #[cfg(test)]
 mod pacing_tests {
-    use super::{WIRE_PACING_FLOOR_MBPS, custom_input_needs_pacing, wire_pacing_rate_for};
+    use super::{
+        WIRE_PACING_FLOOR_MBPS, custom_input_needs_pacing, validate_custom_ffmpeg_args,
+        wire_pacing_rate_for,
+    };
 
     #[test]
     fn pacing_tracks_the_encoder_target_and_never_drops_below_the_floor() {
@@ -1904,6 +1919,34 @@ mod pacing_tests {
     /// A generated source has no frame clock and floods the link: measured
     /// at 29 Mbps out of a 10 Mbps profile, which costs the client whole
     /// frames. It gets `-re`.
+    #[test]
+    fn stdin_is_an_input_and_stdout_is_not() {
+        // The host owns `pipe:1`; naming it would redirect the encoded
+        // stream away from the session.
+        assert!(validate_custom_ffmpeg_args(&args(&["-f", "rawvideo", "-i", "pipe:1"])).is_err());
+        assert!(validate_custom_ffmpeg_args(&args(&["-i", "file:/etc/passwd"])).is_err());
+        assert!(validate_custom_ffmpeg_args(&args(&["-i", "udp://10.0.0.1:9"])).is_err());
+        assert!(validate_custom_ffmpeg_args(&args(&["-i", "tcp://10.0.0.1:9"])).is_err());
+
+        // `pipe:0` is stdin. It is an input, and it is the only way to feed
+        // the host a source FFmpeg cannot open itself -- a PipeWire node
+        // from an xdg-desktop-portal grant, which is how a Wayland desktop
+        // is captured.
+        validate_custom_ffmpeg_args(&args(&[
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            "1920x1080",
+            "-r",
+            "60",
+            "-i",
+            "pipe:0",
+        ]))
+        .expect("stdin is a legitimate capture input");
+    }
+
     #[test]
     fn a_generated_source_is_paced() {
         assert!(custom_input_needs_pacing(&args(&[
