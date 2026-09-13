@@ -1,36 +1,61 @@
 //! Hardware-accelerator discovery shared by host adapters.
 //!
-//! Detection is filesystem-only (no linked drivers, no dlopen here) so this
-//! module builds on every target. Callers combine the report with their
-//! negotiated capabilities to pick an FFmpeg encoder profile; the profiles
-//! themselves are spelled out in [`ffmpeg_profile_args`] so every adapter
-//! uses identical flags.
+//! Detection reads the filesystem where that settles the question and
+//! otherwise asks the encoder itself, by spawning a bounded probe. It never
+//! links or `dlopen`s a driver, so this module still builds on every target.
+//! Callers combine the report with their negotiated capabilities to pick an
+//! FFmpeg encoder profile; the profiles themselves are spelled out in
+//! [`ffmpeg_profile_args`] so every adapter uses identical flags.
 
 /// Accelerators visible on this machine right now.
+///
+/// NVENC is recorded per codec. H.264 and HEVC encode are separate hardware
+/// capabilities -- a card can have one and not the other, and older NVIDIA
+/// silicon commonly does -- so a single `nvenc` flag derived from an H.264
+/// probe would advertise HEVC the machine cannot encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HwReport {
     /// At least one `/dev/dri/renderD*` node exists (VAAPI candidate).
     pub vaapi_node: bool,
-    /// The NVIDIA userspace encode library is installed.
-    pub nvenc_library: bool,
+    /// NVENC can encode H.264 here.
+    pub nvenc_h264: bool,
+    /// NVENC can encode HEVC here.
+    pub nvenc_hevc: bool,
     /// `nvidia-smi` answers, i.e. an NVIDIA kernel driver is loaded.
+    ///
+    /// Reported for diagnostics only. It is deliberately not a precondition
+    /// for NVENC: a container that ships the encode library without the
+    /// management tool has no `nvidia-smi` on `PATH` and encodes perfectly
+    /// well, and gating on it turned that into a silent fallback to
+    /// software.
     pub nvidia_smi: bool,
 }
 
 impl HwReport {
     /// Probe the running machine. Never fails; absence is data.
     pub fn probe() -> Self {
-        let nvidia_smi = command_exists("nvidia-smi");
-        // Prefer the cheap answer, but do not let an unlisted library path
-        // demote a working encoder to the software/VAAPI fallback. The
-        // capability probe only runs when the driver is loaded and the
-        // library search came up empty, so the common cases stay free.
-        let nvenc_library = nvenc_library_location().is_some()
-            || (nvidia_smi && ffmpeg_encoder_usable("h264_nvenc"));
+        // A library on disk is evidence the userspace is installed, but not
+        // that a given codec works, so each codec is asked separately. The
+        // probe spawns FFmpeg, so it runs once at host startup.
+        let installed = nvenc_library_location().is_some();
+        let nvenc_h264 = installed && ffmpeg_encoder_usable("h264_nvenc");
+        let nvenc_hevc = installed && ffmpeg_encoder_usable("hevc_nvenc");
+        // Nothing on disk matched the known paths -- a Flatpak runtime, a
+        // container layout, a distribution nobody listed. Ask the encoder
+        // directly rather than declaring it absent.
+        let (nvenc_h264, nvenc_hevc) = if installed {
+            (nvenc_h264, nvenc_hevc)
+        } else {
+            (
+                ffmpeg_encoder_usable("h264_nvenc"),
+                ffmpeg_encoder_usable("hevc_nvenc"),
+            )
+        };
         Self {
             vaapi_node: vaapi_node_present(),
-            nvenc_library,
-            nvidia_smi,
+            nvenc_h264,
+            nvenc_hevc,
+            nvidia_smi: command_exists("nvidia-smi"),
         }
     }
 
@@ -44,32 +69,23 @@ impl HwReport {
     }
 
     /// Return the discovered NVIDIA encode library path, if any.
+    ///
+    /// A machine can encode with NVENC and still report `None` here: the
+    /// library may live somewhere the path list does not name, which is
+    /// exactly the case the capability probe exists to cover.
     pub fn nvenc_library_location(&self) -> Option<String> {
-        self.nvenc_library.then(nvenc_library_location).flatten()
+        nvenc_library_location()
     }
 
     /// Best FFmpeg encoder this report supports for `codec`, or `None` when
     /// only software encoding is available.
     pub fn preferred_encoder(&self, codec: EncoderCodec) -> Option<&'static str> {
         match codec {
-            EncoderCodec::H264 => {
-                if self.nvenc_library && self.nvidia_smi {
-                    Some("h264_nvenc")
-                } else if self.vaapi_node {
-                    Some("h264_vaapi")
-                } else {
-                    None
-                }
-            }
-            EncoderCodec::H265 => {
-                if self.nvenc_library && self.nvidia_smi {
-                    Some("hevc_nvenc")
-                } else if self.vaapi_node {
-                    Some("hevc_vaapi")
-                } else {
-                    None
-                }
-            }
+            EncoderCodec::H264 if self.nvenc_h264 => Some("h264_nvenc"),
+            EncoderCodec::H265 if self.nvenc_hevc => Some("hevc_nvenc"),
+            EncoderCodec::H264 if self.vaapi_node => Some("h264_vaapi"),
+            EncoderCodec::H265 if self.vaapi_node => Some("hevc_vaapi"),
+            _ => None,
         }
     }
 }
@@ -528,7 +544,8 @@ mod tests {
     fn nvenc_wins_over_vaapi_when_both_are_present() {
         let report = HwReport {
             vaapi_node: true,
-            nvenc_library: true,
+            nvenc_h264: true,
+            nvenc_hevc: true,
             nvidia_smi: true,
         };
         assert_eq!(
@@ -601,13 +618,78 @@ mod tests {
         assert_eq!(encoder_filter_suffix("libx264"), None);
     }
 
+    /// H.264 and HEVC NVENC are separate hardware capabilities.
+    ///
+    /// A card that encodes H.264 need not encode HEVC -- older NVIDIA
+    /// silicon routinely does not -- so proving one must never advertise
+    /// the other. A single flag derived from an H.264 probe did exactly
+    /// that, and the session would negotiate HEVC the machine cannot encode.
     #[test]
-    fn nvenc_library_without_a_loaded_driver_is_not_selected() {
-        let report = HwReport {
-            nvenc_library: true,
+    fn h264_nvenc_does_not_imply_hevc_nvenc() {
+        let h264_only = HwReport {
+            nvenc_h264: true,
             ..HwReport::default()
         };
-        assert_eq!(report.preferred_encoder(EncoderCodec::H264), None);
+        assert_eq!(
+            h264_only.preferred_encoder(EncoderCodec::H264),
+            Some("h264_nvenc")
+        );
+        assert_eq!(
+            h264_only.preferred_encoder(EncoderCodec::H265),
+            None,
+            "HEVC was never probed, so it must not be offered"
+        );
+
+        // ...and a card with only HEVC still offers HEVC.
+        let hevc_only = HwReport {
+            nvenc_hevc: true,
+            ..HwReport::default()
+        };
+        assert_eq!(hevc_only.preferred_encoder(EncoderCodec::H264), None);
+        assert_eq!(
+            hevc_only.preferred_encoder(EncoderCodec::H265),
+            Some("hevc_nvenc")
+        );
+    }
+
+    /// NVENC must not require `nvidia-smi`.
+    ///
+    /// A container that ships the encode library without the management
+    /// tool has no `nvidia-smi` on `PATH` and encodes perfectly well.
+    /// Gating on it turned that into a silent fallback to VAAPI or software.
+    #[test]
+    fn nvenc_does_not_require_the_management_tool() {
+        let report = HwReport {
+            nvenc_h264: true,
+            nvenc_hevc: true,
+            nvidia_smi: false,
+            ..HwReport::default()
+        };
+        assert_eq!(
+            report.preferred_encoder(EncoderCodec::H264),
+            Some("h264_nvenc")
+        );
+        assert_eq!(
+            report.preferred_encoder(EncoderCodec::H265),
+            Some("hevc_nvenc")
+        );
+    }
+
+    /// With no NVENC at all, a render node still yields VAAPI, per codec.
+    #[test]
+    fn vaapi_is_the_fallback_when_nvenc_is_absent() {
+        let report = HwReport {
+            vaapi_node: true,
+            ..HwReport::default()
+        };
+        assert_eq!(
+            report.preferred_encoder(EncoderCodec::H264),
+            Some("h264_vaapi")
+        );
+        assert_eq!(
+            report.preferred_encoder(EncoderCodec::H265),
+            Some("hevc_vaapi")
+        );
     }
 
     #[test]
