@@ -33,6 +33,7 @@ members = [
     "crates/local-ipc",
     "crates/host-agent",
     "crates/diagnostics",
+    "crates/probe-helper",
 ]
 exclude = ["fuzz"]
 

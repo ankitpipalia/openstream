@@ -36,6 +36,7 @@ use openstream_media::latency::{
     TraceEnd,
 };
 use openstream_media::metrics::ReconnectSupervisor;
+use openstream_media::probe::{InteractionProbe, detect as probe_detect};
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
     metrics::MetricsReporter,
@@ -287,12 +288,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // counters are the only record that the discards happened, and a record
     // that has to be switched on is one that will be missing when it
     // matters.
-    let frame_age: SharedFrameAge = Arc::new(Mutex::new(FrameAgeRecord::new()));
+    let telemetry: SharedTelemetry = Arc::new(Mutex::new(ClientTelemetry::new(
+        probe_origin_from_environment(),
+    )));
     let worker = thread::Builder::new()
         .name("openstream-network".to_string())
         .spawn({
-            let frame_age = Arc::clone(&frame_age);
-            move || run_worker(ui_tx, input_rx, frame_age)
+            let telemetry = Arc::clone(&telemetry);
+            move || run_worker(ui_tx, input_rx, telemetry)
         })?;
     window.set_target_fps(120);
     let hotkeys = display::Hotkey::from_env();
@@ -343,8 +346,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let decoded_at = frame.decoded_at();
                     let width = frame.width();
                     let height = frame.height();
-                    with_frame_age(&frame_age, |record| {
-                        record.ui_queue_consumed(&frame, consumed_at);
+                    with_telemetry(&telemetry, |client| {
+                        client.frames.ui_queue_consumed(&frame, consumed_at);
                     });
                     // Malformed decoder output is dropped, never presented.
                     // It stays counted as consumed-and-replaced rather than
@@ -355,14 +358,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     buffer_width = width;
                     buffer_height = height;
-                    buffer = frame.into_pixels();
                     // Recorded before the present call, not after: the span
                     // this closes is "decoded until the client let go of
                     // it", and the presenter's own duration belongs to the
                     // presenter.
-                    with_frame_age(&frame_age, |record| {
-                        record.present_submitted_seq(seq, decoded_at, Stamp::now());
+                    with_telemetry(&telemetry, |client| {
+                        let at = Stamp::now();
+                        client.frames.present_submitted_seq(seq, decoded_at, at);
+                        client.marker_present_submitted(&frame, at);
                     });
+                    buffer = frame.into_pixels();
                     if let Some(presenter) = native_presenter.as_mut() {
                         if let Err(error) = presenter.present(&window, width, height, &buffer) {
                             eprintln!(
@@ -1002,12 +1007,12 @@ fn keyboard_usages() -> &'static [(Key, u32)] {
     ]
 }
 
-fn run_worker(ui_tx: UiSender, input_rx: InputReceiver, frame_age: SharedFrameAge) {
+fn run_worker(ui_tx: UiSender, input_rx: InputReceiver, telemetry: SharedTelemetry) {
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(network_loop(ui_tx.clone(), input_rx, frame_age)),
+        Ok(runtime) => runtime.block_on(network_loop(ui_tx.clone(), input_rx, telemetry)),
         Err(error) => Err(error.to_string().into()),
     };
     if let Err(error) = result {
@@ -1107,7 +1112,7 @@ fn discard_stale_input(input_rx: &InputReceiver) -> bool {
 async fn network_loop(
     ui_tx: UiSender,
     input_rx: InputReceiver,
-    frame_age: SharedFrameAge,
+    telemetry: SharedTelemetry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let max_attempts = match env::var("OPENSTREAM_RECONNECT_ATTEMPTS") {
         Ok(value) if value.eq_ignore_ascii_case("unlimited") => None,
@@ -1119,7 +1124,7 @@ async fn network_loop(
     let mut supervisor = ReconnectSupervisor::new(max_attempts);
     loop {
         let mut progress = SessionProgress::default();
-        let outcome = network_session(&ui_tx, &input_rx, &mut progress, &frame_age).await;
+        let outcome = network_session(&ui_tx, &input_rx, &mut progress, &telemetry).await;
         // Frames the window had taken but not yet submitted are gone with
         // the session, and are counted as never shown rather than left
         // pending across the reconnect.
@@ -1128,10 +1133,10 @@ async fn network_loop(
         // session: a run that reconnected four times is one measurement of
         // this client, and resetting would hide the losses that happened
         // around each drop -- which is where they cluster.
-        with_frame_age(&frame_age, |record| {
-            record.session_ended();
-            for line in record.report() {
-                eprintln!("OpenStream frame-age {line}");
+        with_telemetry(&telemetry, |client| {
+            client.frames.session_ended();
+            for line in client.report() {
+                eprintln!("OpenStream telemetry {line}");
             }
         });
         match outcome {
@@ -1177,7 +1182,7 @@ async fn network_session(
     ui_tx: &UiSender,
     input_rx: &InputReceiver,
     progress: &mut SessionProgress,
-    frame_age: &SharedFrameAge,
+    telemetry: &SharedTelemetry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
@@ -1274,7 +1279,7 @@ async fn network_session(
     let mut last_audio_toc = None;
 
     let (frame_tx, mut frame_rx) = async_mpsc::channel(2);
-    let reader_frame_age = Arc::clone(frame_age);
+    let reader_telemetry = Arc::clone(telemetry);
     tokio::spawn(async move {
         loop {
             let mut raw = vec![0_u8; frame_bytes];
@@ -1297,10 +1302,19 @@ async fn network_session(
             // different number of pictures than the host encoded, so a host
             // id carried through it would look like a correlation without
             // being one.
-            let Some(seq) = with_frame_age(&reader_frame_age, FrameAgeRecord::frame_decoded) else {
+            let Some(seq) =
+                with_telemetry(&reader_telemetry, |client| client.frames.frame_decoded())
+            else {
                 break;
             };
             let frame = DecodedFrame::new(seq, Stamp::now(), width, height, pixels);
+            // Reading the marker here, not after the queues, so a probe
+            // whose frame is later dropped is still counted as decoded --
+            // and counted as never presented, which is the pair the probe's
+            // separate stage counters exist to keep apart.
+            with_telemetry(&reader_telemetry, |client| {
+                client.marker_decoded(&frame, Stamp::now());
+            });
             // Never block here. This task is the only thing draining the
             // decoder's stdout, and the loop that drains `frame_rx` is the
             // same loop that writes access units to the decoder's stdin.
@@ -1315,8 +1329,8 @@ async fn network_session(
             // has not kept up with is dropped, exactly as `UiSender` already
             // drops stale frames and metrics.
             let offer = offer_decoded_frame(&frame_tx, frame);
-            with_frame_age(&reader_frame_age, |record| {
-                record.decoder_queue_offer(offer);
+            with_telemetry(&reader_telemetry, |client| {
+                client.frames.decoder_queue_offer(offer);
             });
             if offer.should_stop() {
                 break;
@@ -1336,6 +1350,8 @@ async fn network_session(
     );
     let mut metrics = MetricsReporter::default();
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(2));
+    let probe_enabled = with_telemetry(telemetry, |client| client.probe.is_some()).unwrap_or(false);
+    let mut probe_tick = tokio::time::interval(PROBE_INTERVAL);
     let mut clipboard_assembler = ClipboardAssembler::default();
     let mut clipboard_transfer_id = 1_u32;
     let mut clipboard_value = if clipboard_policy.may_send(negotiated.clipboard) {
@@ -1607,13 +1623,13 @@ async fn network_session(
             }
             Some(mut frame) = frame_rx.recv() => {
                 let taken_at = Stamp::<ClientClock>::now();
-                with_frame_age(frame_age, |record| {
-                    record.decoder_queue_consumed(&frame, taken_at);
+                with_telemetry(telemetry, |client| {
+                    client.frames.decoder_queue_consumed(&frame, taken_at);
                 });
                 frame.entering_ui_queue(taken_at);
                 let offer = ui_tx.send_frame(frame);
-                with_frame_age(frame_age, |record| {
-                    record.ui_queue_offer(offer);
+                with_telemetry(telemetry, |client| {
+                    client.frames.ui_queue_offer(offer);
                 });
             }
             _ = control_tick.tick() => {
@@ -1624,11 +1640,41 @@ async fn network_session(
             _ = wait_for_outbound_wake(outbound_wake) => {
                 session.flush_outbound_recoverably().await?;
             }
+            _ = probe_tick.tick(), if probe_enabled && negotiated.input => {
+                // Stamp first, then send a real key event. The helper
+                // advances its counter when the injected event reaches it,
+                // so the span covers the client's input path, the network,
+                // host injection and the application's own response -- the
+                // part a benchmark message carrying the id would have
+                // skipped while still being labelled `interaction_*`.
+                //
+                // Nothing happens until the marker has been read once: the
+                // next id is one past whatever the helper is currently
+                // showing, which is how this stays synchronised without a
+                // channel of its own.
+                let sent = with_telemetry(telemetry, |client| {
+                    let Some(next) = client.next_probe_id() else {
+                        return false;
+                    };
+                    let Some(state) = client.probe.as_mut() else {
+                        return false;
+                    };
+                    state.probe.sent(next, Stamp::now());
+                    true
+                });
+                if sent == Some(true) {
+                    let press = InputEvent::keyboard(PROBE_KEY_USAGE, 0, true, monotonic_us());
+                    reliable_control.send(&mut session, &press.encode()).await?;
+                    let release =
+                        InputEvent::keyboard(PROBE_KEY_USAGE, 0, false, monotonic_us());
+                    reliable_control.send(&mut session, &release.encode()).await?;
+                }
+            }
             _ = metrics_tick.tick() => {
                 let mut line = metrics.snapshot().overlay_line();
-                with_frame_age(frame_age, |record| {
+                with_telemetry(telemetry, |client| {
                     line.push_str(" -- ");
-                    line.push_str(&record.overlay_fragment());
+                    line.push_str(&client.frames.overlay_fragment());
                 });
                 let _ = ui_tx.send(UiMessage::Metrics(line));
             }
@@ -1824,22 +1870,125 @@ fn offer_decoded_frame(
     }
 }
 
-/// Shared because the three points a frame passes through are three
-/// different threads: the task reading the decoder's stdout, the session
-/// loop, and the window. The critical sections are a few integer increments
-/// and one array index, so the lock is never held across an await or a
-/// present.
-type SharedFrameAge = Arc<Mutex<FrameAgeRecord>>;
+/// The opt-in interaction probe's client-side state.
+///
+/// The probe id is not carried over any side channel: the host helper simply
+/// counts the input events it receives, so the client learns where the
+/// counter is by reading the marker, and the next id is one past whatever it
+/// last saw. That self-synchronises after a reconnect or a dropped event,
+/// and it means the measured span includes host injection and the helper's
+/// own response to an ordinary event -- which is the part a benchmark
+/// message would have skipped.
+#[derive(Debug)]
+struct ProbeState {
+    origin: (usize, usize),
+    probe: InteractionProbe,
+    last_seen: Option<u16>,
+}
 
-/// Run `edit` against the shared record, returning `None` if a panic
+/// The client's always-on frame accounting and its opt-in interaction probe.
+///
+/// One lock rather than two because they are updated at the same three
+/// points, and the points are on three different threads: the task reading
+/// the decoder's stdout, the session loop, and the window. The critical
+/// sections are integer increments, an array index, and -- only when the
+/// probe is enabled -- a fixed 42-cell read of the frame, so the lock is
+/// never held across an await or a present.
+#[derive(Debug)]
+struct ClientTelemetry {
+    frames: FrameAgeRecord,
+    probe: Option<ProbeState>,
+}
+
+impl ClientTelemetry {
+    fn new(probe_origin: Option<(usize, usize)>) -> Self {
+        Self {
+            frames: FrameAgeRecord::new(),
+            probe: probe_origin.map(|origin| ProbeState {
+                origin,
+                probe: InteractionProbe::new(),
+                last_seen: None,
+            }),
+        }
+    }
+
+    /// Look for the helper's marker in a decoded picture.
+    ///
+    /// Reads at the agreed origin rather than searching: scanning a 1080p
+    /// frame on every decoded picture would cost more than the span being
+    /// measured. A frame with no intact marker is the normal case between
+    /// probes and costs 42 cell samples to rule out.
+    fn marker_decoded(&mut self, frame: &DecodedFrame, at: Stamp<ClientClock>) -> Option<u16> {
+        let state = self.probe.as_mut()?;
+        let marker = probe_detect(frame.pixels(), frame.width(), frame.height(), state.origin)?;
+        state.last_seen = Some(marker);
+        state.probe.marker_decoded(marker, at);
+        Some(marker)
+    }
+
+    fn marker_present_submitted(&mut self, frame: &DecodedFrame, at: Stamp<ClientClock>) {
+        let Some(state) = self.probe.as_mut() else {
+            return;
+        };
+        if let Some(marker) =
+            probe_detect(frame.pixels(), frame.width(), frame.height(), state.origin)
+        {
+            state.probe.marker_present_submitted(marker, at);
+        }
+    }
+
+    /// The id the helper will show once it has received one more event, or
+    /// `None` until the client has read the marker at least once.
+    fn next_probe_id(&self) -> Option<u16> {
+        self.probe
+            .as_ref()?
+            .last_seen
+            .map(|seen| seen.wrapping_add(1))
+    }
+
+    fn report(&self) -> Vec<String> {
+        let mut lines = self.frames.report();
+        if let Some(state) = self.probe.as_ref() {
+            lines.extend(state.probe.report());
+        }
+        lines
+    }
+}
+
+/// Shared across the three threads a frame passes through.
+type SharedTelemetry = Arc<Mutex<ClientTelemetry>>;
+
+/// Run `edit` against the shared telemetry, returning `None` if a panic
 /// elsewhere poisoned the lock. Losing a counter is not a reason to take the
 /// session down, so the caller decides whether a missing answer matters.
-fn with_frame_age<R>(
-    record: &SharedFrameAge,
-    edit: impl FnOnce(&mut FrameAgeRecord) -> R,
+fn with_telemetry<R>(
+    telemetry: &SharedTelemetry,
+    edit: impl FnOnce(&mut ClientTelemetry) -> R,
 ) -> Option<R> {
-    record.lock().ok().map(|mut guard| edit(&mut guard))
+    telemetry.lock().ok().map(|mut guard| edit(&mut guard))
 }
+
+/// Where the host helper draws its marker, when the interaction probe is
+/// enabled. Off unless set: it is a benchmark facility and requires
+/// `openstream-probe-helper` to be running on the host desktop.
+fn probe_origin_from_environment() -> Option<(usize, usize)> {
+    let spec = env::var("OPENSTREAM_PROBE_ORIGIN").ok()?;
+    let (x, y) = spec.split_once(',')?;
+    let origin = (x.trim().parse().ok()?, y.trim().parse().ok()?);
+    eprintln!("OpenStream interaction probe reading marker at {origin:?}");
+    Some(origin)
+}
+
+/// How often to send the probe's input event.
+///
+/// Slow enough that the measurement does not become the load: each probe
+/// costs one key event and one full-screen redraw on the host.
+const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The key the probe presses. A modifier, so an ordinary application that
+/// happens to be focused instead of the helper receives something inert
+/// rather than typed text or a shortcut.
+const PROBE_KEY_USAGE: u32 = 0x0000_00E1;
 
 fn monotonic_us() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -1858,11 +2007,12 @@ impl From<io::Error> for UiMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, HEALTHY_SESSION, InputReceiver,
-        InputSender, PresentedRect, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver,
-        UiSender, axis_value, cycled_display, decoder_args, discard_stale_input,
-        gamepad_axis_index, gamepad_button_index, is_retryable, keyboard_usages,
-        offer_decoded_frame, presented_rect, selected_display_index, stream_pointer_position,
+        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, ClientTelemetry,
+        HEALTHY_SESSION, InputReceiver, InputSender, PresentedRect, SessionProgress, TerminalError,
+        UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display, decoder_args,
+        discard_stale_input, gamepad_axis_index, gamepad_button_index, is_retryable,
+        keyboard_usages, offer_decoded_frame, presented_rect, selected_display_index,
+        stream_pointer_position,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -2237,6 +2387,71 @@ mod tests {
         assert_eq!(record.frames_never_presented(), 9);
         assert_eq!(record.decoded_to_present_submit().count(), 1);
         assert_eq!(record.overlay_fragment(), "shown 1/10");
+    }
+
+    /// The probe is a benchmark facility and must be inert unless asked
+    /// for: it presses a key on the host every half second.
+    #[test]
+    fn the_interaction_probe_is_off_unless_an_origin_is_configured() {
+        let mut telemetry = ClientTelemetry::new(None);
+        assert!(telemetry.probe.is_none());
+        assert_eq!(telemetry.next_probe_id(), None);
+
+        let frame = test_frame(0);
+        assert_eq!(telemetry.marker_decoded(&frame, Stamp::now()), None);
+        telemetry.marker_present_submitted(&frame, Stamp::now());
+
+        let report = telemetry.report().join("\n");
+        assert!(report.contains("decoded_frames="), "{report}");
+        assert!(!report.contains("interaction_"), "{report}");
+    }
+
+    /// The next id is one past whatever the helper is currently showing.
+    /// Until the marker has been read once there is no id to send, because
+    /// the client does not know where the helper's counter is.
+    #[test]
+    fn the_next_probe_id_follows_the_marker_the_client_last_read() {
+        let origin = (0, 0);
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+        assert_eq!(
+            telemetry.next_probe_id(),
+            None,
+            "nothing to send before the marker has been located"
+        );
+
+        let (width, height) = (256, 192);
+        let mut pixels = vec![0_u32; width * height];
+        openstream_media::probe::render(&mut pixels, width, height, origin, 41);
+        let frame = DecodedFrame::new(seq(0), Stamp::now(), width, height, pixels);
+
+        assert_eq!(telemetry.marker_decoded(&frame, Stamp::now()), Some(41));
+        assert_eq!(telemetry.next_probe_id(), Some(42));
+
+        let report = telemetry.report().join("\n");
+        assert!(report.contains("interaction_to_decoded"), "{report}");
+        // Named for what it measures. Nothing here has seen a photon.
+        assert!(!report.contains("photon"), "{report}");
+    }
+
+    /// A frame carrying no marker is the normal case between probes, and
+    /// must not disturb the counter or be reported as a sighting.
+    #[test]
+    fn a_frame_without_a_marker_leaves_the_probe_alone() {
+        let origin = (0, 0);
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+        let (width, height) = (256, 192);
+        let mut pixels = vec![0_u32; width * height];
+        openstream_media::probe::render(&mut pixels, width, height, origin, 9);
+        let marked = DecodedFrame::new(seq(0), Stamp::now(), width, height, pixels);
+        assert_eq!(telemetry.marker_decoded(&marked, Stamp::now()), Some(9));
+
+        let blank = DecodedFrame::new(seq(1), Stamp::now(), width, height, vec![0; width * height]);
+        assert_eq!(telemetry.marker_decoded(&blank, Stamp::now()), None);
+        assert_eq!(
+            telemetry.next_probe_id(),
+            Some(10),
+            "an unmarked frame is not a new sighting"
+        );
     }
 
     fn seq(index: u64) -> DecodedFrameSeq {
