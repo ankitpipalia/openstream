@@ -1613,16 +1613,19 @@ fn spawn_audio_player() -> Result<Option<Child>, Box<dyn std::error::Error + Sen
 /// largest single source of latency in the client.
 ///
 /// libavcodec's H.264 decoder defaults to frame-level threading with one
-/// thread per core, and frame threading holds output back by one frame per
-/// thread so the workers can run ahead. On a ten-core machine that is nine
-/// frames -- 300 ms at 30 fps -- of delay that no amount of network or
-/// encoder tuning can recover. `-thread_type slice` keeps the parallelism
-/// that can be had within a frame and drops the part that costs frames.
+/// thread per core, and frame threading holds output back so the workers
+/// can run ahead. `-thread_type slice` keeps the parallelism that can be
+/// had within a frame and drops the part that costs frames.
 ///
 /// The rest stop the demuxer buffering ahead of the decoder: `nobuffer` and
 /// `low_delay` disable the reordering and read-ahead that exist for files,
-/// and the tiny probe/analyse limits stop FFmpeg reading a second of stream
-/// before it will emit anything at all.
+/// and the tiny probe/analyse limits stop FFmpeg reading a long stretch of
+/// stream before it will emit anything at all.
+///
+/// Together these measured 553 ms on a ten-core client at 30 fps
+/// (1000 ms -> 447 ms glass-to-glass). How that total divides between frame
+/// threading and the demuxer flags has not been measured separately, so no
+/// single figure here is attributed to one of them.
 fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
     vec![
         "-hide_banner".into(),

@@ -1308,6 +1308,21 @@ impl AccessUnitizer {
         }
     }
 
+    /// Split buffered encoder output into complete access units.
+    ///
+    /// **This costs one frame of latency, structurally.** An access unit is
+    /// only known to be complete once the *next* delimiter arrives, so frame
+    /// N is held until the encoder has begun emitting frame N+1: roughly
+    /// 33 ms at 30 fps, 17 ms at 60. It is not a bug in this function --
+    /// with an Annex-B byte stream and no length framing there is nothing
+    /// else to key on -- but it is a real stage in the latency budget and
+    /// one of the few known from source rather than suspected.
+    ///
+    /// Removing it needs a boundary the encoder states rather than one this
+    /// has to infer: a native encoder API that reports each frame or slice
+    /// as it completes. Guessing at boundaries from a hand-written H.264
+    /// parser would trade a known frame of delay for an unknown class of
+    /// corruption.
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         if bytes.len() > MAX_PENDING_ACCESS_UNIT_BYTES
             || self.bytes.len().saturating_add(bytes.len()) > MAX_PENDING_ACCESS_UNIT_BYTES
