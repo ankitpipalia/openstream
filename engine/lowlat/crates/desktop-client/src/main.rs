@@ -1607,11 +1607,37 @@ fn spawn_audio_player() -> Result<Option<Child>, Box<dyn std::error::Error + Sen
     Ok(Some(child))
 }
 
+/// Arguments for the decoder child.
+///
+/// The low-delay flags are not tuning; without them the decoder is the
+/// largest single source of latency in the client.
+///
+/// libavcodec's H.264 decoder defaults to frame-level threading with one
+/// thread per core, and frame threading holds output back by one frame per
+/// thread so the workers can run ahead. On a ten-core machine that is nine
+/// frames -- 300 ms at 30 fps -- of delay that no amount of network or
+/// encoder tuning can recover. `-thread_type slice` keeps the parallelism
+/// that can be had within a frame and drops the part that costs frames.
+///
+/// The rest stop the demuxer buffering ahead of the decoder: `nobuffer` and
+/// `low_delay` disable the reordering and read-ahead that exist for files,
+/// and the tiny probe/analyse limits stop FFmpeg reading a second of stream
+/// before it will emit anything at all.
 fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
     vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        "-fflags".into(),
+        "nobuffer".into(),
+        "-flags".into(),
+        "low_delay".into(),
+        "-thread_type".into(),
+        "slice".into(),
+        "-probesize".into(),
+        "32".into(),
+        "-analyzeduration".into(),
+        "0".into(),
         "-f".into(),
         format.into(),
         "-i".into(),
@@ -2124,6 +2150,34 @@ mod tests {
         // An aspect-preserving rect is never larger than the window.
         let rect = presented_rect((100, 100), (1920, 1080), true);
         assert!(rect.width <= 100 && rect.height <= 100);
+    }
+
+    /// The decoder must not be allowed to buffer frames ahead.
+    ///
+    /// Frame-level threading is the default and costs one frame of latency
+    /// per thread; on a ten-core client that is nine frames. These flags are
+    /// worth more than any other latency change in the client.
+    #[test]
+    fn the_decoder_is_configured_for_low_delay() {
+        let args = decoder_args("h264", 1920, 1080);
+        let pair = |flag: &str, value: &str| {
+            args.windows(2)
+                .any(|window| window[0] == flag && window[1] == value)
+        };
+        assert!(
+            pair("-thread_type", "slice"),
+            "frame threading delays output by a frame per thread: {args:?}"
+        );
+        assert!(pair("-flags", "low_delay"), "{args:?}");
+        assert!(pair("-fflags", "nobuffer"), "{args:?}");
+        assert!(pair("-analyzeduration", "0"), "{args:?}");
+        // The flags have to reach the demuxer, so they must come before -i.
+        let input = args.iter().position(|arg| arg == "-i").expect("has input");
+        let low_delay = args
+            .iter()
+            .position(|arg| arg == "low_delay")
+            .expect("has low_delay");
+        assert!(low_delay < input, "input options must precede -i: {args:?}");
     }
 
     #[test]

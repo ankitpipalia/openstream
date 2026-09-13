@@ -503,22 +503,39 @@ pub fn ffmpeg_profile_args(
     ];
     match encoder {
         "h264_nvenc" | "hevc_nvenc" => {
+            // One frame of VBV. The profile used twice the bitrate, which at
+            // 10 Mbps is two seconds of buffer the rate controller may spend
+            // before it has to converge -- latency no network tuning
+            // recovers. An interactive stream wants the encoder to meet its
+            // budget every frame instead.
+            let vbv = format!("{:.2}M", bitrate_mbps / f64::from(fps.max(1)));
             args.extend(
                 [
                     "-c:v",
                     encoder,
                     "-preset",
                     "p1",
+                    // Ultra-low latency, not merely low: `ll` still leaves
+                    // the encoder a reordering window.
                     "-tune",
-                    "ll",
+                    "ull",
+                    // NVENC defaults `-delay` to INT_MAX and `-zerolatency`
+                    // to false, so by default it may hold frames back before
+                    // emitting any output. For a desktop driven
+                    // interactively that delay buys nothing -- there are no
+                    // B-frames to reorder around -- and is paid every frame.
+                    "-zerolatency",
+                    "1",
+                    "-delay",
+                    "0",
                     "-rc",
-                    "vbr",
+                    "cbr",
                     "-b:v",
                     &rate,
                     "-maxrate",
                     &rate,
                     "-bufsize",
-                    &format!("{:.2}M", bitrate_mbps * 2.0),
+                    &vbv,
                     "-g",
                     &fps.saturating_mul(2).to_string(),
                     "-bf",
@@ -904,7 +921,10 @@ mod tests {
             .expect("nvenc profile");
         let joined = args.join(" ");
         assert!(joined.contains("-preset p1"));
-        assert!(joined.contains("-tune ll"));
+        // `ull`, not `ll`: the merely-low tuning still leaves the encoder a
+        // reordering window, which an interactive desktop pays for on every
+        // frame and gains nothing from.
+        assert!(joined.contains("-tune ull"));
         assert!(joined.contains("-b:v 10.00M"));
         assert!(joined.contains("-bf 0"));
     }
@@ -939,6 +959,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// NVENC must not be left free to hold frames back.
+    ///
+    /// It defaults `-delay` to INT_MAX and `-zerolatency` to false, so out of
+    /// the box the encoder may buffer before emitting anything. For a desktop
+    /// being driven interactively that delay buys nothing -- there are no
+    /// B-frames to reorder around -- and it is paid on every frame.
+    #[test]
+    fn the_nvenc_profile_does_not_let_the_encoder_hold_frames() {
+        let args = ffmpeg_profile_args("h264_nvenc", 1920, 1080, 60, 12.0, "yuv420p")
+            .expect("the NVENC profile builds without probing hardware");
+        let pair = |flag: &str, value: &str| {
+            args.windows(2)
+                .any(|window| window[0] == flag && window[1] == value)
+        };
+
+        assert!(pair("-zerolatency", "1"), "{args:?}");
+        assert!(pair("-delay", "0"), "{args:?}");
+        assert!(pair("-tune", "ull"), "{args:?}");
+        assert!(pair("-bf", "0"), "no B-frames to reorder around: {args:?}");
+
+        // One frame of VBV, not a multiple of the bitrate. At 12 Mbps and
+        // 60 fps that is 0.20 Mb, where twice the bitrate would have been
+        // 24 Mb -- two seconds of slack for the rate controller to spend.
+        let bufsize = args
+            .windows(2)
+            .find(|window| window[0] == "-bufsize")
+            .map(|window| window[1].clone())
+            .expect("the profile sets a VBV size");
+        assert_eq!(bufsize, "0.20M", "one frame of VBV at 12 Mbps / 60 fps");
     }
 
     #[test]
