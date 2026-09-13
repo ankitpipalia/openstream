@@ -1271,13 +1271,16 @@ pub enum SpanValue {
     NotObservable,
     /// Observable, but no frame has crossed it yet.
     NoSamples,
-    /// Measured. Percentiles are upper bounds; see [`Histogram`].
+    /// Measured. Percentiles are bucket upper bounds; `mean_us` and
+    /// `max_us` are exact. See [`Histogram`].
     Measured {
         count: u64,
         p50_upper_us: u64,
         p95_upper_us: u64,
         p99_upper_us: u64,
         max_us: u64,
+        /// Exact arithmetic mean, not a bucket bound. The one number on the
+        /// line that is not rounded up to a bucket edge.
         mean_us: u64,
         /// Samples past the last bucket edge. When this equals `count`,
         /// every percentile above is just the maximum.
@@ -1322,14 +1325,20 @@ impl SpanValue {
                 p95_upper_us,
                 p99_upper_us,
                 max_us,
+                mean_us,
                 overflow,
-                ..
             } => {
-                let mut line = String::with_capacity(96);
+                let mut line = String::with_capacity(112);
                 line.push_str(&format!("n={count}"));
                 line.push_str(&format!(" p50<={p50_upper_us}us"));
                 line.push_str(&format!(" p95<={p95_upper_us}us"));
                 line.push_str(&format!(" p99<={p99_upper_us}us"));
+                // Exact, unlike the percentiles above, because it is a sum
+                // and not a bucket. Worth carrying: the buckets are 100ms
+                // wide either side of 200ms, which is the width of the whole
+                // interaction span -- the first rig run put its median in a
+                // bucket that said "somewhere between 150 and 250ms".
+                line.push_str(&format!(" mean={mean_us}us"));
                 line.push_str(&format!(" max={max_us}us"));
                 // Only when it happened. A reader who sees this knows the
                 // percentiles above have collapsed towards the maximum,
@@ -1966,7 +1975,7 @@ mod observability_tests {
         assert!(measured.is_measured());
         assert_eq!(
             measured.render(),
-            "n=1 p50<=33000us p95<=33000us p99<=33000us max=33000us"
+            "n=1 p50<=33000us p95<=33000us p99<=33000us mean=33000us max=33000us"
         );
 
         // Every stage pair appears, and the holes say what they are.
