@@ -72,6 +72,16 @@ const PULSE_OFF: u32 = 0x0030_3040;
 /// and the loop does no work in that time beyond pumping events.
 const IDLE_FRAME: Duration = Duration::from_millis(2);
 
+/// How often to re-upload an unchanged surface.
+///
+/// A portal screencast only emits a buffer when something on the screen
+/// changed. A helper that drew once and then went still would stop the
+/// capture entirely: the client would decode nothing, never read the
+/// marker, and so never learn which id to send -- the probe would deadlock
+/// before its first measurement. Ten hertz is enough to keep the stream
+/// alive and cheap enough not to become the load being measured.
+const HEARTBEAT: Duration = Duration::from_millis(100);
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = surface_size()?;
     let origin = marker_origin()?;
@@ -118,7 +128,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events: u64 = 0;
     let mut buttons_down = [false; 3];
     let mut last_report = Instant::now();
-    let mut first_frame = true;
+    // Zero elapsed at the start would skip the first upload; force one.
+    let mut last_upload = Instant::now() - HEARTBEAT;
     draw(&mut buffer, width, height, origin, probe_id);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
@@ -151,14 +162,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             draw(&mut buffer, width, height, origin, probe_id);
         }
 
-        // Only upload the surface when it changed. Re-uploading fourteen
-        // million pixels on every iteration cost more CPU than the session
-        // being measured, and a benchmark helper that loads the host is
-        // measuring itself. `update` still pumps the event loop, which is
-        // all an idle helper needs.
-        if advanced || first_frame {
+        // Upload on change, and otherwise at a slow heartbeat.
+        //
+        // Not on every iteration: re-uploading fourteen million pixels at
+        // the poll rate cost more host CPU than the session being measured,
+        // and a benchmark helper that loads the host is measuring itself.
+        //
+        // But not only on change either. A portal screencast is damage
+        // driven: a desktop where nothing moves produces no buffers, so a
+        // helper that went completely still would stop the capture, and the
+        // client would never see the marker it needs in order to know which
+        // id to send next -- a probe that deadlocks itself before the first
+        // measurement. The heartbeat keeps the stream alive at a rate that
+        // costs a few percent of one core.
+        let heartbeat_due = last_upload.elapsed() >= HEARTBEAT;
+        if advanced || heartbeat_due {
             window.update_with_buffer(&buffer, width, height)?;
-            first_frame = false;
+            last_upload = Instant::now();
         } else {
             window.update();
         }
