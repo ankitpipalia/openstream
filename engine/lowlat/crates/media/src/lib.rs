@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 pub mod clipboard;
 pub mod displays;
 pub mod input;
+pub mod latency;
 pub mod metrics;
 pub mod microphone;
 pub mod telemetry;
