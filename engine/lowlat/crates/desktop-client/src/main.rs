@@ -29,11 +29,11 @@ use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
 };
 use openstream_media::displays::Display as RemoteDisplay;
-use openstream_media::frame_age::{DecodedFrame, FrameAgeRecord, FrameOffer};
+use openstream_media::frame_age::{DecodedFrame, DecodedFrameSeq, FrameAgeRecord, FrameOffer};
 use openstream_media::input::{InputEvent, RumbleEvent};
 use openstream_media::latency::{
-    Client as ClientClock, ClientObservability, ClientRecorder, ClientStage, ReportOnDrop, Stamp,
-    TraceEnd,
+    Client as ClientClock, ClientObservability, ClientRecorder, ClientStage, Liveness, Milestone,
+    ReportOnDrop, Stamp, TraceEnd,
 };
 use openstream_media::metrics::ReconnectSupervisor;
 use openstream_media::probe::{InteractionProbe, detect as probe_detect};
@@ -346,9 +346,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let decoded_at = frame.decoded_at();
                     let width = frame.width();
                     let height = frame.height();
-                    with_telemetry(&telemetry, |client| {
+                    let marker = with_telemetry(&telemetry, |client| {
                         client.frames.ui_queue_consumed(&frame, consumed_at);
-                    });
+                        // Read before the pixels move, so the frame that
+                        // gets credited is the frame that was shown.
+                        client.marker_in(&frame)
+                    })
+                    .flatten();
                     // Malformed decoder output is dropped, never presented.
                     // It stays counted as consumed-and-replaced rather than
                     // vanishing: a decoder emitting garbage should show up
@@ -358,16 +362,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     buffer_width = width;
                     buffer_height = height;
-                    // Recorded before the present call, not after: the span
-                    // this closes is "decoded until the client let go of
-                    // it", and the presenter's own duration belongs to the
-                    // presenter.
-                    with_telemetry(&telemetry, |client| {
-                        let at = Stamp::now();
-                        client.frames.present_submitted_seq(seq, decoded_at, at);
-                        client.marker_present_submitted(&frame, at);
-                    });
                     buffer = frame.into_pixels();
+
+                    // Everything below this stamp is the presenter's own
+                    // time: texture upload, surface acquisition, or a
+                    // software blit. Recording `present_submit` before the
+                    // call excluded all of it, and counted a frame as
+                    // submitted even when the call then failed.
+                    let present_started = Stamp::<ClientClock>::now();
                     if let Some(presenter) = native_presenter.as_mut() {
                         if let Err(error) = presenter.present(&window, width, height, &buffer) {
                             eprintln!(
@@ -383,6 +385,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = input_tx.try_send(UiInput::Stop);
                         return Err(error.into());
                     }
+                    // Reached only when a presenter accepted the frame:
+                    // both failure paths above return. Still not photon
+                    // time -- the compositor's queueing, the swap and the
+                    // panel are outside this process.
+                    let presented_at = Stamp::<ClientClock>::now();
+                    with_telemetry(&telemetry, |client| {
+                        client.frames.present_called(present_started, presented_at);
+                        client
+                            .frames
+                            .present_submitted_seq(seq, decoded_at, presented_at);
+                        client.marker_present_submitted(marker, presented_at);
+                        client.liveness.advance(
+                            Milestone::FramePresented,
+                            seq_as_frame_id(seq),
+                            presented_at,
+                        );
+                    });
                 }
                 Ok(UiMessage::Error(error)) => {
                     connected = false;
@@ -1134,8 +1153,8 @@ async fn network_loop(
         // this client, and resetting would hide the losses that happened
         // around each drop -- which is where they cluster.
         with_telemetry(&telemetry, |client| {
-            client.frames.session_ended();
-            for line in client.report() {
+            client.session_ended();
+            for line in client.report(Stamp::now()) {
                 eprintln!("OpenStream telemetry {line}");
             }
         });
@@ -1317,6 +1336,11 @@ async fn network_session(
             };
             // Queue ages run from `ready_at`, so pixel conversion cannot
             // masquerade as queue wait.
+            with_telemetry(&reader_telemetry, |client| {
+                client
+                    .liveness
+                    .advance(Milestone::FrameDecoded, seq_as_frame_id(seq), ready_at);
+            });
             let frame = DecodedFrame::new(seq, raw_ready_at, ready_at, width, height, pixels);
             // Reading the marker here, not after the queues, so a probe
             // whose frame is later dropped is still counted as decoded --
@@ -1360,6 +1384,10 @@ async fn network_session(
     );
     let mut metrics = MetricsReporter::default();
     let mut metrics_tick = tokio::time::interval(Duration::from_secs(2));
+    // Reported once per transition, not once per tick: a stalled pipeline
+    // should say so, not fill the log while it stays stalled.
+    let mut last_stall: Option<Milestone> = None;
+    with_telemetry(telemetry, |client| client.session_started(Stamp::now()));
     let probe_enabled = with_telemetry(telemetry, |client| client.probe.is_some()).unwrap_or(false);
     let mut probe_tick = tokio::time::interval(PROBE_INTERVAL);
     let mut clipboard_assembler = ClipboardAssembler::default();
@@ -1598,6 +1626,11 @@ async fn network_session(
                         stages.begin(frame_id, fragment_at);
                     }
                 }
+                with_telemetry(telemetry, |client| {
+                    client
+                        .liveness
+                        .advance(Milestone::PacketReceived, frame_id, fragment_at);
+                });
                 if let Some(completed) = outcome.completed {
                     // The frame whose last missing fragment this was -- not
                     // necessarily the frame released below, which is
@@ -1700,6 +1733,26 @@ async fn network_session(
                 }
             }
             _ = metrics_tick.tick() => {
+                // A stall is observed here or it is not observed at all.
+                // Nothing else retires a timeline as stalled, so before
+                // this watch existed a zero stall count meant only "no code
+                // ever said the word", not "the pipeline kept moving".
+                let stalled = with_telemetry(telemetry, |client| {
+                    client.liveness.stalled_at(STALL_DEADLINE, Stamp::now())
+                })
+                .flatten();
+                match stalled {
+                    Some(milestone) if last_stall != Some(milestone) => {
+                        eprintln!(
+                            "OpenStream pipeline stalled at {milestone:?}: nothing new in {}s",
+                            STALL_DEADLINE.as_secs_f64()
+                        );
+                        stages.abandon(milestone.stall_reason());
+                        last_stall = Some(milestone);
+                    }
+                    Some(_) => {}
+                    None => last_stall = None,
+                }
                 let mut line = metrics.snapshot().overlay_line();
                 with_telemetry(telemetry, |client| {
                     line.push_str(" -- ");
@@ -1930,6 +1983,13 @@ struct ProbeState {
     /// within one poll interval collapse into no transition at all, and the
     /// first rig run lost three quarters of its keystrokes that way.
     key_down: bool,
+    /// When [`Self::last_sent`] went out, so a probe whose keystroke never
+    /// arrived can be given up on instead of stalling the benchmark.
+    last_sent_at: Option<Stamp<ClientClock>>,
+    /// Probes given up on because their marker never came back in time.
+    /// Reported rather than silently retried: a benchmark that quietly
+    /// stops measuring looks exactly like one that is measuring fine.
+    timeouts: u64,
 }
 
 /// The client's always-on frame accounting and its opt-in interaction probe.
@@ -1943,6 +2003,15 @@ struct ProbeState {
 #[derive(Debug)]
 struct ClientTelemetry {
     frames: FrameAgeRecord,
+    /// Forward-progress watch, so "no stalls" is an observation rather than
+    /// an absence of evidence.
+    ///
+    /// `StageRecorder::stalls()` only counts timelines something explicitly
+    /// retired as stalled, so without this nothing ever would, and a report
+    /// printing zero would be stating that nothing classified a stall -- not
+    /// that the pipeline kept moving. It also gives the per-boundary rates
+    /// needed to say *where* a stream slowed down.
+    liveness: Liveness<ClientClock>,
     probe: Option<ProbeState>,
 }
 
@@ -1950,12 +2019,15 @@ impl ClientTelemetry {
     fn new(probe_origin: Option<(usize, usize)>) -> Self {
         Self {
             frames: FrameAgeRecord::new(),
+            liveness: Liveness::new(Stamp::now()),
             probe: probe_origin.map(|origin| ProbeState {
                 origin,
                 probe: InteractionProbe::new(),
                 last_seen: None,
                 last_sent: None,
                 key_down: false,
+                last_sent_at: None,
+                timeouts: 0,
             }),
         }
     }
@@ -1974,13 +2046,18 @@ impl ClientTelemetry {
         Some(marker)
     }
 
-    fn marker_present_submitted(&mut self, frame: &DecodedFrame, at: Stamp<ClientClock>) {
-        let Some(state) = self.probe.as_mut() else {
-            return;
-        };
-        if let Some(marker) =
-            probe_detect(frame.pixels(), frame.width(), frame.height(), state.origin)
-        {
+    /// The marker in a frame, if the probe is enabled and one is there.
+    ///
+    /// Read separately from crediting it so the pixels can be handed to the
+    /// presenter first: the frame is credited only once a presenter has
+    /// accepted it, and by then the buffer has moved.
+    fn marker_in(&self, frame: &DecodedFrame) -> Option<u16> {
+        let state = self.probe.as_ref()?;
+        probe_detect(frame.pixels(), frame.width(), frame.height(), state.origin)
+    }
+
+    fn marker_present_submitted(&mut self, marker: Option<u16>, at: Stamp<ClientClock>) {
+        if let (Some(state), Some(marker)) = (self.probe.as_mut(), marker) {
             state.probe.marker_present_submitted(marker, at);
         }
     }
@@ -2008,6 +2085,7 @@ impl ClientTelemetry {
     /// one poll interval collapse into nothing -- which is what cost the
     /// first rig run three quarters of its probes.
     fn next_probe_action(&mut self, at: Stamp<ClientClock>) -> ProbeAction {
+        self.expire_stale_probe(at);
         let Some(next) = self.next_probe_id() else {
             // Still holding the key, or nothing new to send. Releasing takes
             // priority: the key must not stay down across a stall.
@@ -2028,14 +2106,78 @@ impl ClientTelemetry {
         }
         state.probe.sent(next, at);
         state.last_sent = Some(next);
+        state.last_sent_at = Some(at);
         state.key_down = true;
         ProbeAction::Press
     }
 
-    fn report(&self) -> Vec<String> {
-        let mut lines = self.frames.report();
+    /// Give up on a probe whose keystroke never reached the helper.
+    ///
+    /// Without this the benchmark stops silently: the marker never moves,
+    /// so `next_probe_id` keeps returning the id already outstanding,
+    /// "never resend the same id" suppresses every tick, and the client
+    /// waits forever while printing nothing. Abandoning the probe first
+    /// means the retry cannot be matched against the stale stamp, so the
+    /// re-send measures the new attempt rather than the lost one.
+    fn expire_stale_probe(&mut self, at: Stamp<ClientClock>) {
+        let Some(state) = self.probe.as_mut() else {
+            return;
+        };
+        let (Some(sent_id), Some(sent_at)) = (state.last_sent, state.last_sent_at) else {
+            return;
+        };
+        if at
+            .since(sent_at)
+            .is_none_or(|waited| waited < PROBE_TIMEOUT)
+        {
+            return;
+        }
+        state.probe.abandon(sent_id);
+        state.timeouts = state.timeouts.saturating_add(1);
+        state.last_sent = None;
+        state.last_sent_at = None;
+        eprintln!(
+            "OpenStream interaction probe {sent_id} timed out after {}s; \
+             the host helper did not advance its marker",
+            PROBE_TIMEOUT.as_secs_f64()
+        );
+    }
+
+    /// Start a session's liveness watch. Rates describe one session, so a
+    /// reconnect does not dilute them with the downtime before it.
+    fn session_started(&mut self, at: Stamp<ClientClock>) {
+        self.liveness = Liveness::new(at);
+    }
+
+    /// End a session's probing. Nothing measured in one session may be
+    /// matched against a marker from the next.
+    fn session_ended(&mut self) {
+        self.frames.session_ended();
+        let Some(state) = self.probe.as_mut() else {
+            return;
+        };
+        // An outstanding probe would otherwise be matched by a marker from
+        // the session that reconnects, and report a span covering the
+        // downtime as if it were interaction latency.
+        state.probe.abandon_all();
+        state.last_seen = None;
+        state.last_sent = None;
+        state.last_sent_at = None;
+        // The host's virtual keyboard state does not survive the session
+        // either, so the next one starts with nothing held.
+        state.key_down = false;
+    }
+
+    fn report(&self, now: Stamp<ClientClock>) -> Vec<String> {
+        let mut lines = self.liveness.report(now);
+        lines.extend(self.frames.report());
         if let Some(state) = self.probe.as_ref() {
             lines.extend(state.probe.report());
+            lines.push(format!(
+                "probe timeouts={} outstanding_at_end={}",
+                state.timeouts,
+                state.probe.outstanding()
+            ));
         }
         lines
     }
@@ -2090,6 +2232,31 @@ const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 /// rather than typed text or a shortcut.
 const PROBE_KEY_USAGE: u32 = 0x0000_00E1;
 
+/// A decoded sequence number as a liveness frame id.
+///
+/// `Liveness` keys on `u32` because it is shared with the host, whose frame
+/// ids are 32-bit. Truncating is safe for the question it answers -- whether
+/// the id *changed* since the last observation -- and two sequence numbers
+/// 2^32 apart cannot be adjacent.
+fn seq_as_frame_id(seq: DecodedFrameSeq) -> u32 {
+    u32::try_from(seq.get() & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+}
+
+/// How long a downstream milestone may go without advancing before the
+/// pipeline is called stalled.
+///
+/// Well beyond any frame interval worth streaming, so ordinary jitter and a
+/// keyframe wait cannot trip it, and short enough that a session which has
+/// stopped moving says so within a metrics tick of noticing.
+const STALL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long to wait for a probe's marker before giving up on it.
+///
+/// Generous against any plausible interaction latency and short enough
+/// that a benchmark which has stopped measuring says so rather than
+/// sitting quietly. A timeout is reported, never silently retried.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn monotonic_us() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
@@ -2107,12 +2274,12 @@ impl From<io::Error> for UiMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, ClientTelemetry,
-        HEALTHY_SESSION, InputReceiver, InputSender, PresentedRect, ProbeAction, SessionProgress,
-        TerminalError, UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display,
-        decoder_args, discard_stale_input, gamepad_axis_index, gamepad_button_index, is_retryable,
-        keyboard_usages, offer_decoded_frame, presented_rect, selected_display_index,
-        stream_pointer_position,
+        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, ClientClock, ClientTelemetry,
+        Duration, HEALTHY_SESSION, InputReceiver, InputSender, PROBE_TIMEOUT, PresentedRect,
+        ProbeAction, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
+        axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
+        gamepad_button_index, is_retryable, keyboard_usages, offer_decoded_frame, presented_rect,
+        selected_display_index, stream_pointer_position,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -2499,9 +2666,10 @@ mod tests {
 
         let frame = test_frame(0);
         assert_eq!(telemetry.marker_decoded(&frame, Stamp::now()), None);
-        telemetry.marker_present_submitted(&frame, Stamp::now());
+        assert_eq!(telemetry.marker_in(&frame), None, "no probe, no detection");
+        telemetry.marker_present_submitted(None, Stamp::now());
 
-        let report = telemetry.report().join("\n");
+        let report = telemetry.report(Stamp::now()).join("\n");
         assert!(report.contains("decoded_frames="), "{report}");
         assert!(!report.contains("interaction_"), "{report}");
     }
@@ -2527,7 +2695,7 @@ mod tests {
         assert_eq!(telemetry.marker_decoded(&frame, Stamp::now()), Some(41));
         assert_eq!(telemetry.next_probe_id(), Some(42));
 
-        let report = telemetry.report().join("\n");
+        let report = telemetry.report(Stamp::now()).join("\n");
         assert!(report.contains("interaction_to_decoded"), "{report}");
         // Named for what it measures. Nothing here has seen a photon.
         assert!(!report.contains("photon"), "{report}");
@@ -2596,6 +2764,105 @@ mod tests {
         );
         assert_eq!(telemetry.next_probe_action(Stamp::now()), ProbeAction::Idle);
         assert!(!telemetry.probe.as_ref().expect("probe enabled").key_down);
+    }
+
+    /// A probe outstanding when a session drops must not be matched by a
+    /// marker from the session that reconnects.
+    ///
+    /// `ClientTelemetry` outlives the reconnect loop, so without an explicit
+    /// reset the next session's first marker would complete a probe stamped
+    /// before the disconnection -- reporting the downtime as interaction
+    /// latency, in the same histogram as the real measurements.
+    #[test]
+    fn a_session_boundary_ends_every_outstanding_probe() {
+        let origin = (0, 0);
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+        telemetry.marker_decoded(&marked_frame(origin, 3), Stamp::now());
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Press
+        );
+        assert_eq!(
+            telemetry.probe.as_ref().expect("probe").probe.outstanding(),
+            1
+        );
+
+        telemetry.session_ended();
+
+        let state = telemetry.probe.as_ref().expect("probe");
+        assert_eq!(state.probe.outstanding(), 0, "nothing survives the drop");
+        assert_eq!(state.probe.abandoned_count(), 1);
+        assert_eq!(state.last_seen, None, "the marker must be read again");
+        assert!(
+            !state.key_down,
+            "the host's key state did not survive either"
+        );
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Idle,
+            "no id to send until a marker is read in the new session"
+        );
+
+        // The next session's marker starts a fresh measurement, and cannot
+        // complete the one abandoned above.
+        telemetry.marker_decoded(&marked_frame(origin, 4), Stamp::now());
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Press
+        );
+        assert_eq!(
+            telemetry
+                .probe
+                .as_ref()
+                .expect("probe")
+                .probe
+                .to_decoded()
+                .count(),
+            0,
+            "no span was manufactured across the reconnect"
+        );
+    }
+
+    /// A lost keystroke must not stop the benchmark forever.
+    ///
+    /// The marker only moves when the helper receives an event, so a lost
+    /// press leaves `last_sent` equal to the next id and "never resend the
+    /// same id" suppresses every subsequent tick. The client then waits
+    /// silently, which looks exactly like a benchmark that is working.
+    #[test]
+    fn a_probe_whose_keystroke_was_lost_times_out_loudly_and_re_arms() {
+        let origin = (0, 0);
+        let base = Instant::now();
+        let at = |ms: u64| Stamp::<ClientClock>::from_instant(base + Duration::from_millis(ms));
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+
+        telemetry.marker_decoded(&marked_frame(origin, 7), at(0));
+        assert_eq!(telemetry.next_probe_action(at(0)), ProbeAction::Press);
+        assert_eq!(telemetry.next_probe_action(at(250)), ProbeAction::Release);
+        // The helper never received it, so the marker never moved.
+        assert_eq!(telemetry.next_probe_action(at(500)), ProbeAction::Idle);
+        assert_eq!(telemetry.next_probe_action(at(1_000)), ProbeAction::Idle);
+
+        // Past the timeout the probe is given up on and a new one goes out.
+        let after = u64::try_from(PROBE_TIMEOUT.as_millis()).expect("small") + 100;
+        assert_eq!(telemetry.next_probe_action(at(after)), ProbeAction::Press);
+
+        let state = telemetry.probe.as_ref().expect("probe");
+        assert_eq!(state.timeouts, 1, "the loss is counted, not hidden");
+        assert_eq!(state.probe.abandoned_count(), 1);
+        assert_eq!(
+            state.probe.outstanding(),
+            1,
+            "only the fresh attempt is outstanding"
+        );
+        // The stale stamp is gone, so a late marker cannot be matched
+        // against it and reported as a multi-second interaction.
+        assert!(
+            telemetry
+                .report(Stamp::now())
+                .iter()
+                .any(|line| line.contains("timeouts=1"))
+        );
     }
 
     fn marked_frame(origin: (usize, usize), probe_id: u16) -> DecodedFrame {

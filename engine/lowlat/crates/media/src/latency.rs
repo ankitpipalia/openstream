@@ -711,10 +711,18 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
         self.frames
     }
 
-    /// Frames whose timeline ended in a stall rather than completing.
+    /// Frames whose timeline was explicitly retired as a stall.
     ///
     /// Always counted, including when tracing is off: the count is the cheap
     /// signal, the timeline is the expensive one.
+    ///
+    /// Named for what it counts. This is zero unless something calls
+    /// [`Self::abandon`] or [`Self::abandon_frame`] with a stalled reason,
+    /// so zero means "nothing classified a frame as stalled", not "frame
+    /// progress stayed healthy". The second claim belongs to [`Liveness`],
+    /// which watches advancement over time rather than individual frames.
+    /// A report that prints this and lets a reader infer the second is
+    /// asserting something it never measured.
     #[must_use]
     pub const fn stalls(&self) -> u64 {
         self.stalls
@@ -783,18 +791,23 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> ReportOnD
 
     /// The lines this would print, without printing them. Separated so the
     /// content can be tested without capturing stderr.
+    ///
+    /// `in_flight` is passed in rather than read here because [`Drop`] has
+    /// to retire the open timelines before it can report on them, and
+    /// reading the count afterwards made it necessarily zero -- a field that
+    /// could only ever print one value.
     #[must_use]
-    pub fn lines(&self) -> Vec<String> {
+    pub fn lines(&self, in_flight: usize) -> Vec<String> {
         if self.recorder.frames() == 0 {
             return Vec::new();
         }
         let mut lines = self.recorder.report();
         lines.push(format!(
-            "{} frames={} stalls={} in_flight_at_end={}",
+            "{} frames={} stalls_observed={} in_flight_at_end={}",
             D::NAME,
             self.recorder.frames(),
             self.recorder.stalls(),
-            self.recorder.in_flight(),
+            in_flight,
         ));
         if let Some(note) = self.note {
             lines.push(format!("{} note: {note}", D::NAME));
@@ -823,8 +836,10 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> std::ops:
 
 impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> Drop for ReportOnDrop<S, D> {
     fn drop(&mut self) {
+        // Counted before retiring them, or the number is always zero.
+        let in_flight = self.recorder.in_flight();
         self.recorder.abandon(TraceEnd::SessionEnded);
-        for line in self.lines() {
+        for line in self.lines(in_flight) {
             eprintln!("OpenStream stage {line}");
         }
     }
@@ -1524,6 +1539,27 @@ pub enum Milestone {
 }
 
 impl Milestone {
+    /// How a frame timeline should be retired when this milestone stops
+    /// advancing.
+    ///
+    /// [`TraceEnd`] has three stalled reasons and there are six milestones,
+    /// so the mapping is coarse by construction: everything upstream of the
+    /// client's decoder becomes `CaptureStalled`, because from a receiver's
+    /// point of view "nothing is being produced" and "nothing is arriving"
+    /// are the same evidence. The report names the milestone itself, so the
+    /// coarse reason never has to be read as the precise one.
+    #[must_use]
+    pub const fn stall_reason(self) -> TraceEnd {
+        match self {
+            Self::FrameEntered
+            | Self::AccessUnitBoundary
+            | Self::PacketSent
+            | Self::PacketReceived => TraceEnd::CaptureStalled,
+            Self::FrameDecoded => TraceEnd::DecoderStalled,
+            Self::FramePresented => TraceEnd::PresenterStalled,
+        }
+    }
+
     pub const ORDER: [Self; 6] = [
         Self::FrameEntered,
         Self::AccessUnitBoundary,
@@ -2247,9 +2283,17 @@ mod observability_tests {
         // Frame 2 is still open when the session ends.
         guard.begin(2, at(base, 20));
 
-        let lines = guard.lines().join("\n");
+        // The count is taken before retiring the open timelines, exactly as
+        // `Drop` must: reading it afterwards made this field necessarily
+        // zero, so it could only ever print one value.
+        let in_flight = guard.in_flight();
+        let lines = guard.lines(in_flight).join("\n");
         assert!(lines.contains("frames=1"), "{lines}");
         assert!(lines.contains("in_flight_at_end=1"), "{lines}");
+        assert!(
+            lines.contains("stalls_observed="),
+            "the field says what it counts: {lines}"
+        );
         assert!(lines.contains("not-observable"), "{lines}");
         assert!(
             lines.contains("is not measured and is not zero"),
@@ -2265,7 +2309,7 @@ mod observability_tests {
             HostRecorder::for_backend(HostObservability::EncodedStreamOnly),
             None,
         );
-        assert!(guard.lines().is_empty());
+        assert!(guard.lines(0).is_empty());
     }
 
     /// The client's frame id does not survive an external decoder, and the

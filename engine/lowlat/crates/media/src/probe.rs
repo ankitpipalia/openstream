@@ -485,6 +485,40 @@ impl InteractionProbe {
         self.present_submitted
     }
 
+    /// Give up on every outstanding probe.
+    ///
+    /// Called at a session boundary. A probe outstanding when a session
+    /// drops can otherwise be matched by a marker from the *next* session,
+    /// and the span it reports then spans the reconnect downtime -- a
+    /// fabricated multi-second interaction latency indistinguishable from a
+    /// real one.
+    pub fn abandon_all(&mut self) {
+        let stranded = u64::try_from(self.outstanding.len()).unwrap_or(u64::MAX);
+        self.outstanding.clear();
+        self.abandoned = self.abandoned.saturating_add(stranded);
+    }
+
+    /// Give up on one probe, so a late marker carrying its id cannot be
+    /// matched against a stamp that is no longer meaningful.
+    pub fn abandon(&mut self, probe_id: u16) -> bool {
+        let Some(index) = self
+            .outstanding
+            .iter()
+            .position(|entry| entry.probe_id == probe_id)
+        else {
+            return false;
+        };
+        self.outstanding.remove(index);
+        self.abandoned = self.abandoned.saturating_add(1);
+        true
+    }
+
+    /// Probes still waiting for their marker.
+    #[must_use]
+    pub fn outstanding(&self) -> usize {
+        self.outstanding.len()
+    }
+
     /// Probes retired without reaching presentation, decoded or not.
     #[must_use]
     pub const fn abandoned_count(&self) -> u64 {
