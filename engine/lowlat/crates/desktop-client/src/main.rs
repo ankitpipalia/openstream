@@ -1289,6 +1289,12 @@ async fn network_session(
             {
                 break;
             }
+            // Stamped before the conversion, not after. The loop below
+            // walks every pixel of the frame and allocates four bytes per
+            // pixel -- about 15 MB at 2560x1440 -- and taking the clock
+            // afterwards left all of it outside every span while the report
+            // still claimed client frame movement had been ruled out.
+            let raw_ready_at = Stamp::<ClientClock>::now();
             let mut pixels = Vec::with_capacity(width * height);
             for pixel in raw.chunks_exact(4) {
                 let value = u32::from(pixel[0])
@@ -1297,17 +1303,21 @@ async fn network_session(
                     | (u32::from(pixel[3]) << 24);
                 pixels.push(value);
             }
+            let ready_at = Stamp::<ClientClock>::now();
             // The sequence number is assigned here, by the client, and is
             // not the host's frame id. The decoder is free to emit a
             // different number of pictures than the host encoded, so a host
             // id carried through it would look like a correlation without
             // being one.
-            let Some(seq) =
-                with_telemetry(&reader_telemetry, |client| client.frames.frame_decoded())
-            else {
+            let Some(seq) = with_telemetry(&reader_telemetry, |client| {
+                client.frames.pixels_unpacked(raw_ready_at, ready_at);
+                client.frames.frame_decoded()
+            }) else {
                 break;
             };
-            let frame = DecodedFrame::new(seq, Stamp::now(), width, height, pixels);
+            // Queue ages run from `ready_at`, so pixel conversion cannot
+            // masquerade as queue wait.
+            let frame = DecodedFrame::new(seq, raw_ready_at, ready_at, width, height, pixels);
             // Reading the marker here, not after the queues, so a probe
             // whose frame is later dropped is still counted as decoded --
             // and counted as never presented, which is the pair the probe's
@@ -2443,7 +2453,7 @@ mod tests {
         // that has stopped consuming entirely.
         for _ in 0..10 {
             let seq = record.frame_decoded();
-            let frame = DecodedFrame::new(seq, Stamp::now(), 1, 1, vec![0]);
+            let frame = DecodedFrame::new(seq, Stamp::now(), Stamp::now(), 1, 1, vec![0]);
             record.decoder_queue_offer(offer_decoded_frame(&decoder_tx, frame));
         }
         assert_eq!(record.decoder_queue().enqueued, 2);
@@ -2512,7 +2522,7 @@ mod tests {
         let (width, height) = (256, 192);
         let mut pixels = vec![0_u32; width * height];
         openstream_media::probe::render(&mut pixels, width, height, origin, 41);
-        let frame = DecodedFrame::new(seq(0), Stamp::now(), width, height, pixels);
+        let frame = DecodedFrame::new(seq(0), Stamp::now(), Stamp::now(), width, height, pixels);
 
         assert_eq!(telemetry.marker_decoded(&frame, Stamp::now()), Some(41));
         assert_eq!(telemetry.next_probe_id(), Some(42));
@@ -2592,7 +2602,7 @@ mod tests {
         let (width, height) = (256, 192);
         let mut pixels = vec![0_u32; width * height];
         openstream_media::probe::render(&mut pixels, width, height, origin, probe_id);
-        DecodedFrame::new(seq(0), Stamp::now(), width, height, pixels)
+        DecodedFrame::new(seq(0), Stamp::now(), Stamp::now(), width, height, pixels)
     }
 
     /// A frame carrying no marker is the normal case between probes, and
@@ -2604,10 +2614,17 @@ mod tests {
         let (width, height) = (256, 192);
         let mut pixels = vec![0_u32; width * height];
         openstream_media::probe::render(&mut pixels, width, height, origin, 9);
-        let marked = DecodedFrame::new(seq(0), Stamp::now(), width, height, pixels);
+        let marked = DecodedFrame::new(seq(0), Stamp::now(), Stamp::now(), width, height, pixels);
         assert_eq!(telemetry.marker_decoded(&marked, Stamp::now()), Some(9));
 
-        let blank = DecodedFrame::new(seq(1), Stamp::now(), width, height, vec![0; width * height]);
+        let blank = DecodedFrame::new(
+            seq(1),
+            Stamp::now(),
+            Stamp::now(),
+            width,
+            height,
+            vec![0; width * height],
+        );
         assert_eq!(telemetry.marker_decoded(&blank, Stamp::now()), None);
         assert_eq!(
             telemetry.next_probe_id(),
@@ -2621,7 +2638,7 @@ mod tests {
     }
 
     fn test_frame(index: u64) -> DecodedFrame {
-        DecodedFrame::new(seq(index), Stamp::now(), 1, 1, vec![0])
+        DecodedFrame::new(seq(index), Stamp::now(), Stamp::now(), 1, 1, vec![0])
     }
 
     /// A stretching presentation puts the picture over the whole window.

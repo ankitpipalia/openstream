@@ -89,6 +89,7 @@ impl fmt::Display for DecodedFrameSeq {
 #[derive(Clone, Debug)]
 pub struct DecodedFrame {
     seq: DecodedFrameSeq,
+    raw_ready_at: Stamp<Client>,
     decoded_at: Stamp<Client>,
     ui_queued_at: Option<Stamp<Client>>,
     width: usize,
@@ -98,9 +99,19 @@ pub struct DecodedFrame {
 
 impl DecodedFrame {
     /// A picture fresh out of the decoder.
+    ///
+    /// `raw_ready_at` is when the decoder's raw bytes were in hand;
+    /// `decoded_at` is when they had been turned into a buffer the window
+    /// can present. Between them sits a per-pixel conversion over several
+    /// megabytes, and it is a separate span rather than part of either
+    /// neighbour: folding it into the queue wait would make CPU work look
+    /// like queueing, and leaving it before the clock -- which is what the
+    /// first rig run did -- excluded it from the measurement entirely while
+    /// the report still claimed client frame movement had been ruled out.
     #[must_use]
     pub const fn new(
         seq: DecodedFrameSeq,
+        raw_ready_at: Stamp<Client>,
         decoded_at: Stamp<Client>,
         width: usize,
         height: usize,
@@ -108,12 +119,19 @@ impl DecodedFrame {
     ) -> Self {
         Self {
             seq,
+            raw_ready_at,
             decoded_at,
             ui_queued_at: None,
             width,
             height,
             pixels,
         }
+    }
+
+    /// When the decoder's raw bytes were in hand, before conversion.
+    #[must_use]
+    pub const fn raw_ready_at(&self) -> Stamp<Client> {
+        self.raw_ready_at
     }
 
     /// Stamp the moment this frame is handed to the window's queue.
@@ -253,6 +271,8 @@ pub struct FrameAgeRecord {
     new_frames_present_submitted: u64,
     repeat_present_submissions: u64,
     pending_frames_replaced: u64,
+    pixel_unpack: Histogram,
+    present_call: Histogram,
     decoder_queue_wait: Histogram,
     ui_queue_wait: Histogram,
     decoded_to_ui_consume: Histogram,
@@ -279,6 +299,8 @@ impl FrameAgeRecord {
             new_frames_present_submitted: 0,
             repeat_present_submissions: 0,
             pending_frames_replaced: 0,
+            pixel_unpack: Histogram::new(),
+            present_call: Histogram::new(),
             decoder_queue_wait: Histogram::new(),
             ui_queue_wait: Histogram::new(),
             decoded_to_ui_consume: Histogram::new(),
@@ -295,6 +317,28 @@ impl FrameAgeRecord {
         self.next_seq = seq.next();
         self.decoded_frames = self.decoded_frames.saturating_add(1);
         seq
+    }
+
+    /// The decoder's raw bytes have been unpacked into a presentable
+    /// buffer.
+    ///
+    /// Measured because nobody had measured it. At 2560x1440 the client
+    /// walks 3.7 million pixels and allocates about 15 MB per picture; that
+    /// may well be cheap, but "may well be" is not a measurement, and the
+    /// first rig run took its `decoded_at` stamp *after* this loop and then
+    /// reported that client frame movement was ruled out.
+    pub fn pixels_unpacked(&mut self, raw_ready_at: Stamp<Client>, ready_at: Stamp<Client>) {
+        self.pixel_unpack.record_span(ready_at.since(raw_ready_at));
+    }
+
+    /// How long a call into the presenter took.
+    ///
+    /// Separate from the spans that end at `present_submit`, because this is
+    /// the presenter's own time -- texture upload, surface acquisition, a
+    /// software blit -- and it starts where the client's accounting for the
+    /// frame stops.
+    pub fn present_called(&mut self, started: Stamp<Client>, returned: Stamp<Client>) {
+        self.present_call.record_span(returned.since(started));
     }
 
     /// Outcome of offering a frame to the decoder-to-session queue.
@@ -430,6 +474,16 @@ impl FrameAgeRecord {
     }
 
     #[must_use]
+    pub const fn pixel_unpack(&self) -> &Histogram {
+        &self.pixel_unpack
+    }
+
+    #[must_use]
+    pub const fn present_call(&self) -> &Histogram {
+        &self.present_call
+    }
+
+    #[must_use]
     pub const fn decoder_queue_wait(&self) -> &Histogram {
         &self.decoder_queue_wait
     }
@@ -452,8 +506,12 @@ impl FrameAgeRecord {
     /// The four spans, each as a [`SpanValue`] so an unexercised one renders
     /// as `no-samples` rather than as a zero.
     #[must_use]
-    pub fn spans(&self) -> [(&'static str, SpanValue); 4] {
+    pub fn spans(&self) -> [(&'static str, SpanValue); 6] {
         [
+            (
+                "pixel_unpack",
+                SpanValue::from_histogram(&self.pixel_unpack),
+            ),
             (
                 "decoder_queue_wait",
                 SpanValue::from_histogram(&self.decoder_queue_wait),
@@ -469,6 +527,10 @@ impl FrameAgeRecord {
             (
                 "decoded_to_present_submit",
                 SpanValue::from_histogram(&self.decoded_to_present_submit),
+            ),
+            (
+                "present_call",
+                SpanValue::from_histogram(&self.present_call),
             ),
         ]
     }
@@ -522,7 +584,14 @@ mod tests {
     }
 
     fn frame(seq: DecodedFrameSeq, base: Instant, decoded_ms: u64) -> DecodedFrame {
-        DecodedFrame::new(seq, at(base, decoded_ms), 4, 2, vec![0; 8])
+        DecodedFrame::new(
+            seq,
+            at(base, decoded_ms),
+            at(base, decoded_ms),
+            4,
+            2,
+            vec![0; 8],
+        )
     }
 
     #[test]
@@ -686,6 +755,55 @@ mod tests {
         assert_eq!(record.ui_queue_wait().max_us(), 7_000);
         assert_eq!(record.decoded_to_ui_consume().max_us(), 11_000);
         assert_eq!(record.decoded_to_present_submit().max_us(), 13_000);
+    }
+
+    /// The pixel conversion and the presenter call are the two pieces of
+    /// real client work that used to sit outside every span: one before the
+    /// clock started, one after it stopped.
+    #[test]
+    fn the_conversion_and_the_presenter_call_are_each_measured() {
+        let base = Instant::now();
+        let mut record = FrameAgeRecord::new();
+        let seq = record.frame_decoded();
+
+        record.pixels_unpacked(at(base, 0), at(base, 3));
+        let picture = DecodedFrame::new(seq, at(base, 0), at(base, 3), 4, 2, vec![0; 8]);
+        record.ui_queue_consumed(&picture, at(base, 9));
+        record.present_called(at(base, 9), at(base, 14));
+        record.present_submitted(&picture, at(base, 14));
+
+        assert_eq!(record.pixel_unpack().max_us(), 3_000);
+        assert_eq!(record.present_call().max_us(), 5_000);
+        // Queue age runs from the ready stamp, so conversion cannot
+        // masquerade as queue wait.
+        assert_eq!(record.decoded_to_ui_consume().max_us(), 6_000);
+        assert_eq!(record.decoded_to_present_submit().max_us(), 11_000);
+
+        let report = record.report().join("\n");
+        assert!(report.contains("pixel_unpack"), "{report}");
+        assert!(report.contains("present_call"), "{report}");
+    }
+
+    /// A frame the presenter refused is not a frame that was presented.
+    ///
+    /// The window records `present_submitted` only after a presenter
+    /// accepts the buffer. When none does, the frame stays consumed and
+    /// unpresented, which is what `frames_never_presented` is for.
+    #[test]
+    fn a_frame_no_presenter_accepted_is_never_counted_as_submitted() {
+        let base = Instant::now();
+        let mut record = FrameAgeRecord::new();
+        let seq = record.frame_decoded();
+        let picture = DecodedFrame::new(seq, at(base, 0), at(base, 1), 4, 2, vec![0; 8]);
+        record.ui_queue_consumed(&picture, at(base, 5));
+        // The presenter was called and refused, so nothing credits it.
+        record.present_called(at(base, 5), at(base, 6));
+        record.session_ended();
+
+        assert_eq!(record.new_frames_present_submitted(), 0);
+        assert_eq!(record.frames_never_presented(), 1);
+        assert_eq!(record.present_call().count(), 1, "the attempt is visible");
+        assert_eq!(record.decoded_to_present_submit().count(), 0);
     }
 
     #[test]
