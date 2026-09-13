@@ -30,7 +30,7 @@ DISPLAY LATENCY          host pixel -> capture -> encode -> network
 INTERACTION LATENCY      physical input -> client capture -> network
                          -> host injection -> application redraw
                          -> the whole display path above
-                         never measured
+                         measured: see First instrumented measurement
 ```
 
 The clock experiment reads a host-generated pixel off the client's window. No
@@ -44,6 +44,17 @@ and a separate event-driven input pipeline. OpenStream passes decoded pixels
 and input through several queues whose semantics favour boundedness and
 reliability over freshness. The highest-value next step is not another fix:
 it is stage-level instrumentation, so the step after it can be attributed.
+
+**That instrumentation now exists and has been run.** See
+[First instrumented measurement](#first-instrumented-measurement-on-442dd2b).
+It rules out two of the four candidates above on this rig -- nothing is being
+dropped by either handoff, and the client's own frame handling costs
+microseconds -- and it puts roughly 10 ms in the window queue against an
+interaction span of a few hundred. It does not yet decompose the rest: the
+host side and the decoder remain outside what an external-process pipeline
+can observe, and two consecutive runs of the same build have not been
+reconciled.
+
 ## Post-merge validation on f6896c4
 
 Measured after #13-#15 landed, with both host and client built from `main`,
@@ -106,6 +117,131 @@ inside one clock domain:
 Never subtract a host `Instant` from a client `Instant`. If a one-way
 network figure is genuinely needed, use a four-timestamp exchange and
 report the synchronisation uncertainty alongside it.
+
+## First instrumented measurement on 442dd2b
+
+The single-clock replacement described above now exists and has been run on
+the rig. Same hardware, KDE Wayland over the portal, NVENC, direct UDP, but
+at **2560x1440 / 60 fps** rather than 1920x1080 / 30 -- native resolution, so
+the probe marker reaches the client unscaled.
+
+No screenshots, no OCR, no cross-host clock offset. Every number below is a
+difference between two readings of one clock.
+
+### Client stage spans, keyed by host frame id
+
+```text
+FirstFragmentReceived -> LastFragmentReceived  n=5376 p50<=500us  p95<=8000us mean=2277us max=102536us
+LastFragmentReceived  -> Reassembled           n=5376 p50<=100us  p95<=100us  mean=3us    max=181us
+Reassembled           -> DecoderSubmitted      n=5374 p50<=100us  p95<=100us  mean=6us    max=127us
+DecoderSubmitted      -> DecodedReady          not-observable
+DecodedReady          -> HandedToWindow        not-observable
+HandedToWindow        -> TakenByWindow         not-observable
+TakenByWindow         -> PresentSubmitted      not-observable
+frames=5384 stalls=0 in_flight_at_end=0
+```
+
+Percentiles are bucket upper bounds; `mean` and `max` are exact.
+
+The four `not-observable` rows are not a gap in the instrumentation. FFmpeg
+does not return the frame id it was given, so nothing the client stamps after
+submission can be attributed to a host frame without inventing the
+correspondence. Those stages are measured instead by decoded sequence number,
+below.
+
+### Client frame age, keyed by decoded sequence number
+
+```text
+decoded_frames=5251 never_presented=0
+decoder_queue enqueued=5251 dropped_newest=0 closed=0
+ui_queue      enqueued=5251 dropped_newest=0 closed=0
+ui_frames_consumed=5251 new_frames_present_submitted=5251 pending_frames_replaced=0
+
+decoder_queue_wait         n=5251 p50<=250us   p95<=500us   mean=185us  max=4344us
+ui_queue_wait              n=5251 p50<=16000us p95<=33000us mean=9629us max=26485us
+decoded_to_ui_consume      n=5251 p50<=16000us p95<=33000us mean=9815us max=26698us
+decoded_to_present_submit  n=5251 p50<=16000us p95<=33000us mean=9816us max=26699us
+```
+
+`present_submit` is the moment the window hands a buffer to the presenter. It
+is not photon time; the compositor's queueing, the swap and the panel are
+outside the process and unmeasured.
+
+### Interaction latency, on the client's clock alone
+
+```text
+interaction_to_decoded         n=478 p50<=500000us mean=285121us max=1229794us overflow=1
+interaction_to_present_submit  n=478 p50<=500000us mean=295399us max=1242699us overflow=1
+probes sent=479 decoded=478 present_submitted=478 abandoned=0 repeat_sightings=43
+```
+
+The probe id travels on an ordinary injected keystroke, so this span includes
+the client's input path, the network, host uinput injection, the helper's own
+response to the event, compositor redraw, portal capture, encode, network and
+decode.
+
+### What the table establishes
+
+- **The client's own frame handling is not the problem, and can now be shown
+  not to be.** Reassembly averages 3us and decoder submission 6us. Nothing in
+  that part of the path is worth optimising.
+- **Nothing is being dropped.** Zero drops in either bounded queue, zero
+  frames consumed and replaced, zero stalls, across 5,251 decoded pictures.
+  This matters because a dropped frame leaves no span sample at all: before
+  these counters, a client discarding half its output would have shown the
+  same healthy distribution as one dropping none.
+- **About 10 ms sits between decode and present-submit**, almost all of it in
+  the window queue, with a tail to 27 ms. That is client-side, it is real,
+  and it is addressable -- but it is roughly 3% of the interaction span.
+- **The remaining ~97% is in the parts this branch cannot yet see**: input
+  transport, host injection, the application's response, compositor redraw,
+  portal capture, encode, and decode. The instrumentation says where to
+  instrument next; it does not yet say where the time goes.
+
+### What it does not establish, and the run-to-run spread
+
+Two consecutive runs of the same build differed materially:
+
+```text
+Run C  interaction_to_decoded  n=444 p50<=250000us max=265773us   ~44 fps decoded
+Run D  interaction_to_decoded  n=478 mean=285121us max=1229794us  ~21 fps decoded
+```
+
+Run D decoded at roughly half run C's frame rate and carried a single
+outlier past 1.2 s. **Neither difference has been explained.** They are
+recorded here rather than averaged away, and no figure from either run should
+be quoted as OpenStream's interaction latency until the spread is understood.
+
+The bucket edges are also too coarse at this range: 150 ms and 250 ms are
+adjacent edges, so a median anywhere between them renders identically. That
+is why the exact mean is now carried beside the percentiles.
+
+Raw telemetry for every run, including the two superseded ones, is in
+[latency-rig-runs.md](evidence/latency-rig-runs.md), along with how to
+reproduce them.
+
+### Three defects the rig found that unit tests did not
+
+Recorded because each was a measurement reporting a number rather than
+failing, which is the failure mode this instrumentation exists to prevent.
+
+1. **The probe report rendered an empty histogram as `n=0 p50<=-us ...
+   max=0us`.** A dash where there was no measurement, and beside it a zero
+   claiming the slowest interaction took no time. It now renders
+   `no-samples`, like every other unmeasured span.
+2. **A 10 Hz helper heartbeat produced an 8.6 fps stream.** A portal
+   screencast is damage driven; a helper that only redraws on input leaves
+   the desktop static and the capture idle. The reported interaction latency
+   was drawn from a stream nobody would run. The heartbeat now defaults to
+   16 ms and is documented as deciding what the probe measures.
+3. **Press and release sent back to back lost three keystrokes in four.** The
+   helper sees a keypress as a down transition between two polls; a pair
+   delivered inside one poll interval collapses into nothing. Each lost
+   keystroke then made the client re-send an id already outstanding, and when
+   the helper finally advanced, the match landed on the oldest stamp carrying
+   that id -- reporting a **10.18 second** interaction latency that was
+   really a lost keystroke. Press and release now go out on separate ticks,
+   and an id is sent once.
 
 ## Evidence
 
