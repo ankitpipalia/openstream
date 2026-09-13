@@ -277,9 +277,12 @@ pub struct RuntimeState {
     /// established at all. When the runner lands, it advances this the way
     /// `note_host_started` advances the host baseline.
     applied_reconnect: AppConfig,
-    /// Values in force for `SettingApplyMode::RestartHost` keys. Advanced
-    /// by `note_host_started`, when the agent reports a child that really
-    /// did come up under the persisted configuration.
+    /// Values in force for `SettingApplyMode::RestartHost` keys.
+    ///
+    /// Nothing advances this yet either, and for a sharper reason than the
+    /// reconnect baseline: the agent cannot say which configuration its
+    /// child is running. See
+    /// [`Self::host_config_revision_is_proven`].
     applied_host: AppConfig,
     /// Values in force for `SettingApplyMode::RestartApplication` keys and
     /// for the deployment mode. Only a process restart advances this, and a
@@ -412,12 +415,31 @@ impl RuntimeState {
             .any(|descriptor| setting_value_changed(descriptor.key, baseline, &self.settings))
     }
 
-    /// Record that a host child really did start under the persisted
-    /// configuration, so `RestartHost`-classed keys stop reading as
-    /// pending. Called only from the host-start outcome path, and only for
-    /// an agent event that proves a child reached a ready state.
-    fn note_host_started(&mut self) {
-        self.applied_host = self.settings.clone();
+    /// Whether the agent has proved which configuration its child is
+    /// running.
+    ///
+    /// It has not, and cannot yet. `HostReady` says a child reached a ready
+    /// state; it says nothing about what that child was configured with.
+    /// The agent builds its `HostAgentConfig` once, at daemon startup, from
+    /// `default_config()` plus environment overrides -- it never reads this
+    /// shell's `settings.json`, and an IPC `Start` carries no settings --
+    /// so a stop/start cycle re-runs the child under the agent's original
+    /// configuration, not the edited one.
+    ///
+    /// Advancing `applied_host` on `HostReady` therefore reports a
+    /// restart-host setting as applied while the running child still has
+    /// the old value: the exact false "already in effect" state these
+    /// baselines exist to prevent, just one step further along. Until the
+    /// agent can report the configuration revision it actually consumed,
+    /// the honest answer is that the change is still pending, so nothing
+    /// advances this baseline.
+    ///
+    /// The mechanism that would close this is a config revision carried
+    /// through `Start` and echoed in `HostHealth`; that belongs with the
+    /// runtime controller in R-01, which is where configuration application
+    /// stops being inferred from process state.
+    const fn host_config_revision_is_proven() -> bool {
+        false
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -551,15 +573,16 @@ impl RuntimeState {
         })
     }
 
-    /// Dispatch one host-lifecycle command and advance the host settings
-    /// baseline whenever it reports a child that really came up.
+    /// Dispatch one host-lifecycle command.
+    ///
+    /// A `HostReady` deliberately does not advance the host settings
+    /// baseline; see [`Self::host_config_revision_is_proven`] for why a
+    /// ready child is not evidence that it consumed the edited settings.
     fn apply_host_command(&mut self, command: AppCommand) -> Result<Vec<AppEvent>, RuntimeError> {
-        let ready = matches!(command, AppCommand::HostReady);
-        let events = self.app.dispatch(command).map_err(RuntimeError::from)?;
-        if ready {
-            self.note_host_started();
+        if matches!(command, AppCommand::HostReady) && Self::host_config_revision_is_proven() {
+            self.applied_host = self.settings.clone();
         }
-        Ok(events)
+        self.app.dispatch(command).map_err(RuntimeError::from)
     }
 
     /// Reconcile `AppModel` with what the host agent reports it is actually
@@ -936,11 +959,18 @@ mod tests {
         assert!(snapshot.pending_settings.is_empty());
     }
 
-    /// A host child that really did start under the persisted
-    /// configuration clears the host-restart requirement: the restart the
-    /// shell was asking for has now happened.
+    /// A ready child is not proof that it consumed the edited settings.
+    ///
+    /// The agent builds its configuration once, at daemon startup, from
+    /// defaults plus environment overrides; it never reads this shell's
+    /// settings file, and an IPC `Start` carries no settings. So a
+    /// stop/start cycle re-runs the child under the agent's original
+    /// configuration. Clearing the host-restart requirement on `HostReady`
+    /// would report a capture-mode change as applied while the running
+    /// child still had the old mode -- the same false "already in effect"
+    /// state the baselines exist to prevent.
     #[test]
-    fn a_host_that_restarts_clears_its_pending_settings() {
+    fn a_ready_child_does_not_clear_a_pending_restart_host_setting() {
         let path = temp_path("host-restart-baseline");
         let mut state = RuntimeState::from_settings_path(Some(path)).unwrap();
         let mut updated = state.settings().clone();
@@ -952,15 +982,49 @@ mod tests {
         assert!(state.snapshot().host_restart_required);
 
         state.dispatch(RuntimeCommand::EnableHosting).unwrap();
-        state
+        let result = state
             .apply_host_start_outcome(Ok(vec![HostAgentEvent::Ready]))
             .unwrap();
+        assert_eq!(result.snapshot.app.host_status, HostStatus::Ready);
 
         let snapshot = state.snapshot();
         assert!(
-            !snapshot.host_restart_required,
-            "the host restarted under the new configuration"
+            snapshot.host_restart_required,
+            "a ready child carries no evidence of which configuration it consumed"
         );
+        assert!(
+            snapshot
+                .pending_settings
+                .iter()
+                .any(|key| key.starts_with("host.capture")),
+            "the capture change is still pending: {:?}",
+            snapshot.pending_settings
+        );
+    }
+
+    /// The revert path still works, and is the one thing that legitimately
+    /// clears a restart-host requirement without the agent proving
+    /// anything: the persisted value is the value already running.
+    #[test]
+    fn reverting_a_restart_host_setting_still_clears_it_after_a_ready_child() {
+        let path = temp_path("host-restart-revert");
+        let mut state = RuntimeState::from_settings_path(Some(path)).unwrap();
+        let original = state.settings().clone();
+        let mut updated = original.clone();
+        updated.host.capture = match original.host.capture {
+            CaptureMode::X11 => CaptureMode::Drm,
+            _ => CaptureMode::X11,
+        };
+        state.update_settings(updated).unwrap();
+        state.dispatch(RuntimeCommand::EnableHosting).unwrap();
+        state
+            .apply_host_start_outcome(Ok(vec![HostAgentEvent::Ready]))
+            .unwrap();
+        assert!(state.snapshot().host_restart_required);
+
+        state.update_settings(original).unwrap();
+        let snapshot = state.snapshot();
+        assert!(!snapshot.host_restart_required);
         assert!(snapshot.pending_settings.is_empty());
     }
 
