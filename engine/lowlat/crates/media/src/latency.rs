@@ -415,6 +415,7 @@ impl<S: Copy + PartialEq, D: ClockDomain> FrameTrace<S, D> {
 #[derive(Debug)]
 pub struct StageRecorder<S: Copy + PartialEq + Ord + 'static, D: ClockDomain> {
     order: &'static [S],
+    observable: &'static [S],
     spans: Vec<Histogram>,
     frames: u64,
     tracing: bool,
@@ -425,11 +426,22 @@ pub struct StageRecorder<S: Copy + PartialEq + Ord + 'static, D: ClockDomain> {
 }
 
 impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageRecorder<S, D> {
-    /// Build a recorder over consecutive stages, aggregates only.
+    /// Build a recorder whose backend can observe every stage.
     #[must_use]
     pub fn new(order: &'static [S]) -> Self {
+        Self::with_observable(order, order)
+    }
+
+    /// Build a recorder where the backend can observe only some stages.
+    ///
+    /// Spans touching an unobservable stage report
+    /// [`SpanValue::NotObservable`] instead of being absent from the table,
+    /// so the gap is stated rather than inferred from a missing row.
+    #[must_use]
+    pub fn with_observable(order: &'static [S], observable: &'static [S]) -> Self {
         Self {
             order,
+            observable,
             spans: vec![Histogram::new(); order.len().saturating_sub(1)],
             frames: 0,
             tracing: false,
@@ -529,6 +541,29 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
         }
     }
 
+    /// What this report can say about the span between two consecutive
+    /// stages: not observable here, observable but unexercised, or measured.
+    #[must_use]
+    pub fn span_value(&self, from: S, to: S) -> SpanValue {
+        if !self.observable.contains(&from) || !self.observable.contains(&to) {
+            return SpanValue::NotObservable;
+        }
+        let Some(histogram) = self.span_histogram(from, to) else {
+            return SpanValue::NotObservable;
+        };
+        if histogram.count() == 0 {
+            return SpanValue::NoSamples;
+        }
+        SpanValue::Measured {
+            count: histogram.count(),
+            p50_upper_us: histogram.p50_upper_bound_us().unwrap_or_default(),
+            p95_upper_us: histogram.p95_upper_bound_us().unwrap_or_default(),
+            p99_upper_us: histogram.p99_upper_bound_us().unwrap_or_default(),
+            max_us: histogram.max_us(),
+            mean_us: histogram.mean_us().unwrap_or_default(),
+        }
+    }
+
     /// Histogram for the span between two consecutive stages.
     #[must_use]
     pub fn span_histogram(&self, from: S, to: S) -> Option<&Histogram> {
@@ -566,26 +601,23 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
         self.traces.iter()
     }
 
-    /// One line per span: `stage -> stage  n=.. p50=..us p95=..us max=..us`.
+    /// One line per span, covering every stage pair including the ones this
+    /// backend cannot see.
+    ///
+    /// Rendering goes through [`SpanValue`], so an unobservable span reads
+    /// `not-observable` and an unexercised one reads `no-samples`. Neither
+    /// can be formatted as a duration by a later caller.
     #[must_use]
     pub fn report(&self) -> Vec<String> {
         self.order
             .windows(2)
-            .enumerate()
-            .map(|(index, pair)| {
-                let histogram = self.spans.get(index).copied().unwrap_or_default();
-                let value =
-                    |v: Option<u64>| v.map_or_else(|| "-".to_string(), |us| format!("{us}"));
+            .map(|pair| {
                 format!(
-                    "{} {:?} -> {:?}  n={} p50<={}us p95<={}us p99<={}us max={}us",
+                    "{} {:?} -> {:?}  {}",
                     D::NAME,
                     pair[0],
                     pair[1],
-                    histogram.count(),
-                    value(histogram.p50_upper_bound_us()),
-                    value(histogram.p95_upper_bound_us()),
-                    value(histogram.p99_upper_bound_us()),
-                    histogram.max_us(),
+                    self.span_value(pair[0], pair[1]).render()
                 )
             })
             .collect()
@@ -594,6 +626,14 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
 
 /// Host-side stage recorder.
 pub type HostRecorder = StageRecorder<HostStage, Host>;
+
+impl HostRecorder {
+    /// Build a host recorder that claims only what this backend can see.
+    #[must_use]
+    pub fn for_backend(observability: HostObservability) -> Self {
+        Self::with_observable(&HostStage::ORDER, observability.observable_stages())
+    }
+}
 /// Client-side stage recorder.
 pub type ClientRecorder = StageRecorder<ClientStage, Client>;
 
@@ -919,6 +959,66 @@ mod trace_end_tests {
     }
 }
 
+/// What a report can say about one span.
+///
+/// Three outcomes, kept apart on purpose. A backend that cannot see a stage
+/// has no number; a stage that has been seen but not yet exercised has no
+/// samples; and a measured stage has bucket-edge bounds. Collapsing the
+/// first two into "0" or "N/A" is how an unmeasured hole becomes a claim
+/// that something was instant, which is the error this whole module exists
+/// to prevent. A formatter has to handle all three by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanValue {
+    /// This backend cannot observe one or both endpoints. The elapsed time
+    /// is real and unknown; it is emphatically not zero.
+    NotObservable,
+    /// Observable, but no frame has crossed it yet.
+    NoSamples,
+    /// Measured. Percentiles are upper bounds; see [`Histogram`].
+    Measured {
+        count: u64,
+        p50_upper_us: u64,
+        p95_upper_us: u64,
+        p99_upper_us: u64,
+        max_us: u64,
+        mean_us: u64,
+    },
+}
+
+impl SpanValue {
+    /// Render for a table, never as a number that could be mistaken for a
+    /// measurement.
+    #[must_use]
+    pub fn render(self) -> String {
+        match self {
+            Self::NotObservable => "not-observable".to_string(),
+            Self::NoSamples => "no-samples".to_string(),
+            Self::Measured {
+                count,
+                p50_upper_us,
+                p95_upper_us,
+                p99_upper_us,
+                max_us,
+                ..
+            } => {
+                let mut line = String::with_capacity(72);
+                line.push_str(&format!("n={count}"));
+                line.push_str(&format!(" p50<={p50_upper_us}us"));
+                line.push_str(&format!(" p95<={p95_upper_us}us"));
+                line.push_str(&format!(" p99<={p99_upper_us}us"));
+                line.push_str(&format!(" max={max_us}us"));
+                line
+            }
+        }
+    }
+
+    /// Whether a number is present at all.
+    #[must_use]
+    pub const fn is_measured(self) -> bool {
+        matches!(self, Self::Measured { .. })
+    }
+}
+
 /// A point in the pipeline whose forward progress is worth watching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Milestone {
@@ -964,6 +1064,9 @@ impl Milestone {
 pub struct Liveness<D: ClockDomain> {
     counts: [u64; Milestone::ORDER.len()],
     last: [Option<Stamp<D>>; Milestone::ORDER.len()],
+    last_id: [Option<u32>; Milestone::ORDER.len()],
+    /// When this milestone last moved to a *different* frame.
+    last_advance: [Option<Stamp<D>>; Milestone::ORDER.len()],
     started: Stamp<D>,
 }
 
@@ -973,6 +1076,8 @@ impl<D: ClockDomain> Liveness<D> {
         Self {
             counts: [0; Milestone::ORDER.len()],
             last: [None; Milestone::ORDER.len()],
+            last_id: [None; Milestone::ORDER.len()],
+            last_advance: [None; Milestone::ORDER.len()],
             started: now,
         }
     }
@@ -984,11 +1089,37 @@ impl<D: ClockDomain> Liveness<D> {
             .expect("every milestone is in ORDER")
     }
 
-    /// Record forward progress past one milestone.
-    pub fn advance(&mut self, milestone: Milestone, at: Stamp<D>) {
+    /// Record that `frame_id` passed this milestone.
+    ///
+    /// Health is measured against the frame *changing*, not against this
+    /// being called. A layer that replays a stale frame keeps its timestamp
+    /// fresh while the pipeline has stopped advancing, and a timestamp-only
+    /// check would call that healthy -- which is the same family of mistake
+    /// as trusting a live process or an open socket. So the same id arriving
+    /// again is counted, and is not progress.
+    pub fn advance(&mut self, milestone: Milestone, frame_id: u32, at: Stamp<D>) {
         let index = Self::index(milestone);
         self.counts[index] = self.counts[index].saturating_add(1);
         self.last[index] = Some(at);
+        if self.last_id[index] != Some(frame_id) {
+            self.last_id[index] = Some(frame_id);
+            self.last_advance[index] = Some(at);
+        }
+    }
+
+    /// The most recent frame id seen at this milestone.
+    #[must_use]
+    pub fn last_frame_id(&self, milestone: Milestone) -> Option<u32> {
+        self.last_id[Self::index(milestone)]
+    }
+
+    /// How long since this milestone moved to a *different* frame.
+    ///
+    /// Distinct from [`Self::since_last`], which only says when it was last
+    /// touched. The gap between the two is exactly a stage repeating itself.
+    #[must_use]
+    pub fn since_advance(&self, milestone: Milestone, now: Stamp<D>) -> Option<Duration> {
+        self.last_advance[Self::index(milestone)].map(|last| now.since(last))
     }
 
     #[must_use]
@@ -1023,6 +1154,10 @@ impl<D: ClockDomain> Liveness<D> {
     /// The first milestone that has fallen behind the one before it by more
     /// than `deadline`, which is where the pipeline stopped.
     ///
+    /// "Behind" means it has not moved to a new frame, not that nothing has
+    /// called it. A stage repeating one frame forever is stalled however
+    /// busy it looks.
+    ///
     /// A stage that has never advanced at all is reported only when the
     /// stage before it has, so a session that has not started yet is not
     /// mistaken for one that died at the first step.
@@ -1033,8 +1168,8 @@ impl<D: ClockDomain> Liveness<D> {
             if self.count(upstream) == 0 {
                 continue;
             }
-            let upstream_moved = self.since_last(upstream, now)?;
-            match self.since_last(downstream, now) {
+            let upstream_moved = self.since_advance(upstream, now)?;
+            match self.since_advance(downstream, now) {
                 // Downstream has never moved although upstream has, and
                 // enough time has passed that it should have.
                 None if upstream_moved >= deadline => return Some(downstream),
@@ -1094,10 +1229,11 @@ mod liveness_tests {
         // Packets keep arriving and being decoded; presentation stops.
         for tick in 0..30 {
             let now = at(base, tick * 33);
-            liveness.advance(Milestone::PacketReceived, now);
-            liveness.advance(Milestone::FrameDecoded, now);
+            let frame = u32::try_from(tick).expect("small");
+            liveness.advance(Milestone::PacketReceived, frame, now);
+            liveness.advance(Milestone::FrameDecoded, frame, now);
             if tick < 10 {
-                liveness.advance(Milestone::FramePresented, now);
+                liveness.advance(Milestone::FramePresented, frame, now);
             }
         }
 
@@ -1118,8 +1254,9 @@ mod liveness_tests {
         let mut liveness = Liveness::<Client>::new(at(base, 0));
         for tick in 0..20 {
             let now = at(base, tick * 33);
+            let frame = u32::try_from(tick).expect("small");
             for milestone in Milestone::ORDER {
-                liveness.advance(milestone, now);
+                liveness.advance(milestone, frame, now);
             }
         }
         let now = at(base, 20 * 33);
@@ -1145,7 +1282,11 @@ mod liveness_tests {
         let base = Instant::now();
         let mut liveness = Liveness::<Client>::new(at(base, 0));
         for tick in 0..60 {
-            liveness.advance(Milestone::FrameDecoded, at(base, tick * 16));
+            liveness.advance(
+                Milestone::FrameDecoded,
+                u32::try_from(tick).expect("small"),
+                at(base, tick * 16),
+            );
         }
         let now = at(base, 1_000);
 
@@ -1370,5 +1511,186 @@ mod context_tests {
         for forbidden in ["token", "Bearer", "192.168", "pairing"] {
             assert!(!joined.contains(forbidden), "leaked {forbidden}");
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::{Client, Liveness, Milestone, Stamp};
+    use std::time::{Duration, Instant};
+
+    fn at(base: Instant, ms: u64) -> Stamp<Client> {
+        Stamp::from_instant(base + Duration::from_millis(ms))
+    }
+
+    /// A stage replaying one frame forever is stalled, however busy it looks.
+    ///
+    /// This is the same family of mistake as trusting a live process or an
+    /// open socket: something keeps being called, so a timestamp keeps being
+    /// refreshed, and nothing is actually moving. Health has to be measured
+    /// against the frame identity changing.
+    #[test]
+    fn a_stage_repeating_one_frame_is_not_progress() {
+        let base = Instant::now();
+        let mut liveness = Liveness::<Client>::new(at(base, 0));
+
+        // Decode keeps advancing; the presenter re-presents frame 7 forever.
+        for tick in 0..40_u32 {
+            let now = at(base, u64::from(tick) * 16);
+            liveness.advance(Milestone::FrameDecoded, tick, now);
+            liveness.advance(Milestone::FramePresented, 7, now);
+        }
+
+        let now = at(base, 40 * 16);
+        // Touched a moment ago...
+        assert!(
+            liveness
+                .since_last(Milestone::FramePresented, now)
+                .expect("touched")
+                < Duration::from_millis(50)
+        );
+        // ...but has not moved to a new frame in the whole run.
+        assert!(
+            liveness
+                .since_advance(Milestone::FramePresented, now)
+                .expect("advanced once, at frame 7")
+                >= Duration::from_millis(600)
+        );
+        assert_eq!(
+            liveness.stalled_at(Duration::from_millis(200), now),
+            Some(Milestone::FramePresented),
+            "a timestamp-only check would have called this healthy"
+        );
+        assert_eq!(liveness.last_frame_id(Milestone::FramePresented), Some(7));
+    }
+
+    /// Genuine progress is not reported as a stall.
+    #[test]
+    fn advancing_frames_are_healthy() {
+        let base = Instant::now();
+        let mut liveness = Liveness::<Client>::new(at(base, 0));
+        for tick in 0..40_u32 {
+            let now = at(base, u64::from(tick) * 16);
+            liveness.advance(Milestone::FrameDecoded, tick, now);
+            liveness.advance(Milestone::FramePresented, tick, now);
+        }
+        let now = at(base, 40 * 16);
+        assert_eq!(liveness.stalled_at(Duration::from_millis(200), now), None);
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::{Host, HostObservability, HostRecorder, HostStage, SpanValue, Stamp};
+    use std::time::{Duration, Instant};
+
+    fn at(base: Instant, ms: u64) -> Stamp<Host> {
+        Stamp::from_instant(base + Duration::from_millis(ms))
+    }
+
+    /// The capture hole must never be formatted as a duration.
+    ///
+    /// With an external encoder, OpenStream never sees a frame go in, so the
+    /// time before the first encoded byte is real and unknown. A report that
+    /// rendered it as `0us`, or dropped the row entirely, would turn an
+    /// unmeasured gap into a claim that capture is instant -- which is the
+    /// exact error this module exists to prevent.
+    #[test]
+    fn an_unobservable_span_reports_itself_rather_than_a_number() {
+        let base = Instant::now();
+        let mut recorder = HostRecorder::for_backend(HostObservability::EncodedStreamOnly);
+
+        // Only the stages this backend can see are ever marked.
+        recorder.begin(1, at(base, 0));
+        recorder.mark(1, HostStage::EncoderFirstByte, at(base, 0));
+        recorder.mark(1, HostStage::AccessUnitBoundaryKnown, at(base, 33));
+        recorder.mark(1, HostStage::FirstFragmentSent, at(base, 34));
+        recorder.mark(1, HostStage::LastFragmentSent, at(base, 37));
+        recorder.finish(1);
+
+        assert_eq!(
+            recorder.span_value(
+                HostStage::FrameEnteredOpenStream,
+                HostStage::EncodeSubmitted
+            ),
+            SpanValue::NotObservable
+        );
+        assert_eq!(
+            recorder.span_value(HostStage::EncodeSubmitted, HostStage::EncoderFirstByte),
+            SpanValue::NotObservable,
+            "a span is unobservable if either end is"
+        );
+
+        let measured = recorder.span_value(
+            HostStage::EncoderFirstByte,
+            HostStage::AccessUnitBoundaryKnown,
+        );
+        assert!(measured.is_measured());
+        assert_eq!(
+            measured.render(),
+            "n=1 p50<=33000us p95<=33000us p99<=33000us max=33000us"
+        );
+
+        // Every stage pair appears, and the holes say what they are.
+        let report = recorder.report();
+        assert_eq!(report.len(), HostStage::ORDER.len() - 1);
+        let holes = report
+            .iter()
+            .filter(|line| line.contains("not-observable"))
+            .count();
+        assert_eq!(holes, 2, "the two unmeasurable spans are named: {report:?}");
+        for line in &report {
+            if line.contains("not-observable") {
+                assert!(
+                    !line.contains("us"),
+                    "a hole rendered as a duration: {line}"
+                );
+                assert!(
+                    !line.contains("n="),
+                    "a hole rendered a sample count: {line}"
+                );
+            }
+        }
+    }
+
+    /// An observable span that nothing has crossed is distinct from one that
+    /// cannot be seen at all.
+    #[test]
+    fn no_samples_is_not_the_same_as_not_observable() {
+        let recorder = HostRecorder::for_backend(HostObservability::EncodedStreamOnly);
+        assert_eq!(
+            recorder.span_value(
+                HostStage::EncoderFirstByte,
+                HostStage::AccessUnitBoundaryKnown
+            ),
+            SpanValue::NoSamples,
+            "observable, just not exercised yet"
+        );
+        assert_eq!(
+            recorder.span_value(
+                HostStage::FrameEnteredOpenStream,
+                HostStage::EncodeSubmitted
+            ),
+            SpanValue::NotObservable
+        );
+    }
+
+    /// A native backend measures everything, with no holes.
+    #[test]
+    fn a_native_backend_has_no_unobservable_spans() {
+        let base = Instant::now();
+        let mut recorder = HostRecorder::for_backend(HostObservability::Full);
+        recorder.begin(1, at(base, 0));
+        for (index, stage) in HostStage::ORDER.iter().enumerate().skip(1) {
+            recorder.mark(1, *stage, at(base, index as u64 * 5));
+        }
+        recorder.finish(1);
+
+        let report = recorder.report();
+        assert!(
+            !report.iter().any(|line| line.contains("not-observable")),
+            "{report:?}"
+        );
+        assert!(report.iter().all(|line| line.contains("n=1")), "{report:?}");
     }
 }
