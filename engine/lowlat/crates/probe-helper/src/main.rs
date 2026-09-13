@@ -63,10 +63,14 @@ const BACKGROUND: u32 = 0x0020_2024;
 const PULSE_ON: u32 = 0x0080_80A0;
 const PULSE_OFF: u32 = 0x0030_3040;
 
-/// How often to redraw when nothing has happened. The marker only changes on
-/// input, but the window still has to be pumped for the compositor and for
-/// the key events themselves to arrive.
-const IDLE_FRAME: Duration = Duration::from_millis(8);
+/// How long to sleep between polls when nothing has happened.
+///
+/// Short, because this is the helper's own contribution to the measured
+/// latency: an event arriving just after a poll waits this long before the
+/// marker advances, and that wait lands inside `interaction_to_decoded`. Two
+/// milliseconds is well under a frame interval at any rate worth measuring,
+/// and the loop does no work in that time beyond pumping events.
+const IDLE_FRAME: Duration = Duration::from_millis(2);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (width, height) = surface_size()?;
@@ -92,8 +96,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     window.set_position(0, 0);
-    // The marker changes only on input, but the event loop still has to run.
-    window.set_target_fps(120);
+    // The event loop has to run for key events to arrive, but the surface is
+    // only uploaded when the marker changes, so this is a poll rate rather
+    // than a frame rate.
+    window.set_target_fps(240);
 
     println!("OpenStream probe helper: surface {width}x{height}");
     println!(
@@ -112,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut events: u64 = 0;
     let mut buttons_down = [false; 3];
     let mut last_report = Instant::now();
+    let mut first_frame = true;
     draw(&mut buffer, width, height, origin, probe_id);
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
@@ -144,7 +151,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             draw(&mut buffer, width, height, origin, probe_id);
         }
 
-        window.update_with_buffer(&buffer, width, height)?;
+        // Only upload the surface when it changed. Re-uploading fourteen
+        // million pixels on every iteration cost more CPU than the session
+        // being measured, and a benchmark helper that loads the host is
+        // measuring itself. `update` still pumps the event loop, which is
+        // all an idle helper needs.
+        if advanced || first_frame {
+            window.update_with_buffer(&buffer, width, height)?;
+            first_frame = false;
+        } else {
+            window.update();
+        }
         if last_report.elapsed() >= Duration::from_secs(5) {
             println!("OpenStream probe helper: {events} events, marker now {probe_id}");
             last_report = Instant::now();

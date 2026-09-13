@@ -303,7 +303,7 @@ pub fn render(
     }
 }
 
-use crate::latency::{Client, Histogram, Stamp};
+use crate::latency::{Client, Histogram, SpanValue, Stamp};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -494,18 +494,16 @@ impl InteractionProbe {
     }
 
     /// Two lines, named for what they actually measure.
+    ///
+    /// Rendered through [`SpanValue`] rather than formatted here, so a span
+    /// no probe has crossed reads `no-samples`. It used to print
+    /// `n=0 p50<=-us ... max=0us`, which put a dash where there was no
+    /// measurement and a zero right next to it -- and `max=0us` is a number,
+    /// claiming the slowest interaction observed took no time at all.
     #[must_use]
     pub fn report(&self) -> Vec<String> {
         let line = |label: &str, histogram: &Histogram| {
-            let value = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |us| us.to_string());
-            format!(
-                "{label}  n={} p50<={}us p95<={}us p99<={}us max={}us",
-                histogram.count(),
-                value(histogram.p50_upper_bound_us()),
-                value(histogram.p95_upper_bound_us()),
-                value(histogram.p99_upper_bound_us()),
-                histogram.max_us()
-            )
+            format!("{label}  {}", SpanValue::from_histogram(histogram).render())
         };
         vec![
             line("interaction_to_decoded       ", &self.to_decoded),
@@ -790,6 +788,29 @@ mod tests {
         assert_eq!(probe.decoded_count(), 1);
         assert_eq!(probe.present_submitted_count(), 1);
         assert_eq!(probe.abandoned_count(), 0);
+    }
+
+    /// A span no probe has crossed must not be formatted as a number.
+    ///
+    /// The report used to print `n=0 p50<=-us p95<=-us max=0us` for an empty
+    /// histogram: a dash where there was no measurement, and `max=0us` right
+    /// beside it, which *is* a number and says the slowest interaction seen
+    /// took no time. Rendering through `SpanValue` makes that state say what
+    /// it is.
+    #[test]
+    fn an_unexercised_probe_span_reads_as_no_samples() {
+        let probe = InteractionProbe::new();
+        let report = probe.report().join("\n");
+        assert!(
+            report.contains("interaction_to_decoded         no-samples"),
+            "{report}"
+        );
+        assert!(
+            report.contains("interaction_to_present_submit  no-samples"),
+            "{report}"
+        );
+        assert!(!report.contains("max=0us"), "{report}");
+        assert!(!report.contains("<=-us"), "{report}");
     }
 
     #[test]
