@@ -60,8 +60,19 @@ export function App({ adapter = defaultAdapter, initialPage = "computers" }: App
 
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     setSnapshot(adapter.getSnapshot());
     const unsubscribe = adapter.subscribe(setSnapshot);
+
+    // Self-scheduling rather than setInterval, so only one refresh is ever
+    // in flight. A fixed interval can start a second invoke while the first
+    // is still stalled, and whichever resolves last wins -- which is how an
+    // older snapshot ends up overwriting a newer one.
+    const scheduleNext = () => {
+      if (!cancelled) {
+        timer = setTimeout(refresh, SNAPSHOT_POLL_INTERVAL_MS);
+      }
+    };
     const refresh = () =>
       adapter
         .refresh()
@@ -74,12 +85,15 @@ export function App({ adapter = defaultAdapter, initialPage = "computers" }: App
           if (!cancelled) {
             setSnapshot(createRuntimeUnavailableSnapshot(BRIDGE_UNAVAILABLE_DETAIL));
           }
-        });
+        })
+        .finally(scheduleNext);
+
     refresh();
-    const timer = setInterval(refresh, SNAPSHOT_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       unsubscribe();
     };
   }, [adapter]);

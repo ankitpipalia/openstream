@@ -24,11 +24,15 @@ mod unix_main {
     const TICK_INTERVAL: Duration = Duration::from_millis(100);
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Everything `build_config` resolves from settings and environment.
+    /// Everything `build_config` resolves from defaults and environment.
     struct AgentStartup {
         config: HostAgentConfig,
         report: openstream_host_agent::PreflightReport,
-        /// Whether the persisted settings ask this machine to host at launch.
+        /// Whether this agent's own effective startup configuration asks
+        /// the machine to host at launch. That configuration is
+        /// `default_config()` plus environment overrides -- notably
+        /// `OPENSTREAM_HOSTING_ENABLED` -- and is deliberately not the
+        /// desktop shell's `settings.json`, which this process never reads.
         host_enabled: bool,
     }
 
@@ -59,12 +63,17 @@ mod unix_main {
         let mut sigterm = signal(SignalKind::terminate())
             .map_err(|error| format!("could not install SIGTERM handler: {error}"))?;
 
-        // Start a child at launch only when the persisted configuration says
-        // this machine hosts. The agent used to spawn one unconditionally, so
-        // a freshly opened desktop shell -- which starts from
-        // `HostStatus::Disabled` -- could report hosting as off while this
-        // process was already streaming. Hosting that nobody asked for is now
-        // waited for over IPC instead.
+        // Start a child at launch only when this agent's own effective
+        // startup configuration says the machine hosts -- defaults plus
+        // environment, `OPENSTREAM_HOSTING_ENABLED` in practice. The agent
+        // used to spawn one unconditionally, so a freshly opened desktop
+        // shell -- which starts from `HostStatus::Disabled` -- could report
+        // hosting as off while this process was already streaming. Hosting
+        // that nobody asked for is now waited for over IPC instead.
+        //
+        // This is not the shell's `host.enabled`: the agent does not read
+        // the shell's settings file, and nothing yet carries settings across
+        // the IPC boundary. Making one the other is part of R-01.
         if host_enabled {
             let mut guard = agent.lock().await;
             let events = guard
@@ -73,7 +82,7 @@ mod unix_main {
             log_events(&events);
         } else {
             eprintln!(
-                "OpenStream host agent: hosting is disabled in settings; waiting for a Start request"
+                "OpenStream host agent: hosting is disabled in this agent's startup configuration; waiting for a Start request"
             );
         }
 
