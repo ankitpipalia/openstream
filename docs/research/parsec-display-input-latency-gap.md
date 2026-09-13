@@ -45,10 +45,18 @@ and input through several queues whose semantics favour boundedness and
 reliability over freshness. The highest-value next step is not another fix:
 it is stage-level instrumentation, so the step after it can be attributed.
 
-**That instrumentation now exists and has been run once.** See
-[First instrumented measurement](#first-instrumented-measurement-on-442dd2b).
-One candidate is ruled out on that rig: nothing was dropped by either
-decoded-frame handoff across 5,251 pictures.
+**That instrumentation now exists and has been run.** See
+[First instrumented measurement](#first-instrumented-measurement-on-442dd2b)
+for the first attempt and
+[the corrected rerun](#corrected-rerun-on-d6218dc) for what it says after
+review. One candidate is ruled out: nothing was dropped by either
+decoded-frame handoff, in either run.
+
+The corrected rerun contradicts the fourth candidate in the other
+direction. Presentation scheduling is not merely untied to refresh -- **the
+presenter call itself costs 9.3 ms per frame** at 2560x1440, which nothing
+had measured, and the raw-to-BGRA conversion costs another 1.8 ms. Both sat
+outside the first run's clock.
 
 **The rest of that first run's conclusions have been retracted.** Review found
 three measurement holes that made the numbers describe less than they
@@ -261,6 +269,57 @@ is why the exact mean is now carried beside the percentiles.
 Raw telemetry for every run, including the two superseded ones, is in
 [latency-rig-runs.md](evidence/latency-rig-runs.md), along with how to
 reproduce them.
+
+## Corrected rerun on d6218dc
+
+Same rig and configuration, after the six defects below were fixed. Three
+spans exist here that did not exist in the first run, and every boundary now
+publishes a rate. Full telemetry:
+[latency-rig-runs.md](evidence/latency-rig-runs.md).
+
+```text
+pixel_unpack               n=8720 mean=1778us  max=3781us
+decoder_queue_wait         n=8720 mean=196us   max=572us
+ui_queue_wait              n=8720 mean=11210us max=36295us
+decoded_to_present_submit  n=8720 mean=20684us max=45654us
+present_call               n=8720 mean=9267us  max=10371us
+
+LastFragmentReceived -> Reassembled  n=8865 mean=282us max=289725us
+
+interaction_to_decoded  n=591 mean=297596us max=1297537us overflow=1
+probes sent=603 decoded=591 present_submitted=591 abandoned=12 timeouts=11
+```
+
+Three measurements that did not exist before:
+
+- **The presenter call costs 9.3 ms**, p95 under 16 ms. `present_submit` used
+  to be stamped before the call, so texture upload, surface acquisition and
+  the software blit were all outside it. The same fix moved
+  `decoded_to_present_submit` from 9.8 ms to 20.7 ms -- roughly half of
+  decode-to-present is the presenter call.
+- **The pixel conversion costs 1.8 ms**, which the first run's clock started
+  after.
+- **Reorder waiting has a 290 ms tail.** The reassembly span went from a 3 us
+  mean over immediately-releasable frames to a 282 us mean once held frames
+  were included in it.
+
+And the rates, which is what the C/D spread needed:
+
+```text
+helper surface uploads   43.6/s   (requested 62.5; each upload costs 4.5 ms)
+client fragments         499.2/s
+client frames decoded     25.8/s
+client frames presented   25.8/s
+```
+
+The helper does not achieve its requested heartbeat, and the client decodes
+26/s against the helper's 44/s. Client CPU is a candidate but not a
+sufficient one -- 1.8 ms of unpack plus 9.3 ms of present is 11 ms per frame,
+which would allow about 90/s. **Where the rate is lost between the helper and
+the decoder is not established**, and the host side is still
+`not-observable`, so the next instrumentation belongs there.
+
+Zero drops again, in both bounded queues, across 8,720 decoded pictures.
 
 ### Six defects found in the instrumentation itself
 
