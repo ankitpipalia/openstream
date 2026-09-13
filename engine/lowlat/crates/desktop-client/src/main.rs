@@ -2157,9 +2157,10 @@ mod tests {
 
     /// The decoder must not be allowed to buffer frames ahead.
     ///
-    /// Frame-level threading is the default and costs one frame of latency
-    /// per thread; on a ten-core client that is nine frames. These flags are
-    /// worth more than any other latency change in the client.
+    /// Frame-level threading is libavcodec's default and holds output back
+    /// so its workers can run ahead. These flags together recovered 553 ms
+    /// of a measured 1,000 ms; how much of that is threading rather than
+    /// the demuxer read-ahead was not measured separately.
     #[test]
     fn the_decoder_is_configured_for_low_delay() {
         let args = decoder_args("h264", 1920, 1080);
