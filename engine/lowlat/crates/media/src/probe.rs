@@ -26,7 +26,7 @@
 //! # Why a binary block rather than text
 //!
 //! The previous measurement read a clock off a screenshot, which cost about
-//! ±30 ms of timing error and, in one run, silently captured the wrong
+//! +/-30 ms of timing error and, in one run, silently captured the wrong
 //! window three times. A marker meant for a machine should be read by one:
 //! this is high-contrast cells detected in the decoded frame in memory,
 //! before presentation, with no screenshot and no OCR anywhere.
