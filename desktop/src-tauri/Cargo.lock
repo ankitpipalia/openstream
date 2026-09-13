@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "openstream-desktop"
-version = "1.0.0"
+version = "1.0.0-dev"
 dependencies = [
  "openstream-app-core",
  "openstream-host-agent",

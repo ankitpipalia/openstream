@@ -399,3 +399,41 @@ fn decode_abort_reason(reason: u8) -> Result<AbortReason, Error> {
         _ => Err(Error::InvalidAbortReason(reason)),
     }
 }
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::PathControl;
+    use crate::transport_meta::TransportAck;
+
+    /// Both of these decoders sit on an attacker-reachable datagram (channels
+    /// 255 and 254) and neither had fuzz coverage. A cheap deterministic sweep
+    /// runs in normal CI, where a fuzz campaign does not.
+    #[test]
+    fn path_control_and_transport_ack_never_panic_on_arbitrary_bytes() {
+        // xorshift keeps this reproducible without a dependency.
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for len in 0..96usize {
+            for _ in 0..64 {
+                let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xFF) as u8).collect();
+                // The contract is a typed error, never a panic and never an
+                // allocation driven by a forged length field.
+                let _ = PathControl::decode(&bytes);
+                let _ = TransportAck::decode(&bytes);
+            }
+        }
+
+        // Truncations of a well-formed prefix are the classic parser trap.
+        let seed = [0xFFu8; 64];
+        for len in 0..seed.len() {
+            let _ = PathControl::decode(&seed[..len]);
+            let _ = TransportAck::decode(&seed[..len]);
+        }
+    }
+}

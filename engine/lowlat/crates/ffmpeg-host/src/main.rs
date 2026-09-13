@@ -56,6 +56,20 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 /// user-visible control action.
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Wire pacing must sit above the encoder target, not below it. The scheduler
+/// paces the sealed datagram stream, which carries per-packet headers, AEAD
+/// tags, audio, control and retransmissions on top of the encoded video, and
+/// an encoder that briefly overshoots its target must not be throttled by the
+/// transport. Without this the scheduler's own default becomes the ceiling and
+/// the frame-level controller then reads the resulting queue growth as network
+/// congestion and lowers the encoder for the wrong reason.
+const WIRE_PACING_HEADROOM: f64 = 1.5;
+const WIRE_PACING_FLOOR_MBPS: f64 = 30.0;
+
+fn wire_pacing_rate_for(bitrate_mbps: f64) -> f64 {
+    (bitrate_mbps * WIRE_PACING_HEADROOM).max(WIRE_PACING_FLOOR_MBPS)
+}
+
 fn remember_adaptive_decision(
     pending: &mut Option<BitrateDecision>,
     decision: Option<BitrateDecision>,
@@ -242,6 +256,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(1.0)
         .min(profile.bitrate_mbps);
+    session
+        .set_wire_pacing_rate(wire_pacing_rate_for(profile.bitrate_mbps))
+        .map_err(|error| format!("wire pacing rate: {error:?}"))?;
     let mut telemetry = PeerTelemetryAdapter::new(
         AdaptiveBitrate::new(profile.bitrate_mbps, min_mbps, profile.bitrate_mbps),
         session.path_generation(),
@@ -1823,5 +1840,21 @@ mod tests {
         let topology = topology_with_selected(&displays, 1);
         assert!(!topology[0].selected());
         assert_eq!(topology[1].flags, SELECTED_FLAG);
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::{WIRE_PACING_FLOOR_MBPS, wire_pacing_rate_for};
+
+    #[test]
+    fn pacing_tracks_the_encoder_target_and_never_drops_below_the_floor() {
+        // A high-bitrate profile must not be throttled by the old fixed
+        // 30 Mbps scheduler default.
+        assert!(wire_pacing_rate_for(100.0) > 100.0);
+        assert!(wire_pacing_rate_for(40.0) > 40.0);
+        // A low-bitrate profile keeps enough headroom for control and audio.
+        assert!((wire_pacing_rate_for(1.0) - WIRE_PACING_FLOOR_MBPS).abs() < f64::EPSILON);
+        assert!((wire_pacing_rate_for(0.0) - WIRE_PACING_FLOOR_MBPS).abs() < f64::EPSILON);
     }
 }

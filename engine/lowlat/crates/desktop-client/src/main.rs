@@ -29,6 +29,7 @@ use openstream_media::clipboard::{
 };
 use openstream_media::displays::Display as RemoteDisplay;
 use openstream_media::input::{InputEvent, RumbleEvent};
+use openstream_media::metrics::ReconnectSupervisor;
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
     metrics::MetricsReporter,
@@ -821,9 +822,47 @@ fn run_worker(ui_tx: UiSender, input_rx: InputReceiver) {
     let _ = ui_tx.send(UiMessage::End);
 }
 
+/// Supervise the session. A transport error used to end the process, because
+/// the backoff schedule in `openstream-media` had no caller. Retry a bounded
+/// number of times instead, and reset the budget after a session that actually
+/// negotiated, so a long-lived connection does not inherit old failures.
 async fn network_loop(
     ui_tx: UiSender,
     input_rx: InputReceiver,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let max_attempts = match env::var("OPENSTREAM_RECONNECT_ATTEMPTS") {
+        Ok(value) if value.eq_ignore_ascii_case("unlimited") => None,
+        Ok(value) => Some(value.parse::<u32>().map_err(|error| {
+            format!("OPENSTREAM_RECONNECT_ATTEMPTS must be a number or 'unlimited': {error}")
+        })?),
+        Err(_) => Some(DEFAULT_RECONNECT_ATTEMPTS),
+    };
+    let mut supervisor = ReconnectSupervisor::new(max_attempts);
+    loop {
+        match network_session(&ui_tx, &input_rx).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let Some(delay) = supervisor.next_delay() else {
+                    return Err(error);
+                };
+                eprintln!(
+                    "OpenStream session ended ({error}); reconnecting in {:.0}s (attempt {})",
+                    delay.as_secs_f64(),
+                    supervisor.attempts()
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// Default reconnect budget. Bounded so an unreachable host eventually
+/// surfaces an error instead of retrying forever behind a blank window.
+const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+
+async fn network_session(
+    ui_tx: &UiSender,
+    input_rx: &InputReceiver,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());

@@ -74,6 +74,9 @@ pub enum RuntimeCommand {
         request_id: String,
     },
     Disconnect,
+    /// Acknowledge a terminal failure and return to a usable idle state.
+    /// Without this the shell has no exit from `AppState::Failed`.
+    ClearFailure,
     EnableHosting,
     DisableHosting,
 }
@@ -385,6 +388,7 @@ impl RuntimeState {
                 Ok(AppCommand::RejectRequest { request_id, now_ms })
             }
             RuntimeCommand::Disconnect => Ok(AppCommand::Disconnect),
+            RuntimeCommand::ClearFailure => Ok(AppCommand::ClearFailure),
             RuntimeCommand::EnableHosting => Ok(AppCommand::EnableHosting),
             RuntimeCommand::DisableHosting => Ok(AppCommand::DisableHosting),
         }

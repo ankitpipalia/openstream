@@ -183,6 +183,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adaptive_enabled = env::var("OPENSTREAM_ADAPTIVE_BITRATE").as_deref() != Ok("0");
     let mut adaptive =
         adaptive_enabled.then(|| AdaptiveBitrate::new(configured_mbps, min_mbps, configured_mbps));
+    // Same reasoning as the portable host: pace the sealed datagram stream
+    // above the encoder target so the transport never becomes the bottleneck
+    // that the frame-level controller then misreads as congestion.
+    session
+        .set_wire_pacing_rate((configured_mbps * 1.5).max(30.0))
+        .map_err(|error| format!("wire pacing rate: {error:?}"))?;
     let stream = Stream::start(Config {
         audio: audio_enabled.then(|| lowlat_audio::Config {
             server: env::var("OPENSTREAM_AUDIO_SERVER").ok(),

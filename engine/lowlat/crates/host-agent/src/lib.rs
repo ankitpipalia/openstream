@@ -1118,6 +1118,15 @@ impl<F: ChildFactory> HostAgent<F> {
                 .as_mut()
                 .expect("stopping retains child")
                 .cleanup_after_reap();
+            // Same crash-forgiveness rule as `handle_exit`. A child that ran
+            // long enough to be healthy must not spend the restart budget:
+            // ending a session at its configured lifetime cap is the normal
+            // outcome, and without this reset a host that never crashes still
+            // reaches `max_restarts` after a few sessions and stops for good.
+            let was_long_running = self.started_at.is_some_and(|started| {
+                now.saturating_duration_since(started)
+                    >= Duration::from_millis(self.config.policy.reset_after_ms)
+            });
             let pending = self.pending_termination.take();
             self.child = None;
             self.started_at = None;
@@ -1131,6 +1140,9 @@ impl<F: ChildFactory> HostAgent<F> {
                     self.state = ChildState::Stopped;
                     events.push(HostAgentEvent::Stopped);
                     return Ok(events);
+                }
+                if was_long_running {
+                    self.restart_count = 0;
                 }
                 self.schedule_restart(now, HostErrorCode::LifetimeExceeded, &mut events);
                 return Ok(events);
@@ -1473,6 +1485,49 @@ mod tests {
             vec![HostAgentEvent::Started { pid: Some(2) }]
         );
         assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 2);
+    }
+
+    #[test]
+    fn healthy_lifetime_cycles_do_not_exhaust_the_restart_budget() {
+        // A host that never crashes and only ever ends sessions by reaching
+        // its configured lifetime cap must keep coming back. `tick` routes a
+        // stopping child to `tick_stopping`, which previously skipped the
+        // crash-forgiveness reset that `handle_exit` performs, so the restart
+        // budget was spent once per healthy session and the agent wedged in
+        // `Failed` on the cycle after `max_restarts`.
+        let factory = FakeFactory::default();
+        {
+            let mut outcomes = factory.outcomes.lock().expect("outcome lock");
+            for pid in 0..6 {
+                outcomes.push_back(FakeSpawnOutcome::Child(FakeChild::exits_after_graceful(
+                    pid,
+                )));
+            }
+        }
+        let lifetime = Duration::from_millis(200);
+        let config = config()
+            .with_max_child_lifetime(Some(lifetime))
+            .expect("lifetime");
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+
+        let mut now = instant();
+        agent.start(now).expect("start");
+        // `max_restarts` is 2 here, so five healthy cycles is well past the
+        // point the old behaviour failed at.
+        for cycle in 0..5 {
+            now += lifetime + Duration::from_millis(1);
+            agent.tick(now).expect("lifetime tick");
+            now += Duration::from_millis(1);
+            agent.tick(now).expect("stopping tick");
+            assert_ne!(
+                agent.health(now).state,
+                ChildState::Failed,
+                "agent wedged in Failed on healthy lifetime cycle {cycle}"
+            );
+            now += Duration::from_millis(200);
+            agent.tick(now).expect("restart tick");
+        }
+        assert_ne!(agent.health(now).state, ChildState::Failed);
     }
 
     #[test]

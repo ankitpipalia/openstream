@@ -583,7 +583,7 @@ impl Role {
 }
 
 /// Short-lived credentials returned by the OpenStream pairing endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pairing {
     pub session_id: String,
     pub host_token: String,
@@ -728,7 +728,7 @@ pub fn load_pairing_from_environment() -> Result<Pairing, Error> {
 /// Mirrors the service's `TurnIssued` JSON so pairing files stay portable.
 /// `username` embeds the expiry (`expiry:session:role`); the service's
 /// `static-auth-secret` is the only other party that can verify it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TurnCredentials {
     pub username: String,
     pub password: String,
@@ -738,6 +738,52 @@ pub struct TurnCredentials {
     pub urls: Vec<String>,
     #[serde(default)]
     pub realm: String,
+}
+
+impl fmt::Debug for Pairing {
+    /// Every token field here is a bearer capability for a live session, so
+    /// the only thing that may be formatted is the non-secret session id and
+    /// the shape of what is held.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Pairing")
+            .field("session_id", &self.session_id)
+            .field("host_token", &"<redacted>")
+            .field("client_token", &"<redacted>")
+            .field("websocket_path", &self.websocket_path)
+            .field("expires_in_seconds", &self.expires_in_seconds)
+            .field("relay_address", &self.relay_address)
+            .field("turn", &self.turn.as_ref().map(|_| "<redacted>"))
+            .field("turn_host", &self.turn_host.as_ref().map(|_| "<redacted>"))
+            .field(
+                "turn_client",
+                &self.turn_client.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "relay_host_ticket",
+                &self.relay_host_ticket.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "relay_client_ticket",
+                &self.relay_client_ticket.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for TurnCredentials {
+    /// `username` embeds the expiry and `password` is the HMAC over it; both
+    /// authenticate a relay allocation, so neither is printable.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TurnCredentials")
+            .field("username", &"<redacted>")
+            .field("password", &"<redacted>")
+            .field("ttl_seconds", &self.ttl_seconds)
+            .field("urls", &self.urls.len())
+            .field("realm", &self.realm)
+            .finish()
+    }
 }
 
 impl TurnCredentials {
@@ -4305,6 +4351,47 @@ mod tests {
         let (outgoing, _outgoing_receiver) = mpsc::channel::<Message>(1);
         let (_incoming_sender, incoming) = mpsc::channel::<Result<Value, Error>>(1);
         Endpoint { outgoing, incoming }
+    }
+
+    #[test]
+    fn pairing_and_turn_credentials_never_print_their_secrets() {
+        let pairing = Pairing {
+            session_id: "session-1".into(),
+            host_token: "HOST-BEARER-SHOULD-NOT-APPEAR".into(),
+            client_token: "CLIENT-BEARER-SHOULD-NOT-APPEAR".into(),
+            websocket_path: "/v1/signal/session-1".into(),
+            expires_in_seconds: 3600,
+            relay_address: None,
+            turn: Some(TurnCredentials {
+                username: "TURN-USER-SHOULD-NOT-APPEAR".into(),
+                password: "TURN-PASS-SHOULD-NOT-APPEAR".into(),
+                ttl_seconds: 3600,
+                urls: vec!["turn:198.51.100.1:3478".into()],
+                realm: "openstream".into(),
+            }),
+            turn_host: None,
+            turn_client: None,
+            relay_host_ticket: Some("RELAY-HOST-TICKET-SHOULD-NOT-APPEAR".into()),
+            relay_client_ticket: Some("RELAY-CLIENT-TICKET-SHOULD-NOT-APPEAR".into()),
+        };
+
+        let rendered = format!("{pairing:?}");
+        for secret in [
+            "HOST-BEARER-SHOULD-NOT-APPEAR",
+            "CLIENT-BEARER-SHOULD-NOT-APPEAR",
+            "TURN-USER-SHOULD-NOT-APPEAR",
+            "TURN-PASS-SHOULD-NOT-APPEAR",
+            "RELAY-HOST-TICKET-SHOULD-NOT-APPEAR",
+            "RELAY-CLIENT-TICKET-SHOULD-NOT-APPEAR",
+        ] {
+            assert!(!rendered.contains(secret), "Debug leaked {secret}");
+        }
+        // The non-secret session id stays useful for diagnostics.
+        assert!(rendered.contains("session-1"));
+
+        let turn_rendered = format!("{:?}", pairing.turn.as_ref().expect("turn"));
+        assert!(!turn_rendered.contains("TURN-USER-SHOULD-NOT-APPEAR"));
+        assert!(!turn_rendered.contains("TURN-PASS-SHOULD-NOT-APPEAR"));
     }
 
     #[test]

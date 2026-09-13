@@ -62,6 +62,7 @@ export type RuntimeCommand =
   | { ApproveRequest: { request_id: string; available: PermissionSet } }
   | { RejectRequest: { request_id: string } }
   | "Disconnect"
+  | "ClearFailure"
   | "EnableHosting"
   | "DisableHosting";
 

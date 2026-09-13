@@ -55,3 +55,7 @@ libmatoya/
 # The nested lowlat checkout used to have its own submodule metadata. The
 # public repository includes the source snapshot, not nested Git metadata.
 engine/lowlat/.gitmodules
+
+# Local session handoffs and audit bundles are working notes, not source.
+handoff.md
+openstream-1.0-review-*/

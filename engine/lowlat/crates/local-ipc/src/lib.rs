@@ -174,6 +174,7 @@ pub enum IpcEvent {
     HostStartRequested,
     HostReady,
     HostStopRequested,
+    FailureCleared,
     HostFailed {
         code: AppErrorCode,
         retryable: bool,
@@ -219,6 +220,7 @@ impl TryFrom<AppEvent> for IpcEvent {
             AppEvent::HostStartRequested => Self::HostStartRequested,
             AppEvent::HostReady => Self::HostReady,
             AppEvent::HostStopRequested => Self::HostStopRequested,
+            AppEvent::FailureCleared => Self::FailureCleared,
             AppEvent::HostFailed { code } => Self::HostFailed {
                 retryable: code.retryable(),
                 code,

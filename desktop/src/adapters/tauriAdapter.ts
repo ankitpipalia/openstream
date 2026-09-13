@@ -1,5 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
+/// Advertised product version. This is a prerelease identifier until
+/// every gate in release/openstream-1.0-gates.tsv actually passes.
+const PRODUCT_VERSION = "1.0.0-dev";
+
 import type {
   AccessSnapshot,
   Capability,
@@ -108,6 +112,7 @@ export type AppEvent =
   | "HostStartRequested"
   | "HostReady"
   | "HostStopRequested"
+  | "FailureCleared"
   | { HostFailed: { code: AppErrorCode } };
 
 export type SettingScope = "global" | "client" | "host" | "device" | "session";
@@ -652,7 +657,7 @@ export function mapRuntimeSnapshot(snapshot: RuntimeSnapshot): ProductSnapshot {
   const access = mapAccess(app);
 
   return {
-    product: { name: "OpenStream", version: "1.0.0", channel: "Desktop shell" },
+    product: { name: "OpenStream", version: PRODUCT_VERSION, channel: "Desktop shell" },
     connection: mapConnection(app),
     computers: mapComputers(app.devices),
     access,
@@ -668,7 +673,7 @@ export function mapRuntimeSnapshot(snapshot: RuntimeSnapshot): ProductSnapshot {
 function unresolvedSnapshot(): ProductSnapshot {
   const controlPlane = capability("control-plane", "Control plane", "pending", "Waiting for the runtime bridge.");
   return {
-    product: { name: "OpenStream", version: "1.0.0", channel: "Desktop shell" },
+    product: { name: "OpenStream", version: PRODUCT_VERSION, channel: "Desktop shell" },
     connection: { state: "idle", detail: "Waiting for the runtime bridge." },
     computers: [],
     access: {

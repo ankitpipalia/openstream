@@ -5,7 +5,17 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# The supplied vendor artifacts are deliberately gitignored, so a clean
+# checkout does not contain them and this script cannot assume its own
+# location holds them. Let the operator point at the directory that does.
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
+artifact_root=${OPENSTREAM_ARTIFACT_ROOT:-$repo_root}
+if [ ! -d "$artifact_root/analysis" ]; then
+    echo "no analysis/ directory under $artifact_root" >&2
+    echo "set OPENSTREAM_ARTIFACT_ROOT to the working copy that holds the supplied artifacts" >&2
+    exit 2
+fi
+repo_root=$artifact_root
 
 print_file() {
     path=$1

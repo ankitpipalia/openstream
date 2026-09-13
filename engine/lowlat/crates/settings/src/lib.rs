@@ -1466,21 +1466,38 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// Give every case its own directory under the system temp dir, so
+    /// `cleanup` has something of its own to remove.
+    ///
+    /// This used to return `temp_dir().join(..)` directly, which made the
+    /// file's parent the system temp directory itself -- and `cleanup` then
+    /// called `remove_dir` on it. That is normally swallowed because the
+    /// directory is busy, but in a fresh container where it is empty the
+    /// removal succeeds and every later test fails with `NotFound`.
     fn temp_path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        let dir = std::env::temp_dir().join(format!(
             "openstream-settings-{name}-{}-{nonce}",
             std::process::id()
-        ))
+        ));
+        fs::create_dir_all(&dir).expect("create private test directory");
+        dir.join("settings.json")
     }
 
     fn cleanup(path: &PathBuf) {
         let _ = fs::remove_file(path);
+        // Only ever remove the private directory created by `temp_path`,
+        // never the system temp directory that contains it.
         if let Some(parent) = path.parent() {
-            let _ = fs::remove_dir(parent);
+            if parent
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("openstream-settings-"))
+            {
+                let _ = fs::remove_dir(parent);
+            }
         }
     }
 

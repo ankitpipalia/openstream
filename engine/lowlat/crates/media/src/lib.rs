@@ -361,11 +361,17 @@ impl JitterBuffer {
             let Some(expected) = self.expected else {
                 break;
             };
+            // Evict the packet furthest ahead of the next one we owe the
+            // decoder. The distance has to be measured forwards, from
+            // `expected` towards the candidate: measuring it backwards makes
+            // every future sequence wrap, which ranks the *nearest* packet
+            // highest and drops a packet that actually arrived, so `poll`
+            // then conceals a gap the network never created.
             let Some(sequence) = self
                 .frames
                 .keys()
                 .copied()
-                .max_by_key(|sequence| expected.wrapping_sub(*sequence))
+                .max_by_key(|sequence| sequence.wrapping_sub(expected))
             else {
                 break;
             };
@@ -1015,6 +1021,54 @@ mod tests {
             Fragment::decode(&bytes),
             Err(Error::FragmentIndexOutOfRange)
         );
+    }
+
+    #[test]
+    fn jitter_overflow_evicts_the_furthest_packet_not_the_nearest() {
+        // A contiguous burst deeper than the queue must never manufacture a
+        // gap for a packet that actually arrived.
+        let mut jitter = JitterBuffer::new(3);
+        for sequence in 100..=103 {
+            jitter.push(AudioFrame {
+                sequence,
+                presentation_time_us: u64::from(sequence) * 20_000,
+                payload: vec![0xAB],
+            });
+        }
+
+        // 103 is the furthest ahead, so it is the one that goes.
+        assert_eq!(jitter.len(), 3);
+        for sequence in 100..=102 {
+            match jitter.poll() {
+                Some(AudioEvent::Frame(frame)) => assert_eq!(frame.sequence, sequence),
+                other => panic!("expected frame {sequence}, got {other:?}"),
+            }
+        }
+        assert!(jitter.is_empty());
+    }
+
+    #[test]
+    fn jitter_overflow_survives_sequence_wraparound() {
+        let mut jitter = JitterBuffer::new(3);
+        for offset in 0..4 {
+            let sequence = u32::MAX.wrapping_sub(1).wrapping_add(offset);
+            jitter.push(AudioFrame {
+                sequence,
+                presentation_time_us: u64::from(offset) * 20_000,
+                payload: vec![0xCD],
+            });
+        }
+
+        assert_eq!(jitter.len(), 3);
+        // The three retained packets are the three nearest to `expected`,
+        // across the u32 wrap, and none of them is concealed.
+        for offset in 0..3 {
+            let sequence = u32::MAX.wrapping_sub(1).wrapping_add(offset);
+            match jitter.poll() {
+                Some(AudioEvent::Frame(frame)) => assert_eq!(frame.sequence, sequence),
+                other => panic!("expected frame {sequence}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
