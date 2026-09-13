@@ -719,7 +719,8 @@ fn preflight() -> Result<(), Box<dyn std::error::Error>> {
         "ffmpeg": ffmpeg,
         "hardware": {
             "vaapi_render_node": hardware.vaapi_render_node(),
-            "nvenc_library": hardware.nvenc_library,
+            "nvenc_h264": hardware.nvenc_h264,
+            "nvenc_hevc": hardware.nvenc_hevc,
             "nvenc_library_location": hardware.nvenc_library_location(),
             "nvidia_smi": hardware.nvidia_smi,
             "preferred_h264_encoder": hardware.preferred_encoder(EncoderCodec::H264),
