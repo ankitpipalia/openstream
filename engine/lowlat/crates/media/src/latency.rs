@@ -244,6 +244,17 @@ impl Histogram {
         self.overflow = self.overflow.saturating_add(1);
     }
 
+    /// Samples that landed past the last bucket edge.
+    ///
+    /// Worth publishing rather than folding into the count: when this equals
+    /// the count, every percentile collapses to the maximum and the numbers
+    /// beside them stop being percentiles in any useful sense. A reader
+    /// needs to be able to see that from the line itself.
+    #[must_use]
+    pub const fn overflow(&self) -> u64 {
+        self.overflow
+    }
+
     #[must_use]
     pub const fn count(&self) -> u64 {
         self.count
@@ -1268,6 +1279,9 @@ pub enum SpanValue {
         p99_upper_us: u64,
         max_us: u64,
         mean_us: u64,
+        /// Samples past the last bucket edge. When this equals `count`,
+        /// every percentile above is just the maximum.
+        overflow: u64,
     },
 }
 
@@ -1291,6 +1305,7 @@ impl SpanValue {
             p99_upper_us: histogram.p99_upper_bound_us().unwrap_or_default(),
             max_us: histogram.max_us(),
             mean_us: histogram.mean_us().unwrap_or_default(),
+            overflow: histogram.overflow(),
         }
     }
 
@@ -1307,14 +1322,22 @@ impl SpanValue {
                 p95_upper_us,
                 p99_upper_us,
                 max_us,
+                overflow,
                 ..
             } => {
-                let mut line = String::with_capacity(72);
+                let mut line = String::with_capacity(96);
                 line.push_str(&format!("n={count}"));
                 line.push_str(&format!(" p50<={p50_upper_us}us"));
                 line.push_str(&format!(" p95<={p95_upper_us}us"));
                 line.push_str(&format!(" p99<={p99_upper_us}us"));
                 line.push_str(&format!(" max={max_us}us"));
+                // Only when it happened. A reader who sees this knows the
+                // percentiles above have collapsed towards the maximum,
+                // which is the difference between a weak upper bound and a
+                // number worth quoting.
+                if overflow > 0 {
+                    line.push_str(&format!(" overflow={overflow}"));
+                }
                 line
             }
         }

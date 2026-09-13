@@ -1652,22 +1652,21 @@ async fn network_session(
                 // next id is one past whatever the helper is currently
                 // showing, which is how this stays synchronised without a
                 // channel of its own.
-                let sent = with_telemetry(telemetry, |client| {
-                    let Some(next) = client.next_probe_id() else {
-                        return false;
-                    };
-                    let Some(state) = client.probe.as_mut() else {
-                        return false;
-                    };
-                    state.probe.sent(next, Stamp::now());
-                    true
+                let action = with_telemetry(telemetry, |client| {
+                    client.next_probe_action(Stamp::now())
                 });
-                if sent == Some(true) {
-                    let press = InputEvent::keyboard(PROBE_KEY_USAGE, 0, true, monotonic_us());
-                    reliable_control.send(&mut session, &press.encode()).await?;
-                    let release =
-                        InputEvent::keyboard(PROBE_KEY_USAGE, 0, false, monotonic_us());
-                    reliable_control.send(&mut session, &release.encode()).await?;
+                match action {
+                    Some(ProbeAction::Press) => {
+                        let press =
+                            InputEvent::keyboard(PROBE_KEY_USAGE, 0, true, monotonic_us());
+                        reliable_control.send(&mut session, &press.encode()).await?;
+                    }
+                    Some(ProbeAction::Release) => {
+                        let release =
+                            InputEvent::keyboard(PROBE_KEY_USAGE, 0, false, monotonic_us());
+                        reliable_control.send(&mut session, &release.encode()).await?;
+                    }
+                    Some(ProbeAction::Idle) | None => {}
                 }
             }
             _ = metrics_tick.tick() => {
@@ -1884,6 +1883,23 @@ struct ProbeState {
     origin: (usize, usize),
     probe: InteractionProbe,
     last_seen: Option<u16>,
+    /// The id most recently sent, so the same one is never sent twice.
+    ///
+    /// `next_probe_id` is derived from the marker, which does not move until
+    /// the helper receives an event. Re-sending on the next tick pushed a
+    /// second outstanding entry with the same id, and when the helper
+    /// finally advanced, the match landed on the *oldest* of them -- turning
+    /// a lost keystroke into a ten-second interaction latency in the first
+    /// rig run.
+    last_sent: Option<u16>,
+    /// Whether the probe key is currently held down on the host.
+    ///
+    /// The press and the release go out on consecutive ticks rather than
+    /// back to back. The helper detects a keypress as a down transition
+    /// between two polls of its event loop; a press and release delivered
+    /// within one poll interval collapse into no transition at all, and the
+    /// first rig run lost three quarters of its keystrokes that way.
+    key_down: bool,
 }
 
 /// The client's always-on frame accounting and its opt-in interaction probe.
@@ -1908,6 +1924,8 @@ impl ClientTelemetry {
                 origin,
                 probe: InteractionProbe::new(),
                 last_seen: None,
+                last_sent: None,
+                key_down: false,
             }),
         }
     }
@@ -1937,13 +1955,51 @@ impl ClientTelemetry {
         }
     }
 
-    /// The id the helper will show once it has received one more event, or
-    /// `None` until the client has read the marker at least once.
+    /// The id the helper will show once it has received one more event.
+    ///
+    /// `None` until the client has read the marker at least once, and `None`
+    /// again while that id is still outstanding: the marker does not move
+    /// until the helper receives an event, so a tick that fires before the
+    /// last one came back would otherwise send the same id a second time.
     fn next_probe_id(&self) -> Option<u16> {
-        self.probe
-            .as_ref()?
-            .last_seen
-            .map(|seen| seen.wrapping_add(1))
+        let state = self.probe.as_ref()?;
+        let next = state.last_seen?.wrapping_add(1);
+        if state.last_sent == Some(next) {
+            return None;
+        }
+        Some(next)
+    }
+
+    /// Decide what to put on the wire this tick.
+    ///
+    /// The probe key is pressed on one tick and released on the next, never
+    /// both in one. The helper sees a keypress as a down transition between
+    /// two polls of its event loop, so a press and release delivered inside
+    /// one poll interval collapse into nothing -- which is what cost the
+    /// first rig run three quarters of its probes.
+    fn next_probe_action(&mut self, at: Stamp<ClientClock>) -> ProbeAction {
+        let Some(next) = self.next_probe_id() else {
+            // Still holding the key, or nothing new to send. Releasing takes
+            // priority: the key must not stay down across a stall.
+            return match self.probe.as_mut() {
+                Some(state) if state.key_down => {
+                    state.key_down = false;
+                    ProbeAction::Release
+                }
+                _ => ProbeAction::Idle,
+            };
+        };
+        let Some(state) = self.probe.as_mut() else {
+            return ProbeAction::Idle;
+        };
+        if state.key_down {
+            state.key_down = false;
+            return ProbeAction::Release;
+        }
+        state.probe.sent(next, at);
+        state.last_sent = Some(next);
+        state.key_down = true;
+        ProbeAction::Press
     }
 
     fn report(&self) -> Vec<String> {
@@ -1979,11 +2035,25 @@ fn probe_origin_from_environment() -> Option<(usize, usize)> {
     Some(origin)
 }
 
+/// What the probe puts on the wire on one tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeAction {
+    /// Press the probe key, having just stamped a new probe.
+    Press,
+    /// Release the key pressed on the previous tick.
+    Release,
+    /// Nothing to do: the marker has not been read yet, or the last probe
+    /// is still outstanding.
+    Idle,
+}
+
 /// How often to send the probe's input event.
 ///
-/// Slow enough that the measurement does not become the load: each probe
-/// costs one key event and one full-screen redraw on the host.
-const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+/// A press goes out on one tick and its release on the next, so a full
+/// probe takes two of these. Slow enough that the measurement does not
+/// become the load -- each probe costs one key event and one redraw on the
+/// host -- and fast enough to gather a few hundred samples in a few minutes.
+const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The key the probe presses. A modifier, so an ordinary application that
 /// happens to be focused instead of the helper receives something inert
@@ -2008,9 +2078,9 @@ impl From<io::Error> for UiMessage {
 mod tests {
     use super::{
         CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, ClientTelemetry,
-        HEALTHY_SESSION, InputReceiver, InputSender, PresentedRect, SessionProgress, TerminalError,
-        UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display, decoder_args,
-        discard_stale_input, gamepad_axis_index, gamepad_button_index, is_retryable,
+        HEALTHY_SESSION, InputReceiver, InputSender, PresentedRect, ProbeAction, SessionProgress,
+        TerminalError, UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display,
+        decoder_args, discard_stale_input, gamepad_axis_index, gamepad_button_index, is_retryable,
         keyboard_usages, offer_decoded_frame, presented_rect, selected_display_index,
         stream_pointer_position,
     };
@@ -2431,6 +2501,78 @@ mod tests {
         assert!(report.contains("interaction_to_decoded"), "{report}");
         // Named for what it measures. Nothing here has seen a photon.
         assert!(!report.contains("photon"), "{report}");
+    }
+
+    /// A press on one tick, its release on the next, and never the same id
+    /// twice.
+    ///
+    /// The first rig run sent press and release back to back and re-sent the
+    /// same id whenever the marker had not moved. The helper detects a
+    /// keypress as a down transition between two polls of its event loop, so
+    /// the pair collapsed into nothing three times out of four; and when a
+    /// later keystroke did land, the match found the *oldest* outstanding
+    /// entry carrying that id -- reporting a ten-second interaction latency
+    /// that was really a lost keystroke and a stale stamp.
+    #[test]
+    fn a_probe_presses_on_one_tick_and_releases_on_the_next() {
+        let origin = (0, 0);
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Idle,
+            "nothing to press before the marker has been read"
+        );
+
+        telemetry.marker_decoded(&marked_frame(origin, 5), Stamp::now());
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Press
+        );
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Release,
+            "the release is a separate tick, so the helper sees a transition"
+        );
+        // The marker has not moved, so there is nothing new to send: the
+        // same id must not go out twice.
+        assert_eq!(telemetry.next_probe_action(Stamp::now()), ProbeAction::Idle);
+        assert_eq!(telemetry.next_probe_action(Stamp::now()), ProbeAction::Idle);
+
+        // The helper received it and advanced. Now there is a new id.
+        telemetry.marker_decoded(&marked_frame(origin, 6), Stamp::now());
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Press
+        );
+
+        let state = telemetry.probe.as_ref().expect("probe enabled");
+        assert_eq!(state.probe.sent_count(), 2, "two probes, not four");
+    }
+
+    /// The key must not stay held when the stream stops advancing.
+    #[test]
+    fn a_held_probe_key_is_released_even_when_the_marker_stops_moving() {
+        let origin = (0, 0);
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+        telemetry.marker_decoded(&marked_frame(origin, 1), Stamp::now());
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Press
+        );
+        // The host never advances the marker again.
+        assert_eq!(
+            telemetry.next_probe_action(Stamp::now()),
+            ProbeAction::Release
+        );
+        assert_eq!(telemetry.next_probe_action(Stamp::now()), ProbeAction::Idle);
+        assert!(!telemetry.probe.as_ref().expect("probe enabled").key_down);
+    }
+
+    fn marked_frame(origin: (usize, usize), probe_id: u16) -> DecodedFrame {
+        let (width, height) = (256, 192);
+        let mut pixels = vec![0_u32; width * height];
+        openstream_media::probe::render(&mut pixels, width, height, origin, probe_id);
+        DecodedFrame::new(seq(0), Stamp::now(), width, height, pixels)
     }
 
     /// A frame carrying no marker is the normal case between probes, and
