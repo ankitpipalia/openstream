@@ -1108,7 +1108,20 @@ async fn network_session(
                     | (u32::from(pixel[3]) << 24);
                 pixels.push(value);
             }
-            if frame_tx.send(pixels).await.is_err() {
+            // Never block here. This task is the only thing draining the
+            // decoder's stdout, and the loop that drains `frame_rx` is the
+            // same loop that writes access units to the decoder's stdin.
+            // Awaiting a full channel therefore deadlocks the session: the
+            // decoder's output pipe fills, the decoder stops reading its
+            // input, the network loop blocks in `write_all`, and so never
+            // reaches `frame_rx.recv()` to make room here. The window then
+            // shows nothing at all while packets pile up unread in the
+            // socket.
+            //
+            // A late frame is worth less than a live one, so a frame the UI
+            // has not kept up with is dropped, exactly as `UiSender` already
+            // drops stale frames and metrics.
+            if !offer_decoded_frame(&frame_tx, pixels) {
                 break;
             }
         }
@@ -1498,6 +1511,27 @@ fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
     ]
 }
 
+/// Hand one decoded frame to the window, dropping it if the window is
+/// behind. Returns false once the window is gone.
+///
+/// This must never await. The task that calls it is the only thing draining
+/// the decoder's stdout, and the loop that drains the receiving end is the
+/// same loop that writes access units to the decoder's stdin. Blocking on a
+/// full channel therefore deadlocks the whole session: the decoder's output
+/// pipe fills, the decoder stops reading its input, the network loop blocks
+/// in `write_all`, and so never reaches the receiver to make room here. The
+/// window shows nothing at all while packets pile up unread in the socket.
+///
+/// A late frame is worth less than a live one, so a frame the window has not
+/// kept up with is dropped -- exactly as `UiSender` already drops stale
+/// frames and metrics.
+fn offer_decoded_frame(sender: &async_mpsc::Sender<Vec<u32>>, pixels: Vec<u32>) -> bool {
+    !matches!(
+        sender.try_send(pixels),
+        Err(async_mpsc::error::TrySendError::Closed(_))
+    )
+}
+
 fn monotonic_us() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
@@ -1518,7 +1552,8 @@ mod tests {
         CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, HEALTHY_SESSION, InputReceiver,
         InputSender, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
         axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
-        gamepad_button_index, is_retryable, keyboard_usages, selected_display_index,
+        gamepad_button_index, is_retryable, keyboard_usages, offer_decoded_frame,
+        selected_display_index,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -1758,6 +1793,39 @@ mod tests {
             negotiated_at: Instant::now().checked_sub(HEALTHY_SESSION),
         };
         assert!(long_lived.was_healthy());
+    }
+
+    /// Handing a decoded frame to a window that is behind must return
+    /// immediately, never park the caller.
+    ///
+    /// The task that calls this is the only drain for the decoder's stdout,
+    /// and the loop that empties this channel is the same loop that feeds
+    /// the decoder's stdin. If a full channel parks the caller, the
+    /// decoder's output pipe fills, the decoder stops reading its input,
+    /// the network loop blocks writing an access unit, and nothing ever
+    /// drains the channel again -- a deadlock whose symptom is a window
+    /// that stays blank while the socket backs up.
+    #[tokio::test]
+    async fn a_frame_the_window_cannot_keep_up_with_is_dropped_not_awaited() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u32>>(2);
+        assert!(offer_decoded_frame(&sender, vec![1]));
+        assert!(offer_decoded_frame(&sender, vec![2]));
+
+        // The channel is now full. This must still return, and promptly.
+        let overflowed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            offer_decoded_frame(&sender, vec![3])
+        })
+        .await
+        .expect("offering a frame must not park the decoder reader");
+        assert!(overflowed, "a full window is not a closed window");
+
+        // The frames already queued are intact; only the late one is gone.
+        assert_eq!(receiver.recv().await, Some(vec![1]));
+        assert_eq!(receiver.recv().await, Some(vec![2]));
+
+        // A closed window ends the reader.
+        drop(receiver);
+        assert!(!offer_decoded_frame(&sender, vec![4]));
     }
 
     #[test]
