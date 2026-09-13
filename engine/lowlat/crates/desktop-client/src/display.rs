@@ -39,6 +39,17 @@ impl DisplayMode {
     }
 
     /// Build the minifb window options for this mode.
+    /// Whether this mode letterboxes: the picture keeps the stream's aspect
+    /// ratio and the leftover window area is background, not video.
+    ///
+    /// It decides where the picture actually *is*, which both the renderer
+    /// and the pointer have to agree on. A pointer mapped against the whole
+    /// window in a letterboxed mode lands in the wrong place by the height
+    /// of the bars.
+    pub(crate) const fn preserves_aspect_ratio(self) -> bool {
+        matches!(self, Self::Fullscreen)
+    }
+
     pub(crate) fn window_options(self) -> WindowOptions {
         let mut options = WindowOptions {
             resize: true,

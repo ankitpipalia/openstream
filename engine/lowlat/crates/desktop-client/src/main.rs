@@ -221,11 +221,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         normal: input_normal_rx,
         critical: input_critical_rx,
     };
+    let display_mode = display::DisplayMode::from_env();
     let mut window = Window::new(
         "OpenStream",
         DEFAULT_WIDTH,
         DEFAULT_HEIGHT,
-        display::DisplayMode::from_env().window_options(),
+        display_mode.window_options(),
     )?;
     let render_backend = render::RenderBackend::from_env();
     let mut native_presenter = if render_backend.is_native() {
@@ -267,16 +268,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = vec![0_u32; DEFAULT_WIDTH * DEFAULT_HEIGHT];
     let mut buffer_width = DEFAULT_WIDTH;
     let mut buffer_height = DEFAULT_HEIGHT;
-    let mut last_mouse = None;
-    let mut button_state = [false; 3];
-    let mut gamepad_ids = HashMap::new();
-    let mut rumble_effects = HashMap::new();
+    let mut input_state = InputState {
+        last_mouse: None,
+        button_state: [false; 3],
+        gamepads: None,
+        gamepad_ids: HashMap::new(),
+        rumble_effects: HashMap::new(),
+    };
     let mut connected = false;
     let mut base_title = String::from("OpenStream");
     let mut displays = Vec::<RemoteDisplay>::new();
     let mut selected_display = None;
     let mut pacer = render::FramePacer::new(60);
-    let mut gamepads = match Gilrs::new() {
+    input_state.gamepads = match Gilrs::new() {
         Ok(gamepads) => Some(gamepads),
         Err(error) => {
             eprintln!("OpenStream gamepad input unavailable: {error}");
@@ -339,9 +343,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     weak,
                 }) => {
                     play_rumble(
-                        &mut gamepads,
-                        &gamepad_ids,
-                        &mut rumble_effects,
+                        &mut input_state.gamepads,
+                        &input_state.gamepad_ids,
+                        &mut input_state.rumble_effects,
                         device_id,
                         strong,
                         weak,
@@ -363,8 +367,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // discarded rather than queued: a key pressed now is
                     // not a key pressed in the session that comes back.
                     connected = false;
-                    last_mouse = None;
-                    button_state = [false; 3];
+                    input_state.last_mouse = None;
+                    input_state.button_state = [false; 3];
                     let seconds = delay_ms as f64 / 1000.0;
                     window.set_title(&format!(
                         "OpenStream -- reconnecting in {seconds:.0}s (attempt {attempt})"
@@ -372,8 +376,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(UiMessage::End) => {
                     connected = false;
-                    last_mouse = None;
-                    button_state = [false; 3];
+                    input_state.last_mouse = None;
+                    input_state.button_state = [false; 3];
                     window.set_title("OpenStream -- disconnected");
                 }
                 Ok(UiMessage::Metrics(line)) => {
@@ -403,11 +407,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             forward_input(
                 &window,
                 &input_tx,
-                &mut last_mouse,
-                &mut button_state,
-                &mut gamepads,
-                &mut gamepad_ids,
-                &mut rumble_effects,
+                (buffer_width, buffer_height),
+                // A GPU present stretches to the surface; only the software
+                // path can letterbox, and only in a mode that asks it to.
+                native_presenter.is_none() && display_mode.preserves_aspect_ratio(),
+                &mut input_state,
             );
         }
         // Window hotkeys (default Ctrl+Alt+End to disconnect, Ctrl+Alt+Home
@@ -439,7 +443,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = input_tx.try_send(UiInput::Release);
     let _ = input_tx.try_send(UiInput::Stop);
-    for effect in rumble_effects.values() {
+    for effect in input_state.rumble_effects.values() {
         let _ = effect.stop();
     }
     let _ = worker.join();
@@ -477,14 +481,127 @@ fn selected_display_index(displays: &[RemoteDisplay]) -> Option<usize> {
 }
 
 #[allow(clippy::cast_possible_truncation)]
+/// Where the streamed picture actually sits inside the window, in window
+/// pixels.
+///
+/// The window and the picture are not the same rectangle whenever the
+/// presentation preserves the stream's aspect ratio: the picture is centred
+/// and the remaining area is background. Renderer and pointer have to agree
+/// on this rectangle or the cursor is wrong by the size of the bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PresentedRect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+/// Compute the rectangle the picture occupies.
+///
+/// A stretching presentation fills the window. An aspect-preserving one
+/// scales until one axis is full and centres the result, which is what
+/// minifb's `ScaleMode::AspectRatioStretch` does and what an
+/// aspect-correct GPU present would do.
+fn presented_rect(
+    window: (usize, usize),
+    stream: (usize, usize),
+    preserve_aspect: bool,
+) -> PresentedRect {
+    let (window_width, window_height) = window;
+    let (stream_width, stream_height) = stream;
+    if !preserve_aspect
+        || window_width == 0
+        || window_height == 0
+        || stream_width == 0
+        || stream_height == 0
+    {
+        return PresentedRect {
+            x: 0,
+            y: 0,
+            width: window_width,
+            height: window_height,
+        };
+    }
+
+    // Scale by whichever axis runs out first, in integers so the rectangle
+    // lands on real pixels.
+    let by_width = window_width * stream_height;
+    let by_height = window_height * stream_width;
+    let (width, height) = if by_width <= by_height {
+        // Width-limited: bars above and below.
+        (window_width, (window_width * stream_height) / stream_width)
+    } else {
+        // Height-limited: bars left and right.
+        (
+            (window_height * stream_width) / stream_height,
+            window_height,
+        )
+    };
+    let width = width.min(window_width);
+    let height = height.min(window_height);
+    PresentedRect {
+        x: (window_width - width) / 2,
+        y: (window_height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Map a pointer position in window pixels onto the streamed image.
+///
+/// The host places absolute coordinates by scaling them out of the streamed
+/// image's own pixel space and into wherever that image sits on its desktop,
+/// so the client has to answer in that space -- not the window's, which is
+/// whatever size the operator dragged it to, and not counting any
+/// letterbox bars, which are not part of the picture at all.
+fn stream_pointer_position(
+    presented: PresentedRect,
+    stream: (usize, usize),
+    pointer: (f32, f32),
+) -> (i32, i32) {
+    let map = |value: f32, origin: usize, extent: usize, stream: usize| -> i32 {
+        if extent == 0 || stream == 0 {
+            return 0;
+        }
+        // A pointer over a bar is outside the picture; clamp it to the
+        // nearest edge rather than reporting a position the picture does
+        // not have.
+        let within = f64::from(value) - origin as f64;
+        let ratio = (within / extent as f64).clamp(0.0, 1.0);
+        let scaled = ratio * stream as f64;
+        // The last pixel is a valid position; one past it is not.
+        let limit = (stream - 1) as f64;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "clamped to [0, stream - 1], and a frame dimension fits an i32"
+        )]
+        {
+            scaled.clamp(0.0, limit).round() as i32
+        }
+    };
+    (
+        map(pointer.0, presented.x, presented.width, stream.0),
+        map(pointer.1, presented.y, presented.height, stream.1),
+    )
+}
+
+/// Everything `forward_input` carries between calls.
+struct InputState {
+    /// Last position sent, in streamed-image pixels, so an unmoved pointer
+    /// is not resent every frame.
+    last_mouse: Option<(i32, i32)>,
+    button_state: [bool; 3],
+    gamepads: Option<Gilrs>,
+    gamepad_ids: HashMap<u32, GamepadId>,
+    rumble_effects: HashMap<u32, Effect>,
+}
+
 fn forward_input(
     window: &Window,
     input_tx: &InputSender,
-    last_mouse: &mut Option<(i32, i32)>,
-    button_state: &mut [bool; 3],
-    gamepads: &mut Option<Gilrs>,
-    gamepad_ids: &mut HashMap<u32, GamepadId>,
-    rumble_effects: &mut HashMap<u32, Effect>,
+    stream: (usize, usize),
+    preserve_aspect: bool,
+    state: &mut InputState,
 ) {
     let timestamp = monotonic_us();
     for &(key, usage) in keyboard_usages() {
@@ -501,17 +618,14 @@ fn forward_input(
     }
 
     if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
-        let current = (x as i32, y as i32);
-        if let Some(previous) = *last_mouse {
-            let dx = current.0.saturating_sub(previous.0);
-            let dy = current.1.saturating_sub(previous.1);
-            if dx != 0 || dy != 0 {
-                let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
-                    true, dx, dy, timestamp,
-                )));
-            }
+        let presented = presented_rect(window.get_size(), stream, preserve_aspect);
+        let current = stream_pointer_position(presented, stream, (x, y));
+        if state.last_mouse != Some(current) {
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
+                false, current.0, current.1, timestamp,
+            )));
         }
-        *last_mouse = Some(current);
+        state.last_mouse = Some(current);
     }
 
     for (index, button) in [MouseButton::Left, MouseButton::Middle, MouseButton::Right]
@@ -519,13 +633,13 @@ fn forward_input(
         .enumerate()
     {
         let pressed = window.get_mouse_down(button);
-        if pressed != button_state[index] {
+        if pressed != state.button_state[index] {
             let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_button(
                 u32::try_from(index + 1).unwrap_or(1),
                 pressed,
                 timestamp,
             )));
-            button_state[index] = pressed;
+            state.button_state[index] = pressed;
         }
     }
 
@@ -539,7 +653,13 @@ fn forward_input(
         }
     }
 
-    poll_gamepads(gamepads, input_tx, timestamp, gamepad_ids, rumble_effects);
+    poll_gamepads(
+        &mut state.gamepads,
+        input_tx,
+        timestamp,
+        &mut state.gamepad_ids,
+        &mut state.rumble_effects,
+    );
 }
 
 fn poll_gamepads(
@@ -1550,10 +1670,10 @@ impl From<io::Error> for UiMessage {
 mod tests {
     use super::{
         CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, HEALTHY_SESSION, InputReceiver,
-        InputSender, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
-        axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
-        gamepad_button_index, is_retryable, keyboard_usages, offer_decoded_frame,
-        selected_display_index,
+        InputSender, PresentedRect, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver,
+        UiSender, axis_value, cycled_display, decoder_args, discard_stale_input,
+        gamepad_axis_index, gamepad_button_index, is_retryable, keyboard_usages,
+        offer_decoded_frame, presented_rect, selected_display_index, stream_pointer_position,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -1826,6 +1946,184 @@ mod tests {
         // A closed window ends the reader.
         drop(receiver);
         assert!(!offer_decoded_frame(&sender, vec![4]));
+    }
+
+    /// A stretching presentation puts the picture over the whole window.
+    #[test]
+    fn a_stretched_picture_fills_the_window() {
+        let rect = presented_rect((1280, 720), (1920, 1080), false);
+        assert_eq!(
+            rect,
+            PresentedRect {
+                x: 0,
+                y: 0,
+                width: 1280,
+                height: 720
+            }
+        );
+    }
+
+    /// A 16:9 stream in a 16:10 window is width-limited, so the bars are
+    /// above and below.
+    #[test]
+    fn a_16_9_stream_in_a_16_10_window_is_letterboxed_vertically() {
+        let rect = presented_rect((2560, 1600), (1920, 1080), true);
+        assert_eq!(
+            rect,
+            PresentedRect {
+                x: 0,
+                y: 80,
+                width: 2560,
+                height: 1440
+            },
+            "2560x1440 of picture with an 80px bar above and below"
+        );
+    }
+
+    /// A 16:9 stream in an ultrawide window is height-limited, so the bars
+    /// are left and right.
+    #[test]
+    fn a_16_9_stream_in_an_ultrawide_window_is_pillarboxed() {
+        let rect = presented_rect((3440, 1440), (1920, 1080), true);
+        assert_eq!(
+            rect,
+            PresentedRect {
+                x: (3440 - 2560) / 2,
+                y: 0,
+                width: 2560,
+                height: 1440
+            }
+        );
+    }
+
+    /// The top of the picture is the top of the *picture*, not the window.
+    ///
+    /// Mapping against the whole window put a pointer at the first row of
+    /// video at y=54 of 1080 instead of y=0 -- the height of the bar,
+    /// expressed in stream pixels. That is the bug this mapping exists to
+    /// avoid, and it returns for any window whose aspect ratio differs from
+    /// the stream's.
+    #[test]
+    fn the_picture_edges_map_to_the_stream_edges_when_letterboxed() {
+        let stream = (1920, 1080);
+        let rect = presented_rect((2560, 1600), stream, true);
+
+        // First and last row of actual picture.
+        assert_eq!(stream_pointer_position(rect, stream, (0.0, 80.0)), (0, 0));
+        assert_eq!(
+            stream_pointer_position(rect, stream, (2560.0, 1520.0)),
+            (1919, 1079)
+        );
+        // All four corners of the image.
+        assert_eq!(stream_pointer_position(rect, stream, (0.0, 80.0)), (0, 0));
+        assert_eq!(
+            stream_pointer_position(rect, stream, (2560.0, 80.0)),
+            (1919, 0)
+        );
+        assert_eq!(
+            stream_pointer_position(rect, stream, (0.0, 1520.0)),
+            (0, 1079)
+        );
+        // The centre of the picture is the centre of the stream.
+        assert_eq!(
+            stream_pointer_position(rect, stream, (1280.0, 800.0)),
+            (960, 540)
+        );
+    }
+
+    /// A pointer over a bar is outside the picture. It clamps to the nearest
+    /// edge rather than reporting a position the picture does not have.
+    #[test]
+    fn a_pointer_over_a_letterbox_bar_clamps_to_the_picture() {
+        let stream = (1920, 1080);
+        let vertical = presented_rect((2560, 1600), stream, true);
+        // Above the top bar and below the bottom one.
+        assert_eq!(
+            stream_pointer_position(vertical, stream, (500.0, 0.0)),
+            (375, 0)
+        );
+        assert_eq!(
+            stream_pointer_position(vertical, stream, (500.0, 1599.0)),
+            (375, 1079)
+        );
+
+        let horizontal = presented_rect((3440, 1440), stream, true);
+        // Left of the left bar and right of the right one.
+        assert_eq!(
+            stream_pointer_position(horizontal, stream, (0.0, 720.0)),
+            (0, 540)
+        );
+        assert_eq!(
+            stream_pointer_position(horizontal, stream, (3439.0, 720.0)),
+            (1919, 540)
+        );
+    }
+
+    /// The pointer must be reported where it is in the *streamed image*,
+    /// not in the window.
+    ///
+    /// The host scales absolute coordinates out of the stream's pixel space
+    /// and onto wherever that image sits on its desktop. The client sent
+    /// relative deltas instead, so the remote cursor drifted away from the
+    /// local one and never came back -- and any window size other than the
+    /// stream size made the drift worse with every movement.
+    #[test]
+    fn a_pointer_is_reported_in_the_streamed_images_own_pixels() {
+        let stream = (1920, 1080);
+
+        let small = presented_rect((1280, 720), stream, false);
+        // A window smaller than the stream: the centre is still the centre.
+        assert_eq!(
+            stream_pointer_position(small, stream, (640.0, 360.0)),
+            (960, 540)
+        );
+
+        // Corners map to corners, and the far edge is the last pixel rather
+        // than one past it.
+        assert_eq!(stream_pointer_position(small, stream, (0.0, 0.0)), (0, 0));
+        assert_eq!(
+            stream_pointer_position(small, stream, (1280.0, 720.0)),
+            (1919, 1079)
+        );
+
+        // A window larger than the stream scales the other way.
+        let large = presented_rect((3840, 2160), stream, false);
+        assert_eq!(
+            stream_pointer_position(large, stream, (1920.0, 1080.0)),
+            (960, 540)
+        );
+
+        // A window matching the stream is the identity.
+        let exact = presented_rect(stream, stream, false);
+        assert_eq!(
+            stream_pointer_position(exact, stream, (123.0, 456.0)),
+            (123, 456)
+        );
+    }
+
+    /// Degenerate input must not panic or divide by zero.
+    #[test]
+    fn a_collapsed_window_reports_the_origin() {
+        let collapsed = presented_rect((0, 0), (1920, 1080), false);
+        assert_eq!(
+            stream_pointer_position(collapsed, (1920, 1080), (10.0, 10.0)),
+            (0, 0)
+        );
+        let no_stream = presented_rect((1280, 720), (0, 0), false);
+        assert_eq!(
+            stream_pointer_position(no_stream, (0, 0), (10.0, 10.0)),
+            (0, 0)
+        );
+        // Some backends report a negative position while dragging out of
+        // the window; it clamps rather than wrapping.
+        let normal = presented_rect((1280, 720), (1920, 1080), false);
+        assert_eq!(
+            stream_pointer_position(normal, (1920, 1080), (-5.0, -5.0)),
+            (0, 0)
+        );
+        // An aspect-preserving rect is never larger than the window.
+        let rect = presented_rect((100, 100), (1920, 1080), true);
+        assert!(rect.width <= 100 && rect.height <= 100);
     }
 
     #[test]
