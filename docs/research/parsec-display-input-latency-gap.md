@@ -45,15 +45,26 @@ and input through several queues whose semantics favour boundedness and
 reliability over freshness. The highest-value next step is not another fix:
 it is stage-level instrumentation, so the step after it can be attributed.
 
-**That instrumentation now exists and has been run.** See
+**That instrumentation now exists and has been run once.** See
 [First instrumented measurement](#first-instrumented-measurement-on-442dd2b).
-It rules out two of the four candidates above on this rig -- nothing is being
-dropped by either handoff, and the client's own frame handling costs
-microseconds -- and it puts roughly 10 ms in the window queue against an
-interaction span of a few hundred. It does not yet decompose the rest: the
-host side and the decoder remain outside what an external-process pipeline
-can observe, and two consecutive runs of the same build have not been
-reconciled.
+One candidate is ruled out on that rig: nothing was dropped by either
+decoded-frame handoff across 5,251 pictures.
+
+**The rest of that first run's conclusions have been retracted.** Review found
+three measurement holes that made the numbers describe less than they
+appeared to, all since fixed and none yet re-measured:
+
+- the reassembly span was computed only for frames the assembler could
+  release immediately, so frames held in the reorder buffer -- the population
+  the span exists to expose -- were absent from it;
+- the client's raw-to-BGRA pixel conversion happened before the frame clock
+  started, so several megabytes of per-frame CPU work sat outside every span;
+- `present_submit` was stamped before the presenter was called, so texture
+  upload, surface acquisition and the blit were all excluded, and a frame
+  whose presenter call then failed had already been counted as presented.
+
+So "client frame movement is ruled out" was not supported by that run. It may
+still be true; it has not been measured.
 
 ## Post-merge validation on f6896c4
 
@@ -180,23 +191,45 @@ the client's input path, the network, host uinput injection, the helper's own
 response to the event, compositor redraw, portal capture, encode, network and
 decode.
 
-### What the table establishes
+### What the table establishes, after review
 
-- **The client's own frame handling is not the problem, and can now be shown
-  not to be.** Reassembly averages 3us and decoder submission 6us. Nothing in
-  that part of the path is worth optimising.
-- **Nothing is being dropped.** Zero drops in either bounded queue, zero
-  frames consumed and replaced, zero stalls, across 5,251 decoded pictures.
-  This matters because a dropped frame leaves no span sample at all: before
-  these counters, a client discarding half its output would have shown the
-  same healthy distribution as one dropping none.
-- **About 10 ms sits between decode and present-submit**, almost all of it in
-  the window queue, with a tail to 27 ms. That is client-side, it is real,
-  and it is addressable -- but it is roughly 3% of the interaction span.
-- **The remaining ~97% is in the parts this branch cannot yet see**: input
-  transport, host injection, the application's response, compositor redraw,
-  portal capture, encode, and decode. The instrumentation says where to
-  instrument next; it does not yet say where the time goes.
+Review of the instrumentation found that three of these spans measured less
+than they appeared to. What survives, and what does not:
+
+**Stands.** Nothing was dropped: zero drops in either bounded queue, zero
+frames consumed and replaced, across 5,251 decoded pictures. That matters
+because a dropped frame leaves no span sample at all -- before these counters
+a client discarding half its output would have shown the same healthy
+distribution as one dropping none. Stale-frame dropping and backpressure were
+not responsible for this run's latency.
+
+**Retracted -- the reassembly figure.** `Assembler::push` returns the frame
+that became *releasable*, which is frequently an older frame than the one the
+arriving fragment just completed, and it returns nothing at all when a frame
+completes while an older one is missing. Completion was stamped only on the
+returning branch, so every frame held in the reorder buffer was missing from
+both adjacent spans. The 3us mean describes a population selected to contain
+no reorder waiting, measured by the span whose purpose is to expose reorder
+waiting.
+
+**Retracted -- "client frame handling is ruled out".** The raw-to-BGRA
+conversion ran before `decoded_at` was stamped, so roughly 3.7 million pixels
+and a 15 MB allocation per picture sat outside every span. It may be cheap.
+Nothing here measured it.
+
+**Retracted -- the 10 ms decode-to-present figure as a bound on client
+presentation cost.** `present_submit` was stamped before the presenter was
+called, so GPU texture upload, surface acquisition and the software blit are
+all outside that 10 ms, and a frame whose presenter call subsequently failed
+had already been counted as submitted.
+
+**Stands, weakly.** Most of the interaction span is still somewhere this
+branch could not see. That remains the shape of the problem; the proportion
+should not be quoted until the reruns land.
+
+**`stalls=0` was not an observation.** Nothing in that run classified a frame
+as stalled, because nothing was watching -- the liveness machinery existed
+and was not wired. It is now.
 
 ### What it does not establish, and the run-to-run spread
 
@@ -212,6 +245,15 @@ outlier past 1.2 s. **Neither difference has been explained.** They are
 recorded here rather than averaged away, and no figure from either run should
 be quoted as OpenStream's interaction latency until the spread is understood.
 
+What was missing was a rate at each boundary. The helper's 16 ms heartbeat is
+a *requested* upload interval and was never evidence it achieved sixty
+uploads per second. The helper now publishes uploads per second and their
+duration, the stage report carries frames per second on both sides, and the
+client's liveness watch reports per-milestone rates. Whichever boundary first
+drops from ~44/s to ~21/s is where to look; until a run produces those
+numbers, attributing the spread to the portal, NVENC, the network, the
+decoder or the helper would be guessing.
+
 The bucket edges are also too coarse at this range: 150 ms and 250 ms are
 adjacent edges, so a median anywhere between them renders identically. That
 is why the exact mean is now carried beside the percentiles.
@@ -220,7 +262,12 @@ Raw telemetry for every run, including the two superseded ones, is in
 [latency-rig-runs.md](evidence/latency-rig-runs.md), along with how to
 reproduce them.
 
-### Three defects the rig found that unit tests did not
+### Six defects found in the instrumentation itself
+
+Three surfaced on the rig and three in review. Every one of them reported a
+number instead of failing, which is the failure mode this instrumentation
+exists to prevent -- and the fact that half were invisible from the rig is
+the argument for reading the instrumentation as carefully as the results.
 
 Recorded because each was a measurement reporting a number rather than
 failing, which is the failure mode this instrumentation exists to prevent.
@@ -242,6 +289,24 @@ failing, which is the failure mode this instrumentation exists to prevent.
    that id -- reporting a **10.18 second** interaction latency that was
    really a lost keystroke. Press and release now go out on separate ticks,
    and an id is sent once.
+
+Found in review of the instrumentation, not from the rig:
+
+4. **Frames held in the reorder buffer never received their completion
+   stamp**, because completion was keyed on `Assembler::push` returning a
+   frame -- and the frame it returns is the one that became *releasable*,
+   often an older one. The reassembly span was therefore measured on the
+   population that had no reorder waiting in it.
+5. **A retransmission of an already-assembled frame opened a stage timeline
+   that could never finish.** `push` returned the same `Ok(None)` for
+   "ignored duplicate" and "accepted, still incomplete", so the client could
+   not tell them apart; the ghost timelines then displaced real ones from the
+   recorder's bounded window. `PushOutcome` now states the lifecycle.
+6. **An out-of-order pair of timestamps became a zero-microsecond sample.**
+   `Stamp::since` saturated, so a bug in the caller's ordering was
+   indistinguishable from a genuinely fast frame and dragged every statistic
+   it entered towards zero. It now returns `None`, and the count of rejected
+   attempts is published beside each span.
 
 ## Evidence
 
