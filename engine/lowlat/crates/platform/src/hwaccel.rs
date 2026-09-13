@@ -9,14 +9,25 @@
 
 /// Accelerators visible on this machine right now.
 ///
-/// NVENC is recorded per codec. H.264 and HEVC encode are separate hardware
-/// capabilities -- a card can have one and not the other, and older NVIDIA
-/// silicon commonly does -- so a single `nvenc` flag derived from an H.264
-/// probe would advertise HEVC the machine cannot encode.
+/// Every accelerator is recorded per codec. H.264 and HEVC encode are
+/// separate hardware capabilities -- a device can have one and not the
+/// other, and older NVIDIA and Intel parts commonly do -- so no single flag
+/// may stand for both. The same applies to VAAPI: a `/dev/dri/renderD*`
+/// node proves a render device exists, not that it encodes anything, and
+/// selecting `hevc_vaapi` because a node is present is how a session
+/// negotiates a codec that fails when FFmpeg opens the encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HwReport {
-    /// At least one `/dev/dri/renderD*` node exists (VAAPI candidate).
+    /// At least one `/dev/dri/renderD*` node exists.
+    ///
+    /// Reported for diagnostics. A render node is a device, not an encoder:
+    /// it says nothing about which codecs that device can encode, so it
+    /// never selects one on its own.
     pub vaapi_node: bool,
+    /// VAAPI can encode H.264 here.
+    pub vaapi_h264: bool,
+    /// VAAPI can encode HEVC here.
+    pub vaapi_hevc: bool,
     /// NVENC can encode H.264 here.
     pub nvenc_h264: bool,
     /// NVENC can encode HEVC here.
@@ -34,27 +45,19 @@ pub struct HwReport {
 impl HwReport {
     /// Probe the running machine. Never fails; absence is data.
     pub fn probe() -> Self {
-        // A library on disk is evidence the userspace is installed, but not
-        // that a given codec works, so each codec is asked separately. The
-        // probe spawns FFmpeg, so it runs once at host startup.
-        let installed = nvenc_library_location().is_some();
-        let nvenc_h264 = installed && ffmpeg_encoder_usable("h264_nvenc");
-        let nvenc_hevc = installed && ffmpeg_encoder_usable("hevc_nvenc");
-        // Nothing on disk matched the known paths -- a Flatpak runtime, a
-        // container layout, a distribution nobody listed. Ask the encoder
-        // directly rather than declaring it absent.
-        let (nvenc_h264, nvenc_hevc) = if installed {
-            (nvenc_h264, nvenc_hevc)
-        } else {
-            (
-                ffmpeg_encoder_usable("h264_nvenc"),
-                ffmpeg_encoder_usable("hevc_nvenc"),
-            )
-        };
+        // Ask each encoder whether it works, in the environment the host
+        // child will inherit. Nothing here is inferred from a file existing:
+        // a library path and a render node are both evidence that userspace
+        // is installed, neither is evidence that a codec encodes. Four
+        // bounded one-frame probes at host startup answer the question that
+        // actually decides the session.
+        let render_node = vaapi_render_node();
         Self {
-            vaapi_node: vaapi_node_present(),
-            nvenc_h264,
-            nvenc_hevc,
+            vaapi_node: render_node.is_some(),
+            vaapi_h264: vaapi_encoder_usable("h264_vaapi", render_node.as_deref()),
+            vaapi_hevc: vaapi_encoder_usable("hevc_vaapi", render_node.as_deref()),
+            nvenc_h264: ffmpeg_encoder_usable("h264_nvenc"),
+            nvenc_hevc: ffmpeg_encoder_usable("hevc_nvenc"),
             nvidia_smi: command_exists("nvidia-smi"),
         }
     }
@@ -83,8 +86,8 @@ impl HwReport {
         match codec {
             EncoderCodec::H264 if self.nvenc_h264 => Some("h264_nvenc"),
             EncoderCodec::H265 if self.nvenc_hevc => Some("hevc_nvenc"),
-            EncoderCodec::H264 if self.vaapi_node => Some("h264_vaapi"),
-            EncoderCodec::H265 if self.vaapi_node => Some("hevc_vaapi"),
+            EncoderCodec::H264 if self.vaapi_h264 => Some("h264_vaapi"),
+            EncoderCodec::H265 if self.vaapi_hevc => Some("hevc_vaapi"),
             _ => None,
         }
     }
@@ -272,10 +275,6 @@ fn path_exists(path: &str) -> bool {
     std::fs::metadata(path).is_ok()
 }
 
-fn vaapi_node_present() -> bool {
-    vaapi_render_node().is_some()
-}
-
 fn nvenc_library_location() -> Option<String> {
     if let Ok(path) = std::env::var("OPENSTREAM_NVENC_LIBRARY")
         && !path.trim().is_empty()
@@ -300,6 +299,49 @@ fn nvenc_library_location() -> Option<String> {
 /// inherit, by encoding a single tiny frame.
 ///
 /// It spawns a process, so it is not free; callers probe once at startup.
+/// Whether FFmpeg can actually open a VAAPI encoder session here.
+///
+/// A VAAPI encode needs more than the encoder name: it needs the device and
+/// the upload that turns software frames into the hardware surfaces the
+/// encoder consumes. Probing without them would fail on every machine and
+/// prove nothing, so the probe runs the same shape the host will.
+fn vaapi_encoder_usable(encoder: &str, render_node: Option<&str>) -> bool {
+    let Some(render_node) = render_node else {
+        return false;
+    };
+    let Some(filter) = encoder_filter_suffix(encoder) else {
+        return false;
+    };
+    let ffmpeg = std::env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
+    run_bounded(
+        std::process::Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-vaapi_device",
+                render_node,
+                "-f",
+                "lavfi",
+                "-i",
+                "nullsrc=s=64x64:d=0.04:r=25",
+                "-vf",
+                filter,
+                "-c:v",
+                encoder,
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        std::time::Duration::from_secs(10),
+    )
+}
+
 fn ffmpeg_encoder_usable(encoder: &str) -> bool {
     let ffmpeg = std::env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
     run_bounded(
@@ -544,6 +586,8 @@ mod tests {
     fn nvenc_wins_over_vaapi_when_both_are_present() {
         let report = HwReport {
             vaapi_node: true,
+            vaapi_h264: true,
+            vaapi_hevc: true,
             nvenc_h264: true,
             nvenc_hevc: true,
             nvidia_smi: true,
@@ -558,6 +602,7 @@ mod tests {
         );
         let vaapi_only = HwReport {
             vaapi_node: true,
+            vaapi_h264: true,
             ..HwReport::default()
         };
         assert_eq!(
@@ -675,11 +720,13 @@ mod tests {
         );
     }
 
-    /// With no NVENC at all, a render node still yields VAAPI, per codec.
+    /// With no NVENC, a VAAPI encoder that was actually probed is used.
     #[test]
     fn vaapi_is_the_fallback_when_nvenc_is_absent() {
         let report = HwReport {
             vaapi_node: true,
+            vaapi_h264: true,
+            vaapi_hevc: true,
             ..HwReport::default()
         };
         assert_eq!(
@@ -688,6 +735,65 @@ mod tests {
         );
         assert_eq!(
             report.preferred_encoder(EncoderCodec::H265),
+            Some("hevc_vaapi")
+        );
+    }
+
+    /// A render node is a device, not an encoder.
+    ///
+    /// `/dev/dri/renderD*` existing proves a DRM render device is present.
+    /// It does not prove the device encodes H.264, and it certainly does not
+    /// prove HEVC -- older Intel and AMD parts commonly have one without the
+    /// other. Selecting an encoder from node presence is the same
+    /// capability-from-presence mistake the NVENC probe just stopped making,
+    /// and it fails later and less legibly: FFmpeg opens the encoder and
+    /// dies after the session has already negotiated the codec.
+    #[test]
+    fn a_render_node_alone_selects_nothing() {
+        let node_only = HwReport {
+            vaapi_node: true,
+            ..HwReport::default()
+        };
+        assert_eq!(node_only.preferred_encoder(EncoderCodec::H264), None);
+        assert_eq!(node_only.preferred_encoder(EncoderCodec::H265), None);
+    }
+
+    /// VAAPI H.264 without HEVC is a real configuration, and must not
+    /// advertise HEVC.
+    #[test]
+    fn vaapi_h264_does_not_imply_vaapi_hevc() {
+        let h264_only = HwReport {
+            vaapi_node: true,
+            vaapi_h264: true,
+            ..HwReport::default()
+        };
+        assert_eq!(
+            h264_only.preferred_encoder(EncoderCodec::H264),
+            Some("h264_vaapi")
+        );
+        assert_eq!(
+            h264_only.preferred_encoder(EncoderCodec::H265),
+            None,
+            "HEVC VAAPI was never probed, so it must not be offered"
+        );
+    }
+
+    /// NVENC still wins over VAAPI per codec: a card with NVENC H.264 and
+    /// VAAPI HEVC uses each where it has it.
+    #[test]
+    fn each_codec_picks_its_own_best_encoder() {
+        let mixed = HwReport {
+            vaapi_node: true,
+            vaapi_hevc: true,
+            nvenc_h264: true,
+            ..HwReport::default()
+        };
+        assert_eq!(
+            mixed.preferred_encoder(EncoderCodec::H264),
+            Some("h264_nvenc")
+        );
+        assert_eq!(
+            mixed.preferred_encoder(EncoderCodec::H265),
             Some("hevc_vaapi")
         );
     }
