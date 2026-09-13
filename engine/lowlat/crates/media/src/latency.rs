@@ -551,17 +551,7 @@ impl<S: Copy + PartialEq + Ord + fmt::Debug + 'static, D: ClockDomain> StageReco
         let Some(histogram) = self.span_histogram(from, to) else {
             return SpanValue::NotObservable;
         };
-        if histogram.count() == 0 {
-            return SpanValue::NoSamples;
-        }
-        SpanValue::Measured {
-            count: histogram.count(),
-            p50_upper_us: histogram.p50_upper_bound_us().unwrap_or_default(),
-            p95_upper_us: histogram.p95_upper_bound_us().unwrap_or_default(),
-            p99_upper_us: histogram.p99_upper_bound_us().unwrap_or_default(),
-            max_us: histogram.max_us(),
-            mean_us: histogram.mean_us().unwrap_or_default(),
-        }
+        SpanValue::from_histogram(histogram)
     }
 
     /// Histogram for the span between two consecutive stages.
@@ -986,6 +976,28 @@ pub enum SpanValue {
 }
 
 impl SpanValue {
+    /// Read a histogram of an *observable* span.
+    ///
+    /// An empty histogram is [`Self::NoSamples`], never a zero. Callers that
+    /// know the span is unobservable must return [`Self::NotObservable`]
+    /// themselves: a histogram cannot tell "nothing has crossed this yet"
+    /// apart from "this endpoint does not exist on this backend", and
+    /// guessing would turn a structural hole into a transient one.
+    #[must_use]
+    pub fn from_histogram(histogram: &Histogram) -> Self {
+        if histogram.count() == 0 {
+            return Self::NoSamples;
+        }
+        Self::Measured {
+            count: histogram.count(),
+            p50_upper_us: histogram.p50_upper_bound_us().unwrap_or_default(),
+            p95_upper_us: histogram.p95_upper_bound_us().unwrap_or_default(),
+            p99_upper_us: histogram.p99_upper_bound_us().unwrap_or_default(),
+            max_us: histogram.max_us(),
+            mean_us: histogram.mean_us().unwrap_or_default(),
+        }
+    }
+
     /// Render for a table, never as a number that could be mistaken for a
     /// measurement.
     #[must_use]

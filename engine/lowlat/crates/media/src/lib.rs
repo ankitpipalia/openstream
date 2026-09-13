@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 pub mod clipboard;
 pub mod displays;
+pub mod frame_age;
 pub mod input;
 pub mod latency;
 pub mod metrics;

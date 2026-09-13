@@ -13,8 +13,8 @@ use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,9 @@ use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
 };
 use openstream_media::displays::Display as RemoteDisplay;
+use openstream_media::frame_age::{DecodedFrame, FrameAgeRecord, FrameOffer};
 use openstream_media::input::{InputEvent, RumbleEvent};
+use openstream_media::latency::{Client as ClientClock, Stamp};
 use openstream_media::metrics::ReconnectSupervisor;
 use openstream_media::{
     Assembler, AudioEvent, AudioFrame, Fragment, FrameAck, JitterBuffer, KEYFRAME_REQUEST,
@@ -79,11 +81,11 @@ enum UiMessage {
         audio: bool,
         input: bool,
     },
-    Frame {
-        width: usize,
-        height: usize,
-        pixels: Vec<u32>,
-    },
+    /// A decoded picture on its way to the presenter. It carries its own
+    /// sequence number and stamps so the window can account for the time it
+    /// spent in this queue and for the frames that never arrived; a bare
+    /// buffer leaves both unknowable at the consuming end.
+    Frame(Box<DecodedFrame>),
     Error(String),
     Metrics(String),
     Rumble {
@@ -130,6 +132,23 @@ impl UiSender {
             &self.normal
         };
         sender.try_send(message).map_err(|_| ())
+    }
+
+    /// Offer a decoded frame to the window, saying which of the two failure
+    /// modes occurred.
+    ///
+    /// `send` collapses both into `Err(())`, which is adequate for a metrics
+    /// line and wrong for a frame: "the window is behind and this picture
+    /// was thrown away" and "the window is gone" call for different
+    /// responses and belong in different counters. A full queue drops the
+    /// *newest* frame, because that is what `try_send` does -- the opposite
+    /// of a latest-frame mailbox, and the reason this is worth measuring.
+    fn send_frame(&self, frame: DecodedFrame) -> FrameOffer {
+        match self.normal.try_send(UiMessage::Frame(Box::new(frame))) {
+            Ok(()) => FrameOffer::Enqueued,
+            Err(mpsc::TrySendError::Full(_)) => FrameOffer::DroppedNewest,
+            Err(mpsc::TrySendError::Disconnected(_)) => FrameOffer::Closed,
+        }
     }
 }
 
@@ -259,9 +278,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("OpenStream renderer smoke passed");
         return Ok(());
     }
+    // Always on. A frame the window never sees leaves no span sample -- it
+    // has no end stamp -- so a client discarding half its decoder output
+    // shows a perfectly healthy decode-to-present distribution. These
+    // counters are the only record that the discards happened, and a record
+    // that has to be switched on is one that will be missing when it
+    // matters.
+    let frame_age: SharedFrameAge = Arc::new(Mutex::new(FrameAgeRecord::new()));
     let worker = thread::Builder::new()
         .name("openstream-network".to_string())
-        .spawn(move || run_worker(ui_tx, input_rx))?;
+        .spawn({
+            let frame_age = Arc::clone(&frame_age);
+            move || run_worker(ui_tx, input_rx, frame_age)
+        })?;
     window.set_target_fps(120);
     let hotkeys = display::Hotkey::from_env();
     let mut last_hotkey: Option<display::HotkeyAction> = None;
@@ -305,18 +334,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     window.set_title(&format!("OpenStream -- {base_title}"));
                 }
-                Ok(UiMessage::Frame {
-                    width,
-                    height,
-                    pixels,
-                }) => {
+                Ok(UiMessage::Frame(frame)) => {
+                    let consumed_at = Stamp::<ClientClock>::now();
+                    let seq = frame.seq();
+                    let decoded_at = frame.decoded_at();
+                    let width = frame.width();
+                    let height = frame.height();
+                    with_frame_age(&frame_age, |record| {
+                        record.ui_queue_consumed(&frame, consumed_at);
+                    });
                     // Malformed decoder output is dropped, never presented.
-                    if render::validate_bgra_frame(width, height, &pixels).is_err() {
+                    // It stays counted as consumed-and-replaced rather than
+                    // vanishing: a decoder emitting garbage should show up
+                    // as frames that never reached the presenter.
+                    if render::validate_bgra_frame(width, height, frame.pixels()).is_err() {
                         continue;
                     }
                     buffer_width = width;
                     buffer_height = height;
-                    buffer = pixels;
+                    buffer = frame.into_pixels();
+                    // Recorded before the present call, not after: the span
+                    // this closes is "decoded until the client let go of
+                    // it", and the presenter's own duration belongs to the
+                    // presenter.
+                    with_frame_age(&frame_age, |record| {
+                        record.present_submitted_seq(seq, decoded_at, Stamp::now());
+                    });
                     if let Some(presenter) = native_presenter.as_mut() {
                         if let Err(error) = presenter.present(&window, width, height, &buffer) {
                             eprintln!(
@@ -956,12 +999,12 @@ fn keyboard_usages() -> &'static [(Key, u32)] {
     ]
 }
 
-fn run_worker(ui_tx: UiSender, input_rx: InputReceiver) {
+fn run_worker(ui_tx: UiSender, input_rx: InputReceiver, frame_age: SharedFrameAge) {
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime.block_on(network_loop(ui_tx.clone(), input_rx)),
+        Ok(runtime) => runtime.block_on(network_loop(ui_tx.clone(), input_rx, frame_age)),
         Err(error) => Err(error.to_string().into()),
     };
     if let Err(error) = result {
@@ -1061,6 +1104,7 @@ fn discard_stale_input(input_rx: &InputReceiver) -> bool {
 async fn network_loop(
     ui_tx: UiSender,
     input_rx: InputReceiver,
+    frame_age: SharedFrameAge,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let max_attempts = match env::var("OPENSTREAM_RECONNECT_ATTEMPTS") {
         Ok(value) if value.eq_ignore_ascii_case("unlimited") => None,
@@ -1072,7 +1116,22 @@ async fn network_loop(
     let mut supervisor = ReconnectSupervisor::new(max_attempts);
     loop {
         let mut progress = SessionProgress::default();
-        match network_session(&ui_tx, &input_rx, &mut progress).await {
+        let outcome = network_session(&ui_tx, &input_rx, &mut progress, &frame_age).await;
+        // Frames the window had taken but not yet submitted are gone with
+        // the session, and are counted as never shown rather than left
+        // pending across the reconnect.
+        //
+        // The counters themselves run for the life of the process, not per
+        // session: a run that reconnected four times is one measurement of
+        // this client, and resetting would hide the losses that happened
+        // around each drop -- which is where they cluster.
+        with_frame_age(&frame_age, |record| {
+            record.session_ended();
+            for line in record.report() {
+                eprintln!("OpenStream frame-age {line}");
+            }
+        });
+        match outcome {
             Ok(()) => return Ok(()),
             Err(error) => {
                 if !is_retryable(error.as_ref()) {
@@ -1115,6 +1174,7 @@ async fn network_session(
     ui_tx: &UiSender,
     input_rx: &InputReceiver,
     progress: &mut SessionProgress,
+    frame_age: &SharedFrameAge,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
@@ -1211,6 +1271,7 @@ async fn network_session(
     let mut last_audio_toc = None;
 
     let (frame_tx, mut frame_rx) = async_mpsc::channel(2);
+    let reader_frame_age = Arc::clone(frame_age);
     tokio::spawn(async move {
         loop {
             let mut raw = vec![0_u8; frame_bytes];
@@ -1228,6 +1289,15 @@ async fn network_session(
                     | (u32::from(pixel[3]) << 24);
                 pixels.push(value);
             }
+            // The sequence number is assigned here, by the client, and is
+            // not the host's frame id. The decoder is free to emit a
+            // different number of pictures than the host encoded, so a host
+            // id carried through it would look like a correlation without
+            // being one.
+            let Some(seq) = with_frame_age(&reader_frame_age, FrameAgeRecord::frame_decoded) else {
+                break;
+            };
+            let frame = DecodedFrame::new(seq, Stamp::now(), width, height, pixels);
             // Never block here. This task is the only thing draining the
             // decoder's stdout, and the loop that drains `frame_rx` is the
             // same loop that writes access units to the decoder's stdin.
@@ -1241,7 +1311,11 @@ async fn network_session(
             // A late frame is worth less than a live one, so a frame the UI
             // has not kept up with is dropped, exactly as `UiSender` already
             // drops stale frames and metrics.
-            if !offer_decoded_frame(&frame_tx, pixels) {
+            let offer = offer_decoded_frame(&frame_tx, frame);
+            with_frame_age(&reader_frame_age, |record| {
+                record.decoder_queue_offer(offer);
+            });
+            if offer.should_stop() {
                 break;
             }
         }
@@ -1485,8 +1559,16 @@ async fn network_session(
                     }
                 }
             }
-            Some(pixels) = frame_rx.recv() => {
-                let _ = ui_tx.send(UiMessage::Frame { width, height, pixels });
+            Some(mut frame) = frame_rx.recv() => {
+                let taken_at = Stamp::<ClientClock>::now();
+                with_frame_age(frame_age, |record| {
+                    record.decoder_queue_consumed(&frame, taken_at);
+                });
+                frame.entering_ui_queue(taken_at);
+                let offer = ui_tx.send_frame(frame);
+                with_frame_age(frame_age, |record| {
+                    record.ui_queue_offer(offer);
+                });
             }
             _ = control_tick.tick() => {
                 reliable_control.retry(&mut session).await?;
@@ -1497,7 +1579,12 @@ async fn network_session(
                 session.flush_outbound_recoverably().await?;
             }
             _ = metrics_tick.tick() => {
-                let _ = ui_tx.send(UiMessage::Metrics(metrics.snapshot().overlay_line()));
+                let mut line = metrics.snapshot().overlay_line();
+                with_frame_age(frame_age, |record| {
+                    line.push_str(" -- ");
+                    line.push_str(&record.overlay_fragment());
+                });
+                let _ = ui_tx.send(UiMessage::Metrics(line));
             }
             _ = clipboard_tick.tick(), if clipboard_policy.may_send(negotiated.clipboard) => {
                 if let Ok(current) = platform_clipboard::read_text()
@@ -1674,11 +1761,38 @@ fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
 /// A late frame is worth less than a live one, so a frame the window has not
 /// kept up with is dropped -- exactly as `UiSender` already drops stale
 /// frames and metrics.
-fn offer_decoded_frame(sender: &async_mpsc::Sender<Vec<u32>>, pixels: Vec<u32>) -> bool {
-    !matches!(
-        sender.try_send(pixels),
-        Err(async_mpsc::error::TrySendError::Closed(_))
-    )
+///
+/// The outcome is returned as a [`FrameOffer`] rather than a `bool`. Under
+/// the `bool` a delivered frame and a discarded one were the same value, so
+/// a client dropping half its decoder output looked identical to one
+/// dropping none: the discarded frames left no span sample either, having no
+/// end stamp, so nothing anywhere recorded them.
+fn offer_decoded_frame(
+    sender: &async_mpsc::Sender<DecodedFrame>,
+    frame: DecodedFrame,
+) -> FrameOffer {
+    match sender.try_send(frame) {
+        Ok(()) => FrameOffer::Enqueued,
+        Err(async_mpsc::error::TrySendError::Full(_)) => FrameOffer::DroppedNewest,
+        Err(async_mpsc::error::TrySendError::Closed(_)) => FrameOffer::Closed,
+    }
+}
+
+/// Shared because the three points a frame passes through are three
+/// different threads: the task reading the decoder's stdout, the session
+/// loop, and the window. The critical sections are a few integer increments
+/// and one array index, so the lock is never held across an await or a
+/// present.
+type SharedFrameAge = Arc<Mutex<FrameAgeRecord>>;
+
+/// Run `edit` against the shared record, returning `None` if a panic
+/// elsewhere poisoned the lock. Losing a counter is not a reason to take the
+/// session down, so the caller decides whether a missing answer matters.
+fn with_frame_age<R>(
+    record: &SharedFrameAge,
+    edit: impl FnOnce(&mut FrameAgeRecord) -> R,
+) -> Option<R> {
+    record.lock().ok().map(|mut guard| edit(&mut guard))
 }
 
 fn monotonic_us() -> u64 {
@@ -1707,6 +1821,8 @@ mod tests {
     use gilrs::{Axis, Button};
     use minifb::Key;
     use openstream_media::displays::{Display, PRIMARY_FLAG, SELECTED_FLAG};
+    use openstream_media::frame_age::{DecodedFrame, DecodedFrameSeq, FrameAgeRecord, FrameOffer};
+    use openstream_media::latency::Stamp;
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -1804,15 +1920,7 @@ mod tests {
             normal: normal_rx,
             critical: critical_rx,
         };
-        assert!(
-            sender
-                .send(UiMessage::Frame {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0],
-                })
-                .is_ok()
-        );
+        assert!(sender.send_frame(test_frame(0)).delivered());
         assert!(sender.send(UiMessage::End).is_ok());
         assert!(matches!(receiver.try_recv(), Ok(UiMessage::End)));
     }
@@ -1888,15 +1996,7 @@ mod tests {
             normal: normal_rx,
             critical: critical_rx,
         };
-        assert!(
-            sender
-                .send(UiMessage::Frame {
-                    width: 1,
-                    height: 1,
-                    pixels: vec![0],
-                })
-                .is_ok()
-        );
+        assert!(sender.send_frame(test_frame(0)).delivered());
         assert!(
             sender
                 .send(UiMessage::Reconnecting {
@@ -1956,25 +2056,149 @@ mod tests {
     /// that stays blank while the socket backs up.
     #[tokio::test]
     async fn a_frame_the_window_cannot_keep_up_with_is_dropped_not_awaited() {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u32>>(2);
-        assert!(offer_decoded_frame(&sender, vec![1]));
-        assert!(offer_decoded_frame(&sender, vec![2]));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<DecodedFrame>(2);
+        assert_eq!(
+            offer_decoded_frame(&sender, test_frame(0)),
+            FrameOffer::Enqueued
+        );
+        assert_eq!(
+            offer_decoded_frame(&sender, test_frame(1)),
+            FrameOffer::Enqueued
+        );
 
         // The channel is now full. This must still return, and promptly.
         let overflowed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            offer_decoded_frame(&sender, vec![3])
+            offer_decoded_frame(&sender, test_frame(2))
         })
         .await
         .expect("offering a frame must not park the decoder reader");
-        assert!(overflowed, "a full window is not a closed window");
+        assert_eq!(
+            overflowed,
+            FrameOffer::DroppedNewest,
+            "a full window is not a closed window"
+        );
+        assert!(!overflowed.should_stop());
 
-        // The frames already queued are intact; only the late one is gone.
-        assert_eq!(receiver.recv().await, Some(vec![1]));
-        assert_eq!(receiver.recv().await, Some(vec![2]));
+        // Today's behaviour, pinned deliberately: the queue keeps the two
+        // *stale* frames and throws away the freshest one. That is what
+        // `try_send` does, and it is the opposite of a latest-frame
+        // mailbox. A later change to drop-oldest should fail this test
+        // rather than quietly changing the latency profile.
+        assert_eq!(receiver.recv().await.map(|frame| frame.seq()), Some(seq(0)));
+        assert_eq!(receiver.recv().await.map(|frame| frame.seq()), Some(seq(1)));
 
         // A closed window ends the reader.
         drop(receiver);
-        assert!(!offer_decoded_frame(&sender, vec![4]));
+        assert_eq!(
+            offer_decoded_frame(&sender, test_frame(3)),
+            FrameOffer::Closed
+        );
+        assert!(offer_decoded_frame(&sender, test_frame(4)).should_stop());
+    }
+
+    /// The window's own queue drops the newest frame too, and says which of
+    /// the two failures happened.
+    ///
+    /// `UiSender::send` folds "full" and "disconnected" into `Err(())`,
+    /// which is fine for a metrics line and wrong for a frame: one means the
+    /// window is behind and this picture is lost, the other means there is
+    /// no window. `send_frame` distinguishes them so the counters can.
+    #[test]
+    fn the_window_queue_drops_the_newest_frame_and_names_the_failure() {
+        let (normal_tx, normal_rx) = mpsc::sync_channel(2);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_UI_QUEUE_CAPACITY);
+        let sender = UiSender {
+            normal: normal_tx,
+            critical: critical_tx,
+        };
+        let receiver = UiReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+        };
+
+        assert_eq!(sender.send_frame(test_frame(0)), FrameOffer::Enqueued);
+        assert_eq!(sender.send_frame(test_frame(1)), FrameOffer::Enqueued);
+        // Full. The newest frame is the one discarded.
+        assert_eq!(sender.send_frame(test_frame(2)), FrameOffer::DroppedNewest);
+
+        let first = match receiver.try_recv() {
+            Ok(UiMessage::Frame(frame)) => frame.seq(),
+            other => panic!("expected a frame, got {other:?}"),
+        };
+        let second = match receiver.try_recv() {
+            Ok(UiMessage::Frame(frame)) => frame.seq(),
+            other => panic!("expected a frame, got {other:?}"),
+        };
+        assert_eq!((first, second), (seq(0), seq(1)));
+
+        drop(receiver);
+        assert_eq!(sender.send_frame(test_frame(3)), FrameOffer::Closed);
+    }
+
+    /// Filling both queues at once: every decoded picture is accounted for
+    /// either as presented or as dropped, and the span histograms alone
+    /// would have shown none of it.
+    #[tokio::test]
+    async fn frames_lost_in_either_queue_are_still_counted() {
+        let mut record = FrameAgeRecord::new();
+        let (decoder_tx, decoder_rx) = tokio::sync::mpsc::channel::<DecodedFrame>(2);
+        let (normal_tx, normal_rx) = mpsc::sync_channel(2);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_UI_QUEUE_CAPACITY);
+        let ui_tx = UiSender {
+            normal: normal_tx,
+            critical: critical_tx,
+        };
+        let ui_rx = UiReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+        };
+
+        // Nothing drains either queue: decode ten pictures into a client
+        // that has stopped consuming entirely.
+        for _ in 0..10 {
+            let seq = record.frame_decoded();
+            let frame = DecodedFrame::new(seq, Stamp::now(), 1, 1, vec![0]);
+            record.decoder_queue_offer(offer_decoded_frame(&decoder_tx, frame));
+        }
+        assert_eq!(record.decoder_queue().enqueued, 2);
+        assert_eq!(record.decoder_queue().dropped_newest, 8);
+
+        // Drain the decoder queue into the window queue, which also fills.
+        let mut decoder_rx = decoder_rx;
+        while let Ok(mut frame) = decoder_rx.try_recv() {
+            let taken_at = Stamp::now();
+            record.decoder_queue_consumed(&frame, taken_at);
+            frame.entering_ui_queue(taken_at);
+            record.ui_queue_offer(ui_tx.send_frame(frame));
+        }
+        assert_eq!(record.ui_queue().enqueued, 2);
+
+        // The window consumes one and presents it, then the session ends.
+        if let Ok(UiMessage::Frame(frame)) = ui_rx.try_recv() {
+            let at = Stamp::now();
+            record.ui_queue_consumed(&frame, at);
+            record.present_submitted(&frame, at);
+        } else {
+            panic!("expected a queued frame");
+        }
+        record.session_ended();
+
+        assert_eq!(record.decoded_frames(), 10);
+        assert_eq!(record.new_frames_present_submitted(), 1);
+        // Nine pictures were decoded and never seen. The one that made it
+        // has a healthy-looking span, which is precisely why the counters
+        // have to be published next to it.
+        assert_eq!(record.frames_never_presented(), 9);
+        assert_eq!(record.decoded_to_present_submit().count(), 1);
+        assert_eq!(record.overlay_fragment(), "shown 1/10");
+    }
+
+    fn seq(index: u64) -> DecodedFrameSeq {
+        (0..index).fold(DecodedFrameSeq::FIRST, |current, _| current.next())
+    }
+
+    fn test_frame(index: u64) -> DecodedFrame {
+        DecodedFrame::new(seq(index), Stamp::now(), 1, 1, vec![0])
     }
 
     /// A stretching presentation puts the picture over the whole window.
