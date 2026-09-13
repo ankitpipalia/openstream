@@ -20,7 +20,7 @@ use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
 };
 use openstream_media::latency::{
-    Host as HostClock, HostObservability, HostRecorder, HostStage, ReportOnDrop, Stamp,
+    Host as HostClock, HostObservability, HostRecorder, HostStage, ReportOnDrop, RunContext, Stamp,
 };
 use openstream_media::{
     AdaptiveBitrate, AudioFrame, BitrateDecision, KEYFRAME_REQUEST, MAX_FRAGMENT_BYTES,
@@ -305,6 +305,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // out": the stages before the first encoded byte report
     // `not-observable`, which is the truth, rather than zero.
     let observability = HostObservability::EncodedStreamOnly;
+    // Emitted with the stage table, not supplied by hand afterwards: a
+    // "P95 <= 4ms" line means nothing six months later without the codec,
+    // the resolution and the build it was taken on.
+    for line in (RunContext {
+        codec: format!("{:?}", negotiated.video),
+        width: negotiated.width,
+        height: negotiated.height,
+        fps: negotiated.fps,
+        path: format!("{:?}", session.connection_path()),
+        profile: profile.pix_fmt.clone(),
+        bitrate_mbps: Some(format!("{:.2}", profile.bitrate_mbps)),
+        capture_backend: Some(capture_backend.clone()),
+        encoder: Some(profile.encoder.clone()),
+        host_observability: Some(observability),
+        ..RunContext::default()
+    })
+    .report()
+    {
+        eprintln!("OpenStream run {line}");
+    }
     let mut stages = ReportOnDrop::new(
         HostRecorder::for_backend(observability),
         observability.unobserved_note(),
@@ -470,7 +490,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // a frame interval. That delay is structural and belongs
                     // inside the span rather than beside it.
                     stages.mark(frame_id, HostStage::AccessUnitBoundaryKnown, read_at);
-                    stages.mark(frame_id, HostStage::FirstFragmentSent, Stamp::now());
+                    // Queued, not sent: `send_access_unit` fragments the
+                    // access unit into the outbound queue and returns. It
+                    // does not establish that a datagram reached the socket.
+                    stages.mark(frame_id, HostStage::FirstFragmentQueued, Stamp::now());
                     send_access_unit(
                         &mut session,
                         frame_id,
@@ -479,7 +502,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         negotiated.video,
                     )
                     .await?;
-                    stages.mark(frame_id, HostStage::LastFragmentSent, Stamp::now());
+                    stages.mark(frame_id, HostStage::LastFragmentQueued, Stamp::now());
                     stages.finish(frame_id);
                     telemetry.frame_sent(
                         frame_id,

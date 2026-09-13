@@ -33,7 +33,7 @@ use openstream_media::frame_age::{DecodedFrame, DecodedFrameSeq, FrameAgeRecord,
 use openstream_media::input::{InputEvent, RumbleEvent};
 use openstream_media::latency::{
     Client as ClientClock, ClientObservability, ClientRecorder, ClientStage, Liveness, Milestone,
-    ReportOnDrop, Stamp, TraceEnd,
+    ReportOnDrop, RunContext, Stamp, TraceEnd,
 };
 use openstream_media::metrics::ReconnectSupervisor;
 use openstream_media::probe::{InteractionProbe, detect as probe_detect};
@@ -1378,6 +1378,34 @@ async fn network_session(
     // frame. The stages past it report `not-observable`, and what actually
     // happens there is measured by decoded sequence number in `frame_age`.
     let observability = ClientObservability::ExternalDecoder;
+    // Emitted with the stage table rather than supplied by hand afterwards.
+    // The host half is left explicitly unstated: this side is told the
+    // negotiated codec and size and nothing about how they were produced.
+    for line in (RunContext {
+        codec: format!("{:?}", negotiated.video),
+        width: negotiated.width,
+        height: negotiated.height,
+        fps: negotiated.fps,
+        path: format!("{:?}", session.connection_path()),
+        profile: format!("{format}-low-delay"),
+        decoder: Some(format!(
+            "{} {format}",
+            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+        )),
+        // The presenter is chosen in `main` and the window is not this
+        // task's to inspect, so the backend it settled on is named there
+        // and not guessed here.
+        presenter: Some(format!("{:?}", render::RenderBackend::from_env())),
+        // minifb's software path does not expose whether the compositor
+        // synchronised the update, and saying "off" would be a guess.
+        vsync: Some("not-reported-by-presenter".to_string()),
+        client_observability: Some(observability),
+        ..RunContext::default()
+    })
+    .report()
+    {
+        eprintln!("OpenStream run {line}");
+    }
     let mut stages = ReportOnDrop::new(
         ClientRecorder::for_decoder(observability),
         observability.unobserved_note(),

@@ -147,10 +147,16 @@ pub enum HostStage {
     /// frame interval. That delay is structural, not a measurement error,
     /// and it is inside the span rather than beside it.
     AccessUnitBoundaryKnown,
-    /// First fragment handed to the transport.
-    FirstFragmentSent,
-    /// Last fragment handed to the transport.
-    LastFragmentSent,
+    /// First fragment handed to the outbound queue.
+    ///
+    /// **Not "sent".** The fragment has been packetized and queued for the
+    /// transport; whether it reached a socket, let alone the wire, is not
+    /// established here. Naming it `Sent` would become actively misleading
+    /// the moment anyone tried to attribute transport scheduling latency
+    /// with it.
+    FirstFragmentQueued,
+    /// Last fragment handed to the outbound queue. Same caveat.
+    LastFragmentQueued,
 }
 
 /// Points in a frame's life that the client can time.
@@ -175,8 +181,8 @@ impl HostStage {
         Self::EncodeSubmitted,
         Self::EncoderFirstByte,
         Self::AccessUnitBoundaryKnown,
-        Self::FirstFragmentSent,
-        Self::LastFragmentSent,
+        Self::FirstFragmentQueued,
+        Self::LastFragmentQueued,
     ];
 }
 
@@ -1068,8 +1074,8 @@ mod tests {
             recorder.mark(frame, HostStage::EncodeSubmitted, host_at(base, 2));
             recorder.mark(frame, HostStage::EncoderFirstByte, host_at(base, 6));
             recorder.mark(frame, HostStage::AccessUnitBoundaryKnown, host_at(base, 39));
-            recorder.mark(frame, HostStage::FirstFragmentSent, host_at(base, 40));
-            recorder.mark(frame, HostStage::LastFragmentSent, host_at(base, 43));
+            recorder.mark(frame, HostStage::FirstFragmentQueued, host_at(base, 40));
+            recorder.mark(frame, HostStage::LastFragmentQueued, host_at(base, 43));
             recorder.finish(frame);
         }
 
@@ -1095,7 +1101,7 @@ mod tests {
             recorder
                 .span_histogram(
                     HostStage::FrameEnteredOpenStream,
-                    HostStage::LastFragmentSent
+                    HostStage::LastFragmentQueued
                 )
                 .is_none()
         );
@@ -1200,7 +1206,7 @@ mod tests {
         assert_eq!(ids, vec![1], "the stalled frame is kept, not dropped");
         let stalled = recorder.traces().next().expect("frame 1 retained");
         assert_eq!(stalled.ended, Some(TraceEnd::Superseded));
-        assert!(stalled.stamp_of(HostStage::LastFragmentSent).is_none());
+        assert!(stalled.stamp_of(HostStage::LastFragmentQueued).is_none());
         assert!(stalled.stamp_of(HostStage::EncodeSubmitted).is_some());
     }
 
@@ -1884,8 +1890,8 @@ impl HostObservability {
             Self::EncodedStreamOnly => &[
                 HostStage::EncoderFirstByte,
                 HostStage::AccessUnitBoundaryKnown,
-                HostStage::FirstFragmentSent,
-                HostStage::LastFragmentSent,
+                HostStage::FirstFragmentQueued,
+                HostStage::LastFragmentQueued,
             ],
             Self::Full => &HostStage::ORDER,
         }
@@ -1917,16 +1923,59 @@ pub struct RunContext {
     pub width: u16,
     pub height: u16,
     pub fps: u16,
-    pub bitrate_mbps: String,
-    pub capture_backend: String,
-    pub encoder: String,
-    pub decoder: String,
-    pub presenter: String,
     /// `direct` or `relay`.
     pub path: String,
-    pub vsync: String,
     pub profile: String,
-    pub host_observability: HostObservability,
+    /// Host-side configuration. `None` on a client export.
+    ///
+    /// The client is told the negotiated codec and size and nothing about
+    /// how the host produced them. Writing a guess into a field whose whole
+    /// purpose is to let a number be placed later is worse than saying the
+    /// emitting side could not see it -- the same rule the spans follow.
+    pub bitrate_mbps: Option<String>,
+    pub capture_backend: Option<String>,
+    pub encoder: Option<String>,
+    pub host_observability: Option<HostObservability>,
+    /// Client-side configuration. `None` on a host export.
+    pub decoder: Option<String>,
+    pub presenter: Option<String>,
+    pub vsync: Option<String>,
+    pub client_observability: Option<ClientObservability>,
+}
+
+impl Default for RunContext {
+    /// Everything unstated. Fill in what this side actually knows with
+    /// struct-update syntax and leave the rest.
+    fn default() -> Self {
+        Self {
+            commit: commit_from_environment(),
+            codec: String::new(),
+            width: 0,
+            height: 0,
+            fps: 0,
+            path: String::new(),
+            profile: String::new(),
+            bitrate_mbps: None,
+            capture_backend: None,
+            encoder: None,
+            host_observability: None,
+            decoder: None,
+            presenter: None,
+            vsync: None,
+            client_observability: None,
+        }
+    }
+}
+
+/// The build this run came from, or `unknown`.
+///
+/// Read from `OPENSTREAM_COMMIT` rather than baked in by a build script, so
+/// an ordinary build stays reproducible. A run without it can still be read;
+/// it just cannot be placed against a later one, which is the entire reason
+/// this context exists, so the rig sets it.
+#[must_use]
+pub fn commit_from_environment() -> String {
+    std::env::var("OPENSTREAM_COMMIT").unwrap_or_else(|_| "unknown".to_string())
 }
 
 impl RunContext {
@@ -1936,23 +1985,39 @@ impl RunContext {
     /// configuration choice, not a session secret.
     #[must_use]
     pub fn report(&self) -> Vec<String> {
+        // A field this side cannot see says so, rather than printing an
+        // empty value that reads as a configuration choice.
+        fn stated(name: &str, value: Option<&str>) -> String {
+            value.map_or_else(
+                || format!("{name}=not-visible-from-here"),
+                |value| format!("{name}={value}"),
+            )
+        }
         let mut lines = vec![
             format!("commit={}", self.commit),
             format!("codec={}", self.codec),
             format!("size={}x{}", self.width, self.height),
             format!("fps={}", self.fps),
-            format!("bitrate_mbps={}", self.bitrate_mbps),
-            format!("capture={}", self.capture_backend),
-            format!("encoder={}", self.encoder),
-            format!("decoder={}", self.decoder),
-            format!("presenter={}", self.presenter),
             format!("path={}", self.path),
-            format!("vsync={}", self.vsync),
             format!("profile={}", self.profile),
-            format!("host_observability={:?}", self.host_observability),
+            stated("bitrate_mbps", self.bitrate_mbps.as_deref()),
+            stated("capture", self.capture_backend.as_deref()),
+            stated("encoder", self.encoder.as_deref()),
+            stated("decoder", self.decoder.as_deref()),
+            stated("presenter", self.presenter.as_deref()),
+            stated("vsync", self.vsync.as_deref()),
         ];
-        if let Some(note) = self.host_observability.unobserved_note() {
-            lines.push(format!("unobserved={note}"));
+        if let Some(observability) = self.host_observability {
+            lines.push(format!("host_observability={observability:?}"));
+            if let Some(note) = observability.unobserved_note() {
+                lines.push(format!("unobserved={note}"));
+            }
+        }
+        if let Some(observability) = self.client_observability {
+            lines.push(format!("client_observability={observability:?}"));
+            if let Some(note) = observability.unobserved_note() {
+                lines.push(format!("unobserved={note}"));
+            }
         }
         lines
     }
@@ -1960,7 +2025,7 @@ impl RunContext {
 
 #[cfg(test)]
 mod context_tests {
-    use super::{HostObservability, HostStage, RunContext};
+    use super::{ClientObservability, HostObservability, HostStage, RunContext};
 
     /// The external-encoder path cannot time capture, and must say so
     /// rather than reporting those stages as instant.
@@ -2001,15 +2066,16 @@ mod context_tests {
             width: 1920,
             height: 1080,
             fps: 30,
-            bitrate_mbps: "10.00".into(),
-            capture_backend: "portal-pipewire".into(),
-            encoder: "h264_nvenc".into(),
-            decoder: "ffmpeg".into(),
-            presenter: "minifb-software".into(),
             path: "direct".into(),
-            vsync: "off".into(),
             profile: "balanced".into(),
-            host_observability: HostObservability::EncodedStreamOnly,
+            bitrate_mbps: Some("10.00".into()),
+            capture_backend: Some("portal-pipewire".into()),
+            encoder: Some("h264_nvenc".into()),
+            host_observability: Some(HostObservability::EncodedStreamOnly),
+            decoder: Some("ffmpeg".into()),
+            presenter: Some("minifb-software".into()),
+            vsync: Some("off".into()),
+            client_observability: None,
         };
 
         let report = context.report();
@@ -2040,6 +2106,42 @@ mod context_tests {
         for forbidden in ["token", "Bearer", "192.168", "pairing"] {
             assert!(!joined.contains(forbidden), "leaked {forbidden}");
         }
+    }
+
+    /// A side that cannot see a field says so, rather than exporting an
+    /// empty value that reads as a configuration choice.
+    #[test]
+    fn a_client_export_does_not_invent_the_host_half() {
+        let context = RunContext {
+            codec: "H264".into(),
+            width: 2560,
+            height: 1440,
+            fps: 60,
+            path: "direct".into(),
+            profile: "balanced".into(),
+            decoder: Some("ffmpeg".into()),
+            presenter: Some("minifb-software".into()),
+            vsync: Some("off".into()),
+            client_observability: Some(ClientObservability::ExternalDecoder),
+            ..RunContext::default()
+        };
+
+        let report = context.report().join("\n");
+        assert!(report.contains("decoder=ffmpeg"), "{report}");
+        assert!(
+            report.contains("encoder=not-visible-from-here"),
+            "the client is never told the host's encoder: {report}"
+        );
+        assert!(report.contains("capture=not-visible-from-here"), "{report}");
+        assert!(!report.contains("host_observability="), "{report}");
+        assert!(
+            report.contains("client_observability=ExternalDecoder"),
+            "{report}"
+        );
+        assert!(
+            report.contains("frame-age"),
+            "the client's own unobserved tail is named: {report}"
+        );
     }
 }
 
@@ -2140,8 +2242,8 @@ mod observability_tests {
         recorder.begin(1, at(base, 0));
         recorder.mark(1, HostStage::EncoderFirstByte, at(base, 0));
         recorder.mark(1, HostStage::AccessUnitBoundaryKnown, at(base, 33));
-        recorder.mark(1, HostStage::FirstFragmentSent, at(base, 34));
-        recorder.mark(1, HostStage::LastFragmentSent, at(base, 37));
+        recorder.mark(1, HostStage::FirstFragmentQueued, at(base, 34));
+        recorder.mark(1, HostStage::LastFragmentQueued, at(base, 37));
         recorder.finish(1);
 
         assert_eq!(
@@ -2245,8 +2347,8 @@ mod observability_tests {
         recorder.set_tracing(true);
         recorder.begin(1, at(base, 0));
         recorder.mark(1, HostStage::AccessUnitBoundaryKnown, at(base, 8));
-        recorder.mark(1, HostStage::FirstFragmentSent, at(base, 9));
-        recorder.mark(1, HostStage::LastFragmentSent, at(base, 10));
+        recorder.mark(1, HostStage::FirstFragmentQueued, at(base, 9));
+        recorder.mark(1, HostStage::LastFragmentQueued, at(base, 10));
         recorder.finish(1);
 
         let trace = recorder.traces().next().expect("one trace retained");
