@@ -267,16 +267,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = vec![0_u32; DEFAULT_WIDTH * DEFAULT_HEIGHT];
     let mut buffer_width = DEFAULT_WIDTH;
     let mut buffer_height = DEFAULT_HEIGHT;
-    let mut last_mouse = None;
-    let mut button_state = [false; 3];
-    let mut gamepad_ids = HashMap::new();
-    let mut rumble_effects = HashMap::new();
+    let mut input_state = InputState {
+        last_mouse: None,
+        button_state: [false; 3],
+        gamepads: None,
+        gamepad_ids: HashMap::new(),
+        rumble_effects: HashMap::new(),
+    };
     let mut connected = false;
     let mut base_title = String::from("OpenStream");
     let mut displays = Vec::<RemoteDisplay>::new();
     let mut selected_display = None;
     let mut pacer = render::FramePacer::new(60);
-    let mut gamepads = match Gilrs::new() {
+    input_state.gamepads = match Gilrs::new() {
         Ok(gamepads) => Some(gamepads),
         Err(error) => {
             eprintln!("OpenStream gamepad input unavailable: {error}");
@@ -339,9 +342,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     weak,
                 }) => {
                     play_rumble(
-                        &mut gamepads,
-                        &gamepad_ids,
-                        &mut rumble_effects,
+                        &mut input_state.gamepads,
+                        &input_state.gamepad_ids,
+                        &mut input_state.rumble_effects,
                         device_id,
                         strong,
                         weak,
@@ -363,8 +366,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // discarded rather than queued: a key pressed now is
                     // not a key pressed in the session that comes back.
                     connected = false;
-                    last_mouse = None;
-                    button_state = [false; 3];
+                    input_state.last_mouse = None;
+                    input_state.button_state = [false; 3];
                     let seconds = delay_ms as f64 / 1000.0;
                     window.set_title(&format!(
                         "OpenStream -- reconnecting in {seconds:.0}s (attempt {attempt})"
@@ -372,8 +375,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(UiMessage::End) => {
                     connected = false;
-                    last_mouse = None;
-                    button_state = [false; 3];
+                    input_state.last_mouse = None;
+                    input_state.button_state = [false; 3];
                     window.set_title("OpenStream -- disconnected");
                 }
                 Ok(UiMessage::Metrics(line)) => {
@@ -403,11 +406,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             forward_input(
                 &window,
                 &input_tx,
-                &mut last_mouse,
-                &mut button_state,
-                &mut gamepads,
-                &mut gamepad_ids,
-                &mut rumble_effects,
+                (buffer_width, buffer_height),
+                &mut input_state,
             );
         }
         // Window hotkeys (default Ctrl+Alt+End to disconnect, Ctrl+Alt+Home
@@ -439,7 +439,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = input_tx.try_send(UiInput::Release);
     let _ = input_tx.try_send(UiInput::Stop);
-    for effect in rumble_effects.values() {
+    for effect in input_state.rumble_effects.values() {
         let _ = effect.stop();
     }
     let _ = worker.join();
@@ -477,14 +477,49 @@ fn selected_display_index(displays: &[RemoteDisplay]) -> Option<usize> {
 }
 
 #[allow(clippy::cast_possible_truncation)]
+/// Map a pointer position in window pixels onto the streamed image.
+///
+/// The host places absolute coordinates by scaling them out of the streamed
+/// image's own pixel space and into wherever that image sits on its desktop,
+/// so the client has to answer in that space -- not in the window's, which
+/// is whatever size the operator dragged it to.
+fn stream_pointer_position(
+    window_size: (usize, usize),
+    stream: (usize, usize),
+    pointer: (f32, f32),
+) -> (i32, i32) {
+    let map = |value: f32, window: usize, stream: usize| -> i32 {
+        if window == 0 || stream == 0 {
+            return 0;
+        }
+        let ratio = f64::from(value.max(0.0)) / window as f64;
+        let scaled = ratio * stream as f64;
+        // The last pixel is a valid position; one past it is not.
+        let limit = (stream - 1) as f64;
+        scaled.clamp(0.0, limit).round() as i32
+    };
+    (
+        map(pointer.0, window_size.0, stream.0),
+        map(pointer.1, window_size.1, stream.1),
+    )
+}
+
+/// Everything `forward_input` carries between calls.
+struct InputState {
+    /// Last position sent, in streamed-image pixels, so an unmoved pointer
+    /// is not resent every frame.
+    last_mouse: Option<(i32, i32)>,
+    button_state: [bool; 3],
+    gamepads: Option<Gilrs>,
+    gamepad_ids: HashMap<u32, GamepadId>,
+    rumble_effects: HashMap<u32, Effect>,
+}
+
 fn forward_input(
     window: &Window,
     input_tx: &InputSender,
-    last_mouse: &mut Option<(i32, i32)>,
-    button_state: &mut [bool; 3],
-    gamepads: &mut Option<Gilrs>,
-    gamepad_ids: &mut HashMap<u32, GamepadId>,
-    rumble_effects: &mut HashMap<u32, Effect>,
+    stream: (usize, usize),
+    state: &mut InputState,
 ) {
     let timestamp = monotonic_us();
     for &(key, usage) in keyboard_usages() {
@@ -501,17 +536,13 @@ fn forward_input(
     }
 
     if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
-        let current = (x as i32, y as i32);
-        if let Some(previous) = *last_mouse {
-            let dx = current.0.saturating_sub(previous.0);
-            let dy = current.1.saturating_sub(previous.1);
-            if dx != 0 || dy != 0 {
-                let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
-                    true, dx, dy, timestamp,
-                )));
-            }
+        let current = stream_pointer_position(window.get_size(), stream, (x, y));
+        if state.last_mouse != Some(current) {
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
+                false, current.0, current.1, timestamp,
+            )));
         }
-        *last_mouse = Some(current);
+        state.last_mouse = Some(current);
     }
 
     for (index, button) in [MouseButton::Left, MouseButton::Middle, MouseButton::Right]
@@ -519,13 +550,13 @@ fn forward_input(
         .enumerate()
     {
         let pressed = window.get_mouse_down(button);
-        if pressed != button_state[index] {
+        if pressed != state.button_state[index] {
             let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_button(
                 u32::try_from(index + 1).unwrap_or(1),
                 pressed,
                 timestamp,
             )));
-            button_state[index] = pressed;
+            state.button_state[index] = pressed;
         }
     }
 
@@ -539,7 +570,13 @@ fn forward_input(
         }
     }
 
-    poll_gamepads(gamepads, input_tx, timestamp, gamepad_ids, rumble_effects);
+    poll_gamepads(
+        &mut state.gamepads,
+        input_tx,
+        timestamp,
+        &mut state.gamepad_ids,
+        &mut state.rumble_effects,
+    );
 }
 
 fn poll_gamepads(
@@ -1553,7 +1590,7 @@ mod tests {
         InputSender, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
         axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
         gamepad_button_index, is_retryable, keyboard_usages, offer_decoded_frame,
-        selected_display_index,
+        selected_display_index, stream_pointer_position,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -1826,6 +1863,67 @@ mod tests {
         // A closed window ends the reader.
         drop(receiver);
         assert!(!offer_decoded_frame(&sender, vec![4]));
+    }
+
+    /// The pointer must be reported where it is in the *streamed image*,
+    /// not in the window.
+    ///
+    /// The host scales absolute coordinates out of the stream's pixel space
+    /// and onto wherever that image sits on its desktop. The client sent
+    /// relative deltas instead, so the remote cursor drifted away from the
+    /// local one and never came back -- and any window size other than the
+    /// stream size made the drift worse with every movement.
+    #[test]
+    fn a_pointer_is_reported_in_the_streamed_images_own_pixels() {
+        let stream = (1920, 1080);
+
+        // A window smaller than the stream: the centre is still the centre.
+        assert_eq!(
+            stream_pointer_position((1280, 720), stream, (640.0, 360.0)),
+            (960, 540)
+        );
+
+        // Corners map to corners, and the far edge is the last pixel rather
+        // than one past it.
+        assert_eq!(
+            stream_pointer_position((1280, 720), stream, (0.0, 0.0)),
+            (0, 0)
+        );
+        assert_eq!(
+            stream_pointer_position((1280, 720), stream, (1280.0, 720.0)),
+            (1919, 1079)
+        );
+
+        // A window larger than the stream scales the other way.
+        assert_eq!(
+            stream_pointer_position((3840, 2160), stream, (1920.0, 1080.0)),
+            (960, 540)
+        );
+
+        // A window matching the stream is the identity.
+        assert_eq!(
+            stream_pointer_position(stream, stream, (123.0, 456.0)),
+            (123, 456)
+        );
+    }
+
+    /// Degenerate input must not panic or divide by zero.
+    #[test]
+    fn a_collapsed_window_reports_the_origin() {
+        assert_eq!(
+            stream_pointer_position((0, 0), (1920, 1080), (10.0, 10.0)),
+            (0, 0)
+        );
+        assert_eq!(
+            stream_pointer_position((1280, 720), (0, 0), (10.0, 10.0)),
+            (0, 0)
+        );
+        // Some backends report a negative position while dragging out of
+        // the window; it clamps rather than wrapping.
+        assert_eq!(
+            stream_pointer_position((1280, 720), (1920, 1080), (-5.0, -5.0)),
+            (0, 0)
+        );
     }
 
     #[test]
