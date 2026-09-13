@@ -26,6 +26,12 @@ use tokio_tungstenite::tungstenite::Message;
 /// completes within a tenth of a second.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to let a spawned peer settle before manipulating the test
+/// clock. This is a real-time wait because what it waits for -- a task
+/// finishing its socket setup -- is real I/O, and it is generous because
+/// the cost is paid once by one test while the alternative is a flake.
+const SETTLE_BEFORE_CLOCK_JUMP: Duration = Duration::from_millis(250);
+
 struct LoopbackIceEnv {
     previous: Option<String>,
 }
@@ -1185,9 +1191,15 @@ async fn host_first_waits_past_old_phase_deadline_then_exchanges_encrypted_contr
     });
 
     host_connected.await.expect("host reaches signaling");
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
+    // `host_connected` fires when the *bridge* finishes the WebSocket
+    // upgrade, which is strictly earlier than the host task returning from
+    // its own `connect` and reaching the deadline-free waiting state. There
+    // is no signal for the latter -- a host in that state sends nothing --
+    // so this settles for it. Four `yield_now()`s used to stand in for this
+    // and were not enough under a loaded `cargo test --workspace`: the clock
+    // jump below landed while the host was still mid-establishment and the
+    // run failed with `NoReachableCandidate` roughly half the time.
+    tokio::time::sleep(SETTLE_BEFORE_CLOCK_JUMP).await;
     tokio::time::pause();
     // The old implementation would have started candidate exchange as soon
     // as the host WebSocket opened and timed out after 15 seconds. Advancing
