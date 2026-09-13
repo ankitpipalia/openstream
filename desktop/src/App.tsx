@@ -13,6 +13,16 @@ import { SettingsPage } from "./pages/SettingsPage";
 
 const defaultAdapter = createDefaultAdapter();
 const BRIDGE_UNAVAILABLE_DETAIL = "The runtime bridge did not respond.";
+/**
+ * How often the shell re-reads the runtime snapshot.
+ *
+ * Rust reconciles its host state against the real agent on its own clock --
+ * a child that crashed, restarted, or exhausted its restart budget is not a
+ * reply to anything the operator did -- so a shell that only refreshed on
+ * user action would keep rendering whatever was true when the operator last
+ * pressed something.
+ */
+const SNAPSHOT_POLL_INTERVAL_MS = 2_000;
 
 interface AppProps {
   adapter?: ProductAdapter;
@@ -52,20 +62,24 @@ export function App({ adapter = defaultAdapter, initialPage = "computers" }: App
     let cancelled = false;
     setSnapshot(adapter.getSnapshot());
     const unsubscribe = adapter.subscribe(setSnapshot);
-    adapter
-      .refresh()
-      .then((next) => {
-        if (!cancelled) {
-          setSnapshot(next);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setSnapshot(createRuntimeUnavailableSnapshot(BRIDGE_UNAVAILABLE_DETAIL));
-        }
-      });
+    const refresh = () =>
+      adapter
+        .refresh()
+        .then((next) => {
+          if (!cancelled) {
+            setSnapshot(next);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSnapshot(createRuntimeUnavailableSnapshot(BRIDGE_UNAVAILABLE_DETAIL));
+          }
+        });
+    refresh();
+    const timer = setInterval(refresh, SNAPSHOT_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
+      clearInterval(timer);
       unsubscribe();
     };
   }, [adapter]);

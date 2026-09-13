@@ -24,8 +24,20 @@ mod unix_main {
     const TICK_INTERVAL: Duration = Duration::from_millis(100);
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// Everything `build_config` resolves from settings and environment.
+    struct AgentStartup {
+        config: HostAgentConfig,
+        report: openstream_host_agent::PreflightReport,
+        /// Whether the persisted settings ask this machine to host at launch.
+        host_enabled: bool,
+    }
+
     pub(crate) async fn run() -> Result<(), String> {
-        let (config, report) = build_config()?;
+        let AgentStartup {
+            config,
+            report,
+            host_enabled,
+        } = build_config()?;
         eprintln!(
             "OpenStream host agent: selected backend={}",
             report.selected.label()
@@ -47,12 +59,22 @@ mod unix_main {
         let mut sigterm = signal(SignalKind::terminate())
             .map_err(|error| format!("could not install SIGTERM handler: {error}"))?;
 
-        {
+        // Start a child at launch only when the persisted configuration says
+        // this machine hosts. The agent used to spawn one unconditionally, so
+        // a freshly opened desktop shell -- which starts from
+        // `HostStatus::Disabled` -- could report hosting as off while this
+        // process was already streaming. Hosting that nobody asked for is now
+        // waited for over IPC instead.
+        if host_enabled {
             let mut guard = agent.lock().await;
             let events = guard
                 .start(Instant::now())
                 .map_err(|error| error.to_string())?;
             log_events(&events);
+        } else {
+            eprintln!(
+                "OpenStream host agent: hosting is disabled in settings; waiting for a Start request"
+            );
         }
 
         loop {
@@ -243,7 +265,7 @@ mod unix_main {
         }
     }
 
-    fn build_config() -> Result<(HostAgentConfig, openstream_host_agent::PreflightReport), String> {
+    fn build_config() -> Result<AgentStartup, String> {
         let mut settings = default_config();
         apply_environment_overrides(&mut settings).map_err(|error| error.to_string())?;
         let explicit_child = env::var_os("OPENSTREAM_HOST_CHILD");
@@ -297,7 +319,11 @@ mod unix_main {
                 .with_pairing_file(path)
                 .map_err(|error| error.to_string())?;
         }
-        Ok((config, report))
+        Ok(AgentStartup {
+            config,
+            report,
+            host_enabled: settings.host.enabled,
+        })
     }
 
     fn pairing_file_from_environment_with(

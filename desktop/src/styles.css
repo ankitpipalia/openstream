@@ -95,7 +95,7 @@ button { color: inherit; }
 .status-pending .status-dot, .status-starting .status-dot { background: var(--yellow); }
 .status-experimental { color: var(--purple); border-color: rgba(189, 156, 255, .24); background: rgba(189, 156, 255, .08); }
 .status-experimental .status-dot { background: var(--purple); }
-.status-unavailable, .status-offline, .status-idle, .status-stopped { color: var(--muted); border-color: var(--border); background: rgba(145, 160, 178, .06); }
+.status-unavailable, .status-not-implemented, .status-offline, .status-idle, .status-stopped { color: var(--muted); border-color: var(--border); background: rgba(145, 160, 178, .06); }
 
 .primary-button, .secondary-button { min-height: 34px; padding: 0 13px; border-radius: 6px; font-size: 11px; font-weight: 650; cursor: pointer; transition: opacity .16s ease, background .16s ease; }
 .primary-button { border: 1px solid rgba(105, 183, 255, .5); background: var(--accent-strong); color: #07121d; }

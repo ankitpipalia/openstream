@@ -9,13 +9,14 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
@@ -91,6 +92,15 @@ enum UiMessage {
         weak: u8,
     },
     Displays(Vec<RemoteDisplay>),
+    /// The session dropped and the worker is waiting out its backoff before
+    /// trying again. The window must stop sampling and forwarding input
+    /// for the duration: nothing is draining the input queue while the
+    /// worker sleeps, so anything typed here would otherwise sit in the
+    /// queue and be delivered to whatever session connects next.
+    Reconnecting {
+        attempt: u32,
+        delay_ms: u64,
+    },
     End,
 }
 
@@ -108,7 +118,11 @@ impl UiSender {
     fn send(&self, message: UiMessage) -> Result<(), ()> {
         let critical = matches!(
             &message,
-            UiMessage::Ready { .. } | UiMessage::Error(_) | UiMessage::Displays(_) | UiMessage::End
+            UiMessage::Ready { .. }
+                | UiMessage::Error(_)
+                | UiMessage::Displays(_)
+                | UiMessage::Reconnecting { .. }
+                | UiMessage::End
         );
         let sender = if critical {
             &self.critical
@@ -344,8 +358,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     window.set_title(&format!("OpenStream -- {base_title} -- {monitor}"));
                 }
+                Ok(UiMessage::Reconnecting { attempt, delay_ms }) => {
+                    // Everything the operator does during the backoff is
+                    // discarded rather than queued: a key pressed now is
+                    // not a key pressed in the session that comes back.
+                    connected = false;
+                    last_mouse = None;
+                    button_state = [false; 3];
+                    let seconds = delay_ms as f64 / 1000.0;
+                    window.set_title(&format!(
+                        "OpenStream -- reconnecting in {seconds:.0}s (attempt {attempt})"
+                    ));
+                }
                 Ok(UiMessage::End) => {
                     connected = false;
+                    last_mouse = None;
+                    button_state = [false; 3];
                     window.set_title("OpenStream -- disconnected");
                 }
                 Ok(UiMessage::Metrics(line)) => {
@@ -822,10 +850,94 @@ fn run_worker(ui_tx: UiSender, input_rx: InputReceiver) {
     let _ = ui_tx.send(UiMessage::End);
 }
 
+/// Default reconnect budget. Bounded so an unreachable host eventually
+/// surfaces an error instead of retrying forever behind a blank window.
+const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// How long a negotiated session must survive before its predecessor's
+/// failures are forgiven.
+///
+/// Resetting the moment a session negotiates would be wrong in the other
+/// direction: a peer that accepts the handshake and drops immediately would
+/// refresh the budget on every attempt and retry at the floor delay
+/// forever. A session that negotiated and then stayed up this long has
+/// demonstrably made progress.
+const HEALTHY_SESSION: Duration = Duration::from_secs(30);
+
+/// An error that retrying cannot fix.
+///
+/// A missing pairing file, an unparseable environment variable, an absent
+/// FFmpeg binary, or a negotiated frame too large to decode will fail
+/// identically on every attempt. Retrying them costs the operator the whole
+/// 1 + 2 + 4 + 8 + 16 second schedule before the real problem is printed.
+#[derive(Debug)]
+struct TerminalError(Box<dyn std::error::Error + Send + Sync>);
+
+impl TerminalError {
+    fn new(cause: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self(cause.into())
+    }
+}
+
+impl fmt::Display for TerminalError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for TerminalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Whether an error from `network_session` is worth another attempt.
+fn is_retryable(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    !error.is::<TerminalError>()
+}
+
+/// How far a session got before it ended. `network_session` records the
+/// moment it finished negotiating, which is the earliest point at which the
+/// peer has proved it can complete an authenticated exchange.
+#[derive(Default)]
+struct SessionProgress {
+    negotiated_at: Option<Instant>,
+}
+
+impl SessionProgress {
+    fn negotiated(&mut self) {
+        self.negotiated_at = Some(Instant::now());
+    }
+
+    fn was_healthy(&self) -> bool {
+        self.negotiated_at
+            .is_some_and(|at| at.elapsed() >= HEALTHY_SESSION)
+    }
+}
+
+/// Discard input queued while no session was draining it, and report
+/// whether the operator asked to stop in the meantime.
+///
+/// Without this, keystrokes and clicks made during a backoff wait sit in
+/// the bounded queue and are delivered in full to whichever session
+/// connects next -- a key pressed and released before the drop arrives as
+/// a press in a session the operator never typed into, and a held button
+/// arrives with no matching release. Only the explicit stop survives.
+fn discard_stale_input(input_rx: &InputReceiver) -> bool {
+    let mut stop_requested = false;
+    while let Ok(input) = input_rx.try_recv() {
+        if matches!(input, UiInput::Stop) {
+            stop_requested = true;
+        }
+    }
+    stop_requested
+}
+
 /// Supervise the session. A transport error used to end the process, because
 /// the backoff schedule in `openstream-media` had no caller. Retry a bounded
 /// number of times instead, and reset the budget after a session that actually
-/// negotiated, so a long-lived connection does not inherit old failures.
+/// negotiated and stayed up, so a long-lived connection does not inherit old
+/// failures.
 async fn network_loop(
     ui_tx: UiSender,
     input_rx: InputReceiver,
@@ -839,39 +951,63 @@ async fn network_loop(
     };
     let mut supervisor = ReconnectSupervisor::new(max_attempts);
     loop {
-        match network_session(&ui_tx, &input_rx).await {
+        let mut progress = SessionProgress::default();
+        match network_session(&ui_tx, &input_rx, &mut progress).await {
             Ok(()) => return Ok(()),
             Err(error) => {
+                if !is_retryable(error.as_ref()) {
+                    return Err(error);
+                }
+                // A session that negotiated and then ran is evidence the
+                // configuration works; only consecutive failures count
+                // against the budget.
+                if progress.was_healthy() {
+                    supervisor.reset();
+                }
                 let Some(delay) = supervisor.next_delay() else {
                     return Err(error);
                 };
+                let attempt = supervisor.attempts();
                 eprintln!(
-                    "OpenStream session ended ({error}); reconnecting in {:.0}s (attempt {})",
+                    "OpenStream session ended ({error}); reconnecting in {:.0}s (attempt {attempt})",
                     delay.as_secs_f64(),
-                    supervisor.attempts()
                 );
+                // Tell the window before sleeping. Nothing drains the input
+                // queue while this task is parked, so the window has to stop
+                // filling it.
+                let _ = ui_tx.send(UiMessage::Reconnecting {
+                    attempt,
+                    delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                });
                 tokio::time::sleep(delay).await;
+                // Drop anything that was queued before the window saw the
+                // message above, so the new session starts from a clean
+                // input state.
+                if discard_stale_input(&input_rx) {
+                    return Ok(());
+                }
             }
         }
     }
 }
 
-/// Default reconnect budget. Bounded so an unreachable host eventually
-/// surfaces an error instead of retrying forever behind a blank window.
-const DEFAULT_RECONNECT_ATTEMPTS: u32 = 5;
-
 async fn network_session(
     ui_tx: &UiSender,
     input_rx: &InputReceiver,
+    progress: &mut SessionProgress,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let origin = env::var("OPENSTREAM_SIGNAL_ORIGIN")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let pairing = load_pairing_from_environment()?;
+    // Configuration faults are terminal: none of these produce a different
+    // answer on a second attempt, so waiting out the backoff schedule only
+    // delays showing the operator what is actually wrong.
+    let pairing = load_pairing_from_environment().map_err(TerminalError::new)?;
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| "0.0.0.0:0".to_string())
-        .parse::<SocketAddr>()?;
+        .parse::<SocketAddr>()
+        .map_err(TerminalError::new)?;
     let stun_servers = match env::var("OPENSTREAM_STUN_SERVERS") {
-        Ok(spec) => parse_stun_servers(&spec)?,
+        Ok(spec) => parse_stun_servers(&spec).map_err(TerminalError::new)?,
         Err(_) => Vec::new(),
     };
     let mut session =
@@ -902,14 +1038,17 @@ async fn network_session(
     let frame_bytes = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or("negotiated frame dimensions overflow")?;
+        .ok_or_else(|| TerminalError::new("negotiated frame dimensions overflow"))?;
     const MAX_DECODE_FRAME_BYTES: usize = 64 * 1024 * 1024;
     if frame_bytes > MAX_DECODE_FRAME_BYTES {
-        return Err(format!(
+        return Err(TerminalError::new(format!(
             "negotiated decoded frame is too large ({frame_bytes} bytes; limit {MAX_DECODE_FRAME_BYTES})"
-        )
+        ))
         .into());
     }
+    // The peer completed an authenticated negotiation, which is the earliest
+    // point at which this attempt counts as progress.
+    progress.negotiated();
     let _ = ui_tx.send(UiMessage::Ready {
         width,
         height,
@@ -931,7 +1070,9 @@ async fn network_session(
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|error| format!("could not start FFmpeg decoder: {error}"))?;
+            .map_err(|error| {
+                TerminalError::new(format!("could not start FFmpeg decoder: {error}"))
+            })?;
     let mut decoder_stdin = decoder
         .stdin
         .take()
@@ -1374,14 +1515,16 @@ impl From<io::Error> for UiMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, InputReceiver, InputSender,
-        UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display, decoder_args,
-        gamepad_axis_index, gamepad_button_index, keyboard_usages, selected_display_index,
+        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, HEALTHY_SESSION, InputReceiver,
+        InputSender, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
+        axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
+        gamepad_button_index, is_retryable, keyboard_usages, selected_display_index,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
     use openstream_media::displays::{Display, PRIMARY_FLAG, SELECTED_FLAG};
     use std::sync::mpsc;
+    use std::time::Instant;
 
     #[test]
     fn gamepad_layout_is_stable_across_platform_backends() {
@@ -1488,6 +1631,133 @@ mod tests {
         );
         assert!(sender.send(UiMessage::End).is_ok());
         assert!(matches!(receiver.try_recv(), Ok(UiMessage::End)));
+    }
+
+    fn input_channels() -> (InputSender, InputReceiver) {
+        let (normal_tx, normal_rx) = mpsc::sync_channel(64);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
+        (
+            InputSender {
+                normal: normal_tx,
+                critical: critical_tx,
+            },
+            InputReceiver {
+                normal: normal_rx,
+                critical: critical_rx,
+            },
+        )
+    }
+
+    fn key_event(down: bool) -> UiInput {
+        UiInput::Event(openstream_media::input::InputEvent::keyboard(
+            0x1a, 0, down, 1,
+        ))
+    }
+
+    /// Input typed while the worker is waiting out a reconnect backoff must
+    /// never reach the session that comes back.
+    ///
+    /// Nothing drains the queue while the worker sleeps, and the session
+    /// loop drains it in full the moment it starts, so without this a key
+    /// pressed and released during the wait is delivered to a session the
+    /// operator never typed into -- and a button still held when the
+    /// connection dropped arrives with no matching release.
+    #[test]
+    fn input_queued_during_a_reconnect_is_discarded_before_the_next_session() {
+        let (sender, receiver) = input_channels();
+        assert!(sender.try_send(key_event(true)).is_ok());
+        assert!(sender.try_send(key_event(false)).is_ok());
+        assert!(sender.try_send(UiInput::SelectDisplay(2)).is_ok());
+
+        assert!(!discard_stale_input(&receiver), "no stop was requested");
+        assert!(
+            receiver.try_recv().is_err(),
+            "the next session must start from an empty input queue"
+        );
+    }
+
+    /// An explicit stop is the one thing the discard must not swallow:
+    /// closing the window during a backoff wait has to end the worker
+    /// rather than start another attempt.
+    #[test]
+    fn a_stop_requested_during_a_reconnect_survives_the_discard() {
+        let (sender, receiver) = input_channels();
+        assert!(sender.try_send(key_event(true)).is_ok());
+        assert!(sender.try_send(UiInput::Stop).is_ok());
+
+        assert!(discard_stale_input(&receiver));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// The reconnect notice shares the priority lane with the other
+    /// lifecycle messages: the window has to see it even behind a backlog
+    /// of stale frames, because it is what stops input being sampled.
+    #[test]
+    fn a_reconnect_notice_survives_a_full_frame_queue() {
+        let (normal_tx, normal_rx) = mpsc::sync_channel(1);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_UI_QUEUE_CAPACITY);
+        let sender = UiSender {
+            normal: normal_tx,
+            critical: critical_tx,
+        };
+        let receiver = UiReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+        };
+        assert!(
+            sender
+                .send(UiMessage::Frame {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0],
+                })
+                .is_ok()
+        );
+        assert!(
+            sender
+                .send(UiMessage::Reconnecting {
+                    attempt: 1,
+                    delay_ms: 1_000,
+                })
+                .is_ok()
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(UiMessage::Reconnecting { attempt: 1, .. })
+        ));
+    }
+
+    /// A configuration fault fails identically on every attempt, so it must
+    /// not consume the retry budget or make the operator wait out the whole
+    /// backoff schedule before seeing what is wrong.
+    #[test]
+    fn a_configuration_fault_is_not_retried() {
+        let terminal: Box<dyn std::error::Error + Send + Sync> =
+            TerminalError::new("missing pairing file").into();
+        assert!(!is_retryable(terminal.as_ref()));
+        assert!(terminal.to_string().contains("missing pairing file"));
+
+        let transport: Box<dyn std::error::Error + Send + Sync> = "connection reset".into();
+        assert!(is_retryable(transport.as_ref()));
+    }
+
+    /// Only a session that negotiated *and* then stayed up forgives earlier
+    /// failures. A peer that accepts the handshake and drops immediately
+    /// would otherwise refresh the budget on every attempt and retry at the
+    /// floor delay forever.
+    #[test]
+    fn only_a_session_that_stayed_up_forgives_earlier_failures() {
+        let never = SessionProgress::default();
+        assert!(!never.was_healthy());
+
+        let mut just_negotiated = SessionProgress::default();
+        just_negotiated.negotiated();
+        assert!(!just_negotiated.was_healthy());
+
+        let long_lived = SessionProgress {
+            negotiated_at: Instant::now().checked_sub(HEALTHY_SESSION),
+        };
+        assert!(long_lived.was_healthy());
     }
 
     #[test]

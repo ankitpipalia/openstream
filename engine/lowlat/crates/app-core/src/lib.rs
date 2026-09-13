@@ -72,6 +72,34 @@ pub struct PermissionSet {
 }
 
 impl PermissionSet {
+    /// Zero authority. This is what an idle, signed-out, or failed app holds:
+    /// `view_only` still grants the right to see the remote screen, which is
+    /// not something a session that does not exist should confer.
+    pub const fn none() -> Self {
+        Self {
+            view: false,
+            keyboard: false,
+            mouse: false,
+            gamepad: false,
+            clipboard: false,
+            microphone: false,
+            tablet: false,
+            virtual_usb: false,
+        }
+    }
+
+    /// True when no capability at all is granted.
+    pub const fn is_empty(self) -> bool {
+        !(self.view
+            || self.keyboard
+            || self.mouse
+            || self.gamepad
+            || self.clipboard
+            || self.microphone
+            || self.tablet
+            || self.virtual_usb)
+    }
+
     pub const fn view_only() -> Self {
         Self {
             view: true,
@@ -113,8 +141,11 @@ impl PermissionSet {
 }
 
 impl Default for PermissionSet {
+    /// A permission set that materialises from nothing -- a `#[serde(default)]`
+    /// field, a `Default::default()` placeholder -- must grant nothing. A
+    /// caller that wants the view right has to ask for it by name.
     fn default() -> Self {
-        Self::view_only()
+        Self::none()
     }
 }
 
@@ -219,41 +250,92 @@ impl ConnectionRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiagnosticSnapshot {
-    pub signal: String,
-    pub direct_udp: String,
-    pub stun: String,
-    pub relay: String,
-    pub turn: String,
-    pub capture_backend: String,
-    pub encoder: String,
-    pub decoder: String,
-    pub renderer: String,
-    pub audio: String,
-    pub input: String,
-    pub virtual_devices: String,
-    pub last_error: Option<AppErrorCode>,
+/// Runtime truth for one diagnostic probe.
+///
+/// This is a closed set decided in Rust, never inferred by a consumer from
+/// prose. A shell that has to guess -- treating any string it does not
+/// recognise as working -- turns "not implemented", "disabled", or "not
+/// configured" into a green check, which is precisely the failure mode that
+/// makes hardware debugging miserable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticState {
+    /// Probed and working.
+    Available,
+    /// Not probed yet, or waiting on something else to start.
+    Pending,
+    /// Implemented and usable, but not covered by the acceptance gates.
+    Experimental,
+    /// Implemented, but unusable here: absent hardware, denied permission,
+    /// or a policy that switches it off.
+    Unavailable,
+    /// No implementation exists on this platform. Distinct from
+    /// `Unavailable`, which a configuration change could resolve.
+    NotImplemented,
 }
 
-impl Default for DiagnosticSnapshot {
-    fn default() -> Self {
+impl DiagnosticState {
+    /// Whether the probe reports a working capability. Nothing but
+    /// `Available` does.
+    pub const fn is_available(self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+/// One probe result: a machine-readable state plus operator-facing prose.
+/// Consumers render `detail`; they branch only on `state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Diagnostic {
+    pub state: DiagnosticState,
+    pub detail: String,
+}
+
+impl Diagnostic {
+    pub fn new(state: DiagnosticState, detail: impl Into<String>) -> Self {
         Self {
-            signal: "unknown".into(),
-            direct_udp: "unknown".into(),
-            stun: "unknown".into(),
-            relay: "unknown".into(),
-            turn: "unknown".into(),
-            capture_backend: "unknown".into(),
-            encoder: "unknown".into(),
-            decoder: "unknown".into(),
-            renderer: "unknown".into(),
-            audio: "unknown".into(),
-            input: "unknown".into(),
-            virtual_devices: "unknown".into(),
-            last_error: None,
+            state,
+            detail: detail.into(),
         }
     }
+
+    pub fn available(detail: impl Into<String>) -> Self {
+        Self::new(DiagnosticState::Available, detail)
+    }
+
+    pub fn pending(detail: impl Into<String>) -> Self {
+        Self::new(DiagnosticState::Pending, detail)
+    }
+
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self::new(DiagnosticState::Unavailable, detail)
+    }
+
+    pub fn not_implemented(detail: impl Into<String>) -> Self {
+        Self::new(DiagnosticState::NotImplemented, detail)
+    }
+}
+
+impl Default for Diagnostic {
+    fn default() -> Self {
+        Self::pending("Not probed yet.")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiagnosticSnapshot {
+    pub signal: Diagnostic,
+    pub direct_udp: Diagnostic,
+    pub stun: Diagnostic,
+    pub relay: Diagnostic,
+    pub turn: Diagnostic,
+    pub capture_backend: Diagnostic,
+    pub encoder: Diagnostic,
+    pub decoder: Diagnostic,
+    pub renderer: Diagnostic,
+    pub audio: Diagnostic,
+    pub input: Diagnostic,
+    pub virtual_devices: Diagnostic,
+    pub last_error: Option<AppErrorCode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +436,11 @@ pub enum AppCommand {
     Disconnected,
     EnableHosting,
     DisableHosting,
+    /// The agent observed its child leave a ready state and start again --
+    /// a crash followed by a restart, or a backoff wait. This is an
+    /// observation, not an intent: it never enables hosting the operator
+    /// turned off, so a `Disabled` model stays disabled.
+    HostStarting,
     HostReady,
     HostFailed {
         message: String,
@@ -386,6 +473,8 @@ pub enum AppEvent {
     DisconnectRequested,
     Disconnected,
     HostStartRequested,
+    /// The agent's child left a ready state and is starting again.
+    HostStarting,
     HostReady,
     HostStopRequested,
     HostFailed {
@@ -436,7 +525,7 @@ impl AppModel {
             used_request_ids: Vec::new(),
             active_device_id: None,
             active_session_id: None,
-            active_permissions: PermissionSet::view_only(),
+            active_permissions: PermissionSet::none(),
         }
     }
 
@@ -480,7 +569,7 @@ impl AppModel {
     fn clear_active_session(&mut self) {
         self.active_device_id = None;
         self.active_session_id = None;
-        self.active_permissions = PermissionSet::view_only();
+        self.active_permissions = PermissionSet::none();
         self.pending_request = None;
     }
 
@@ -692,6 +781,23 @@ impl AppModel {
                 } else {
                     Vec::new()
                 })
+            }
+            AppCommand::HostStarting => {
+                // Only a model that already believes hosting is wanted may
+                // be moved back to `Starting`. `Disabled` is the operator's
+                // decision and an agent observation does not overturn it.
+                if matches!(self.host_status, HostStatus::Disabled) {
+                    return Err(AppError::new(
+                        AppErrorCode::InvalidState,
+                        false,
+                        "hosting is disabled",
+                    ));
+                }
+                if matches!(self.host_status, HostStatus::Starting) {
+                    return Ok(Vec::new());
+                }
+                self.host_status = HostStatus::Starting;
+                Ok(vec![AppEvent::HostStarting])
             }
             AppCommand::HostReady => {
                 if !matches!(self.host_status, HostStatus::Starting | HostStatus::Ready) {
@@ -1080,10 +1186,14 @@ mod tests {
 
         let snapshot = model.snapshot(DiagnosticSnapshot::default());
         assert!(matches!(snapshot.state, AppState::Failed { .. }));
-        // The authority of a dead session must not survive it.
+        // The authority of a dead session must not survive it. Not even the
+        // view right: with no session there is nothing to view, and a
+        // non-empty `active_permissions` is exactly the stale grant a later
+        // caller would read as "this much is still allowed".
         assert_eq!(snapshot.active_device_id, None);
         assert_eq!(snapshot.active_session_id, None);
-        assert_eq!(snapshot.active_permissions, PermissionSet::view_only());
+        assert_eq!(snapshot.active_permissions, PermissionSet::none());
+        assert!(snapshot.active_permissions.is_empty());
         assert!(snapshot.pending_request.is_none());
     }
 
@@ -1117,7 +1227,36 @@ mod tests {
         let snapshot = model.snapshot(DiagnosticSnapshot::default());
         assert!(matches!(snapshot.state, AppState::Failed { .. }));
         assert_eq!(snapshot.active_session_id, None);
-        assert_eq!(snapshot.active_permissions, PermissionSet::view_only());
+        assert!(snapshot.active_permissions.is_empty());
+    }
+
+    /// A child that crashes right after it was reported ready must be able
+    /// to move the model back to `Starting`. Without this transition the
+    /// shell keeps claiming a host is up while the agent is restarting it.
+    #[test]
+    fn a_restarting_child_moves_a_ready_host_back_to_starting() {
+        let mut model = model();
+        model.dispatch(AppCommand::EnableHosting).unwrap();
+        model.dispatch(AppCommand::HostReady).unwrap();
+        assert_eq!(model.host_status(), HostStatus::Ready);
+
+        let events = model.dispatch(AppCommand::HostStarting).unwrap();
+        assert_eq!(events, vec![AppEvent::HostStarting]);
+        assert_eq!(model.host_status(), HostStatus::Starting);
+
+        // Already starting is a no-op, not a repeated event.
+        assert!(model.dispatch(AppCommand::HostStarting).unwrap().is_empty());
+    }
+
+    /// `HostStarting` is an observation of the agent, never an intent. It
+    /// must not be able to switch hosting back on after the operator
+    /// disabled it.
+    #[test]
+    fn a_restart_observation_cannot_re_enable_disabled_hosting() {
+        let mut model = model();
+        assert_eq!(model.host_status(), HostStatus::Disabled);
+        assert!(model.dispatch(AppCommand::HostStarting).is_err());
+        assert_eq!(model.host_status(), HostStatus::Disabled);
     }
 
     #[test]

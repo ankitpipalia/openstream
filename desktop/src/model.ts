@@ -8,7 +8,7 @@ export const navigationItems: ReadonlyArray<{ id: PageId; label: string; hint: s
   { id: "about", label: "About", hint: "Version and project details" },
 ];
 
-export type CapabilityState = "available" | "pending" | "unavailable" | "experimental";
+export type CapabilityState = "available" | "pending" | "unavailable" | "experimental" | "not-implemented";
 
 export interface Capability {
   id: string;
@@ -144,6 +144,8 @@ export function capabilityLabel(state: CapabilityState): string {
       return "Experimental";
     case "unavailable":
       return "Unavailable";
+    case "not-implemented":
+      return "Not implemented";
   }
 }
 

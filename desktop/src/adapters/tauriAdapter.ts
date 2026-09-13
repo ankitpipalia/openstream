@@ -70,19 +70,33 @@ interface ConnectionRequest {
   expires_at_ms: number;
 }
 
+/// Runtime truth for one probe, decided in Rust. The state is a closed set
+/// and the detail is prose for the operator; nothing here is parsed.
+export type DiagnosticState =
+  | "available"
+  | "pending"
+  | "experimental"
+  | "unavailable"
+  | "not_implemented";
+
+export interface Diagnostic {
+  state: DiagnosticState;
+  detail: string;
+}
+
 interface RuntimeDiagnostics {
-  signal: string;
-  direct_udp: string;
-  stun: string;
-  relay: string;
-  turn: string;
-  capture_backend: string;
-  encoder: string;
-  decoder: string;
-  renderer: string;
-  audio: string;
-  input: string;
-  virtual_devices: string;
+  signal: Diagnostic;
+  direct_udp: Diagnostic;
+  stun: Diagnostic;
+  relay: Diagnostic;
+  turn: Diagnostic;
+  capture_backend: Diagnostic;
+  encoder: Diagnostic;
+  decoder: Diagnostic;
+  renderer: Diagnostic;
+  audio: Diagnostic;
+  input: Diagnostic;
+  virtual_devices: Diagnostic;
   last_error: AppErrorCode | null;
 }
 
@@ -540,19 +554,35 @@ function mapAccess(app: AppSnapshot): AccessSnapshot {
   return { pairing, controlPlane, trustedDevices: [] };
 }
 
-function diagnosticState(value: string): CapabilityState {
-  const normalized = value.toLowerCase();
-  if (normalized === "unknown") {
-    return "pending";
+/// Translate Rust's diagnostic state into the shell's capability state.
+///
+/// This used to infer the state from the prose: anything that was not
+/// literally "unknown" and did not contain "fail", "error", or
+/// "unavailable" was rendered as a green Available. That turned "not
+/// implemented", "disabled", "pending", "experimental", and "not
+/// configured" into working capabilities, which is the worst possible
+/// answer to give someone debugging hardware. Rust now decides, and this
+/// only renames.
+function diagnosticState(value: DiagnosticState): CapabilityState {
+  switch (value) {
+    case "available":
+      return "available";
+    case "experimental":
+      return "experimental";
+    case "unavailable":
+      return "unavailable";
+    case "not_implemented":
+      return "not-implemented";
+    case "pending":
+      return "pending";
+    default:
+      // An unrecognised state is not evidence that anything works.
+      return "unavailable";
   }
-  if (normalized.includes("fail") || normalized.includes("error") || normalized.includes("unavailable")) {
-    return "unavailable";
-  }
-  return "available";
 }
 
-function diagnosticCapability(id: string, label: string, value: string): Capability {
-  return capability(id, label, diagnosticState(value), `Reported as "${value}".`);
+function diagnosticCapability(id: string, label: string, value: Diagnostic): Capability {
+  return capability(id, label, diagnosticState(value.state), value.detail);
 }
 
 function mapSessionState(app: AppSnapshot): DiagnosticsSnapshot["session"] {

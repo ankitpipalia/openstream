@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { createDefaultAdapter, createTauriAdapter } from "./tauriAdapter";
 import type {
   AppConfig,
+  Diagnostic,
   RuntimeDispatchResult,
   RuntimeSnapshot,
   SettingApplyMode,
@@ -119,6 +120,10 @@ function runtimeConfigFixture(): AppConfig {
   };
 }
 
+function pendingDiagnostic(): Diagnostic {
+  return { state: "pending", detail: "Not probed yet." };
+}
+
 function runtimeSnapshotFixture(): RuntimeSnapshot {
   return {
     app: {
@@ -140,18 +145,18 @@ function runtimeSnapshotFixture(): RuntimeSnapshot {
         virtual_usb: false,
       },
       diagnostics: {
-        signal: "unknown",
-        direct_udp: "unknown",
-        stun: "unknown",
-        relay: "unknown",
-        turn: "unknown",
-        capture_backend: "unknown",
-        encoder: "unknown",
-        decoder: "unknown",
-        renderer: "unknown",
-        audio: "unknown",
-        input: "unknown",
-        virtual_devices: "unknown",
+        signal: pendingDiagnostic(),
+        direct_udp: pendingDiagnostic(),
+        stun: pendingDiagnostic(),
+        relay: pendingDiagnostic(),
+        turn: pendingDiagnostic(),
+        capture_backend: pendingDiagnostic(),
+        encoder: pendingDiagnostic(),
+        decoder: pendingDiagnostic(),
+        renderer: pendingDiagnostic(),
+        audio: pendingDiagnostic(),
+        input: pendingDiagnostic(),
+        virtual_devices: pendingDiagnostic(),
         last_error: null,
       },
     },
@@ -264,6 +269,39 @@ describe("tauri adapter", () => {
 
     const snapshot = await adapter.updateSettings(updated.settings);
     expect(snapshot.settings[0].items[0].value).toBe("performance");
+  });
+
+  it("renders the diagnostic state Rust reported, never one inferred from its prose", async () => {
+    const fixture = runtimeSnapshotFixture();
+    const snapshotWithProbes: RuntimeSnapshot = {
+      ...fixture,
+      app: {
+        ...fixture.app,
+        diagnostics: {
+          ...fixture.app.diagnostics,
+          // Prose that the old text-sniffing adapter turned green: none of
+          // these contain "fail", "error", or "unavailable", so anything
+          // that guesses from the words reports a working capability.
+          encoder: { state: "not_implemented", detail: "No native encoder on this platform." },
+          renderer: { state: "unavailable", detail: "Disabled by policy." },
+          audio: { state: "experimental", detail: "Not covered by the acceptance gates." },
+          input: { state: "available", detail: "uinput probe succeeded." },
+        },
+      },
+    };
+
+    const adapter = createTauriAdapter(async () => snapshotWithProbes);
+    const snapshot = await adapter.refresh();
+    const state = (id: string) =>
+      snapshot.diagnostics.checks.find((check) => check.id === id)?.state;
+
+    expect(state("encoder")).toBe("not-implemented");
+    expect(state("renderer")).toBe("unavailable");
+    expect(state("audio")).toBe("experimental");
+    expect(state("input")).toBe("available");
+
+    const detail = snapshot.diagnostics.checks.find((check) => check.id === "encoder")?.detail;
+    expect(detail).toBe("No native encoder on this platform.");
   });
 
   it("propagates a bridge failure instead of fabricating an available snapshot", async () => {
