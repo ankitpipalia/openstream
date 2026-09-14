@@ -34,6 +34,10 @@ workspace = true
 
 [dev-dependencies]
 tokio-tungstenite.workspace = true
+# Already in the dependency graph via axum, so this adds no new supply-chain
+# surface. `ServiceExt::oneshot` drives the real router in-process, which
+# tests the routes and extractors rather than the handler functions alone.
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
