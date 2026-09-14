@@ -72,8 +72,15 @@ const PULSE_OFF: u32 = 0x0030_3040;
 /// and the loop does no work in that time beyond pumping events.
 const IDLE_FRAME: Duration = Duration::from_millis(2);
 
-/// Default interval between re-uploads of an unchanged surface, in
-/// milliseconds. Overridden by `OPENSTREAM_PROBE_HEARTBEAT_MS`.
+/// Default interval between the *starts* of re-uploads of an unchanged
+/// surface, in milliseconds. Overridden by
+/// `OPENSTREAM_PROBE_HEARTBEAT_MS`.
+///
+/// Start-to-start, so the requested rate is `1000 / heartbeat` and the
+/// upload's own cost does not silently lengthen the period. Measuring from
+/// the end of the previous upload made a 16ms setting run at about 49Hz
+/// rather than 62.5Hz, and that shortfall then looked like evidence about
+/// the capture path.
 ///
 /// This setting decides what the probe is measuring, so it is worth being
 /// explicit about both directions.
@@ -137,8 +144,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         marker_height()
     );
     println!(
-        "OpenStream probe helper: heartbeat {}ms -- the capture runs no faster than this",
-        heartbeat.as_millis()
+        "OpenStream probe helper: heartbeat {}ms start-to-start ({:.1}/s requested) -- \
+         the capture runs no faster than this",
+        heartbeat.as_millis(),
+        1.0 / heartbeat.as_secs_f64()
     );
     println!("OpenStream probe helper: give the client the same origin; Escape quits");
 
@@ -212,7 +221,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             uploads += 1;
             upload_total += took;
             upload_max = upload_max.max(took);
-            last_upload = Instant::now();
+            // Start-to-start, not end-to-start. Stamping after the upload
+            // made the real period `heartbeat + upload`: a 16ms heartbeat
+            // with a 4.5ms upload ran at about 49Hz, and the shortfall
+            // against the requested rate was the helper's own scheduling
+            // rather than anything downstream of it.
+            last_upload = began;
         } else {
             window.update();
         }

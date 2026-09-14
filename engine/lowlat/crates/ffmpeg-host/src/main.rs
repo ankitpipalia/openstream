@@ -316,7 +316,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         path: format!("{:?}", session.connection_path()),
         profile: profile.pix_fmt.clone(),
         bitrate_mbps: Some(format!("{:.2}", profile.bitrate_mbps)),
-        capture_backend: Some(capture_backend.clone()),
+        // `capture_backend` is derived from the platform default unless the
+        // operator set it. When custom FFmpeg arguments supply the real
+        // capture path, the derived value describes something that is not
+        // running, so it is withheld rather than exported as fact.
+        capture_backend: if env::var_os("OPENSTREAM_FFMPEG_ARGS").is_some()
+            && env::var_os("OPENSTREAM_CAPTURE_BACKEND").is_none()
+        {
+            None
+        } else {
+            Some(capture_backend.clone())
+        },
         encoder: Some(profile.encoder.clone()),
         host_observability: Some(observability),
         ..RunContext::default()

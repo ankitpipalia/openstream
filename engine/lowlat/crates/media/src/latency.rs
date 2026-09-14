@@ -396,6 +396,15 @@ pub enum TraceEnd {
     TraceRingEvicted,
     /// The session ended before the frame did.
     SessionEnded,
+    /// Complete and correctly released, then deliberately discarded because
+    /// the decoder was waiting for a keyframe to recover.
+    ///
+    /// Distinct from [`Self::Superseded`] on purpose. Both retire an
+    /// unfinished timeline, but one means "a newer frame pushed this out of
+    /// the window" and the other means "the client chose not to decode a
+    /// frame it had in hand". Reading a recovery skip as contention would
+    /// send someone looking for a queueing problem that is not there.
+    RecoverySkipped,
     /// No further capture progress within the liveness deadline.
     CaptureStalled,
     /// The decoder accepted the frame and produced nothing.
@@ -1297,7 +1306,8 @@ mod tests {
 #[cfg(test)]
 mod trace_end_tests {
     use super::{
-        Client, ClientRecorder, ClientStage, IN_FLIGHT_CAPACITY, Stamp, TRACE_CAPACITY, TraceEnd,
+        Client, ClientRecorder, ClientStage, IN_FLIGHT_CAPACITY, SpanValue, Stamp, TRACE_CAPACITY,
+        TraceEnd,
     };
     use std::time::{Duration, Instant};
 
@@ -1376,10 +1386,45 @@ mod trace_end_tests {
     }
 
     /// Housekeeping is not a stall, and a stall is not housekeeping.
+    /// A frame the client deliberately skipped during recovery gets its own
+    /// terminal reason, so a trace does not read it as contention.
+    #[test]
+    fn a_recovery_skip_is_not_contention_and_not_a_stall() {
+        let base = Instant::now();
+        let mut recorder = ClientRecorder::new(&ClientStage::ORDER);
+        recorder.set_tracing(true);
+
+        // A gap raised a keyframe request; this dependent frame is released
+        // in order and then deliberately not decoded.
+        recorder.begin(9, at(base, 0));
+        recorder.mark(9, ClientStage::LastFragmentReceived, at(base, 2));
+        recorder.mark(9, ClientStage::Reassembled, at(base, 3));
+        recorder.abandon_frame(9, TraceEnd::RecoverySkipped);
+
+        assert_eq!(recorder.in_flight(), 0, "the timeline does not linger");
+        assert_eq!(
+            recorder.stalls(),
+            0,
+            "choosing not to decode is not a stall"
+        );
+        let trace = recorder.traces().next().expect("one trace");
+        assert_eq!(trace.ended, Some(TraceEnd::RecoverySkipped));
+        assert!(
+            trace.stamp_of(ClientStage::DecoderSubmitted).is_none(),
+            "no submission is invented for a frame that was never submitted"
+        );
+        assert_eq!(
+            recorder.span_value(ClientStage::Reassembled, ClientStage::DecoderSubmitted),
+            SpanValue::NoSamples { invalid: 0 },
+            "and it contributes no sample to the span it never crossed"
+        );
+    }
+
     #[test]
     fn only_real_stalls_count_as_stalls() {
         assert!(!TraceEnd::Completed.is_stall());
         assert!(!TraceEnd::Superseded.is_stall());
+        assert!(!TraceEnd::RecoverySkipped.is_stall());
         assert!(!TraceEnd::TraceRingEvicted.is_stall());
         assert!(!TraceEnd::SessionEnded.is_stall());
         assert!(TraceEnd::CaptureStalled.is_stall());
@@ -1958,7 +2003,14 @@ pub struct RunContext {
     pub host_observability: Option<HostObservability>,
     /// Client-side configuration. `None` on a host export.
     pub decoder: Option<String>,
-    pub presenter: Option<String>,
+    /// The presenter the client was *configured* to use.
+    ///
+    /// Named for that rather than for the presenter in use, because the
+    /// window can fall back from a native renderer to the software path at
+    /// runtime and the session task that exports this does not own the
+    /// window. A trace claiming `Metal` while minifb was actually blitting
+    /// would be worse than one that says what was asked for.
+    pub configured_presenter: Option<String>,
     pub vsync: Option<String>,
     pub client_observability: Option<ClientObservability>,
 }
@@ -1980,7 +2032,7 @@ impl Default for RunContext {
             encoder: None,
             host_observability: None,
             decoder: None,
-            presenter: None,
+            configured_presenter: None,
             vsync: None,
             client_observability: None,
         }
@@ -2024,7 +2076,7 @@ impl RunContext {
             stated("capture", self.capture_backend.as_deref()),
             stated("encoder", self.encoder.as_deref()),
             stated("decoder", self.decoder.as_deref()),
-            stated("presenter", self.presenter.as_deref()),
+            stated("configured_presenter", self.configured_presenter.as_deref()),
             stated("vsync", self.vsync.as_deref()),
         ];
         if let Some(observability) = self.host_observability {
@@ -2093,7 +2145,7 @@ mod context_tests {
             encoder: Some("h264_nvenc".into()),
             host_observability: Some(HostObservability::EncodedStreamOnly),
             decoder: Some("ffmpeg".into()),
-            presenter: Some("minifb-software".into()),
+            configured_presenter: Some("minifb-software".into()),
             vsync: Some("off".into()),
             client_observability: None,
         };
@@ -2106,7 +2158,7 @@ mod context_tests {
             "fps=30",
             "encoder=",
             "decoder=",
-            "presenter=",
+            "configured_presenter=",
             "path=",
             "vsync=",
             "profile=",
@@ -2140,7 +2192,7 @@ mod context_tests {
             path: "direct".into(),
             profile: "balanced".into(),
             decoder: Some("ffmpeg".into()),
-            presenter: Some("minifb-software".into()),
+            configured_presenter: Some("minifb-software".into()),
             vsync: Some("off".into()),
             client_observability: Some(ClientObservability::ExternalDecoder),
             ..RunContext::default()

@@ -1395,7 +1395,7 @@ async fn network_session(
         // The presenter is chosen in `main` and the window is not this
         // task's to inspect, so the backend it settled on is named there
         // and not guessed here.
-        presenter: Some(format!("{:?}", render::RenderBackend::from_env())),
+        configured_presenter: Some(format!("{:?}", render::RenderBackend::from_env())),
         // minifb's software path does not expose whether the compositor
         // synchronised the update, and saying "off" would be a guess.
         vsync: Some("not-reported-by-presenter".to_string()),
@@ -1672,16 +1672,26 @@ async fn network_session(
                     // decode in order. Nothing more will arrive for it.
                     stages.abandon_frame(*dropped, TraceEnd::Superseded);
                 }
-                ready_frames.extend(outcome.ready);
+                // The release stamp is taken here, as each frame leaves the
+                // reorder buffer, and carried with it. Stamping inside the
+                // loop below instead put two unrelated awaits inside the
+                // span: the reliable keyframe request, and -- for every
+                // frame after the first -- the previous frame's decoder
+                // write and ACK. That is what the 290ms tail in the
+                // `LastFragmentReceived -> Reassembled` measurement was
+                // actually timing.
+                if let Some(frame) = outcome.ready {
+                    ready_frames.push((frame, Stamp::<ClientClock>::now()));
+                }
                 while let Some(frame) = assembler.pop_ready() {
-                    ready_frames.push(frame);
+                    ready_frames.push((frame, Stamp::<ClientClock>::now()));
                 }
                 if assembler.take_keyframe_request() {
                     waiting_for_keyframe = true;
                     reliable_control.send(&mut session, KEYFRAME_REQUEST).await?;
                 }
-                for frame in ready_frames {
-                    stages.mark(frame.frame_id, ClientStage::Reassembled, Stamp::now());
+                for (frame, released_at) in ready_frames {
+                    stages.mark(frame.frame_id, ClientStage::Reassembled, released_at);
                     if frame.keyframe {
                         waiting_for_keyframe = false;
                     }
@@ -1704,11 +1714,14 @@ async fn network_session(
                             .send_if_available(&mut session, &ack)
                             .await?;
                     } else {
-                        // Discarded while waiting for a keyframe. It has a
-                        // beginning and no end, and leaving it in the ring
-                        // would let it be evicted later and counted as a
-                        // stall that never happened.
-                        stages.abandon_frame(frame.frame_id, TraceEnd::Superseded);
+                        // Complete, correctly released, and then dropped
+                        // because the decoder is waiting to recover. Retired
+                        // under its own reason rather than `Superseded`:
+                        // nothing pushed this frame out, the client chose
+                        // not to decode it, and reading that as contention
+                        // sends someone hunting a queueing problem that is
+                        // not there.
+                        stages.abandon_frame(frame.frame_id, TraceEnd::RecoverySkipped);
                     }
                 }
             }
@@ -2018,6 +2031,9 @@ struct ProbeState {
     /// Reported rather than silently retried: a benchmark that quietly
     /// stops measuring looks exactly like one that is measuring fine.
     timeouts: u64,
+    /// Why this session's interaction measurement stopped being trustworthy,
+    /// if it did. `Some` means no further probes are sent.
+    invalidated: Option<&'static str>,
 }
 
 /// The client's always-on frame accounting and its opt-in interaction probe.
@@ -2056,6 +2072,7 @@ impl ClientTelemetry {
                 key_down: false,
                 last_sent_at: None,
                 timeouts: 0,
+                invalidated: None,
             }),
         }
     }
@@ -2114,6 +2131,20 @@ impl ClientTelemetry {
     /// first rig run three quarters of its probes.
     fn next_probe_action(&mut self, at: Stamp<ClientClock>) -> ProbeAction {
         self.expire_stale_probe(at);
+        // Once invalid, the only thing left to do is let go of the key.
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|state| state.invalidated.is_some())
+        {
+            return match self.probe.as_mut() {
+                Some(state) if state.key_down => {
+                    state.key_down = false;
+                    ProbeAction::Release
+                }
+                _ => ProbeAction::Idle,
+            };
+        }
         let Some(next) = self.next_probe_id() else {
             // Still holding the key, or nothing new to send. Releasing takes
             // priority: the key must not stay down across a stall.
@@ -2151,6 +2182,9 @@ impl ClientTelemetry {
         let Some(state) = self.probe.as_mut() else {
             return;
         };
+        if state.invalidated.is_some() {
+            return;
+        }
         let (Some(sent_id), Some(sent_at)) = (state.last_sent, state.last_sent_at) else {
             return;
         };
@@ -2164,9 +2198,12 @@ impl ClientTelemetry {
         state.timeouts = state.timeouts.saturating_add(1);
         state.last_sent = None;
         state.last_sent_at = None;
+        state.invalidated =
+            Some("a probe timed out; a delayed input event cannot be told from a lost one");
         eprintln!(
             "OpenStream interaction probe {sent_id} timed out after {}s; \
-             the host helper did not advance its marker",
+             interaction measurement for this session is now invalid and \
+             probing has stopped",
             PROBE_TIMEOUT.as_secs_f64()
         );
     }
@@ -2191,6 +2228,9 @@ impl ClientTelemetry {
         state.last_seen = None;
         state.last_sent = None;
         state.last_sent_at = None;
+        // A new session is a new measurement: nothing in flight from the old
+        // one can reach the new helper's marker state.
+        state.invalidated = None;
         // The host's virtual keyboard state does not survive the session
         // either, so the next one starts with nothing held.
         state.key_down = false;
@@ -2206,6 +2246,17 @@ impl ClientTelemetry {
                 state.timeouts,
                 state.probe.outstanding()
             ));
+            if let Some(reason) = state.invalidated {
+                // A reader who quotes the interaction numbers without this
+                // line is quoting a measurement that stopped partway
+                // through the run.
+                lines.push(format!("probe INVALID: {reason}"));
+                lines.push(
+                    "probe the interaction spans above cover only what was \
+                     measured before that point"
+                        .to_string(),
+                );
+            }
         }
         lines
     }
@@ -2851,14 +2902,18 @@ mod tests {
         );
     }
 
-    /// A lost keystroke must not stop the benchmark forever.
+    /// A probe timeout invalidates the session's interaction measurement
+    /// rather than re-arming the same id.
     ///
-    /// The marker only moves when the helper receives an event, so a lost
-    /// press leaves `last_sent` equal to the next id and "never resend the
-    /// same id" suppresses every subsequent tick. The client then waits
-    /// silently, which looks exactly like a benchmark that is working.
+    /// Re-arming looks safe and is not. The input event travels over the
+    /// reliable control channel, which retransmits, so a benchmark timeout
+    /// says nothing about whether that record is still in flight. If the
+    /// delayed event lands after a new probe for the same id was stamped,
+    /// the client credits an old keystroke against a new timestamp and
+    /// reports an impossibly fast interaction. The client cannot tell that
+    /// apart from a real one, so it stops measuring and says so.
     #[test]
-    fn a_probe_whose_keystroke_was_lost_times_out_loudly_and_re_arms() {
+    fn a_probe_timeout_invalidates_the_session_rather_than_re_arming() {
         let origin = (0, 0);
         let base = Instant::now();
         let at = |ms: u64| Stamp::<ClientClock>::from_instant(base + Duration::from_millis(ms));
@@ -2871,25 +2926,85 @@ mod tests {
         assert_eq!(telemetry.next_probe_action(at(500)), ProbeAction::Idle);
         assert_eq!(telemetry.next_probe_action(at(1_000)), ProbeAction::Idle);
 
-        // Past the timeout the probe is given up on and a new one goes out.
+        // Past the timeout the probe is given up on and nothing new goes
+        // out: a delayed reliable input record may still be travelling, and
+        // crediting it against a fresh stamp would manufacture a fast
+        // sample rather than a slow one.
         let after = u64::try_from(PROBE_TIMEOUT.as_millis()).expect("small") + 100;
-        assert_eq!(telemetry.next_probe_action(at(after)), ProbeAction::Press);
+        assert_eq!(
+            telemetry.next_probe_action(at(after)),
+            ProbeAction::Idle,
+            "the key was already released on the previous tick"
+        );
+        assert_eq!(
+            telemetry.next_probe_action(at(after + 500)),
+            ProbeAction::Idle
+        );
 
         let state = telemetry.probe.as_ref().expect("probe");
         assert_eq!(state.timeouts, 1, "the loss is counted, not hidden");
         assert_eq!(state.probe.abandoned_count(), 1);
+        assert_eq!(state.probe.outstanding(), 0, "nothing is left armed");
+        assert!(state.invalidated.is_some());
+
+        // Even a marker advancing afterwards must not restart measurement.
+        telemetry.marker_decoded(&marked_frame(origin, 8), at(after + 600));
         assert_eq!(
-            state.probe.outstanding(),
-            1,
-            "only the fresh attempt is outstanding"
+            telemetry.next_probe_action(at(after + 700)),
+            ProbeAction::Idle,
+            "a late marker does not make the session measurable again"
         );
-        // The stale stamp is gone, so a late marker cannot be matched
-        // against it and reported as a multi-second interaction.
+
+        let report = telemetry.report(Stamp::now()).join("\n");
+        assert!(report.contains("timeouts=1"), "{report}");
+        assert!(
+            report.contains("probe INVALID:"),
+            "a run that stopped measuring must say so: {report}"
+        );
+    }
+
+    /// A reconnect is a fresh measurement: nothing in flight from the old
+    /// session can reach the new helper's marker state.
+    #[test]
+    fn a_new_session_can_measure_again_after_an_invalidating_timeout() {
+        let origin = (0, 0);
+        let base = Instant::now();
+        let at = |ms: u64| Stamp::<ClientClock>::from_instant(base + Duration::from_millis(ms));
+        let mut telemetry = ClientTelemetry::new(Some(origin));
+
+        telemetry.marker_decoded(&marked_frame(origin, 1), at(0));
+        assert_eq!(telemetry.next_probe_action(at(0)), ProbeAction::Press);
+        let after = u64::try_from(PROBE_TIMEOUT.as_millis()).expect("small") + 100;
+        // The key was still held, so it is released before going idle: an
+        // invalidated benchmark must not leave a key down on the host.
+        assert_eq!(telemetry.next_probe_action(at(after)), ProbeAction::Release);
+        assert_eq!(
+            telemetry.next_probe_action(at(after + 10)),
+            ProbeAction::Idle
+        );
         assert!(
             telemetry
-                .report(Stamp::now())
-                .iter()
-                .any(|line| line.contains("timeouts=1"))
+                .probe
+                .as_ref()
+                .expect("probe")
+                .invalidated
+                .is_some()
+        );
+
+        telemetry.session_ended();
+        assert!(
+            telemetry
+                .probe
+                .as_ref()
+                .expect("probe")
+                .invalidated
+                .is_none()
+        );
+
+        telemetry.marker_decoded(&marked_frame(origin, 20), at(after + 500));
+        assert_eq!(
+            telemetry.next_probe_action(at(after + 600)),
+            ProbeAction::Press
         );
     }
 
