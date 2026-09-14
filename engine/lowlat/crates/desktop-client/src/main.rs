@@ -53,6 +53,7 @@ use tokio::process::{Child, Command};
 
 mod display;
 mod mic;
+mod raw_pointer;
 mod render;
 // Pure lifecycle/input-safety seam; a future winit presenter can consume it
 // without making this minifb path or the dependency graph change in this slice.
@@ -400,6 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = vec![0_u32; DEFAULT_WIDTH * DEFAULT_HEIGHT];
     let mut buffer_width = DEFAULT_WIDTH;
     let mut buffer_height = DEFAULT_HEIGHT;
+    let immersive_requested = env::var("OPENSTREAM_IMMERSIVE").as_deref() == Ok("1");
     let mut input_state = InputState {
         last_mouse: None,
         last_window_mouse: None,
@@ -407,8 +409,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gamepads: None,
         gamepad_ids: HashMap::new(),
         rumble_effects: HashMap::new(),
-        immersive: env::var("OPENSTREAM_IMMERSIVE").as_deref() == Ok("1"),
+        immersive: immersive_requested,
+        raw_pointer: if immersive_requested {
+            raw_pointer::RawPointer::capture()
+        } else {
+            // Not immersive: leave the cursor associated with the device.
+            raw_pointer::RawPointer::inactive()
+        },
     };
+    if immersive_requested {
+        // Which path is running decides whether a turn can continue past the
+        // window edge, so it is worth saying out loud rather than leaving the
+        // operator to infer it from behaviour.
+        println!(
+            "OpenStream run pointer={}",
+            if input_state.raw_pointer.is_active() {
+                "raw device capture"
+            } else {
+                "relative from window position (stops at the window edge)"
+            }
+        );
+    }
     // Optional pixel-level diagnostic; off unless the operator asks for it.
     let mut frame_dump = FrameDump::from_env();
     let mut connected = false;
@@ -594,8 +615,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
         }
         if connected {
+            // Read with the mutable borrow held here; forward_input only
+            // needs the answer, not the window's focus machinery.
+            let focused = window.is_active();
             forward_input(
                 &window,
+                focused,
                 &input_tx,
                 (buffer_width, buffer_height),
                 // A GPU present stretches to the surface; only the software
@@ -890,15 +915,29 @@ struct InputState {
     gamepad_ids: HashMap<u32, GamepadId>,
     rumble_effects: HashMap<u32, Effect>,
     immersive: bool,
+    /// Held only in immersive mode, and only where the platform supports it.
+    /// When it is active the window-position path above is not used at all.
+    raw_pointer: raw_pointer::RawPointer,
 }
 
 fn forward_input(
     window: &Window,
+    focused: bool,
     input_tx: &InputSender,
     stream: (usize, usize),
     preserve_aspect: bool,
     state: &mut InputState,
 ) {
+    // Capture follows focus, so switching away from the client hands the
+    // cursor back instead of leaving it hidden behind another window.
+    state.raw_pointer.follow_focus(focused);
+    if !focused {
+        // Drop the reference sample. Keeping it would turn the gap between
+        // leaving the window and returning to it into one large relative
+        // jump the user never made.
+        state.last_window_mouse = None;
+    }
+
     // Strictly increasing, because the host orders pointer motion by this
     // and equal stamps would leave it breaking ties.
     let timestamp = monotonic_input_stamp();
@@ -915,8 +954,22 @@ fn forward_input(
         }
     }
 
-    if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
+    // A held capture reports device motion whether or not the cursor is over
+    // the window -- it is deliberately not over the window, since capture
+    // decouples the two. Reading it must not be gated on a window-relative
+    // position, or the deltas the capture exists to deliver would be dropped
+    // exactly when they start arriving.
+    if let Some((dx, dy)) = state.raw_pointer.delta() {
+        if dx != 0 || dy != 0 {
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
+                true, dx, dy, timestamp,
+            )));
+        }
+    } else if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
         if state.immersive {
+            // Compatibility relative path: window positions are clamped, so
+            // this stops producing motion at an edge. It is what runs where
+            // the platform cannot capture the device.
             if let Some((last_x, last_y)) = state.last_window_mouse {
                 #[allow(clippy::cast_possible_truncation)]
                 let dx = (x - last_x).round() as i32;
