@@ -627,10 +627,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
         }
+        // Capture is held only while the session is live and the window has
+        // focus. Keying it on both is what stops a window left open after a
+        // disconnect from keeping the pointer hidden, and it must run outside
+        // the connected branch below, which stops being entered at exactly
+        // the moment the capture needs releasing.
+        let focused = window.is_active();
+        input_state.raw_pointer.follow_focus(connected && focused);
+        if !connected {
+            keyboard_connected.store(false, Ordering::Relaxed);
+        }
         if connected {
-            // Read with the mutable borrow held here; forward_input only
-            // needs the answer, not the window's focus machinery.
-            let focused = window.is_active();
             forward_input(
                 &window,
                 focused,
@@ -941,9 +948,6 @@ fn forward_input(
     preserve_aspect: bool,
     state: &mut InputState,
 ) {
-    // Capture follows focus, so switching away from the client hands the
-    // cursor back instead of leaving it hidden behind another window.
-    state.raw_pointer.follow_focus(focused);
     if !focused {
         // Drop the reference sample. Keeping it would turn the gap between
         // leaving the window and returning to it into one large relative
