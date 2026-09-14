@@ -452,17 +452,23 @@ mod tests {
 
         // Whatever the report says, the injector must agree. The host adapter
         // applies the master input gate to each grant, exactly as here.
-        let permissions = lowlat_inject::event::Permissions::from_keyboard_pointer_grants(
-            policy.input && policy.keyboard,
-            policy.input && policy.mouse,
-            policy.input && policy.gamepad,
-        );
-        assert!(
-            permissions.gamepad,
-            "the injector must act on the gamepad grant the report advertised"
-        );
-        assert!(!permissions.keyboard);
-        assert!(!permissions.pointer);
+        //
+        // Unix-only because `lowlat-inject` does not build for Windows; see
+        // the dev-dependency's target gate in Cargo.toml.
+        #[cfg(unix)]
+        {
+            let permissions = lowlat_inject::event::Permissions::from_keyboard_pointer_grants(
+                policy.input && policy.keyboard,
+                policy.input && policy.mouse,
+                policy.input && policy.gamepad,
+            );
+            assert!(
+                permissions.gamepad,
+                "the injector must act on the gamepad grant the report advertised"
+            );
+            assert!(!permissions.keyboard);
+            assert!(!permissions.pointer);
+        }
     }
 
     #[test]
