@@ -225,16 +225,8 @@ impl ControlPlaneClient {
         })
     }
 
-    pub fn origin(&self) -> &str {
-        &self.origin
-    }
-
     pub fn is_authenticated(&self) -> bool {
         self.access_token.is_some() && self.account.is_some()
-    }
-
-    pub fn account(&self) -> Option<&AuthenticatedAccount> {
-        self.account.as_ref()
     }
 
     /// Change the endpoint only as a Rust-owned settings outcome. Tokens are
