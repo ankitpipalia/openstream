@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 openstream-app-core = { path = "../app-core" }
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -16,6 +16,7 @@ path = "src/main.rs"
 libc.workspace = true
 openstream-app-core = { path = "../app-core" }
 openstream-local-ipc = { path = "../local-ipc" }
+openstream-platform = { path = "../platform" }
 openstream-settings = { path = "../settings" }
 serde.workspace = true
 serde_json.workspace = true

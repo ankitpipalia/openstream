@@ -192,6 +192,7 @@ pub struct DeviceEnrollment {
 
 /// Durable trust state for an enrolled device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeviceTrustState {
     Pending,
     Trusted,
@@ -406,6 +407,10 @@ pub type RejectReason = ConnectionRejectReason;
 pub enum AppCommand {
     BeginAuthentication,
     AuthenticationSucceeded,
+    AuthenticationFailed {
+        retryable: bool,
+    },
+    SignOut,
     Connect {
         device_id: String,
         request_id: String,
@@ -428,6 +433,13 @@ pub enum AppCommand {
     ConnectionEstablished {
         session_id: String,
         generation: u64,
+    },
+    /// Establishment failed before an authenticated session existed. This is
+    /// distinct from `ConnectionLost`: there is no active session to put into
+    /// reconnecting state, but the caller still needs a typed terminal
+    /// outcome instead of leaving the model stuck in `Connecting`.
+    ConnectionFailed {
+        retryable: bool,
     },
     ConnectionLost {
         retryable: bool,
@@ -454,6 +466,10 @@ pub enum AppCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppEvent {
     AuthenticationStarted,
+    AuthenticationFailed {
+        retryable: bool,
+    },
+    SignedOut,
     AuthenticationRequired,
     ApprovalRequired(ConnectionRequest),
     ConnectionApproved {
@@ -468,6 +484,9 @@ pub enum AppEvent {
     ConnectionReady {
         session_id: String,
         generation: u64,
+    },
+    ConnectionFailed {
+        retryable: bool,
     },
     ReconnectStarted,
     DisconnectRequested,
@@ -581,6 +600,13 @@ impl AppModel {
         }
     }
 
+    /// Replace the discovery result supplied by the authenticated control
+    /// plane. The UI cannot call this through `AppCommand`; only the runtime
+    /// reconciliation boundary may replace server observations.
+    pub fn replace_devices(&mut self, devices: Vec<DeviceSummary>) {
+        self.devices = devices.into_iter().take(MAX_DEVICES).collect();
+    }
+
     pub fn devices(&self) -> &[DeviceSummary] {
         &self.devices
     }
@@ -624,6 +650,25 @@ impl AppModel {
                 }
                 self.state = AppState::Ready;
                 Ok(Vec::new())
+            }
+            AppCommand::AuthenticationFailed { retryable } => {
+                if !matches!(self.state, AppState::Authenticating) {
+                    return Err(invalid_state("authentication failed in the wrong state"));
+                }
+                self.state = AppState::SignedOut;
+                Ok(vec![AppEvent::AuthenticationFailed { retryable }])
+            }
+            AppCommand::SignOut => {
+                if !matches!(self.state, AppState::Ready) {
+                    return Err(invalid_state("sign out requires an idle ready state"));
+                }
+                self.clear_active_session();
+                self.state = if self.mode == DeploymentMode::Local {
+                    AppState::Ready
+                } else {
+                    AppState::SignedOut
+                };
+                Ok(vec![AppEvent::SignedOut])
             }
             AppCommand::Connect {
                 device_id,
@@ -695,6 +740,36 @@ impl AppModel {
                     session_id,
                     generation,
                 }])
+            }
+            AppCommand::ConnectionFailed { retryable } => {
+                let active = matches!(
+                    self.state,
+                    AppState::RequestingConnection { .. }
+                        | AppState::WaitingForApproval { .. }
+                        | AppState::Connecting { .. }
+                        | AppState::Negotiating { .. }
+                        | AppState::Reconnecting { .. }
+                );
+                if !active {
+                    return Err(invalid_state(
+                        "connection failure requires an active connection attempt",
+                    ));
+                }
+                self.clear_active_session();
+                self.state = AppState::Failed {
+                    code: if retryable {
+                        AppErrorCode::Unavailable
+                    } else {
+                        AppErrorCode::Transport
+                    },
+                    retryable,
+                    message: if retryable {
+                        "connection could not be established".into()
+                    } else {
+                        "connection could not be established and cannot be retried".into()
+                    },
+                };
+                Ok(vec![AppEvent::ConnectionFailed { retryable }])
             }
             AppCommand::ConnectionLost { retryable } => {
                 // A reconnect attempt can itself fail, so a loss is accepted

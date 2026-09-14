@@ -16,7 +16,46 @@ export function ComputersPage({
   onSnapshot: (snapshot: ProductSnapshot) => void;
 }) {
   const [refreshing, setRefreshing] = useState(false);
+  const [action, setAction] = useState<string | null>(null);
   const controlPlane = snapshot.access.controlPlane;
+
+  async function handleConnect(deviceId: string) {
+    setAction(deviceId);
+    try {
+      onSnapshot(
+        await adapter.dispatch({
+          Connect: {
+            device_id: deviceId,
+            requested: {
+              view: true,
+              keyboard: true,
+              mouse: true,
+              gamepad: false,
+              clipboard: false,
+              microphone: false,
+              tablet: false,
+              virtual_usb: false,
+            },
+          },
+        }),
+      );
+    } catch {
+      onSnapshot(createRuntimeUnavailableSnapshot("The session runner could not be started."));
+    } finally {
+      setAction(null);
+    }
+  }
+
+  async function handleDisconnect() {
+    setAction("disconnect");
+    try {
+      onSnapshot(await adapter.dispatch("Disconnect"));
+    } catch {
+      onSnapshot(createRuntimeUnavailableSnapshot("The session runner could not be stopped."));
+    } finally {
+      setAction(null);
+    }
+  }
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -36,9 +75,16 @@ export function ComputersPage({
         title="Computers"
         description="Discover trusted OpenStream hosts and start a session when the control plane reports one as available."
         actions={
-          <button className="secondary-button" type="button" onClick={handleRefresh} disabled={refreshing}>
-            Refresh
-          </button>
+          <>
+            {snapshot.connection.state !== "idle" ? (
+              <button className="secondary-button" type="button" onClick={handleDisconnect} disabled={action !== null}>
+                Disconnect
+              </button>
+            ) : null}
+            <button className="secondary-button" type="button" onClick={handleRefresh} disabled={refreshing || action !== null}>
+              Refresh
+            </button>
+          </>
         }
       />
 
@@ -62,7 +108,14 @@ export function ComputersPage({
                   {computer.lastSeen ? <span className="muted-label">Last seen {computer.lastSeen}</span> : null}
                 </div>
                 <div className="computer-actions">
-                  <button className="secondary-button" type="button" disabled title="The session command adapter is not connected">Connect</button>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => handleConnect(computer.id)}
+                    disabled={computer.status !== "online" || action !== null}
+                  >
+                    {action === computer.id ? "Starting…" : snapshot.connection.computerId === computer.id ? "Connected" : "Connect"}
+                  </button>
                 </div>
               </article>
             ))}

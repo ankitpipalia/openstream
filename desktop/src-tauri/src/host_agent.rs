@@ -155,6 +155,19 @@ impl HostAgentClient {
         self.dispatch(AgentIpcCommand::Start).await
     }
 
+    /// Start with the validated non-secret settings currently owned by the
+    /// desktop runtime. The host agent resolves executable paths, probes the
+    /// machine, and adds the protected pairing-file boundary itself.
+    pub async fn start_with_settings(
+        &self,
+        settings: &openstream_settings::AppConfig,
+    ) -> Result<Vec<HostAgentEvent>, HostAgentBridgeError> {
+        self.dispatch(AgentIpcCommand::StartWithSettings {
+            settings: Box::new(settings.clone()),
+        })
+        .await
+    }
+
     pub async fn stop(&self) -> Result<Vec<HostAgentEvent>, HostAgentBridgeError> {
         self.dispatch(AgentIpcCommand::Stop).await
     }

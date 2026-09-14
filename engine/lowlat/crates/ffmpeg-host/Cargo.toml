@@ -12,6 +12,7 @@ name = "openstream-ffmpeg-host"
 path = "src/main.rs"
 
 [dependencies]
+libc.workspace = true
 lowlat-audio.workspace = true
 lowlat-core.workspace = true
 openstream-client-core = { path = "../client-core" }

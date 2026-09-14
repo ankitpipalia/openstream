@@ -148,6 +148,14 @@ pub enum IpcResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IpcEvent {
     AuthenticationStarted,
+    /// Authentication was attempted and rejected. Carries only whether another
+    /// attempt is worthwhile; the control plane's reason never crosses this
+    /// boundary, because "wrong password" and "device revoked" are exactly the
+    /// details an observer of the socket should not learn.
+    AuthenticationFailed {
+        retryable: bool,
+    },
+    SignedOut,
     AuthenticationRequired,
     ApprovalRequired {
         request_id: RequestId,
@@ -167,6 +175,9 @@ pub enum IpcEvent {
     ConnectionReady {
         session_id: String,
         generation: u64,
+    },
+    ConnectionFailed {
+        retryable: bool,
     },
     ReconnectStarted,
     DisconnectRequested,
@@ -189,6 +200,10 @@ impl TryFrom<AppEvent> for IpcEvent {
     fn try_from(event: AppEvent) -> Result<Self, Self::Error> {
         Ok(match event {
             AppEvent::AuthenticationStarted => Self::AuthenticationStarted,
+            AppEvent::AuthenticationFailed { retryable } => {
+                Self::AuthenticationFailed { retryable }
+            }
+            AppEvent::SignedOut => Self::SignedOut,
             AppEvent::AuthenticationRequired => Self::AuthenticationRequired,
             AppEvent::ApprovalRequired(request) => Self::ApprovalRequired {
                 request_id: RequestId::new(request.request_id)?,
@@ -215,6 +230,7 @@ impl TryFrom<AppEvent> for IpcEvent {
                 session_id,
                 generation,
             },
+            AppEvent::ConnectionFailed { retryable } => Self::ConnectionFailed { retryable },
             AppEvent::ReconnectStarted => Self::ReconnectStarted,
             AppEvent::DisconnectRequested => Self::DisconnectRequested,
             AppEvent::Disconnected => Self::Disconnected,
@@ -242,6 +258,7 @@ pub enum IpcError {
     Json(String),
     Io(io::ErrorKind),
     InvalidEndpoint,
+    InsecureParentOwnership,
     InsecureParentPermissions,
     ExistingPath,
     SymlinkPath,
@@ -265,6 +282,9 @@ impl fmt::Display for IpcError {
             Self::Json(reason) => write!(formatter, "IPC JSON is invalid: {reason}"),
             Self::Io(kind) => write!(formatter, "IPC I/O failed: {kind}"),
             Self::InvalidEndpoint => formatter.write_str("invalid IPC endpoint path"),
+            Self::InsecureParentOwnership => {
+                formatter.write_str("IPC endpoint parent has the wrong owner")
+            }
             Self::InsecureParentPermissions => {
                 formatter.write_str("IPC endpoint parent is not private")
             }
@@ -415,15 +435,26 @@ impl Endpoint {
         use std::os::unix::fs::PermissionsExt;
 
         let parent = self.path.parent().ok_or(IpcError::InvalidEndpoint)?;
-        let created = if parent.exists() {
-            false
-        } else {
-            fs::create_dir_all(parent).map_err(|error| IpcError::Io(error.kind()))?;
-            true
+        let (metadata, created) = match fs::symlink_metadata(parent) {
+            Ok(metadata) => (metadata, false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir_all(parent).map_err(|error| IpcError::Io(error.kind()))?;
+                (
+                    fs::symlink_metadata(parent).map_err(|error| IpcError::Io(error.kind()))?,
+                    true,
+                )
+            }
+            Err(error) => return Err(IpcError::Io(error.kind())),
         };
-        let metadata = fs::symlink_metadata(parent).map_err(|error| IpcError::Io(error.kind()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(IpcError::SymlinkPath);
+        }
         if !metadata.is_dir() {
             return Err(IpcError::ExistingPath);
+        }
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(IpcError::InsecureParentOwnership);
         }
         let mode = metadata.permissions().mode() & 0o777;
         if !created && mode & 0o077 != 0 {

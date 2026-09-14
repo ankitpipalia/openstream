@@ -142,10 +142,37 @@ impl Permissions {
     /// never implicitly create or drive one.
     #[must_use]
     pub const fn from_host_grants(input: bool, gamepad: bool) -> Self {
+        // One coarse switch: the master gate applies to all three.
+        Self::from_keyboard_pointer_grants(input, input, input && gamepad)
+    }
+
+    /// Build permissions from independent keyboard, pointer and gamepad
+    /// grants.
+    ///
+    /// The old [`Self::from_host_grants`] helper remains for callers that have
+    /// one coarse input switch. Host adapters that expose separate product
+    /// permissions must use this constructor so revoking the mouse does not
+    /// revoke the keyboard (or vice versa).
+    ///
+    /// All three grants are independent here, and the gamepad grant is *not*
+    /// conditioned on the other two. It used to be, and that made the host
+    /// advertise a capability it would then refuse to act on: the capability
+    /// report gates gamepad on the master input switch alone, so a policy of
+    /// `input=on, keyboard=off, mouse=off, gamepad=on` negotiated gamepad
+    /// support and then silently dropped every gamepad event. A caller that
+    /// wants the master gate applied must apply it to the value it passes --
+    /// which is what every host adapter already does, and what
+    /// [`Self::from_host_grants`] does above.
+    #[must_use]
+    pub const fn from_keyboard_pointer_grants(
+        keyboard: bool,
+        pointer: bool,
+        gamepad: bool,
+    ) -> Self {
         Self {
-            keyboard: input,
-            pointer: input,
-            gamepad: input && gamepad,
+            keyboard,
+            pointer,
+            gamepad,
         }
     }
 }
@@ -1105,6 +1132,25 @@ mod tests {
 
     fn injector() -> Injector {
         Injector::new(Extents::alone(1920, 1080))
+    }
+
+    /// A gamepad-only grant stays a gamepad grant.
+    ///
+    /// The capability report advertises gamepad on the master input switch
+    /// alone, so this configuration is reachable from real policy. If the
+    /// injector folded the gamepad grant into keyboard-or-pointer, the host
+    /// would negotiate gamepad support and then drop every gamepad event --
+    /// the capability model promising something the injector refuses.
+    #[test]
+    fn a_gamepad_only_grant_is_not_cancelled_by_keyboard_and_mouse_being_off() {
+        assert_eq!(
+            Permissions::from_keyboard_pointer_grants(false, false, true),
+            Permissions {
+                keyboard: false,
+                pointer: false,
+                gamepad: true,
+            }
+        );
     }
 
     #[test]

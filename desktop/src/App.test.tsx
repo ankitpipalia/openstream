@@ -34,7 +34,7 @@ describe("OpenStream desktop shell", () => {
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     expect(screen.getAllByText("Unavailable", { exact: true }).length).toBeGreaterThan(0);
     expect(
-      screen.getAllByText("This setting is visible, but its backend capability is not available yet.").length,
+      screen.getAllByText("This setting is not available on the current runtime.").length,
     ).toBeGreaterThan(0);
   });
 
@@ -47,6 +47,11 @@ describe("OpenStream desktop shell", () => {
       },
       dispatch: async () => createEmptySnapshot(),
       updateSettings: async () => createEmptySnapshot(),
+      updateSetting: async () => createEmptySnapshot(),
+      setDeviceTrust: async () => createEmptySnapshot(),
+      signIn: async () => createEmptySnapshot(),
+      registerAccount: async () => createEmptySnapshot(),
+      signOut: async () => createEmptySnapshot(),
     };
 
     render(<App adapter={adapter} />);
@@ -68,6 +73,11 @@ describe("OpenStream desktop shell", () => {
       },
       dispatch: async () => createEmptySnapshot(),
       updateSettings: async () => createEmptySnapshot(),
+      updateSetting: async () => createEmptySnapshot(),
+      setDeviceTrust: async () => createEmptySnapshot(),
+      signIn: async () => createEmptySnapshot(),
+      registerAccount: async () => createEmptySnapshot(),
+      signOut: async () => createEmptySnapshot(),
     };
 
     render(<App adapter={adapter} />);

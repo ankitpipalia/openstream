@@ -3,6 +3,20 @@
 This is the execution plan, not a claim that every phase is complete. Each
 phase has a concrete gate and must remain honest about what it verifies.
 
+## Current handoff state — 2026-09-14
+
+The broader production-completion implementation lives in the isolated
+`codex/production-completion` worktree. Its continuation note is
+[`handoff.md`](../handoff.md). What it establishes is a source-verified
+runtime and control-plane foundation, not a complete product: secure remote
+Connect, native VideoToolbox decode, raw mouse capture, WAN/TURN validation,
+packaging and signing all remain incomplete. The tree builds, is clean under
+Clippy `-D warnings`, and passes the workspace, Tauri, frontend and
+local-acceptance suites. Hardware, WAN/TURN, package and signing
+evidence has not been produced, so the release checker correctly still reports
+`NOT READY`. The edits are uncommitted; `origin/main` remains the clean
+baseline, and the worktree is neither merged nor release-ready.
+
 ## Engineering hardening P0 — correctness, security, and liveness
 
 - [x] Replace guest bearer-token management URLs with stable non-secret guest

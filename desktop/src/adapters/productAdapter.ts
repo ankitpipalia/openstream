@@ -14,6 +14,11 @@ export interface ProductAdapter {
   refresh(): Promise<ProductSnapshot>;
   dispatch(command: RuntimeCommand): Promise<ProductSnapshot>;
   updateSettings(config: unknown): Promise<ProductSnapshot>;
+  updateSetting(key: string, value: string | number | boolean | null): Promise<ProductSnapshot>;
+  setDeviceTrust(deviceId: string, trust: "trusted" | "revoked"): Promise<ProductSnapshot>;
+  signIn(username: string, password: string): Promise<ProductSnapshot>;
+  registerAccount(username: string, password: string): Promise<ProductSnapshot>;
+  signOut(): Promise<ProductSnapshot>;
 }
 
 export interface LocalProductAdapter extends ProductAdapter {
@@ -201,6 +206,11 @@ export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmpt
     refresh: async () => currentSnapshot,
     dispatch: async () => currentSnapshot,
     updateSettings: async () => currentSnapshot,
+    updateSetting: async () => currentSnapshot,
+    setDeviceTrust: async () => currentSnapshot,
+    signIn: async () => currentSnapshot,
+    registerAccount: async () => currentSnapshot,
+    signOut: async () => currentSnapshot,
     setSnapshot: (snapshot) => {
       currentSnapshot = snapshot;
       for (const listener of listeners) {

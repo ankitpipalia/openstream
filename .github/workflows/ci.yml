@@ -217,6 +217,7 @@ jobs:
           -p openstream-platform
           -p openstream-client-core
           -p openstream-mobile-ffi
+          -p openstream-host-agent
       - name: Check cross-platform FFmpeg host adapter
         if: matrix.host
         env:
@@ -324,6 +325,13 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: Deny
         run: cargo deny check
+      # The desktop shell is a separate Cargo workspace with its own lockfile,
+      # so the engine policy above never reaches it. Without this step the
+      # product users actually install is the one component outside dependency
+      # policy. Its exceptions are named and explained in its own deny.toml.
+      - name: Deny (desktop product shell)
+        run: cargo deny --manifest-path desktop/src-tauri/Cargo.toml check
+        working-directory: .
 
   smoke:
     name: protocol and media smoke

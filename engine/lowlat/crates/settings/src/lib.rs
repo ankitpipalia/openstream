@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -244,6 +245,43 @@ pub struct AppConfig {
     pub advanced: AdvancedConfig,
 }
 
+/// Return a stable, non-secret revision for the effective persisted settings.
+/// Secret-bearing fields in `AppConfig` are references rather than values, so
+/// this digest can cross the local host-agent boundary without carrying a
+/// credential. The revision is deliberately based on canonical serde field
+/// order and is used to prove which settings a child was started with.
+pub fn config_revision(config: &AppConfig) -> String {
+    let bytes = serde_json::to_vec(config).expect("validated AppConfig is serializable");
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Return the revision of the subset consumed by the persistent host agent.
+///
+/// A desktop setting such as the client renderer must not make an already
+/// healthy host appear stale. Conversely, every value projected into the host
+/// child environment must participate in this digest so a matching revision
+/// is evidence that the child was started from the same host configuration.
+/// Keep this as a structured value rather than hashing the full `AppConfig` so
+/// the boundary remains stable when client-only settings are added.
+pub fn host_config_revision(config: &AppConfig) -> String {
+    let value = serde_json::json!({
+        "client_signal_origin": &config.client.signal_origin,
+        "client_profile": &config.client.profile,
+        "host": &config.host,
+        "video": &config.video,
+        "audio": &config.audio,
+        "input": &config.input,
+        "network": &config.network,
+        "advanced_ffmpeg_path": &config.advanced.ffmpeg_path,
+        "advanced_ffmpeg_reconfigure": config.advanced.ffmpeg_reconfigure,
+        "advanced_max_session_seconds": config.advanced.max_session_seconds,
+    });
+    let bytes = serde_json::to_vec(&value).expect("validated host settings are serializable");
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceConfig {
     #[serde(default = "default_device_name")]
@@ -475,6 +513,7 @@ impl AppConfig {
         if self.client.signal_origin.chars().any(char::is_whitespace) {
             return invalid("client.signal_origin", "must not contain whitespace");
         }
+        validate_signal_origin(&self.client.signal_origin, self.network.local_no_auth)?;
         validate_mode("client.profile", &self.client.profile, is_profile_known)?;
         validate_mode(
             "client.window_mode",
@@ -1323,6 +1362,86 @@ fn default_host_name() -> String {
 fn default_signal_origin() -> String {
     "http://127.0.0.1:8080".to_string()
 }
+
+/// Validate the configured control-plane origin.
+///
+/// Plaintext is confined to the two deployments the documentation actually
+/// supports: loopback development, and the explicit Trusted LAN mode. The
+/// second is gated on `network.local_no_auth` because that is the same switch
+/// the service itself requires before it will bind a private address without
+/// an admin token, so the two ends cannot disagree about which mode is in
+/// force. Anything else is a remote control plane and must use HTTPS: a
+/// bearer capability sent over plaintext to a routable address is readable by
+/// every hop in between.
+///
+/// A private-LAN address is not an authentication boundary, and enabling the
+/// mode is an explicit operator decision -- see `docs/BUILD.md`.
+fn validate_signal_origin(origin: &str, local_no_auth: bool) -> Result<(), SettingsError> {
+    let Ok(url) = url::Url::parse(origin) else {
+        return invalid("client.signal_origin", "must be an absolute HTTP(S) origin");
+    };
+    // Take the parsed host rather than `host_str`, which serializes an IPv6
+    // literal with its brackets and would therefore never parse as an address.
+    let Some(host) = url.host() else {
+        return invalid("client.signal_origin", "must include a host");
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (!url.path().is_empty() && url.path() != "/")
+    {
+        return invalid(
+            "client.signal_origin",
+            "must be a bare http(s) origin without credentials, path, query, or fragment",
+        );
+    }
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let address = match host {
+        url::Host::Ipv4(address) => Some(std::net::IpAddr::V4(address)),
+        url::Host::Ipv6(address) => Some(std::net::IpAddr::V6(address)),
+        url::Host::Domain(name) if name.eq_ignore_ascii_case("localhost") => {
+            return Ok(());
+        }
+        url::Host::Domain(_) => None,
+    };
+    if address.is_some_and(|address| address.is_loopback()) {
+        return Ok(());
+    }
+    if local_no_auth && address.is_some_and(is_private_lan_address) {
+        return Ok(());
+    }
+    invalid(
+        "client.signal_origin",
+        "remote control planes must use HTTPS; plaintext is limited to loopback, \
+         or to a numeric private-LAN address with network.local_no_auth enabled",
+    )
+}
+
+/// RFC 1918, RFC 4193, and link-local addressing.
+///
+/// This is the client half of the rule the signaling service enforces on its
+/// own bind address. It decides only whether a plaintext origin is one of the
+/// documented local deployments; it is never an identity or authorization
+/// check, because any device that can reach the address can reach the service.
+fn is_private_lan_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            (octets[0] == 10)
+                || (octets[0] == 169 && octets[1] == 254)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+        }
+        std::net::IpAddr::V6(address) => {
+            let octets = address.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
+}
 const fn default_true() -> bool {
     true
 }
@@ -1689,6 +1808,96 @@ mod tests {
         assert!(
             matches!(config.validate(), Err(SettingsError::InvalidField { field, .. }) if field == "client.renderer")
         );
+    }
+
+    #[test]
+    fn remote_plaintext_control_planes_are_rejected() {
+        let mut config = default_config();
+        config.client.signal_origin = "http://control.example".to_string();
+        assert!(matches!(
+            config.validate(),
+            Err(SettingsError::InvalidField { field, .. }) if field == "client.signal_origin"
+        ));
+
+        config.client.signal_origin = "https://control.example".to_string();
+        config.validate().expect("remote HTTPS origin is valid");
+    }
+
+    #[test]
+    fn loopback_and_opted_in_private_lan_plaintext_origins_are_accepted() {
+        // The default is loopback plaintext and must keep validating, or no
+        // freshly installed shell could start.
+        default_config()
+            .validate()
+            .expect("the default loopback origin is valid");
+
+        for origin in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            let mut config = default_config();
+            config.client.signal_origin = origin.to_string();
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{origin} should be valid: {error}"));
+        }
+
+        // Trusted LAN mode is a documented deployment (`docs/BUILD.md`), so a
+        // numeric private address over plaintext is accepted -- but only with
+        // the same explicit opt-in the service itself demands.
+        let mut config = default_config();
+        config.client.signal_origin = "http://192.168.1.69:8080".to_string();
+        assert!(
+            matches!(
+                config.validate(),
+                Err(SettingsError::InvalidField { field, .. }) if field == "client.signal_origin"
+            ),
+            "a private-LAN plaintext origin must not be accepted without the opt-in"
+        );
+        config.network.local_no_auth = true;
+        config
+            .validate()
+            .expect("Trusted LAN mode accepts a private-LAN plaintext origin");
+
+        // The opt-in does not extend plaintext to a routable address or to a
+        // name, neither of which the service would bind in that mode either.
+        for origin in ["http://203.0.113.10:8080", "http://host.example:8080"] {
+            let mut config = default_config();
+            config.network.local_no_auth = true;
+            config.client.signal_origin = origin.to_string();
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(SettingsError::InvalidField { field, .. })
+                        if field == "client.signal_origin"
+                ),
+                "{origin} must stay rejected even with the local opt-in"
+            );
+        }
+    }
+
+    #[test]
+    fn signal_origins_carrying_credentials_or_paths_are_rejected() {
+        for origin in [
+            "https://user:secret@control.example",
+            "https://control.example/v1/session",
+            "https://control.example?token=abc",
+            "https://control.example#fragment",
+            "ftp://control.example",
+            "not-a-url",
+        ] {
+            let mut config = default_config();
+            config.client.signal_origin = origin.to_string();
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(SettingsError::InvalidField { field, .. })
+                        if field == "client.signal_origin"
+                ),
+                "{origin} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -29,21 +29,21 @@ function runtimeDescriptorsFixture(): SettingDescriptor[] {
     descriptor("client.window_mode", "client", "live", "available", "normal"),
     descriptor("client.renderer", "client", "reconnect", "available", "normal"),
     descriptor("client.vsync", "client", "live", "available", "normal"),
-    descriptor("client.decoder", "client", "reconnect", "available", "normal"),
+    descriptor("client.decoder", "client", "reconnect", "experimental", "normal"),
     descriptor("client.codec", "session", "reconnect", "available", "normal"),
     descriptor("client.chroma", "session", "reconnect", "experimental", "advanced"),
     descriptor("client.bit_depth", "session", "reconnect", "experimental", "advanced"),
-    descriptor("client.immersive", "client", "live", "available", "normal"),
+    descriptor("client.immersive", "client", "live", "experimental", "normal"),
     descriptor("host.enabled", "host", "restart_host", "available", "normal"),
     descriptor("host.name", "host", "live", "available", "normal"),
     descriptor("host.capture.drm", "host", "restart_host", "experimental", "experimental"),
     descriptor("host.capture.x11", "host", "restart_host", "available", "normal"),
-    descriptor("host.stay_awake", "host", "live", "available", "normal"),
+    descriptor("host.stay_awake", "host", "restart_host", "not_implemented", "advanced"),
     descriptor("input.keyboard", "host", "live", "available", "normal"),
-    descriptor("input.mouse", "host", "live", "available", "normal"),
+    descriptor("input.mouse", "host", "live", "experimental", "normal"),
     descriptor("input.gamepad", "host", "live", "experimental", "advanced"),
     descriptor("input.clipboard", "host", "live", "available", "advanced"),
-    descriptor("input.microphone", "host", "live", "available", "advanced"),
+    descriptor("input.microphone", "host", "live", "experimental", "advanced"),
     descriptor("network.client_port", "global", "reconnect", "available", "advanced"),
     descriptor("network.host_start_port", "host", "restart_host", "available", "advanced"),
     descriptor("network.upnp", "global", "reconnect", "available", "advanced"),
@@ -165,10 +165,24 @@ function runtimeSnapshotFixture(): RuntimeSnapshot {
     restart_required: false,
     host_restart_required: false,
     pending_settings: [],
+    trusted_devices: [],
   };
 }
 
 describe("tauri adapter", () => {
+  /// Look a setting up by its stable key rather than by position. The
+  /// sections are presentation order, so indexing into them makes an
+  /// unrelated UI reordering look like a mapping regression.
+  function settingValue(snapshot: { settings: { items: { id: string; value: unknown }[] }[] }, key: string) {
+    for (const section of snapshot.settings) {
+      const item = section.items.find((candidate) => candidate.id === key);
+      if (item) {
+        return item.value;
+      }
+    }
+    throw new Error(`no setting rendered for ${key}`);
+  }
+
   it("loads a Rust snapshot through the Tauri adapter", async () => {
     const adapter = createTauriAdapter(async (command) => {
       expect(command).toBe("runtime_snapshot");
@@ -176,7 +190,7 @@ describe("tauri adapter", () => {
     });
     const snapshot = await adapter.refresh();
     expect(snapshot.connection.state).toBe("idle");
-    expect(snapshot.settings[0].items[0].value).toBe("balanced");
+    expect(settingValue(snapshot, "client.profile")).toBe("balanced");
   });
 
   it("keeps the fixture adapter outside Tauri", async () => {
@@ -268,7 +282,7 @@ describe("tauri adapter", () => {
     });
 
     const snapshot = await adapter.updateSettings(updated.settings);
-    expect(snapshot.settings[0].items[0].value).toBe("performance");
+    expect(settingValue(snapshot, "client.profile")).toBe("performance");
   });
 
   it("renders the diagnostic state Rust reported, never one inferred from its prose", async () => {

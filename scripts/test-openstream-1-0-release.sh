@@ -30,6 +30,14 @@ artifact_root="$fixture_root/artifacts"
 manifest="$fixture_root/manifest.tsv"
 report="$fixture_root/gate-report.tsv"
 
+write_fixture_sbom() {
+    # Generated from this repository's real lockfiles, because the checker now
+    # proves coverage against them. A hand-written stub cannot satisfy that,
+    # and should not: the whole point of the gate is that an SBOM has to
+    # inventory what actually ships.
+    OPENSTREAM_SBOM_QUIET=1 "$script_dir/generate-sbom.sh" "$1" >/dev/null
+}
+
 build_fixture() {
     rm -rf -- "$fixture_root"
     mkdir -p \
@@ -76,9 +84,11 @@ build_fixture() {
         printf '%b\n' 'macos-apple-silicon-app-archive\tVERIFIED\tfixture-macos-key'
     } >"$artifact_root/signing/openstream-1.0.0-signing.tsv"
 
-    printf '%b\n' \
-        '{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","name":"OpenStream 1.0"}' \
-        >"$artifact_root/sbom/openstream-1.0.0.spdx.json"
+    # A complete fixture needs a complete SBOM. The checker requires a
+    # described root, resolvable relationships, a namespace, and coverage of
+    # all three dependency graphs that ship, so the "complete evidence passes"
+    # case has to supply exactly that.
+    write_fixture_sbom "$artifact_root/sbom/openstream-1.0.0.spdx.json"
 
     {
         for relative_path in \
@@ -132,6 +142,59 @@ build_fixture
 printf '%s\n' 'test: missing SBOM fails closed'
 rm -- "$artifact_root/sbom/openstream-1.0.0.spdx.json"
 assert_checker_fails missing-sbom
+
+build_fixture
+printf '%s\n' 'test: a syntactically valid but empty SBOM fails closed'
+# The original gate was a grep for `spdxVersion`, which this document passes.
+printf '%s\n' \
+    '{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","name":"OpenStream 1.0"}' \
+    >"$artifact_root/sbom/openstream-1.0.0.spdx.json"
+assert_checker_fails shallow-sbom
+
+build_fixture
+printf '%s\n' 'test: an SBOM that only claims coverage in prose fails closed'
+# Coverage used to be inferred from substrings in package comments, so one
+# dummy package could assert all three graphs without listing any of them.
+printf '%s\n' \
+    '{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","documentNamespace":"urn:fixture","documentDescribes":["SPDXRef-a"],"packages":[{"SPDXID":"SPDXRef-a","name":"claims-everything","versionInfo":"1.0.0","comment":"engine workspace desktop shell crate desktop shell npm"}],"relationships":[{"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":"SPDXRef-a"}]}' \
+    >"$artifact_root/sbom/openstream-1.0.0.spdx.json"
+assert_checker_fails sbom-claims-coverage-in-prose
+
+build_fixture
+printf '%s\n' 'test: a minimal CycloneDX document fails closed'
+# CycloneDX used to short-circuit the whole check on a non-empty components
+# array. It is held to the same coverage requirement as SPDX.
+printf '%s\n' \
+    '{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"anything","version":"1.0.0"}]}' \
+    >"$artifact_root/sbom/openstream-1.0.0.spdx.json"
+assert_checker_fails minimal-cyclonedx
+
+build_fixture
+printf '%s\n' 'test: an SBOM missing a shipped dependency graph fails closed'
+python3 - "$artifact_root/sbom/openstream-1.0.0.spdx.json" <<'DROP_NPM'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+dropped = {
+    package["SPDXID"]
+    for package in document["packages"]
+    if "npm" in str(package.get("comment", ""))
+}
+document["packages"] = [
+    package for package in document["packages"] if package["SPDXID"] not in dropped
+]
+document["relationships"] = [
+    relationship
+    for relationship in document["relationships"]
+    if relationship["relatedSpdxElement"] not in dropped
+]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(document, handle, indent=2, sort_keys=True)
+DROP_NPM
+assert_checker_fails sbom-missing-npm-graph
 
 build_fixture
 printf '%s\n' 'test: unverified signing evidence fails closed'

@@ -4,6 +4,14 @@ version = "1.0.0-dev"
 description = "OpenStream desktop shell"
 authors = ["OpenStream contributors"]
 edition = "2021"
+# Declared so the shell is not reported as unlicensed by its own dependency
+# policy. OpenStream-owned code is MIT; see LICENSE and THIRD_PARTY.md.
+license = "MIT"
+# This is a product binary, not a library for crates.io. Saying so matches
+# every other crate in the repository and lets the dependency policy apply its
+# path-dependency exemption, which crates.io rules otherwise withhold from a
+# publishable crate.
+publish = false
 
 [lib]
 name = "openstream_desktop_lib"
@@ -15,9 +23,17 @@ tauri-build = { version = "2.0.0", features = [] }
 [dependencies]
 tauri = { version = "2.0.0", features = [] }
 openstream-app-core = { path = "../../engine/lowlat/crates/app-core" }
+openstream-client-core = { path = "../../engine/lowlat/crates/client-core" }
 openstream-settings = { path = "../../engine/lowlat/crates/settings" }
 openstream-host-agent = { path = "../../engine/lowlat/crates/host-agent" }
 openstream-local-ipc = { path = "../../engine/lowlat/crates/local-ipc" }
+libc = "0.2"
+hex = "0.4"
+reqwest = { version = "0.13.5", features = ["json"] }
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "process", "sync", "fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

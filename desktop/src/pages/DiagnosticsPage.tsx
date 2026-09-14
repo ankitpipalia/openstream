@@ -1,4 +1,7 @@
+import { useState } from "react";
+
 import type { Capability, ProductSnapshot } from "../model";
+import type { ProductAdapter } from "../adapters/productAdapter";
 import { CapabilityBadge, SessionStatusBadge } from "../components/StatusBadge";
 import { PageHeader, SectionCard } from "../components/AppShell";
 
@@ -14,8 +17,29 @@ function CapabilityRow({ capability }: { capability: Capability }) {
   );
 }
 
-export function DiagnosticsPage({ snapshot }: { snapshot: ProductSnapshot }) {
+export function DiagnosticsPage({
+  snapshot,
+  adapter,
+  onSnapshot,
+}: {
+  snapshot: ProductSnapshot;
+  adapter: ProductAdapter;
+  onSnapshot: (snapshot: ProductSnapshot) => void;
+}) {
   const { diagnostics } = snapshot;
+  const [refreshing, setRefreshing] = useState(false);
+
+  async function runChecks() {
+    setRefreshing(true);
+    try {
+      onSnapshot(await adapter.refresh());
+    } catch {
+      // The parent poll will retry. Keep this page's error surface bounded to
+      // a static message rather than exposing bridge or server details.
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   return (
     <div className="page-stack">
@@ -23,7 +47,7 @@ export function DiagnosticsPage({ snapshot }: { snapshot: ProductSnapshot }) {
         eyebrow="Observability"
         title="Diagnostics"
         description="See what OpenStream has actually verified. Pending and unavailable states are intentionally explicit."
-        actions={<button className="secondary-button" type="button" disabled title="Diagnostics refresh is waiting for the runtime adapter">Run checks</button>}
+        actions={<button className="secondary-button" type="button" onClick={() => void runChecks()} disabled={refreshing}>{refreshing ? "Checking…" : "Run checks"}</button>}
       />
 
       <div className="diagnostics-overview">

@@ -217,6 +217,30 @@ non-loopback deployment. Set a strong `OPENSTREAM_ADMIN_TOKEN`; without it,
 session-management endpoints refuse requests unless the server is explicitly
 run in loopback-only development mode with `OPENSTREAM_ALLOW_NO_AUTH=1`.
 
+Account registration is closed by default. `POST /v1/auth/register` accepts
+an unauthenticated request only while the control-plane store is empty, so a
+fresh deployment can be bootstrapped by creating its first account; after
+that the endpoint requires the administrator capability. Set
+`OPENSTREAM_ALLOW_OPEN_REGISTRATION=1` to deliberately run an open endpoint.
+Leaving it open on a reachable service lets a stranger create accounts and,
+because a taken username is answered with `409 Conflict`, enumerate the
+accounts that already exist.
+
+Password verification is intentionally expensive, so the service bounds how
+much of it an unauthenticated caller can demand: authentication attempts and
+credential renewals have separate per-minute budgets, the number of
+simultaneous key derivations is capped, and each budget is applied both
+service-wide and per source address so one caller cannot spend everyone
+else's share.
+
+Behind a reverse proxy every request appears to come from the proxy, which
+would collapse those per-source budgets into one. Set
+`OPENSTREAM_TRUSTED_PROXIES` to the comma-separated addresses of your own
+proxies; the last `X-Forwarded-For` entry is then used as the source, and
+only for requests that actually arrive from one of those addresses. The
+header is ignored from every other peer, because believing it from an
+arbitrary caller would hand each of them an unlimited supply of identities.
+
 For the local-first MVP, an explicit Trusted LAN mode - no account
 authentication - is available with `OPENSTREAM_LOCAL_NO_AUTH=1` plus a
 numeric RFC1918/ULA/link-local

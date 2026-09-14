@@ -66,6 +66,25 @@ async fn websocket_bridge() -> (String, JoinHandle<()>) {
             }
         });
 
+        // Publish the establishment epoch, exactly as the real service does
+        // once -- and only once -- both role sockets exist. Peers now refuse
+        // to send any ICE record before this arrives, which is the whole
+        // point of the epoch: a record from an earlier pairing of sockets can
+        // never be mistaken for a current one. Without it this bridge is a
+        // server that never declares a pair, and both peers wait forever.
+        let ready = Message::Text(
+            serde_json::json!({
+                "type": "ice_peer_ready",
+                "establishment_generation": 1,
+            })
+            .to_string(),
+        );
+        if to_first.send(ready.clone()).await.is_err() || to_second.send(ready).await.is_err() {
+            first_writer.abort();
+            second_writer.abort();
+            return;
+        }
+
         loop {
             tokio::select! {
                 message = first_source.next() => {

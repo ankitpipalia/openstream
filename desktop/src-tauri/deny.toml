@@ -1,0 +1,90 @@
+# Dependency policy for the desktop product shell.
+#
+# This crate is a separate Cargo workspace from engine/lowlat with its own
+# lockfile, so the engine's policy does not reach it. Without this file the
+# entire product shell -- the thing users actually install -- sits outside
+# dependency policy, which is a worse position than any exception below.
+#
+# The rule the engine file exists for is unchanged and is repeated here: no
+# GPL/LGPL/AGPL component may enter the link graph. What differs is that the
+# Tauri webview stack brings weak-copyleft and unmaintained crates that cannot
+# be removed without removing Tauri, so those are named, scoped, and explained
+# rather than waved through by leaving the crate unchecked.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # Unmaintained Unicode data crates, reached only through
+    # tauri-utils -> urlpattern -> unic-ucd-ident. The whole rust-unic project
+    # is unmaintained and the advisory states no safe upgrade exists, so this
+    # cannot be resolved by bumping a version; it needs urlpattern to move off
+    # rust-unic. These are pure Unicode property tables with no network, file,
+    # or process surface, which is why the exposure is acceptable while the
+    # upstream fix is outstanding.
+    #
+    # Re-check on every Tauri upgrade and remove the entry the moment
+    # urlpattern drops the dependency.
+    { id = "RUSTSEC-2025-0098", reason = "rust-unic is unmaintained; reached only via tauri-utils -> urlpattern, and no upgrade path exists yet" },
+    # proc-macro-error is unmaintained. It is a build-time-only procedural
+    # macro helper: it contributes no code to the shipped binary, so an
+    # unmaintained advisory here is a supply-chain-freshness concern rather
+    # than a runtime exposure.
+    { id = "RUSTSEC-2024-0370", reason = "build-time proc-macro dependency only; no code reaches the shipped binary" },
+    # The remaining entries are the same unmaintained rust-unic family
+    # reported under separate advisory ids.
+    { id = "RUSTSEC-2025-0075", reason = "rust-unic family, same root cause as RUSTSEC-2025-0098" },
+    { id = "RUSTSEC-2025-0080", reason = "rust-unic family, same root cause as RUSTSEC-2025-0098" },
+    { id = "RUSTSEC-2025-0081", reason = "rust-unic family, same root cause as RUSTSEC-2025-0098" },
+    { id = "RUSTSEC-2025-0100", reason = "rust-unic family, same root cause as RUSTSEC-2025-0098" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+    # **Weak, file-level copyleft, and deliberately distinguished from the
+    # licences this policy exists to keep out.** MPL-2.0 obliges publication of
+    # modifications to the covered *files*; it does not reach the combined
+    # work, so linking it does not relicense OpenStream the way a GPL codec
+    # would. OpenStream ships these crates unmodified.
+    #
+    # Every MPL-2.0 crate here arrives through Tauri's webview stack
+    # (cssparser, cssparser-macros, selectors, dtoa-short) or its directory
+    # lookup (option-ext). Keep the notices in THIRD_PARTY.md current, and if a
+    # modification to one of these crates is ever required, publish it.
+    "MPL-2.0",
+]
+exceptions = [
+    { allow = ["CC0-1.0"], name = "hexf-parse" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Nothing copyleft beyond the weak, file-level MPL-2.0 allowance above. A GPL
+# or LGPL component in this graph is a release blocker, not an exception.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

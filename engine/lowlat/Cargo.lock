@@ -1827,6 +1827,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "url",
@@ -1840,6 +1841,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "gilrs",
+ "libc",
  "lowlat-audio",
  "lowlat-core",
  "minifb",
@@ -1852,6 +1854,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "wgpu",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1866,6 +1869,7 @@ dependencies = [
 name = "openstream-ffmpeg-host"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lowlat-audio",
  "lowlat-core",
  "lowlat-inject",
@@ -1885,6 +1889,7 @@ dependencies = [
  "lowlat-host",
  "openstream-app-core",
  "openstream-local-ipc",
+ "openstream-platform",
  "openstream-settings",
  "serde",
  "serde_json",
@@ -1913,6 +1918,7 @@ dependencies = [
 name = "openstream-local-ipc"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "openstream-app-core",
  "serde",
  "serde_json",
@@ -1946,6 +1952,9 @@ dependencies = [
 [[package]]
 name = "openstream-platform"
 version = "0.1.0"
+dependencies = [
+ "lowlat-inject",
+]
 
 [[package]]
 name = "openstream-probe-helper"
@@ -1983,6 +1992,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
+ "url",
  "windows-sys 0.59.0",
 ]
 
@@ -1993,7 +2004,10 @@ dependencies = [
  "axum",
  "base64",
  "futures-util",
+ "getrandom 0.2.17",
+ "hex",
  "hmac",
+ "libc",
  "openstream-protocol",
  "ring",
  "serde",
@@ -2004,6 +2018,7 @@ dependencies = [
  "tokio-tungstenite 0.24.0",
  "uuid",
  "webrtc-ice",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2355,9 +2370,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "once_cell",
  "ring",

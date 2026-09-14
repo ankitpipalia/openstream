@@ -7,9 +7,13 @@
 //! ScreenCaptureKit backends behind the same packetizer.
 
 use std::env;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
@@ -28,6 +32,7 @@ use openstream_media::{
 };
 use openstream_platform::clipboard as platform_clipboard;
 use openstream_platform::clipboard_policy::ClipboardPolicy;
+use openstream_platform::host_heartbeat::{self, HostPhase};
 use openstream_platform::policy::{
     HostCapabilityProbes, HostDeviceCapabilities, RuntimeAvailability, UnavailableReason,
 };
@@ -58,6 +63,8 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 /// independent of adaptive bitrate restarts because monitor selection is a
 /// user-visible control action.
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const FRAME_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const INPUT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Wire pacing must sit above the encoder target, not below it. The scheduler
 /// paces the sealed datagram stream, which carries per-packet headers, AEAD
@@ -95,6 +102,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Started before anything that can block, and in particular before
+    // waiting for a peer. The supervisor's only evidence that this process is
+    // alive is this file, and establishment is allowed to take as long as it
+    // likes -- so a heartbeat that only begins once a peer has arrived leaves
+    // the supervisor with nothing to read during precisely the wait it is
+    // supposed to tolerate.
+    let frame_heartbeat = FrameHeartbeat::from_environment();
     let origin =
         env::var("OPENSTREAM_SIGNAL_ORIGIN").unwrap_or_else(|_| DEFAULT_SIGNAL_ORIGIN.to_string());
     let pairing = load_pairing_from_environment()?;
@@ -105,9 +119,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(spec) => parse_stun_servers(&spec)?,
         Err(_) => Vec::new(),
     };
+    // No deadline attached, here or in the agent: a host is routinely started
+    // long before its client, and that wait is the protocol working.
+    frame_heartbeat.set_phase(HostPhase::WaitingForPeer);
     let mut session =
         PeerSession::establish_configured(&origin, &pairing, Role::Host, bind, &stun_servers)
             .await?;
+    frame_heartbeat.set_phase(HostPhase::Negotiating);
     eprintln!(
         "OpenStream selected data path: {:?}",
         session.connection_path()
@@ -259,14 +277,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(1.0)
         .min(profile.bitrate_mbps);
+    let aggregate_bandwidth_cap = env::var("OPENSTREAM_HOST_BANDWIDTH_MBPS")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let wire_rate = aggregate_bandwidth_cap.map_or_else(
+        || wire_pacing_rate_for(profile.bitrate_mbps),
+        |cap| wire_pacing_rate_for(profile.bitrate_mbps).min(cap),
+    );
     session
-        .set_wire_pacing_rate(wire_pacing_rate_for(profile.bitrate_mbps))
+        .set_wire_pacing_rate(wire_rate)
         .map_err(|error| format!("wire pacing rate: {error:?}"))?;
     let mut telemetry = PeerTelemetryAdapter::new(
         AdaptiveBitrate::new(profile.bitrate_mbps, min_mbps, profile.bitrate_mbps),
         session.path_generation(),
         0,
     );
+    // Capture and encode are up from here, so a counter that stops advancing
+    // now is a real stall and the agent may act on it.
+    frame_heartbeat.set_phase(HostPhase::Streaming);
     let restart_policy = reconfigure::RestartPolicy::from_env();
     let mut last_restart: Option<Instant> = None;
     // `AdaptiveBitrate::tick` emits one-shot decisions. Keep one pending when
@@ -361,6 +390,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut clipboard_tick = tokio::time::interval(Duration::from_millis(500));
 
     let mut peer_ended = false;
+    let mut input_watchdog_fired = false;
     'stream: while Instant::now() < deadline {
         let outbound_backpressured = matches!(
             session.flush_outbound_recoverably().await?,
@@ -519,6 +549,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         payload.len(),
                         started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                     );
+                    frame_heartbeat.note_frame();
                     frame_id = frame_id.wrapping_add(1);
                     chunks += 1;
                     // Whatever is left in the unitizer is the next access
@@ -554,6 +585,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             _ = control_tick.tick() => {
+                if input_enabled {
+                    let peer_is_stale = session.last_peer_activity_age() >= INPUT_WATCHDOG_TIMEOUT;
+                    if peer_is_stale && !input_watchdog_fired {
+                        host_input.release_all();
+                        input_watchdog_fired = true;
+                        eprintln!("OpenStream released host input after peer liveness timeout");
+                    } else if !peer_is_stale {
+                        input_watchdog_fired = false;
+                    }
+                }
                 host_input.tick();
                 while let Some(rumble) = host_input.rumble() {
                     reliable_control.send(&mut session, &rumble.encode()).await?;
@@ -843,6 +884,253 @@ fn configured_limits() -> (u16, u16, u16) {
         parse("OPENSTREAM_HEIGHT", 1080),
         parse("OPENSTREAM_FPS", 60),
     )
+}
+
+/// Small liveness side channel owned by the host child. It records only a
+/// monotonically increasing encoded-frame count; the host agent reads that
+/// count and the file's mtime, and never has to parse encoder output or user
+/// media.
+///
+/// # Why the media loop only touches a counter
+///
+/// Publishing is filesystem work, and this sits beside the encode/packetize
+/// path whose whole purpose is to not wait for anything. The media task
+/// therefore does one relaxed atomic increment; a separate task publishes it
+/// on a timer. Nothing about a liveness file belongs on the latency path.
+///
+/// # Why publication is atomic, and never fatal
+///
+/// The previous version truncated the file in place and then wrote. A reader
+/// that landed in that window saw an empty file, parsed no frame count, and
+/// concluded the pipeline was dead -- so the agent could restart a host that
+/// was streaming perfectly. Writing a temporary file and renaming it means a
+/// reader sees either the old count or the new one, never nothing.
+///
+/// A publication error is also no longer allowed to end the session. This is
+/// telemetry: if it cannot be written, the honest outcome is that the agent
+/// stops seeing fresh counts and acts on its own schedule, not that a working
+/// stream is torn down from inside the read loop.
+#[derive(Debug)]
+struct FrameHeartbeat {
+    frames: Arc<AtomicU64>,
+    /// The phase the agent is told about, as [`HostPhase::as_u8`].
+    ///
+    /// Atomic rather than locked because the publisher thread reads it on
+    /// every tick and the session loop writes it at a handful of transitions;
+    /// a lock here would put the session loop behind a wedged filesystem,
+    /// which is the exact coupling this thread exists to avoid.
+    phase: Arc<AtomicU8>,
+    stopping: Arc<AtomicBool>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrameHeartbeat {
+    fn from_environment() -> Self {
+        let frames = Arc::new(AtomicU64::new(0));
+        let phase = Arc::new(AtomicU8::new(HostPhase::Starting.as_u8()));
+        let Some(path) = env::var_os("OPENSTREAM_FRAME_HEARTBEAT_FILE").map(PathBuf::from) else {
+            return Self {
+                frames,
+                phase,
+                stopping: Arc::new(AtomicBool::new(false)),
+                publisher: None,
+            };
+        };
+        let published = Arc::clone(&frames);
+        let published_phase = Arc::clone(&phase);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::clone(&stopping);
+        // A plain thread, not a Tokio task. Publishing is blocking file I/O,
+        // and the failure that matters is a wedged filesystem -- an NFS mount
+        // that has gone away, a full disk, a device that stopped answering.
+        // On a runtime worker such a write occupies that worker for as long as
+        // the kernel takes, which on this process means stalling the encode
+        // and transport tasks it shares a thread with. A dedicated thread can
+        // block for as long as it likes and nothing else notices.
+        let publisher = std::thread::Builder::new()
+            .name("openstream-heartbeat".to_string())
+            .spawn(move || {
+                let mut reported_failure = false;
+                while !stop_signal.load(Ordering::Relaxed) {
+                    let frames = published.load(Ordering::Relaxed);
+                    let phase = HostPhase::from_u8(published_phase.load(Ordering::Relaxed));
+                    match publish_frame_heartbeat(&path, phase, frames) {
+                        Ok(()) => reported_failure = false,
+                        Err(error) => {
+                            // Once per failure run, not once per tick: a
+                            // wedged runtime directory must not turn a 250ms
+                            // timer into a log flood.
+                            if !reported_failure {
+                                eprintln!(
+                                    "OpenStream frame heartbeat could not be published: {error}; \
+                                     liveness reporting is degraded and the stream continues"
+                                );
+                                reported_failure = true;
+                            }
+                        }
+                    }
+                    std::thread::sleep(FRAME_HEARTBEAT_INTERVAL);
+                }
+            })
+            .ok();
+        Self {
+            frames,
+            phase,
+            stopping,
+            publisher,
+        }
+    }
+
+    /// Tell the supervisor what this host is doing.
+    ///
+    /// The transitions matter more than the values: until this reports
+    /// [`HostPhase::Streaming`], the agent must not hold the host to a
+    /// frame-progress deadline, because a host waiting for a peer has no
+    /// frames to produce and is not faulty for having none.
+    fn set_phase(&self, phase: HostPhase) {
+        self.phase.store(phase.as_u8(), Ordering::Relaxed);
+    }
+
+    /// Count one encoded access unit. This is the only thing the media loop
+    /// does, and it cannot fail or block.
+    fn note_frame(&self) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for FrameHeartbeat {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        // Deliberately not joined. The thread wakes at most one heartbeat
+        // interval later and exits on its own; waiting for it here would make
+        // session teardown inherit exactly the filesystem stall this thread
+        // exists to contain.
+        drop(self.publisher.take());
+    }
+}
+
+/// Write the frame count so a concurrent reader can never observe a partial
+/// file.
+///
+/// The temporary file carries the process id so two hosts sharing a runtime
+/// directory cannot collide, and the rename replaces the published file in
+/// one step.
+fn publish_frame_heartbeat(
+    path: &std::path::Path,
+    phase: HostPhase,
+    frames: u64,
+) -> io::Result<()> {
+    validate_heartbeat_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "heartbeat has no parent"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "heartbeat has no file name"))?;
+    let temporary = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+
+    let write = (|| -> io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&temporary)?;
+        write!(file, "{}", host_heartbeat::render(phase, frames))?;
+        // Flushed, but deliberately not `sync_data`. A frame counter is not
+        // durable state: after a crash it means nothing, and forcing a device
+        // flush four times a second buys nothing for it.
+        file.flush()?;
+        Ok(())
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return write;
+    }
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// Validate the agent-owned heartbeat boundary before every write. The
+/// process is intentionally unprivileged, but a replaced runtime directory or
+/// symlink must never make it overwrite an arbitrary operator-chosen file.
+fn validate_heartbeat_path(path: &std::path::Path) -> io::Result<()> {
+    if !path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path.to_string_lossy().len() > 4096
+        || path.to_string_lossy().chars().any(char::is_control)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "heartbeat path is invalid",
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "heartbeat has no parent"))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "heartbeat parent is not a directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { libc::geteuid() };
+        if parent_metadata.uid() != uid || parent_metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "heartbeat parent is not private",
+            ));
+        }
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "heartbeat file is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "heartbeat file is not private",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "heartbeat file is a reparse point",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Everything `spawn_ffmpeg` needs beyond process-global configuration.

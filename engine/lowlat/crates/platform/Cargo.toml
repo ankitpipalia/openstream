@@ -9,5 +9,21 @@ authors = ["OpenStream contributors"]
 
 [dependencies]
 
+# Test-only, and Unix-only.
+#
+# The capability report and the injector must agree about which grants a
+# policy actually produces, and that can only be asserted with both in scope.
+# It stays a dev-dependency so this portable crate gains no runtime edge to a
+# Linux-first injector.
+#
+# The target gate is load-bearing rather than tidy. `lowlat-inject` declares
+# `pub mod uinput` ungated while that module is Linux-only, so the crate does
+# not compile for Windows at all -- and `cargo test -p openstream-platform`
+# builds dev-dependencies, which is how an unconditional edge here took the
+# Windows CI job down with it. Unix rather than Linux because the injector
+# does build on macOS, so the agreement stays asserted there.
+[target.'cfg(unix)'.dev-dependencies]
+lowlat-inject.workspace = true
+
 [lints]
 workspace = true

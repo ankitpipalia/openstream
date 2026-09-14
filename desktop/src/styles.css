@@ -102,6 +102,10 @@ button { color: inherit; }
 .secondary-button { border: 1px solid var(--border-strong); background: rgba(177, 200, 224, .06); color: var(--text); }
 .secondary-button:hover:not(:disabled) { background: rgba(177, 200, 224, .12); }
 .primary-button:disabled, .secondary-button:disabled { cursor: not-allowed; opacity: .42; }
+.auth-form { display: flex; flex-direction: column; gap: 14px; max-width: 460px; }
+.auth-field { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
+.auth-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.section-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .full-width-button { width: 100%; margin-top: 21px; }
 .save-state { color: var(--faint); font-size: 11px; }
 

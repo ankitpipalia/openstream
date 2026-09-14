@@ -8,6 +8,7 @@
 
 pub mod clipboard;
 pub mod clipboard_policy;
+pub mod host_heartbeat;
 pub mod hwaccel;
 pub mod policy;
 

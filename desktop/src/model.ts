@@ -58,13 +58,15 @@ export interface PermissionSet {
  */
 export type RuntimeCommand =
   | "SignIn"
+  | "SignOut"
   | { Connect: { device_id: string; requested: PermissionSet } }
   | { ApproveRequest: { request_id: string; available: PermissionSet } }
   | { RejectRequest: { request_id: string } }
   | "Disconnect"
   | "ClearFailure"
   | "EnableHosting"
-  | "DisableHosting";
+  | "DisableHosting"
+  | "RestartHosting";
 
 export type PairingState = "not-configured" | "pending" | "ready" | "unavailable";
 
@@ -73,8 +75,12 @@ export interface TrustedDevice {
   name: string;
   platform: string;
   addedAt: string;
-  status: "trusted" | "pending" | "revoked";
+  status: DeviceTrustState;
+  /** Short display fingerprint; never the raw public key. */
+  fingerprint?: string;
 }
+
+export type DeviceTrustState = "trusted" | "pending" | "revoked";
 
 export interface AccessSnapshot {
   pairing: {
@@ -92,7 +98,14 @@ export interface SettingItem {
   value: string | number | boolean;
   state: CapabilityState;
   options?: string[];
+  scope?: SettingScope;
+  applyMode?: SettingApplyMode;
+  visibility?: SettingVisibility;
 }
+
+export type SettingScope = "global" | "client" | "host" | "device" | "session";
+export type SettingApplyMode = "live" | "reconnect" | "restart_host" | "restart_application";
+export type SettingVisibility = "normal" | "advanced" | "experimental";
 
 export interface SettingSection {
   id: string;
