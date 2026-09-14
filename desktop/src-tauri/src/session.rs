@@ -159,6 +159,13 @@ pub struct SessionSupervisor {
     /// 0700 and owner-checked, so the capability never sits anywhere another
     /// user could reach it.
     credential_file: PathBuf,
+    /// Where a *host* capability is written for the host agent to read.
+    ///
+    /// A sibling of this supervisor's own client credential, in the same
+    /// already-private directory, so there is one place on this machine where
+    /// session capabilities live rather than two with different owners and
+    /// different permission checks.
+    host_credential_file: PathBuf,
     /// Whether this supervisor wrote the pairing file it handed the runner,
     /// and must therefore remove it when the session ends.
     ///
@@ -189,6 +196,7 @@ impl SessionSupervisor {
             generation: None,
             status_file: runtime_dir.join("session-status.json"),
             credential_file: runtime_dir.join("session-credential.json"),
+            host_credential_file: runtime_dir.join("host-credential.json"),
             owns_pairing_file: false,
             state: SessionProcessState::Idle,
             exit_state: SessionProcessState::Idle,
@@ -461,6 +469,12 @@ impl SessionSupervisor {
         Ok(self.health())
     }
 
+    /// Where a host capability should be written for the agent.
+    #[must_use]
+    pub fn host_credential_path(&self) -> &Path {
+        &self.host_credential_file
+    }
+
     pub async fn disconnect(&mut self) -> Result<SessionHealth, SessionError> {
         if self.child.is_none() {
             // No runner is not the same as nothing left to do. A previous
@@ -695,7 +709,7 @@ impl SessionSupervisor {
 /// anything is written to it and renamed into place, so the contents are
 /// never visible under the final name at wider permissions, and a reader
 /// never sees a half-written credential.
-fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
+pub(crate) fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
     let parent = path.parent().ok_or(SessionError::PairingInsecure)?;
     let temporary = parent.join(format!(
         ".{}.tmp-{}",

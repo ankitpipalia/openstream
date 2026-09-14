@@ -168,6 +168,28 @@ impl HostAgentClient {
         .await
     }
 
+    /// Start a session against a role capability the broker issued.
+    ///
+    /// Only the path crosses the socket. The agent opens it through the same
+    /// protected-file check every other pairing goes through, so the
+    /// capability itself never appears in an IPC frame, a log, or a crash
+    /// dump of either process.
+    pub async fn start_session(
+        &self,
+        pairing_file: &std::path::Path,
+        settings: &openstream_settings::AppConfig,
+    ) -> Result<Vec<HostAgentEvent>, HostAgentBridgeError> {
+        let pairing_file = pairing_file
+            .to_str()
+            .ok_or(HostAgentBridgeError::InvalidResponse)?
+            .to_string();
+        self.dispatch(AgentIpcCommand::StartSession {
+            pairing_file,
+            settings: Box::new(settings.clone()),
+        })
+        .await
+    }
+
     pub async fn stop(&self) -> Result<Vec<HostAgentEvent>, HostAgentBridgeError> {
         self.dispatch(AgentIpcCommand::Stop).await
     }

@@ -465,21 +465,70 @@ async fn host_connect_requests(
         .map_err(control_plane_error_runtime)
 }
 
-/// Approve a request and receive the host capability for the session.
+/// Approve a request and start hosting the session it created.
 ///
-/// The capability is returned rather than stored: nothing in this shell runs
-/// the host end -- that is the host agent's job -- so holding it here would
-/// be keeping a credential with no one to give it to.
+/// The capability goes to the host agent, which is the process that actually
+/// runs the host end. It travels as a private file rather than as an IPC
+/// field: the agent validates ownership and permissions before opening it,
+/// and the capability never appears in a message, a log, or a crash dump of
+/// either process.
+///
+/// Nothing about the credential is returned to the caller. The UI needs to
+/// know that hosting started, not what the capability was, and handing a
+/// bearer token to a WebView is how it ends up somewhere it cannot be
+/// withdrawn from.
 #[tauri::command]
 async fn approve_connect_request(
+    state: tauri::State<'_, SharedRuntime>,
+    session: tauri::State<'_, SharedSession>,
     control_plane: tauri::State<'_, SharedControlPlane>,
     request_id: String,
-) -> Result<control_plane::ConnectCredential, RuntimeError> {
-    let mut client = control_plane.lock().await;
-    client
-        .approve_connect(&request_id)
-        .await
-        .map_err(control_plane_error_runtime)
+) -> Result<(), RuntimeError> {
+    let credential = {
+        let mut client = control_plane.lock().await;
+        client
+            .approve_connect(&request_id)
+            .await
+            .map_err(control_plane_error_runtime)?
+    };
+    if credential.role != "host" {
+        // The broker answers an approval with the host side. Anything else is
+        // a routing mistake above, and starting the host agent against a
+        // client capability would fail later and less legibly.
+        return Err(RuntimeError::StateUnavailable);
+    }
+    let settings = {
+        let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        runtime.settings().clone()
+    };
+    let pairing = openstream_client_core::Pairing::from_role_credential(
+        openstream_client_core::RoleCredential {
+            session_id: credential.session_id,
+            role: openstream_client_core::Role::Host,
+            token: credential.token,
+            websocket_path: credential.websocket_path,
+            expires_in_seconds: 0,
+            relay_address: credential.relay_address,
+            relay_ticket: Some(credential.relay_ticket),
+            turn: None,
+        },
+    );
+    let path = {
+        let supervisor = session.lock().await;
+        supervisor.host_credential_path().to_path_buf()
+    };
+    session::write_private_json(&path, &pairing).map_err(session_error_to_runtime)?;
+    let started = HostAgentClient::new()
+        .map_err(|_| RuntimeError::StateUnavailable)?
+        .start_session(&path, &settings)
+        .await;
+    if started.is_err() {
+        // A capability on disk that nothing is going to read is a capability
+        // nobody is watching.
+        let _ = std::fs::remove_file(&path);
+        return Err(RuntimeError::StateUnavailable);
+    }
+    Ok(())
 }
 
 /// Refuse a request.

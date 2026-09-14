@@ -231,6 +231,23 @@ mod unix_main {
             AgentIpcCommand::StartWithSettings { settings } => {
                 Some(build_config_from_settings(*settings))
             }
+            AgentIpcCommand::StartSession {
+                pairing_file,
+                settings,
+            } => Some(
+                build_config_from_settings(*settings).and_then(|mut startup| {
+                    // Validated here, inside the agent, rather than trusted from
+                    // the caller. The path arrived over a local socket; the file
+                    // it names is a bearer capability, and the ownership and
+                    // permission checks are what stop this command being a way
+                    // to read an arbitrary file as one.
+                    startup.config = startup
+                        .config
+                        .with_pairing_file(&pairing_file)
+                        .map_err(|error| error.to_string())?;
+                    Ok(startup)
+                }),
+            ),
             _ => None,
         };
         let mut guard = agent.lock().await;
@@ -248,7 +265,8 @@ mod unix_main {
                 AgentIpcCommand::Tick => openstream_host_agent::HostAgentCommand::Tick,
                 AgentIpcCommand::Health
                 | AgentIpcCommand::Shutdown
-                | AgentIpcCommand::StartWithSettings { .. } => {
+                | AgentIpcCommand::StartWithSettings { .. }
+                | AgentIpcCommand::StartSession { .. } => {
                     openstream_host_agent::HostAgentCommand::Shutdown
                 }
             };
