@@ -156,6 +156,19 @@ pub(crate) enum ConnectError {
     Forbidden,
     /// The request is not in a state where this makes sense.
     InvalidState,
+    /// This party has already approved this request.
+    ///
+    /// Distinct from [`Self::InvalidState`] because it is not an error at
+    /// all: it is a retry of an approval whose response was lost, and the
+    /// caller should be handed the credential it never received rather than
+    /// a conflict it cannot recover from.
+    AlreadyApproved,
+    /// The session behind an approval does not exist yet.
+    ///
+    /// A momentary state between minting the credentials and publishing the
+    /// session. Handing a credential out in that window would name a session
+    /// the peer cannot join, which a client cannot tell apart from a fault.
+    NotPublished,
     /// The target device is not online.
     TargetOffline,
     /// The target is not a device this account may connect to.
@@ -176,6 +189,12 @@ pub(crate) struct ConnectRequest {
     pub expires_at: Instant,
     /// Set on approval. The session these credentials belong to.
     pub session_id: Option<String>,
+    /// Whether that session actually exists yet.
+    ///
+    /// Approval mints the credentials; publishing the session is a separate
+    /// step that can fail, or simply not have happened yet when a concurrent
+    /// retry arrives. Until this is set there is nothing to join.
+    published: bool,
     /// Retained until the request expires, so a lost response can be
     /// retried. See the module documentation.
     host_credential: Option<String>,
@@ -301,6 +320,7 @@ impl ConnectBroker {
             created_at: now,
             expires_at: now + REQUEST_TTL,
             session_id: None,
+            published: false,
             host_credential: None,
             client_credential: None,
         };
@@ -359,6 +379,11 @@ impl ConnectBroker {
             // state test so a stranger cannot learn a request's state by
             // comparing which error comes back.
             return Err(ConnectError::Forbidden);
+        }
+        if request.state == ConnectState::Approved {
+            // A retry of an approval whose response was lost. Not an error:
+            // the caller is entitled to the credential it never received.
+            return Err(ConnectError::AlreadyApproved);
         }
         if request.state != ConnectState::Pending {
             return Err(ConnectError::InvalidState);
@@ -425,6 +450,9 @@ impl ConnectBroker {
         if request.state != ConnectState::Approved {
             return Err(ConnectError::InvalidState);
         }
+        if !request.published {
+            return Err(ConnectError::NotPublished);
+        }
         let session_id = request
             .session_id
             .clone()
@@ -458,6 +486,9 @@ impl ConnectBroker {
         if request.state != ConnectState::Approved {
             return Err(ConnectError::InvalidState);
         }
+        if !request.published {
+            return Err(ConnectError::NotPublished);
+        }
         let session_id = request
             .session_id
             .clone()
@@ -467,6 +498,48 @@ impl ConnectBroker {
             .clone()
             .ok_or(ConnectError::InvalidState)?;
         Ok((session_id, credential))
+    }
+
+    /// The pair of credentials an approval just minted.
+    ///
+    /// Used once, by the approving request, to build the session the two
+    /// credentials belong to. This is the only place both halves are visible
+    /// together, and it is reachable only by the device that approved -- the
+    /// two collection paths still hand out one each.
+    pub(crate) fn minted_credentials(
+        &self,
+        request_id: &str,
+        answered_by: Party<'_>,
+    ) -> Result<(String, String), ConnectError> {
+        let request = self
+            .requests
+            .get(request_id)
+            .ok_or(ConnectError::NotFound)?;
+        if request.account_id != answered_by.account_id
+            || request.target_device_id != answered_by.device_id
+        {
+            return Err(ConnectError::Forbidden);
+        }
+        let host = request
+            .host_credential
+            .clone()
+            .ok_or(ConnectError::InvalidState)?;
+        let client = request
+            .client_credential
+            .clone()
+            .ok_or(ConnectError::InvalidState)?;
+        Ok((host, client))
+    }
+
+    /// Record that the session behind an approval now exists.
+    ///
+    /// Until this is called the credentials exist but name nothing, so
+    /// collection is refused. The window is short but reachable: a host
+    /// retrying an approval can arrive between the mint and the publish.
+    pub(crate) fn mark_published(&mut self, request_id: &str) {
+        if let Some(request) = self.requests.get_mut(request_id) {
+            request.published = true;
+        }
     }
 
     /// Withdraw an approval whose session could not be published.
@@ -536,6 +609,11 @@ mod tests {
     }
 
     fn approve(broker: &mut ConnectBroker, now: Instant) {
+        approve_only(broker, now);
+        broker.mark_published("request-1");
+    }
+
+    fn approve_only(broker: &mut ConnectBroker, now: Instant) {
         broker
             .approve(
                 "request-1",
@@ -654,6 +732,78 @@ mod tests {
             .collect_client_credential("request-1", client, now)
             .expect("a retry must not be refused");
         assert_eq!(first, retry);
+    }
+
+    /// An approval whose response was lost is a retry, not a conflict.
+    ///
+    /// The host has no separate collection route: approval is how it receives
+    /// its credential. Refusing the second attempt therefore leaves a live
+    /// session that the host can never join, which is the same unrecoverable
+    /// failure once-only collection produced -- just one layer up.
+    #[test]
+    fn re_approving_is_reported_as_already_approved_not_as_a_conflict() {
+        let now = Instant::now();
+        let mut broker = pending(now);
+        approve(&mut broker, now);
+        assert_eq!(
+            broker.approve(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: HOST
+                },
+                SessionGrant {
+                    session_id: "session-2".to_string(),
+                    host_credential: "H2".to_string(),
+                    client_credential: "C2".to_string(),
+                },
+                now
+            ),
+            Err(ConnectError::AlreadyApproved),
+            "the caller is entitled to the credential it never received"
+        );
+    }
+
+    /// Nothing may be collected before the session exists.
+    ///
+    /// Between minting the credentials and publishing the session there is a
+    /// window in which a concurrent retry could otherwise be handed a
+    /// credential naming a session that is not there -- which a client cannot
+    /// tell apart from a fault.
+    #[test]
+    fn no_credential_is_handed_out_before_its_session_exists() {
+        let now = Instant::now();
+        let mut broker = pending(now);
+        approve_only(&mut broker, now);
+
+        let host = Party {
+            account_id: ACCOUNT,
+            device_id: HOST,
+        };
+        let client = Party {
+            account_id: ACCOUNT,
+            device_id: CLIENT,
+        };
+        assert_eq!(
+            broker.collect_host_credential("request-1", host, now),
+            Err(ConnectError::NotPublished)
+        );
+        assert_eq!(
+            broker.collect_client_credential("request-1", client, now),
+            Err(ConnectError::NotPublished)
+        );
+
+        broker.mark_published("request-1");
+        assert!(
+            broker
+                .collect_host_credential("request-1", host, now)
+                .is_ok()
+        );
+        assert!(
+            broker
+                .collect_client_credential("request-1", client, now)
+                .is_ok()
+        );
     }
 
     /// Retries do not extend the window. The clock is what bounds exposure.
@@ -948,29 +1098,5 @@ mod tests {
         broker.heartbeat(ACCOUNT, HOST, now);
         broker.go_offline(HOST);
         assert!(!broker.is_online(ACCOUNT, HOST, now));
-    }
-
-    /// Approving twice does not mint a second pair of credentials.
-    #[test]
-    fn a_request_can_only_be_approved_once() {
-        let now = Instant::now();
-        let mut broker = pending(now);
-        approve(&mut broker, now);
-        assert_eq!(
-            broker.approve(
-                "request-1",
-                Party {
-                    account_id: ACCOUNT,
-                    device_id: HOST
-                },
-                SessionGrant {
-                    session_id: "session-2".to_string(),
-                    host_credential: "H2".to_string(),
-                    client_credential: "C2".to_string(),
-                },
-                now
-            ),
-            Err(ConnectError::InvalidState)
-        );
     }
 }

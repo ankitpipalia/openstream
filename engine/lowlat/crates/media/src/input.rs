@@ -941,7 +941,15 @@ mod tests {
 /// in step with it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MotionGate {
-    newest_absolute_us: Option<u64>,
+    /// The ordering key of the newest admitted absolute position.
+    ///
+    /// A timestamp alone is not a total order: two positions produced in the
+    /// same microsecond compare equal, and whichever arrived first would win,
+    /// so the pointer's final place depended on delivery order -- exactly
+    /// what an unreliable path does not preserve. The key therefore carries
+    /// the position as well, which makes it total: the same set of packets
+    /// leaves the pointer in the same place however they are reordered.
+    newest_absolute: Option<(u64, i32, i32)>,
 }
 
 impl MotionGate {
@@ -953,16 +961,17 @@ impl MotionGate {
         if !absolute_motion {
             return true;
         }
-        match self.newest_absolute_us {
-            // Strictly greater. An equal timestamp is not evidence of order:
-            // two positions produced in the same microsecond can arrive
-            // either way round, and admitting both made the rule depend on
-            // arrival rather than on the stamp. Refusing the tie costs at
-            // most one position per microsecond -- imperceptible -- and buys
-            // a verdict that is the same however the packets are reordered.
-            Some(newest) if event.timestamp_us <= newest => false,
+        // Compared as a whole, so the order is total. Ties on the timestamp
+        // are broken by the position itself: an arbitrary rule, but a fixed
+        // one, and a fixed rule is what makes the outcome independent of
+        // arrival order. The client also stamps strictly increasing values
+        // (see `monotonic_input_stamp`), so ties should not occur at all --
+        // this is what keeps the host correct when they do.
+        let key = (event.timestamp_us, event.value, event.value2);
+        match self.newest_absolute {
+            Some(newest) if key <= newest => false,
             _ => {
-                self.newest_absolute_us = Some(event.timestamp_us);
+                self.newest_absolute = Some(key);
                 true
             }
         }
@@ -974,7 +983,7 @@ impl MotionGate {
     /// positions is unrelated to the last, and a retained high-water mark
     /// would silently swallow the beginning of it.
     pub fn reset(&mut self) {
-        self.newest_absolute_us = None;
+        self.newest_absolute = None;
     }
 }
 
@@ -1008,24 +1017,40 @@ mod motion_gate_tests {
         assert!(gate.admit(InputEvent::pointer_motion(true, 5, 5, 200)));
     }
 
-    /// A tie is not evidence of order, so the verdict does not depend on
-    /// which of the two arrived first.
+    /// Two positions sharing a timestamp leave the pointer in the same place
+    /// whichever order they arrive in.
     ///
-    /// Admitting both made the outcome depend on arrival order, which is
-    /// exactly what an unreliable path does not preserve: the same two
-    /// packets could leave the pointer in either place.
+    /// Refusing ties outright was not enough: it made the *first* arrival
+    /// win, so the final position still depended on delivery order, which is
+    /// precisely what an unreliable path does not preserve.
     #[test]
-    fn an_equal_timestamp_is_refused_so_the_rule_is_deterministic() {
-        let first = InputEvent::pointer_motion(false, 1, 1, 100);
-        let second = InputEvent::pointer_motion(false, 2, 2, 100);
+    fn tied_timestamps_resolve_the_same_way_in_either_order() {
+        let lower = InputEvent::pointer_motion(false, 1, 1, 100);
+        let higher = InputEvent::pointer_motion(false, 2, 2, 100);
 
         let mut forwards = MotionGate::default();
-        assert!(forwards.admit(first));
-        assert!(!forwards.admit(second));
+        let forwards_final = [lower, higher]
+            .into_iter()
+            .filter(|event| forwards.admit(*event))
+            .last()
+            .expect("something is admitted");
 
         let mut backwards = MotionGate::default();
-        assert!(backwards.admit(second));
-        assert!(!backwards.admit(first));
+        let backwards_final = [higher, lower]
+            .into_iter()
+            .filter(|event| backwards.admit(*event))
+            .last()
+            .expect("something is admitted");
+
+        assert_eq!(
+            (forwards_final.value, forwards_final.value2),
+            (backwards_final.value, backwards_final.value2),
+            "the pointer must end in the same place however the tie arrived"
+        );
+        assert_eq!(
+            forwards, backwards,
+            "and the gate must be in the same state"
+        );
     }
 
     /// The gate's verdict is independent of delivery order.
@@ -1041,7 +1066,10 @@ mod motion_gate_tests {
             let mut newest_admitted = None;
             for offset in 0..stamps.len() {
                 let stamp = stamps[(rotation + offset) % stamps.len()];
-                let event = InputEvent::pointer_motion(false, 0, 0, stamp);
+                // Distinct positions as well as distinct stamps, so a tie
+                // break cannot accidentally carry this test.
+                let position = i32::try_from(stamp).expect("test stamps are small");
+                let event = InputEvent::pointer_motion(false, position, 0, stamp);
                 if gate.admit(event) {
                     assert!(
                         newest_admitted.is_none_or(|previous| stamp > previous),
@@ -1068,6 +1096,52 @@ mod motion_gate_tests {
         assert!(gate.admit(InputEvent::pointer_button(1, false, 100)));
         assert!(gate.admit(InputEvent::release(100)));
         assert!(gate.admit(InputEvent::gamepad_button(0, 0, false, 100)));
+    }
+
+    /// Whatever the arrival order, the gate ends in the same state.
+    ///
+    /// The strongest form of the property: over every permutation of a set of
+    /// positions -- ties included -- the surviving position is identical.
+    #[test]
+    fn every_delivery_order_of_the_same_positions_ends_identically() {
+        // Two pairs share a timestamp, so the tie break is exercised.
+        let events = [
+            InputEvent::pointer_motion(false, 1, 1, 100),
+            InputEvent::pointer_motion(false, 2, 2, 100),
+            InputEvent::pointer_motion(false, 3, 3, 200),
+            InputEvent::pointer_motion(false, 4, 4, 200),
+        ];
+
+        let mut expected: Option<MotionGate> = None;
+        // All 24 permutations of four elements.
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a, b, c, d];
+                        if order
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .len()
+                            != 4
+                        {
+                            continue;
+                        }
+                        let mut gate = MotionGate::default();
+                        for index in order {
+                            let _ = gate.admit(events[index]);
+                        }
+                        match expected {
+                            None => expected = Some(gate),
+                            Some(first) => assert_eq!(
+                                gate, first,
+                                "delivery order {order:?} produced a different result"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A reset lets a new stream of positions start from anywhere.

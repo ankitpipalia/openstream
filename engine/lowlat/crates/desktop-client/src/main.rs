@@ -15,6 +15,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -794,7 +795,9 @@ fn forward_input(
     preserve_aspect: bool,
     state: &mut InputState,
 ) {
-    let timestamp = monotonic_us();
+    // Strictly increasing, because the host orders pointer motion by this
+    // and equal stamps would leave it breaking ties.
+    let timestamp = monotonic_input_stamp();
     for &(key, usage) in keyboard_usages() {
         if window.is_key_pressed(key, KeyRepeat::No) {
             let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
@@ -2717,12 +2720,41 @@ const STALL_DEADLINE: Duration = Duration::from_secs(2);
 /// sitting quietly. A timeout is reported, never silently retried.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A process-local monotonic microsecond reading.
+///
+/// Monotonic but not *strictly* increasing: two calls in the same microsecond
+/// return the same value. Use [`monotonic_input_stamp`] for anything the host
+/// will order by.
 fn monotonic_us() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-    // This function is only an input timestamp; it is not used for crypto or
-    // ordering, so a process-local monotonic approximation is sufficient.
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// A strictly increasing stamp for input the host orders by.
+///
+/// Pointer motion travels on an unreliable, unordered path, and the host
+/// decides which of two positions is newer by comparing stamps. Two positions
+/// produced inside the same microsecond would compare equal, and the host
+/// would then have to break the tie by some rule of its own -- which it does,
+/// but a tie that never occurs is better than one resolved arbitrarily.
+///
+/// So a reading that has not advanced is bumped past the last one issued. The
+/// stamp can therefore run slightly ahead of the clock under a burst, which
+/// costs nothing: it is an ordering key, not a measurement.
+fn monotonic_input_stamp() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = monotonic_us();
+    // Relaxed is enough: this only has to be a distinct increasing value per
+    // call, and the compare-exchange loop provides that on its own.
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let stamp = now.max(last.saturating_add(1));
+        match LAST.compare_exchange_weak(last, stamp, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return stamp,
+            Err(observed) => last = observed,
+        }
+    }
 }
 
 impl From<io::Error> for UiMessage {

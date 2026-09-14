@@ -180,7 +180,7 @@ mod platform {
 mod platform {
     use super::ContainmentError;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
@@ -315,8 +315,15 @@ mod platform {
         pub fn resume(&self) -> Result<(), ContainmentError> {
             let pid = self.contained_pid.ok_or(ContainmentError::Unusable)?;
             // SAFETY: a thread snapshot over all processes; closed below.
+            //
+            // The sentinel here is INVALID_HANDLE_VALUE, not null --
+            // `CreateToolhelp32Snapshot` is one of the Win32 calls that
+            // returns the former. Checking for null instead would let a
+            // failed snapshot through, and the walk below would then be
+            // performed on an invalid handle: it still fails closed, but it
+            // fails two calls later and reports the wrong cause.
             let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-            if snapshot.is_null() {
+            if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
                 return Err(ContainmentError::Os);
             }
             // SAFETY: an all-zero entry is the documented starting state; the

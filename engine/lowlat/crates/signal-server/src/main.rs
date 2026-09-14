@@ -479,6 +479,12 @@ struct CreationLimiter {
 }
 
 impl CreationLimiter {
+    /// How much of the window's budget is currently spent.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
     fn allow(&mut self, now: Instant) -> bool {
         self.events
             .retain(|created| now.saturating_duration_since(*created) < SESSION_CREATE_WINDOW);
@@ -1977,6 +1983,13 @@ fn connect_error_response(error: connect::ConnectError) -> Response {
         // enumerate ids and learn which ones belong to somebody else.
         ConnectError::NotFound | ConnectError::Forbidden => StatusCode::NOT_FOUND,
         ConnectError::InvalidState => StatusCode::CONFLICT,
+        // Retryable: the credentials exist but their session does not yet.
+        // 503 rather than 409 so a client knows to try again rather than to
+        // give up on the request.
+        ConnectError::NotPublished => StatusCode::SERVICE_UNAVAILABLE,
+        // Never rendered: the approve handler turns this into a collection.
+        // Mapped anyway so a future caller cannot reach a panic through it.
+        ConnectError::AlreadyApproved => StatusCode::CONFLICT,
         ConnectError::TargetOffline | ConnectError::TargetNotConnectable => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -2132,69 +2145,88 @@ async fn connect_approve(
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    if !state.session_creates.lock().await.allow(Instant::now()) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            "session creation rate limit exceeded\n",
-        )
-            .into_response();
-    }
     let now = Instant::now();
-    let session_id = Uuid::new_v4().simple().to_string();
-    let host_token = Uuid::new_v4().simple().to_string();
-    let client_token = Uuid::new_v4().simple().to_string();
+    let party = connect::Party {
+        account_id: &account_id,
+        device_id: &device_id,
+    };
 
     // Approve first. If this is refused -- the request expired, or this is
     // not the device being asked -- no session is created, so a rejected
     // approval cannot leave an orphan session behind holding capacity.
-    let approved = {
+    //
+    // An approval this device already made is *not* a refusal. Its response
+    // was lost, and the only thing it can usefully be sent now is the
+    // credential it never received, so that case falls through to collection
+    // below. Anything else, including the rate limit, applies only to an
+    // approval that is actually creating a session: a retry must not consume
+    // a creation slot for a session that already exists.
+    let fresh = {
         let mut broker = state.connect.lock().await;
         match broker.approve(
             &request_id,
-            connect::Party {
-                account_id: &account_id,
-                device_id: &device_id,
-            },
+            party,
             connect::SessionGrant {
-                session_id: session_id.clone(),
-                host_credential: host_token.clone(),
-                client_credential: client_token.clone(),
+                session_id: Uuid::new_v4().simple().to_string(),
+                host_credential: Uuid::new_v4().simple().to_string(),
+                client_credential: Uuid::new_v4().simple().to_string(),
             },
             now,
         ) {
-            Ok(request) => request,
+            Ok(request) => Some(request),
+            Err(connect::ConnectError::AlreadyApproved) => None,
             Err(error) => return connect_error_response(error),
         }
     };
 
-    let session = build_session(
-        DEFAULT_TTL_SECONDS,
-        host_token,
-        client_token,
-        Some(SessionOwnership {
-            account_id: account_id.clone(),
-            requester_device_id: approved.requester_device_id.clone(),
-            target_device_id: device_id.clone(),
-            request_id: request_id.clone(),
-        }),
-    );
-    if let Err(response) = insert_session(&state, session_id.clone(), session).await {
-        // The session could not be published, so the approval must not stand:
-        // leaving it would hand out credentials for a session that does not
-        // exist, which the client cannot distinguish from a network fault.
-        state.connect.lock().await.withdraw(&request_id);
-        return response;
+    if let Some(approved) = fresh {
+        if !state.session_creates.lock().await.allow(Instant::now()) {
+            state.connect.lock().await.withdraw(&request_id);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "session creation rate limit exceeded\n",
+            )
+                .into_response();
+        }
+        let Some(session_id) = approved.session_id.clone() else {
+            state.connect.lock().await.withdraw(&request_id);
+            return connect_error_response(connect::ConnectError::InvalidState);
+        };
+        let (host_token, client_token) = match state
+            .connect
+            .lock()
+            .await
+            .minted_credentials(&request_id, party)
+        {
+            Ok(pair) => pair,
+            Err(error) => return connect_error_response(error),
+        };
+        let session = build_session(
+            DEFAULT_TTL_SECONDS,
+            host_token,
+            client_token,
+            Some(SessionOwnership {
+                account_id: account_id.clone(),
+                requester_device_id: approved.requester_device_id.clone(),
+                target_device_id: device_id.clone(),
+                request_id: request_id.clone(),
+            }),
+        );
+        if let Err(response) = insert_session(&state, session_id, session).await {
+            // The session could not be published, so the approval must not
+            // stand: leaving it would hand out credentials for a session that
+            // does not exist, which the client cannot distinguish from a
+            // network fault.
+            state.connect.lock().await.withdraw(&request_id);
+            return response;
+        }
+        // Only now may either end collect. Between the mint above and this
+        // line the credentials name a session that does not exist.
+        state.connect.lock().await.mark_published(&request_id);
     }
 
     let mut broker = state.connect.lock().await;
-    match broker.collect_host_credential(
-        &request_id,
-        connect::Party {
-            account_id: &account_id,
-            device_id: &device_id,
-        },
-        now,
-    ) {
+    match broker.collect_host_credential(&request_id, party, now) {
         Ok((session_id, token)) => Json(ConnectCredential {
             websocket_path: format!("/v1/signal/{session_id}/host"),
             relay_ticket: relay_ticket::mint(&state.relay_secret, &session_id, "host", "host", 1),
@@ -7367,6 +7399,143 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(first, again, "a retry gets the same credential");
+    }
+
+    /// An approval whose response was lost can be repeated.
+    ///
+    /// The host has no separate collection route: approving *is* how it
+    /// receives its credential. So a dropped response left a live session the
+    /// host could never join -- the same unrecoverable failure that once-only
+    /// collection produced, one layer up. This drives the exact sequence:
+    /// approve, discard the answer, approve again with the identical request.
+    #[tokio::test]
+    async fn a_lost_approval_response_can_be_repeated_by_the_host() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        // The host approves and the response is lost on the way back.
+        let (status, first) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {first}");
+        let session_id = first["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        // The host repeats the identical request.
+        let (status, again) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a retried approval must not be a conflict: {again}"
+        );
+        assert_eq!(
+            first, again,
+            "and must return the same session and host credential"
+        );
+
+        // Exactly one session exists: the retry did not mint a second.
+        let sessions = state.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a retry must not create a second session"
+        );
+        assert!(sessions.contains_key(&session_id));
+        drop(sessions);
+
+        // And the client can still collect its own side afterwards.
+        let (status, client_grant) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(client_grant["role"], "client");
+        assert_eq!(client_grant["session_id"], serde_json::json!(session_id));
+        assert_ne!(
+            client_grant["token"], first["token"],
+            "the two roles still hold different capabilities"
+        );
+    }
+
+    /// A retried approval does not spend a session-creation slot.
+    ///
+    /// The limit exists to bound how many sessions can be created. A retry
+    /// creates none, so charging it would let a flaky network exhaust the
+    /// budget for sessions that already exist.
+    #[tokio::test]
+    async fn a_retried_approval_does_not_consume_the_creation_budget() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        let spent_after_first = state.session_creates.lock().await.len();
+        for _ in 0..5 {
+            let (status, _) = call(
+                &app,
+                "POST",
+                &format!("/v1/connect/{request_id}/approve"),
+                Some(&host_token),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            state.session_creates.lock().await.len(),
+            spent_after_first,
+            "retries must not be charged against session creation"
+        );
     }
 
     /// An untrusted or unknown device is not connectable.
