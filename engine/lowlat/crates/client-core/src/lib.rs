@@ -32,6 +32,7 @@ use openstream_transport_policy::{
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
@@ -1482,6 +1483,11 @@ pub struct PeerSession {
     prefetched: Option<Packet>,
     /// Last direct-path keepalive sent by the owning event loop.
     last_keepalive: std::time::Instant,
+    /// Last authenticated packet received from the peer, including transport
+    /// metadata and path-control traffic that `recv()` consumes internally.
+    /// Host adapters use this to release injected input after a real peer
+    /// liveness gap rather than guessing from application traffic frequency.
+    last_peer_activity: std::time::Instant,
     migration_enabled: bool,
     migration: MigrationController,
     migration_config: MigrationConfig,
@@ -2320,6 +2326,11 @@ impl PeerSession {
         ice_urls: &[IceUrl],
     ) -> Result<Self, Error> {
         let mut signal = Endpoint::connect(server_origin, pairing, role).await?;
+        // Waiting for the server-owned pair is outside the candidate/key
+        // deadlines. A host and client are allowed to start at different
+        // times while the session remains alive, but no ICE record may be
+        // sent until both current role sockets have received this epoch.
+        let establishment_generation = wait_for_ice_ready(&mut signal).await?;
         let udp_network = if local_bind.port() == 0 {
             UDPNetwork::Ephemeral(Default::default())
         } else {
@@ -2364,13 +2375,22 @@ impl PeerSession {
         let sender = signal.sender();
         let candidate_failed_forwarder = Arc::clone(&candidate_failed);
         let candidate_forwarder = tokio::spawn(async move {
+            let mut candidate_count = 0_usize;
             while let Some(candidate) = candidate_rx.recv().await {
                 let message = match candidate {
-                    Some(candidate) => serde_json::json!({
-                        "type": "ice_candidate",
-                        "candidate": candidate,
+                    Some(candidate) => {
+                        candidate_count = candidate_count.saturating_add(1);
+                        serde_json::json!({
+                            "type": "ice_candidate_v2",
+                            "establishment_generation": establishment_generation,
+                            "candidate": candidate,
+                        })
+                    }
+                    None => serde_json::json!({
+                        "type": "ice_candidate_done_v2",
+                        "establishment_generation": establishment_generation,
+                        "count": candidate_count,
                     }),
-                    None => serde_json::json!({ "type": "ice_candidate_done" }),
                 };
                 if sender.send(&message).is_err() {
                     candidate_failed_forwarder.store(true, Ordering::Release);
@@ -2381,7 +2401,8 @@ impl PeerSession {
 
         let (local_ufrag, local_pwd) = agent.get_local_user_credentials().await;
         signal.send(&serde_json::json!({
-            "type": "ice_credentials",
+            "type": "ice_credentials_v2",
+            "establishment_generation": establishment_generation,
             "ufrag": local_ufrag,
             "pwd": local_pwd,
         }))?;
@@ -2400,7 +2421,26 @@ impl PeerSession {
                 .recv_until(phase_deadline, "ice credentials/candidates")
                 .await?;
             match message.get("type").and_then(Value::as_str) {
-                Some("ice_credentials") => {
+                Some("ice_peer_reset") => {
+                    candidate_forwarder.abort();
+                    return Err(Error::InvalidMessage(
+                        "ICE establishment reset; reconnect for a new epoch".into(),
+                    ));
+                }
+                Some("ice_peer_ready") => {
+                    if !handle_ice_generation(&message, "ice_peer_ready", establishment_generation)?
+                    {
+                        continue;
+                    }
+                }
+                Some("ice_credentials_v2") => {
+                    if !handle_ice_generation(
+                        &message,
+                        "ice_credentials_v2",
+                        establishment_generation,
+                    )? {
+                        continue;
+                    }
                     remote_ufrag = Some(required_ice_credential(
                         &message,
                         "ufrag",
@@ -2412,7 +2452,14 @@ impl PeerSession {
                         MAX_ICE_PASSWORD_BYTES,
                     )?);
                 }
-                Some("ice_candidate") => {
+                Some("ice_candidate_v2") => {
+                    if !handle_ice_generation(
+                        &message,
+                        "ice_candidate_v2",
+                        establishment_generation,
+                    )? {
+                        continue;
+                    }
                     remote_candidate_count += 1;
                     if remote_candidate_count > MAX_REMOTE_CANDIDATES {
                         candidate_forwarder.abort();
@@ -2422,12 +2469,12 @@ impl PeerSession {
                         .get("candidate")
                         .and_then(Value::as_str)
                         .ok_or_else(|| {
-                            Error::InvalidMessage("ice_candidate.candidate is missing".into())
+                            Error::InvalidMessage("ice_candidate_v2.candidate is missing".into())
                         })?;
                     if raw.is_empty() || raw.len() > MAX_CANDIDATE_BYTES {
                         candidate_forwarder.abort();
                         return Err(Error::InvalidMessage(
-                            "ice_candidate.candidate has an invalid length".into(),
+                            "ice_candidate_v2.candidate has an invalid length".into(),
                         ));
                     }
                     let candidate =
@@ -2437,13 +2484,25 @@ impl PeerSession {
                         .add_remote_candidate(&candidate)
                         .map_err(|error| Error::Ice(error.to_string()))?;
                 }
-                Some("ice_candidate_done") => remote_candidates_done = true,
+                Some("ice_candidate_done_v2") => {
+                    if !handle_ice_generation(
+                        &message,
+                        "ice_candidate_done_v2",
+                        establishment_generation,
+                    )? {
+                        continue;
+                    }
+                    remote_candidates_done = true;
+                }
                 // A peer that pipelines its key before candidate_done must not
                 // deadlock the later key phase: stash it for use below.
-                Some("key") if early_key.is_none() => {
-                    early_key = decode_peer_key(&message)?;
+                Some("ice_key_v2") if early_key.is_none() => {
+                    if !handle_ice_generation(&message, "ice_key_v2", establishment_generation)? {
+                        continue;
+                    }
+                    early_key = Some(decode_ice_peer_key(&message, establishment_generation)?);
                 }
-                Some("key") => {}
+                Some("ice_key_v2") => {}
                 _ => {}
             }
         }
@@ -2454,10 +2513,11 @@ impl PeerSession {
 
         let key_exchange = KeyExchange::generate()?;
         let identity = local_identity()?;
-        signal.send(&encode_key_message(
+        signal.send(&encode_ice_key_message(
             &key_exchange,
             &identity,
             &pairing.session_id,
+            establishment_generation,
             role,
         )?)?;
         let key_deadline = TokioInstant::now() + PHASE_TIMEOUT;
@@ -2465,14 +2525,40 @@ impl PeerSession {
             Some(stashed) => stashed,
             None => loop {
                 let message = signal.recv_until(key_deadline, "key exchange").await?;
-                if message.get("type").and_then(Value::as_str) != Some("key") {
-                    continue;
+                match message.get("type").and_then(Value::as_str) {
+                    Some("ice_peer_reset") => {
+                        candidate_forwarder.abort();
+                        return Err(Error::InvalidMessage(
+                            "ICE establishment reset; reconnect for a new epoch".into(),
+                        ));
+                    }
+                    Some("ice_peer_ready") => {
+                        if !handle_ice_generation(
+                            &message,
+                            "ice_peer_ready",
+                            establishment_generation,
+                        )? {
+                            continue;
+                        }
+                    }
+                    Some("ice_key_v2") => {
+                        if !handle_ice_generation(&message, "ice_key_v2", establishment_generation)?
+                        {
+                            continue;
+                        }
+                        break decode_ice_peer_key(&message, establishment_generation)?;
+                    }
+                    _ => continue,
                 }
-                break decode_peer_key(&message)?
-                    .ok_or_else(|| Error::InvalidMessage("key.public_key is missing".into()))?;
             },
         };
-        authenticate_peer(server_origin, pairing, role, &peer_public)?;
+        authenticate_ice_peer(
+            server_origin,
+            pairing,
+            role,
+            establishment_generation,
+            &peer_public,
+        )?;
         let keys = key_exchange
             .derive_session_keys(peer_public.ephemeral, &pairing.session_id)
             .map_err(|_| Error::PeerKeyRejected)?;
@@ -2521,6 +2607,7 @@ impl PeerSession {
             ice_counters: PathCounters::default(),
             prefetched: None,
             last_keepalive: now,
+            last_peer_activity: now,
             migration_enabled: false,
             migration: MigrationController::new(role),
             migration_config: MigrationConfig::new(pairing, role, vec![], vec![]),
@@ -2756,6 +2843,7 @@ impl PeerSession {
                     ice_counters: PathCounters::default(),
                     prefetched,
                     last_keepalive: now,
+                    last_peer_activity: now,
                     migration_enabled: false,
                     migration: MigrationController::new(role),
                     migration_config: MigrationConfig::new(
@@ -2962,6 +3050,13 @@ impl PeerSession {
     /// Return authenticated delivery telemetry for the active path generation.
     pub fn transport_delivery_snapshot(&mut self, now: Instant) -> PeerDeliverySnapshot {
         self.delivery.snapshot(self.policy_now_ms(now)).into()
+    }
+
+    /// Age of the most recent authenticated packet received from the peer.
+    /// This is a liveness observation only; it is not a replacement for the
+    /// transport's own idle timeout or for end-to-end frame acknowledgements.
+    pub fn last_peer_activity_age(&self) -> Duration {
+        self.last_peer_activity.elapsed()
     }
 
     /// Send one encrypted application packet through the bounded scheduler.
@@ -3359,6 +3454,7 @@ impl PeerSession {
                 });
             }
         };
+        self.last_peer_activity = Instant::now();
         Ok(Some(ReceivedPacket {
             packet,
             ingress,
@@ -3514,6 +3610,7 @@ const PATH_PROBE_ACK: &[u8] = b"openstream/path-probe-ack/v1";
 const PATH_KEEPALIVE: &[u8] = b"openstream/path-keepalive/v1";
 const PATH_KEEPALIVE_ACK: &[u8] = b"openstream/path-keepalive-ack/v1";
 const DIRECT_KEY_TRANSCRIPT_DOMAIN: &[u8] = b"OpenStream direct key v2";
+const ICE_KEY_TRANSCRIPT_DOMAIN: &[u8] = b"OpenStream ICE key v2";
 const MAX_DIRECT_RESET_REASON_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3811,6 +3908,10 @@ struct PeerKey {
 }
 
 fn direct_message_generation(message: &Value, message_type: &str) -> Result<u64, Error> {
+    establishment_message_generation(message, message_type)
+}
+
+fn establishment_message_generation(message: &Value, message_type: &str) -> Result<u64, Error> {
     if message.get("type").and_then(Value::as_str) != Some(message_type) {
         return Err(Error::InvalidMessage(format!(
             "expected {message_type} message"
@@ -3830,6 +3931,48 @@ fn direct_message_generation(message: &Value, message_type: &str) -> Result<u64,
         )));
     }
     Ok(generation)
+}
+
+async fn wait_for_ice_ready(signal: &mut Endpoint) -> Result<u64, Error> {
+    loop {
+        let message = signal.recv().await?;
+        match message.get("type").and_then(Value::as_str) {
+            Some("ice_peer_ready") => {
+                return establishment_message_generation(&message, "ice_peer_ready");
+            }
+            Some("ice_peer_reset") => {
+                // A reset before readiness only describes an epoch that is no
+                // longer current. Keep waiting for the next exact pair rather
+                // than starting a phase timer or accepting stale records.
+                continue;
+            }
+            Some("error") => {
+                return Err(Error::InvalidMessage(
+                    "signaling server rejected ICE establishment".into(),
+                ));
+            }
+            // Relay proof and unrelated control envelopes may arrive before
+            // readiness. They are not part of the ICE transcript.
+            _ => continue,
+        }
+    }
+}
+
+fn handle_ice_generation(
+    message: &Value,
+    message_type: &str,
+    expected: u64,
+) -> Result<bool, Error> {
+    let generation = establishment_message_generation(message, message_type)?;
+    if generation < expected {
+        return Ok(false);
+    }
+    if generation > expected {
+        return Err(Error::InvalidMessage(format!(
+            "{message_type} generation is future"
+        )));
+    }
+    Ok(true)
 }
 
 fn decode_direct_candidate(message: &Value) -> Result<Candidate, Error> {
@@ -3889,7 +4032,8 @@ fn direct_candidate_count(message: &Value) -> Result<usize, Error> {
     Ok(count)
 }
 
-fn direct_key_transcript(
+fn key_transcript(
+    domain: &[u8],
     session_id: &str,
     generation: u64,
     role: Role,
@@ -3897,21 +4041,50 @@ fn direct_key_transcript(
 ) -> Result<Vec<u8>, Error> {
     if generation == 0 {
         return Err(Error::InvalidMessage(
-            "direct_key generation must be positive".into(),
+            "establishment key generation must be positive".into(),
         ));
     }
     let session_length = u32::try_from(session_id.len()).map_err(|_| {
-        Error::InvalidMessage("session_id is too long for direct key transcript".into())
+        Error::InvalidMessage("session_id is too long for establishment key transcript".into())
     })?;
-    let mut transcript =
-        Vec::with_capacity(DIRECT_KEY_TRANSCRIPT_DOMAIN.len() + 4 + session_id.len() + 8 + 1 + 32);
-    transcript.extend_from_slice(DIRECT_KEY_TRANSCRIPT_DOMAIN);
+    let mut transcript = Vec::with_capacity(domain.len() + 4 + session_id.len() + 8 + 1 + 32);
+    transcript.extend_from_slice(domain);
     transcript.extend_from_slice(&session_length.to_be_bytes());
     transcript.extend_from_slice(session_id.as_bytes());
     transcript.extend_from_slice(&generation.to_be_bytes());
     transcript.push(identity_role(role));
     transcript.extend_from_slice(&ephemeral);
     Ok(transcript)
+}
+
+fn direct_key_transcript(
+    session_id: &str,
+    generation: u64,
+    role: Role,
+    ephemeral: [u8; 32],
+) -> Result<Vec<u8>, Error> {
+    key_transcript(
+        DIRECT_KEY_TRANSCRIPT_DOMAIN,
+        session_id,
+        generation,
+        role,
+        ephemeral,
+    )
+}
+
+fn ice_key_transcript(
+    session_id: &str,
+    generation: u64,
+    role: Role,
+    ephemeral: [u8; 32],
+) -> Result<Vec<u8>, Error> {
+    key_transcript(
+        ICE_KEY_TRANSCRIPT_DOMAIN,
+        session_id,
+        generation,
+        role,
+        ephemeral,
+    )
 }
 
 fn encode_direct_key_message(
@@ -3930,6 +4103,29 @@ fn encode_direct_key_message(
         .map_err(|_| Error::Identity(IdentityError::SigningFailed))?;
     Ok(serde_json::json!({
         "type": "direct_key",
+        "establishment_generation": generation,
+        "public_key": hex::encode(ephemeral),
+        "identity_public_key": hex::encode(identity.public_key()),
+        "signature": hex::encode(signature),
+    }))
+}
+
+fn encode_ice_key_message(
+    key_exchange: &KeyExchange,
+    identity: &IdentityKey,
+    session_id: &str,
+    generation: u64,
+    role: Role,
+) -> Result<Value, Error> {
+    let ephemeral = key_exchange.public_key();
+    let transcript = ice_key_transcript(session_id, generation, role, ephemeral)?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(identity.pkcs8())
+        .map_err(|_| Error::Identity(IdentityError::InvalidKeyMaterial))?;
+    let signature = key_pair.sign(&transcript);
+    let signature = <[u8; 64]>::try_from(signature.as_ref())
+        .map_err(|_| Error::Identity(IdentityError::SigningFailed))?;
+    Ok(serde_json::json!({
+        "type": "ice_key_v2",
         "establishment_generation": generation,
         "public_key": hex::encode(ephemeral),
         "identity_public_key": hex::encode(identity.public_key()),
@@ -3985,6 +4181,54 @@ fn decode_direct_peer_key(message: &Value, generation: u64) -> Result<PeerKey, E
     })
 }
 
+fn decode_ice_peer_key(message: &Value, generation: u64) -> Result<PeerKey, Error> {
+    let object = message
+        .as_object()
+        .ok_or_else(|| Error::InvalidMessage("ice_key_v2 must be an object".into()))?;
+    if object.len() != 5 {
+        return Err(Error::InvalidMessage(
+            "ice_key_v2 has unexpected fields".into(),
+        ));
+    }
+    let message_generation = establishment_message_generation(message, "ice_key_v2")?;
+    if message_generation != generation {
+        return Err(Error::InvalidMessage(
+            "ice_key_v2 generation does not match the active epoch".into(),
+        ));
+    }
+    let ephemeral = fixed_hex::<32>(
+        object
+            .get("public_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidMessage("ice_key_v2.public_key is missing".into()))?,
+        "ice_key_v2.public_key",
+    )?;
+    if ephemeral == [0; 32] {
+        return Err(Error::PeerKeyRejected);
+    }
+    let identity = fixed_hex::<32>(
+        object
+            .get("identity_public_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::InvalidMessage("ice_key_v2.identity_public_key is missing".into())
+            })?,
+        "ice_key_v2.identity_public_key",
+    )?;
+    let signature = fixed_hex::<64>(
+        object
+            .get("signature")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidMessage("ice_key_v2.signature is missing".into()))?,
+        "ice_key_v2.signature",
+    )?;
+    Ok(PeerKey {
+        ephemeral,
+        identity,
+        signature,
+    })
+}
+
 fn verify_direct_key_signature(
     peer: &PeerKey,
     session_id: &str,
@@ -4000,37 +4244,19 @@ fn verify_direct_key_signature(
         .is_ok()
 }
 
-/// Decode a peer's signed ephemeral-key message. Bare public keys from the
-/// pre-authentication protocol are intentionally rejected: encryption without
-/// peer authentication is vulnerable to a signaling-service MITM.
-fn decode_peer_key(message: &Value) -> Result<Option<PeerKey>, Error> {
-    if message.get("type").and_then(Value::as_str) != Some("key") {
-        return Ok(None);
-    }
-    let encoded = message
-        .get("public_key")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::InvalidMessage("key.public_key is missing".into()))?;
-    let ephemeral = fixed_hex::<32>(encoded, "key.public_key")?;
-    let identity = fixed_hex::<32>(
-        message
-            .get("identity_public_key")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::InvalidMessage("key.identity_public_key is missing".into()))?,
-        "key.identity_public_key",
-    )?;
-    let signature = fixed_hex::<64>(
-        message
-            .get("signature")
-            .and_then(Value::as_str)
-            .ok_or_else(|| Error::InvalidMessage("key.signature is missing".into()))?,
-        "key.signature",
-    )?;
-    Ok(Some(PeerKey {
-        ephemeral,
-        identity,
-        signature,
-    }))
+fn verify_ice_key_signature(
+    peer: &PeerKey,
+    session_id: &str,
+    generation: u64,
+    sender_role: Role,
+) -> bool {
+    let Ok(transcript) = ice_key_transcript(session_id, generation, sender_role, peer.ephemeral)
+    else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ED25519, peer.identity)
+        .verify(&transcript, &peer.signature)
+        .is_ok()
 }
 
 fn fixed_hex<const N: usize>(encoded: &str, field: &str) -> Result<[u8; N], Error> {
@@ -4076,30 +4302,186 @@ fn opposite_role(role: Role) -> Role {
 }
 
 fn local_identity() -> Result<IdentityKey, Error> {
-    match std::env::var("OPENSTREAM_IDENTITY_KEY") {
-        Ok(encoded) => identity_from_bytes(hex::decode(encoded.trim()).map_err(Error::Hex)?),
-        Err(std::env::VarError::NotPresent) => {
-            match std::env::var("OPENSTREAM_IDENTITY_KEY_FILE") {
-                Ok(path) => {
-                    let bytes = std::fs::read(path).map_err(|error| {
-                        Error::InvalidMessage(format!(
-                            "OPENSTREAM_IDENTITY_KEY_FILE could not be read: {error}"
-                        ))
-                    })?;
-                    identity_from_bytes(bytes)
-                }
-                Err(std::env::VarError::NotPresent) => {
-                    IdentityKey::generate().map_err(Error::Identity)
-                }
-                Err(error) => Err(Error::InvalidMessage(format!(
-                    "OPENSTREAM_IDENTITY_KEY_FILE could not be read: {error}"
-                ))),
-            }
+    if let Ok(encoded) = std::env::var("OPENSTREAM_IDENTITY_KEY") {
+        if std::env::var("OPENSTREAM_DEVELOPER_OVERRIDE").as_deref() != Ok("1") {
+            return Err(Error::InvalidMessage(
+                "raw identity keys require OPENSTREAM_DEVELOPER_OVERRIDE=1".into(),
+            ));
         }
-        Err(error) => Err(Error::InvalidMessage(format!(
-            "OPENSTREAM_IDENTITY_KEY could not be read: {error}"
-        ))),
+        return identity_from_bytes(hex::decode(encoded.trim()).map_err(Error::Hex)?);
     }
+
+    if let Ok(path) = std::env::var("OPENSTREAM_IDENTITY_KEY_FILE") {
+        return load_identity_file(Path::new(&path));
+    }
+
+    let path = identity_store_path()?;
+    load_or_create_identity(&path)
+}
+
+/// Return the stable public half of this process's device identity.
+///
+/// Product/control-plane code uses this for enrollment and trust display. The
+/// private PKCS#8 material remains inside the identity loader and is never
+/// serialized into a UI snapshot or sent to the control plane.
+pub fn local_identity_public_key() -> Result<[u8; 32], Error> {
+    Ok(local_identity()?.public_key())
+}
+
+/// Return a stable display-safe identifier derived from the public identity.
+/// It is not a credential and is only used to correlate this installation
+/// across control-plane restarts.
+pub fn local_device_id() -> Result<String, Error> {
+    let public_key = local_identity_public_key()?;
+    Ok(hex::encode(&sha2::Sha256::digest(public_key)[..16]))
+}
+
+/// Resolve the durable device identity location. Production callers use this
+/// path automatically; an explicit path remains useful for a service broker or
+/// a test fixture but is held to the same absolute/private-file checks.
+fn identity_store_path() -> Result<std::path::PathBuf, Error> {
+    if let Some(path) = std::env::var_os("OPENSTREAM_IDENTITY_STORE") {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(Error::InvalidMessage(
+                "OPENSTREAM_IDENTITY_STORE must be absolute".into(),
+            ));
+        }
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| Error::InvalidMessage("home directory is unavailable".into()))?
+        .join("Library")
+        .join("Application Support")
+        .join("OpenStream");
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| Error::InvalidMessage("application data directory is unavailable".into()))?
+        .join("OpenStream");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })
+        .ok_or_else(|| Error::InvalidMessage("state directory is unavailable".into()))?
+        .join("openstream");
+
+    Ok(base.join("device-identity.pk8"))
+}
+
+fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
+    if !path.is_absolute() {
+        return Err(Error::InvalidMessage(
+            "identity store path must be absolute".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::InvalidMessage("identity store has no parent directory".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| Error::InvalidMessage("identity store directory is unavailable".into()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| Error::InvalidMessage("identity store directory is insecure".into()))?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            let identity = IdentityKey::generate().map_err(Error::Identity)?;
+            use std::io::Write;
+            file.write_all(identity.pkcs8())
+                .and_then(|_| file.sync_all())
+                .map_err(|_| Error::InvalidMessage("identity store could not be written".into()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
+                    |_| Error::InvalidMessage("identity store permissions could not be set".into()),
+                )?;
+            }
+            Ok(identity)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => load_identity_file(path),
+        Err(_) => Err(Error::InvalidMessage(
+            "identity store could not be created".into(),
+        )),
+    }
+}
+
+fn load_identity_file(path: &Path) -> Result<IdentityKey, Error> {
+    if !path.is_absolute() {
+        return Err(Error::InvalidMessage(
+            "identity key file path must be absolute".into(),
+        ));
+    }
+    let link_metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| Error::InvalidMessage("identity key file is unavailable".into()))?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(Error::InvalidMessage(
+            "identity key file is a symlink".into(),
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| Error::InvalidMessage("identity key file is unavailable".into()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| Error::InvalidMessage("identity key file metadata is unavailable".into()))?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(Error::InvalidMessage("identity key file is invalid".into()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { libc::geteuid() };
+        if metadata.uid() != uid || metadata.mode() & 0o077 != 0 || metadata.mode() & 0o400 == 0 {
+            return Err(Error::InvalidMessage(
+                "identity key file permissions are insecure".into(),
+            ));
+        }
+    }
+    // Size the buffer from the limit that is actually enforced below, not
+    // from the file's claimed length: `take` bounds the read either way, so a
+    // multi-gigabyte file would otherwise buy an attacker one allocation of
+    // its full size before the length check ever ran.
+    const MAX_IDENTITY_KEY_BYTES: usize = 4096;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_IDENTITY_KEY_BYTES)
+            .min(MAX_IDENTITY_KEY_BYTES),
+    );
+    file.take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::InvalidMessage("identity key file could not be read".into()))?;
+    if bytes.len() > 4096 {
+        return Err(Error::InvalidMessage(
+            "identity key file is too large".into(),
+        ));
+    }
+    identity_from_bytes(bytes)
 }
 
 fn identity_from_bytes(bytes: Vec<u8>) -> Result<IdentityKey, Error> {
@@ -4117,47 +4499,10 @@ fn identity_from_bytes(bytes: Vec<u8>) -> Result<IdentityKey, Error> {
     IdentityKey::from_pkcs8(&decoded).map_err(Error::Identity)
 }
 
-fn encode_key_message(
-    key_exchange: &KeyExchange,
-    identity: &IdentityKey,
-    session_id: &str,
-    role: Role,
-) -> Result<Value, Error> {
-    let ephemeral = key_exchange.public_key();
-    let signature = identity
-        .sign_key_exchange(session_id, identity_role(role), ephemeral)
-        .map_err(Error::Identity)?;
-    Ok(serde_json::json!({
-        "type": "key",
-        "public_key": hex::encode(ephemeral),
-        "identity_public_key": hex::encode(identity.public_key()),
-        "signature": hex::encode(signature),
-    }))
-}
-
 /// Verify the peer's signature and enforce the production identity-pin
 /// policy. Loopback remains convenient for local demos; non-loopback sessions
 /// fail closed unless the operator pins the peer identity fingerprint or
 /// explicitly opts into the unsafe lab override.
-fn authenticate_peer(
-    server_origin: &str,
-    pairing: &Pairing,
-    local_role: Role,
-    peer: &PeerKey,
-) -> Result<(), Error> {
-    let peer_role = opposite_role(local_role);
-    if !IdentityKey::verify_key_exchange(
-        peer.identity,
-        peer.signature,
-        &pairing.session_id,
-        identity_role(peer_role),
-        peer.ephemeral,
-    ) {
-        return Err(Error::PeerIdentityRejected);
-    }
-    enforce_peer_identity_policy(server_origin, peer)
-}
-
 fn authenticate_direct_peer(
     server_origin: &str,
     pairing: &Pairing,
@@ -4167,6 +4512,20 @@ fn authenticate_direct_peer(
 ) -> Result<(), Error> {
     let peer_role = opposite_role(local_role);
     if !verify_direct_key_signature(peer, &pairing.session_id, generation, peer_role) {
+        return Err(Error::PeerIdentityRejected);
+    }
+    enforce_peer_identity_policy(server_origin, peer)
+}
+
+fn authenticate_ice_peer(
+    server_origin: &str,
+    pairing: &Pairing,
+    local_role: Role,
+    generation: u64,
+    peer: &PeerKey,
+) -> Result<(), Error> {
+    let peer_role = opposite_role(local_role);
+    if !verify_ice_key_signature(peer, &pairing.session_id, generation, peer_role) {
         return Err(Error::PeerIdentityRejected);
     }
     enforce_peer_identity_policy(server_origin, peer)
@@ -4823,6 +5182,7 @@ mod tests {
             ice_counters: PathCounters::default(),
             prefetched: None,
             last_keepalive: now,
+            last_peer_activity: now,
             migration_enabled: false,
             migration: MigrationController::new(Role::Host),
             migration_config: MigrationConfig::new(&pairing(), Role::Host, vec![], vec![]),

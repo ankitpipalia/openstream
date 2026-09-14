@@ -78,7 +78,12 @@ impl HostInput {
 
         #[cfg(target_os = "macos")]
         {
-            return match MacInput::new(1, 1) {
+            // The probe asks one question: will CoreGraphics give this
+            // process an event source at all. Both grants are withheld so a
+            // probe instance cannot inject anything even if it outlived this
+            // expression, and so the probe never stands in for a policy
+            // decision made elsewhere.
+            return match MacInput::new(1, 1, false, false) {
                 Ok(input) => {
                     drop(input);
                     RuntimeAvailability::Available
@@ -108,25 +113,40 @@ impl HostInput {
             let mut devices = lowlat_inject::uinput::Devices::create("openstream")
                 .map_err(|error| error.to_string())?;
             let gamepad_enabled = policy.gamepad;
-            let permissions =
-                lowlat_inject::event::Permissions::from_host_grants(true, gamepad_enabled);
+            let permissions = lowlat_inject::event::Permissions::from_keyboard_pointer_grants(
+                policy.keyboard,
+                policy.mouse,
+                gamepad_enabled,
+            );
             let mut injector = injector;
             injector.set_permissions(permissions, &mut devices);
             return Ok(Self::Linux(Box::new(LinuxInput {
                 injector,
                 devices,
                 gamepad_enabled,
+                keyboard_enabled: policy.keyboard,
+                mouse_enabled: policy.mouse,
             })));
         }
 
         #[cfg(target_os = "windows")]
         {
-            return Ok(Self::Windows(WindowsInput::new(width, height)));
+            return Ok(Self::Windows(WindowsInput::new(
+                width,
+                height,
+                policy.keyboard,
+                policy.mouse,
+            )));
         }
 
         #[cfg(target_os = "macos")]
         {
-            return Ok(Self::Mac(MacInput::new(width, height)?));
+            return Ok(Self::Mac(MacInput::new(
+                width,
+                height,
+                policy.keyboard,
+                policy.mouse,
+            )?));
         }
 
         #[allow(unreachable_code)]
@@ -139,6 +159,7 @@ impl HostInput {
         }
         let event = InputEvent::decode(payload)
             .map_err(|error| InputError::Malformed(error.to_string()))?;
+        validate_basic_input_permission(event.kind, self.keyboard_enabled(), self.mouse_enabled())?;
         validate_event_capability(
             event.kind,
             self.gamepad_enabled(),
@@ -164,6 +185,38 @@ impl HostInput {
         false
     }
 
+    fn keyboard_enabled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Self::Linux(input) = self {
+            return input.keyboard_enabled;
+        }
+        #[cfg(target_os = "windows")]
+        if let Self::Windows(input) = self {
+            return input.keyboard_enabled;
+        }
+        #[cfg(target_os = "macos")]
+        if let Self::Mac(input) = self {
+            return input.keyboard_enabled;
+        }
+        false
+    }
+
+    fn mouse_enabled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Self::Linux(input) = self {
+            return input.mouse_enabled;
+        }
+        #[cfg(target_os = "windows")]
+        if let Self::Windows(input) = self {
+            return input.mouse_enabled;
+        }
+        #[cfg(target_os = "macos")]
+        if let Self::Mac(input) = self {
+            return input.mouse_enabled;
+        }
+        false
+    }
+
     fn gamepad_implemented(&self) -> bool {
         #[cfg(target_os = "linux")]
         if matches!(self, Self::Linux(_)) {
@@ -176,6 +229,28 @@ impl HostInput {
         #[cfg(target_os = "linux")]
         if let Self::Linux(input) = self {
             input.devices.tick();
+        }
+    }
+
+    /// Release every locally injected key, button, axis and pointer grab.
+    /// This is intentionally callable by the session liveness watchdog as
+    /// well as by `Drop`: a live host process must not retain input state
+    /// after the authenticated peer has disappeared silently.
+    pub(crate) fn release_all(&mut self) {
+        let result: Result<(), String> = match self {
+            Self::Disabled => Ok(()),
+            #[cfg(target_os = "linux")]
+            Self::Linux(input) => {
+                input.release_all();
+                Ok(())
+            }
+            #[cfg(target_os = "windows")]
+            Self::Windows(input) => input.release_all(),
+            #[cfg(target_os = "macos")]
+            Self::Mac(input) => input.release_all(),
+        };
+        if let Err(error) = result {
+            eprintln!("OpenStream could not release host input state: {error}");
         }
     }
 
@@ -194,21 +269,7 @@ impl HostInput {
 
 impl Drop for HostInput {
     fn drop(&mut self) {
-        let result: Result<(), String> = match self {
-            Self::Disabled => Ok(()),
-            #[cfg(target_os = "linux")]
-            Self::Linux(input) => {
-                input.release_all();
-                Ok(())
-            }
-            #[cfg(target_os = "windows")]
-            Self::Windows(input) => input.release_all(),
-            #[cfg(target_os = "macos")]
-            Self::Mac(input) => input.release_all(),
-        };
-        if let Err(error) = result {
-            eprintln!("OpenStream could not release host input state: {error}");
-        }
+        self.release_all();
     }
 }
 
@@ -217,6 +278,8 @@ pub(crate) struct LinuxInput {
     injector: lowlat_inject::event::Injector,
     devices: lowlat_inject::uinput::Devices,
     gamepad_enabled: bool,
+    keyboard_enabled: bool,
+    mouse_enabled: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -266,6 +329,31 @@ fn validate_event_capability(
             reason: UnavailableReason::AdapterNotImplemented,
         }),
     }
+}
+
+fn validate_basic_input_permission(
+    kind: InputKind,
+    keyboard_enabled: bool,
+    mouse_enabled: bool,
+) -> Result<(), InputError> {
+    let allowed = match kind {
+        InputKind::Keyboard => keyboard_enabled,
+        InputKind::PointerMotion | InputKind::PointerButton | InputKind::Wheel => mouse_enabled,
+        InputKind::Release => true,
+        InputKind::GamepadButton
+        | InputKind::GamepadAxis
+        | InputKind::GamepadUnplug
+        | InputKind::PenMotion
+        | InputKind::PenButton
+        | InputKind::PenProximity => true,
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(InputError::Unavailable {
+        capability: DeviceCapability::Input,
+        reason: UnavailableReason::DisabledByPolicy,
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -333,15 +421,24 @@ mod windows {
         height: u32,
         active_keys: Vec<u16>,
         active_buttons: [bool; 5],
+        pub(super) keyboard_enabled: bool,
+        pub(super) mouse_enabled: bool,
     }
 
     impl WindowsInput {
-        pub(super) fn new(width: u16, height: u16) -> Self {
+        pub(super) fn new(
+            width: u16,
+            height: u16,
+            keyboard_enabled: bool,
+            mouse_enabled: bool,
+        ) -> Self {
             Self {
                 width: u32::from(width).max(1),
                 height: u32::from(height).max(1),
                 active_keys: Vec::with_capacity(64),
                 active_buttons: [false; 5],
+                keyboard_enabled,
+                mouse_enabled,
             }
         }
 
@@ -685,10 +782,17 @@ mod macos {
         height: f64,
         active_keys: Vec<u16>,
         active_buttons: [bool; 5],
+        pub(super) keyboard_enabled: bool,
+        pub(super) mouse_enabled: bool,
     }
 
     impl MacInput {
-        pub(super) fn new(width: u16, height: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        pub(super) fn new(
+            width: u16,
+            height: u16,
+            keyboard_enabled: bool,
+            mouse_enabled: bool,
+        ) -> Result<Self, Box<dyn std::error::Error>> {
             let source = unsafe { CGEventSourceCreate(HID_STATE) };
             if source.is_null() {
                 return Err("CoreGraphics could not create an event source".into());
@@ -699,6 +803,8 @@ mod macos {
                 height: f64::from(height.max(1)),
                 active_keys: Vec::with_capacity(64),
                 active_buttons: [false; 5],
+                keyboard_enabled,
+                mouse_enabled,
             })
         }
 

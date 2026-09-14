@@ -8,7 +8,9 @@ mod unix_main {
         run_preflight,
     };
     use openstream_local_ipc::{Endpoint, IpcError, read_frame, write_frame};
-    use openstream_settings::{CaptureMode, apply_environment_overrides, default_config};
+    use openstream_settings::{
+        AppConfig, CaptureMode, apply_environment_overrides, default_config,
+    };
     use std::env;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -29,10 +31,10 @@ mod unix_main {
         config: HostAgentConfig,
         report: openstream_host_agent::PreflightReport,
         /// Whether this agent's own effective startup configuration asks
-        /// the machine to host at launch. That configuration is
-        /// `default_config()` plus environment overrides -- notably
-        /// `OPENSTREAM_HOSTING_ENABLED` -- and is deliberately not the
-        /// desktop shell's `settings.json`, which this process never reads.
+        /// the machine to host at launch. A persistent service starts from
+        /// defaults plus environment overrides; a desktop shell may also
+        /// replace the validated child configuration through the typed IPC
+        /// settings command.
         host_enabled: bool,
     }
 
@@ -63,17 +65,10 @@ mod unix_main {
         let mut sigterm = signal(SignalKind::terminate())
             .map_err(|error| format!("could not install SIGTERM handler: {error}"))?;
 
-        // Start a child at launch only when this agent's own effective
-        // startup configuration says the machine hosts -- defaults plus
-        // environment, `OPENSTREAM_HOSTING_ENABLED` in practice. The agent
-        // used to spawn one unconditionally, so a freshly opened desktop
-        // shell -- which starts from `HostStatus::Disabled` -- could report
-        // hosting as off while this process was already streaming. Hosting
-        // that nobody asked for is now waited for over IPC instead.
-        //
-        // This is not the shell's `host.enabled`: the agent does not read
-        // the shell's settings file, and nothing yet carries settings across
-        // the IPC boundary. Making one the other is part of R-01.
+        // Start a child at launch only when this agent's effective startup
+        // configuration says the machine hosts. A freshly opened shell can
+        // still reconcile an already-running service, and future settings
+        // changes use the typed StartWithSettings path below.
         if host_enabled {
             let mut guard = agent.lock().await;
             let events = guard
@@ -228,16 +223,38 @@ mod unix_main {
             };
         }
 
-        let mut guard = agent.lock().await;
-        let command = match request.command {
-            AgentIpcCommand::Start => openstream_host_agent::HostAgentCommand::Start,
-            AgentIpcCommand::Stop => openstream_host_agent::HostAgentCommand::Stop,
-            AgentIpcCommand::Tick => openstream_host_agent::HostAgentCommand::Tick,
-            AgentIpcCommand::Health | AgentIpcCommand::Shutdown => {
-                openstream_host_agent::HostAgentCommand::Shutdown
+        // Build a settings-driven child configuration before taking the
+        // agent mutex. Probing an encoder/capture backend can take seconds on
+        // a wedged driver; holding the lifecycle lock while doing that would
+        // make Health/Stop appear hung to the desktop shell.
+        let prepared = match request.command.clone() {
+            AgentIpcCommand::StartWithSettings { settings } => {
+                Some(build_config_from_settings(*settings))
             }
+            _ => None,
         };
-        match guard.dispatch(command, Instant::now()) {
+        let mut guard = agent.lock().await;
+        let outcome = if let Some(prepared) = prepared {
+            match prepared {
+                Ok(startup) if startup.report.reason.is_none() => guard
+                    .replace_config(startup.config)
+                    .and_then(|_| guard.start(Instant::now())),
+                Ok(_) | Err(_) => Err(AgentError::InvalidConfig),
+            }
+        } else {
+            let command = match request.command {
+                AgentIpcCommand::Start => openstream_host_agent::HostAgentCommand::Start,
+                AgentIpcCommand::Stop => openstream_host_agent::HostAgentCommand::Stop,
+                AgentIpcCommand::Tick => openstream_host_agent::HostAgentCommand::Tick,
+                AgentIpcCommand::Health
+                | AgentIpcCommand::Shutdown
+                | AgentIpcCommand::StartWithSettings { .. } => {
+                    openstream_host_agent::HostAgentCommand::Shutdown
+                }
+            };
+            guard.dispatch(command, Instant::now())
+        };
+        match outcome {
             Ok(events) => {
                 log_events(&events);
                 AgentIpcResponse::Accepted {
@@ -277,12 +294,22 @@ mod unix_main {
     fn build_config() -> Result<AgentStartup, String> {
         let mut settings = default_config();
         apply_environment_overrides(&mut settings).map_err(|error| error.to_string())?;
+        build_config_from_settings(settings)
+    }
+
+    fn build_config_from_settings(settings: AppConfig) -> Result<AgentStartup, String> {
+        settings.validate().map_err(|error| error.to_string())?;
         let explicit_child = env::var_os("OPENSTREAM_HOST_CHILD");
         let executable = explicit_child
             .clone()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("openstream-ffmpeg-host"));
-        let ffmpeg = env::var_os("OPENSTREAM_FFMPEG");
+        let ffmpeg = settings
+            .advanced
+            .ffmpeg_path
+            .clone()
+            .map(OsString::from)
+            .or_else(|| env::var_os("OPENSTREAM_FFMPEG"));
         let native_drm_reachable = native_drm_reachable();
         let native_drm_usable =
             native_drm_usable_with(native_drm_reachable, explicit_child.is_some(), |name| {
@@ -307,6 +334,10 @@ mod unix_main {
         let mut config = HostAgentConfig::from_settings(&settings, executable)
             .map_err(|error| error.to_string())?
             .with_backend(report.selected.label())
+            .map_err(|error| error.to_string())?;
+        let heartbeat_path = frame_heartbeat_path()?;
+        config = config
+            .with_frame_heartbeat_file(heartbeat_path)
             .map_err(|error| error.to_string())?;
         let selected_capture = match report.selected {
             HostBackend::FfmpegX11 => Some("x11grab"),
@@ -417,6 +448,52 @@ mod unix_main {
             .unwrap_or_else(|| OsString::from("/tmp"));
         let base = PathBuf::from(base);
         Ok(base.join("openstream").join("host-agent.sock"))
+    }
+
+    fn frame_heartbeat_path() -> Result<PathBuf, String> {
+        let socket = socket_path()?;
+        let parent = socket
+            .parent()
+            .ok_or_else(|| "host-agent socket has no parent".to_string())?;
+        if let Ok(metadata) = std::fs::symlink_metadata(parent) {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("host-agent runtime directory is not a private directory".to_string());
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    return Err("host-agent runtime directory is a reparse point".to_string());
+                }
+            }
+        }
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create host-agent runtime directory: {error}"))?;
+        let metadata = std::fs::symlink_metadata(parent)
+            .map_err(|error| format!("could not inspect host-agent runtime directory: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("host-agent runtime directory is not a directory".to_string());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("host-agent runtime directory is a reparse point".to_string());
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err("host-agent runtime directory has the wrong owner".to_string());
+            }
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| format!("could not protect host-agent runtime directory: {error}"),
+            )?;
+        }
+        Ok(parent.join("host-frame.heartbeat"))
     }
 
     #[cfg(test)]

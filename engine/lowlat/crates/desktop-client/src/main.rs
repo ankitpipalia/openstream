@@ -10,8 +10,10 @@
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,7 +32,7 @@ use openstream_media::clipboard::{
 };
 use openstream_media::displays::Display as RemoteDisplay;
 use openstream_media::frame_age::{DecodedFrame, DecodedFrameSeq, FrameAgeRecord, FrameOffer};
-use openstream_media::input::{InputEvent, RumbleEvent};
+use openstream_media::input::{FLAG_RELATIVE, InputEvent, InputKind, RumbleEvent};
 use openstream_media::latency::{
     Client as ClientClock, ClientObservability, ClientRecorder, ClientStage, Liveness, Milestone,
     ReportOnDrop, RunContext, Stamp, TraceEnd,
@@ -189,10 +191,28 @@ enum UiInput {
 struct InputSender {
     normal: SyncSender<UiInput>,
     critical: SyncSender<UiInput>,
+    relative_motion: Arc<Mutex<Option<InputEvent>>>,
 }
 
 impl InputSender {
     fn try_send(&self, input: UiInput) -> Result<(), ()> {
+        if let UiInput::Event(event) = input
+            && event.kind == InputKind::PointerMotion
+            && event.flags & FLAG_RELATIVE != 0
+        {
+            let mut pending = self.relative_motion.lock().map_err(|_| ())?;
+            if let Some(previous) = *pending {
+                *pending = Some(InputEvent::pointer_motion(
+                    true,
+                    previous.value.saturating_add(event.value),
+                    previous.value2.saturating_add(event.value2),
+                    event.timestamp_us,
+                ));
+            } else {
+                *pending = Some(event);
+            }
+            return Ok(());
+        }
         let critical = matches!(
             &input,
             UiInput::Release | UiInput::SelectDisplay(_) | UiInput::Stop
@@ -210,17 +230,75 @@ impl InputSender {
 struct InputReceiver {
     normal: Receiver<UiInput>,
     critical: Receiver<UiInput>,
+    relative_motion: Arc<Mutex<Option<InputEvent>>>,
+    deferred_critical: Option<UiInput>,
 }
 
 impl InputReceiver {
-    /// Normal events are drained before the critical lane so an explicit
-    /// release cannot be reordered ahead of already-queued button presses.
-    fn try_recv(&self) -> Result<UiInput, TryRecvError> {
-        match self.normal.try_recv() {
-            Ok(input) => Ok(input),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => self.critical.try_recv(),
+    /// Release and stop are safety barriers: they must not sit behind a full
+    /// normal queue containing stale key/button transitions. A display
+    /// selection is deferred until already-queued input has drained so it
+    /// cannot reorder a user's click with a monitor change.
+    fn try_recv(&mut self) -> Result<UiInput, TryRecvError> {
+        if let Some(input) = self.deferred_critical.take() {
+            return Ok(input);
+        }
+        match self.critical.try_recv() {
+            Ok(input @ (UiInput::Release | UiInput::Stop)) => {
+                self.discard_normal();
+                Ok(input)
+            }
+            Ok(input @ UiInput::SelectDisplay(_)) => match self.normal.try_recv() {
+                Ok(normal) => {
+                    self.deferred_critical = Some(input);
+                    Ok(normal)
+                }
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(input),
+            },
+            // `InputSender::try_send` routes ordinary events to the normal
+            // lane, so this is unreachable today. It is still delivered
+            // rather than dropped: the one thing this queue must never do is
+            // lose a key or button transition, and a silent discard here
+            // would leave a key held on the host with no matching release.
+            Ok(input @ UiInput::Event(_)) => Ok(input),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => match self.normal.try_recv() {
+                Ok(input) => Ok(input),
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => self
+                    .relative_motion
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.take())
+                    .map(|event| Ok(UiInput::Event(event)))
+                    .unwrap_or(Err(TryRecvError::Empty)),
+            },
         }
     }
+
+    fn discard_normal(&mut self) {
+        while self.normal.try_recv().is_ok() {}
+        if let Ok(mut pending) = self.relative_motion.lock() {
+            *pending = None;
+        }
+    }
+}
+
+fn input_channels(normal_capacity: usize) -> (InputSender, InputReceiver) {
+    let (normal_tx, normal_rx) = mpsc::sync_channel(normal_capacity);
+    let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
+    let relative_motion = Arc::new(Mutex::new(None));
+    (
+        InputSender {
+            normal: normal_tx,
+            critical: critical_tx,
+            relative_motion: Arc::clone(&relative_motion),
+        },
+        InputReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+            relative_motion,
+            deferred_critical: None,
+        },
+    )
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -234,16 +312,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         normal: ui_normal_rx,
         critical: ui_critical_rx,
     };
-    let (input_normal_tx, input_normal_rx) = mpsc::sync_channel(INPUT_QUEUE_CAPACITY);
-    let (input_critical_tx, input_critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
-    let input_tx = InputSender {
-        normal: input_normal_tx,
-        critical: input_critical_tx,
-    };
-    let input_rx = InputReceiver {
-        normal: input_normal_rx,
-        critical: input_critical_rx,
-    };
+    let (input_tx, input_rx) = input_channels(INPUT_QUEUE_CAPACITY);
     let display_mode = display::DisplayMode::from_env();
     let mut window = Window::new(
         "OpenStream",
@@ -305,10 +374,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer_height = DEFAULT_HEIGHT;
     let mut input_state = InputState {
         last_mouse: None,
+        last_window_mouse: None,
         button_state: [false; 3],
         gamepads: None,
         gamepad_ids: HashMap::new(),
         rumble_effects: HashMap::new(),
+        immersive: env::var("OPENSTREAM_IMMERSIVE").as_deref() == Ok("1"),
     };
     let mut connected = false;
     let mut base_title = String::from("OpenStream");
@@ -405,6 +476,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(UiMessage::Error(error)) => {
                     connected = false;
+                    // A decoder, transport, or protocol error can arrive
+                    // while a key/button is held. Release before changing
+                    // local state so the host never has to infer cleanup from
+                    // a later reconnect or process exit.
+                    let _ = input_tx.try_send(UiInput::Release);
+                    input_state.last_mouse = None;
+                    input_state.last_window_mouse = None;
+                    input_state.button_state = [false; 3];
                     window.set_title(&format!("OpenStream -- error: {error}"));
                 }
                 Ok(UiMessage::Rumble {
@@ -437,7 +516,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // discarded rather than queued: a key pressed now is
                     // not a key pressed in the session that comes back.
                     connected = false;
+                    let _ = input_tx.try_send(UiInput::Release);
                     input_state.last_mouse = None;
+                    input_state.last_window_mouse = None;
                     input_state.button_state = [false; 3];
                     let seconds = delay_ms as f64 / 1000.0;
                     window.set_title(&format!(
@@ -446,7 +527,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Ok(UiMessage::End) => {
                     connected = false;
+                    let _ = input_tx.try_send(UiInput::Release);
                     input_state.last_mouse = None;
+                    input_state.last_window_mouse = None;
                     input_state.button_state = [false; 3];
                     window.set_title("OpenStream -- disconnected");
                 }
@@ -458,6 +541,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     connected = false;
+                    let _ = input_tx.try_send(UiInput::Release);
+                    input_state.last_mouse = None;
+                    input_state.last_window_mouse = None;
+                    input_state.button_state = [false; 3];
                     break;
                 }
             }
@@ -660,10 +747,17 @@ struct InputState {
     /// Last position sent, in streamed-image pixels, so an unmoved pointer
     /// is not resent every frame.
     last_mouse: Option<(i32, i32)>,
+    /// Last window-space sample used by the compatibility immersive path.
+    /// minifb does not expose a raw `DeviceEvent`; when immersive mode is
+    /// requested we still send relative deltas and coalesce them at the
+    /// bounded input boundary. The native winit runner can replace this with
+    /// true device motion without changing the wire event.
+    last_window_mouse: Option<(f32, f32)>,
     button_state: [bool; 3],
     gamepads: Option<Gilrs>,
     gamepad_ids: HashMap<u32, GamepadId>,
     rumble_effects: HashMap<u32, Effect>,
+    immersive: bool,
 }
 
 fn forward_input(
@@ -688,14 +782,29 @@ fn forward_input(
     }
 
     if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
-        let presented = presented_rect(window.get_size(), stream, preserve_aspect);
-        let current = stream_pointer_position(presented, stream, (x, y));
-        if state.last_mouse != Some(current) {
-            let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
-                false, current.0, current.1, timestamp,
-            )));
+        if state.immersive {
+            if let Some((last_x, last_y)) = state.last_window_mouse {
+                #[allow(clippy::cast_possible_truncation)]
+                let dx = (x - last_x).round() as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let dy = (y - last_y).round() as i32;
+                if dx != 0 || dy != 0 {
+                    let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
+                        true, dx, dy, timestamp,
+                    )));
+                }
+            }
+            state.last_window_mouse = Some((x, y));
+        } else {
+            let presented = presented_rect(window.get_size(), stream, preserve_aspect);
+            let current = stream_pointer_position(presented, stream, (x, y));
+            if state.last_mouse != Some(current) {
+                let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
+                    false, current.0, current.1, timestamp,
+                )));
+            }
+            state.last_mouse = Some(current);
         }
-        state.last_mouse = Some(current);
     }
 
     for (index, button) in [MouseButton::Left, MouseButton::Middle, MouseButton::Right]
@@ -1027,6 +1136,7 @@ fn keyboard_usages() -> &'static [(Key, u32)] {
 }
 
 fn run_worker(ui_tx: UiSender, input_rx: InputReceiver, telemetry: SharedTelemetry) {
+    let _ = write_session_status("starting", None, None);
     let result = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1037,7 +1147,216 @@ fn run_worker(ui_tx: UiSender, input_rx: InputReceiver, telemetry: SharedTelemet
     if let Err(error) = result {
         let _ = ui_tx.send(UiMessage::Error(error.to_string()));
     }
+    let _ = write_session_status("stopped", None, None);
     let _ = ui_tx.send(UiMessage::End);
+}
+
+/// Secret-free lifecycle status consumed by the desktop product shell.
+///
+/// The session runner is intentionally a separate process from Tauri. The
+/// shell therefore needs one small, private observation channel to know
+/// whether the process is still negotiating or has reached an authenticated
+/// session. This file contains only a state label, the non-secret session id,
+/// and a path generation; it never contains pairing tokens, keys, or media.
+fn write_session_status(
+    state: &str,
+    session_id: Option<&str>,
+    generation: Option<u64>,
+) -> io::Result<()> {
+    let Some(path) = env::var_os("OPENSTREAM_SESSION_STATUS_FILE").map(PathBuf::from) else {
+        return Ok(());
+    };
+    if !path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path.to_string_lossy().len() > 4096
+        || state.is_empty()
+        || state.len() > 32
+        || state.chars().any(char::is_control)
+        || session_id.is_some_and(|value| {
+            value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session status path or value is invalid",
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "session status has no parent")
+    })?;
+    validate_session_status_path(&path, parent)?;
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session-status"),
+        std::process::id()
+    ));
+    let json = serde_json::json!({
+        "state": state,
+        "session_id": session_id,
+        "generation": generation,
+    });
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        serde_json::to_writer(&mut file, &json)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        replace_session_status(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// The status file is a control-plane observation, not a writable IPC
+/// endpoint. Keep it inside the private runtime directory and reject a
+/// symlink/reparse point before the atomic replace. The supervisor repeats
+/// these checks while reading, so a malformed or replaced file fails closed.
+fn validate_session_status_path(
+    path: &std::path::Path,
+    parent: &std::path::Path,
+) -> io::Result<()> {
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "session status parent is not a private directory",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if parent_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session status parent is a reparse point",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if parent_metadata.uid() != unsafe { libc::geteuid() }
+            || parent_metadata.mode() & 0o077 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session status parent is not private",
+            ));
+        }
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "session status destination is not a regular file",
+            ));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session status destination is a reparse point",
+                ));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session status destination is not private",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_session_status(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> io::Result<()> {
+    std::fs::rename(temporary, destination)
+}
+
+#[cfg(not(unix))]
+fn replace_session_status(
+    temporary: &std::path::Path,
+    destination: &std::path::Path,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+        };
+        let temporary_wide = windows_wide_path(temporary)?;
+        let destination_wide = windows_wide_path(destination)?;
+        let replaced = unsafe {
+            ReplaceFileW(
+                destination_wide.as_ptr(),
+                temporary_wide.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        if replaced != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(2 | 3)) {
+            return Err(error);
+        }
+        let created = unsafe {
+            MoveFileExW(
+                temporary_wide.as_ptr(),
+                destination_wide.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if created != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temporary, destination)
+    }
+}
+
+#[cfg(windows)]
+fn windows_wide_path(path: &std::path::Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
 }
 
 /// Default reconnect budget. Bounded so an unreachable host eventually
@@ -1113,7 +1432,7 @@ impl SessionProgress {
 /// connects next -- a key pressed and released before the drop arrives as
 /// a press in a session the operator never typed into, and a held button
 /// arrives with no matching release. Only the explicit stop survives.
-fn discard_stale_input(input_rx: &InputReceiver) -> bool {
+fn discard_stale_input(input_rx: &mut InputReceiver) -> bool {
     let mut stop_requested = false;
     while let Ok(input) = input_rx.try_recv() {
         if matches!(input, UiInput::Stop) {
@@ -1130,7 +1449,7 @@ fn discard_stale_input(input_rx: &InputReceiver) -> bool {
 /// failures.
 async fn network_loop(
     ui_tx: UiSender,
-    input_rx: InputReceiver,
+    mut input_rx: InputReceiver,
     telemetry: SharedTelemetry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let max_attempts = match env::var("OPENSTREAM_RECONNECT_ATTEMPTS") {
@@ -1143,7 +1462,7 @@ async fn network_loop(
     let mut supervisor = ReconnectSupervisor::new(max_attempts);
     loop {
         let mut progress = SessionProgress::default();
-        let outcome = network_session(&ui_tx, &input_rx, &mut progress, &telemetry).await;
+        let outcome = network_session(&ui_tx, &mut input_rx, &mut progress, &telemetry).await;
         // Frames the window had taken but not yet submitted are gone with
         // the session, and are counted as never shown rather than left
         // pending across the reconnect.
@@ -1189,7 +1508,7 @@ async fn network_loop(
                 // Drop anything that was queued before the window saw the
                 // message above, so the new session starts from a clean
                 // input state.
-                if discard_stale_input(&input_rx) {
+                if discard_stale_input(&mut input_rx) {
                     return Ok(());
                 }
             }
@@ -1199,7 +1518,7 @@ async fn network_loop(
 
 async fn network_session(
     ui_tx: &UiSender,
-    input_rx: &InputReceiver,
+    input_rx: &mut InputReceiver,
     progress: &mut SessionProgress,
     telemetry: &SharedTelemetry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1209,6 +1528,7 @@ async fn network_session(
     // answer on a second attempt, so waiting out the backoff schedule only
     // delays showing the operator what is actually wrong.
     let pairing = load_pairing_from_environment().map_err(TerminalError::new)?;
+    let _ = write_session_status("negotiating", Some(&pairing.session_id), None);
     let bind = env::var("OPENSTREAM_UDP_BIND")
         .unwrap_or_else(|_| "0.0.0.0:0".to_string())
         .parse::<SocketAddr>()
@@ -1220,6 +1540,11 @@ async fn network_session(
     let mut session =
         PeerSession::establish_configured(&origin, &pairing, Role::Client, bind, &stun_servers)
             .await?;
+    let _ = write_session_status(
+        "connected",
+        Some(&pairing.session_id),
+        Some(session.path_generation()),
+    );
     let path = session.connection_path();
     let clipboard_policy = ClipboardPolicy::from_env();
     eprintln!("{}", clipboard_policy.log_line());
@@ -2353,12 +2678,12 @@ impl From<io::Error> for UiMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRITICAL_INPUT_QUEUE_CAPACITY, CRITICAL_UI_QUEUE_CAPACITY, ClientClock, ClientTelemetry,
-        Duration, HEALTHY_SESSION, InputReceiver, InputSender, PROBE_TIMEOUT, PresentedRect,
-        ProbeAction, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
-        axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
-        gamepad_button_index, is_retryable, keyboard_usages, offer_decoded_frame, presented_rect,
-        selected_display_index, stream_pointer_position,
+        CRITICAL_UI_QUEUE_CAPACITY, ClientClock, ClientTelemetry, Duration, HEALTHY_SESSION,
+        InputReceiver, InputSender, PROBE_TIMEOUT, PresentedRect, ProbeAction, SessionProgress,
+        TerminalError, UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display,
+        decoder_args, discard_stale_input, gamepad_axis_index, gamepad_button_index, is_retryable,
+        keyboard_usages, offer_decoded_frame, presented_rect, selected_display_index,
+        stream_pointer_position,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -2426,16 +2751,10 @@ mod tests {
 
     #[test]
     fn critical_input_survives_a_full_normal_queue() {
-        let (normal_tx, normal_rx) = mpsc::sync_channel(1);
-        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
-        let sender = InputSender {
-            normal: normal_tx,
-            critical: critical_tx,
-        };
-        let receiver = InputReceiver {
-            normal: normal_rx,
-            critical: critical_rx,
-        };
+        // A one-slot normal lane, so the second ordinary event is
+        // guaranteed to hit backpressure and the critical lane still has to
+        // get through.
+        let (sender, mut receiver) = super::input_channels(1);
         let event = UiInput::Event(openstream_media::input::InputEvent::release(1));
         assert!(sender.try_send(event).is_ok());
         assert!(
@@ -2446,8 +2765,8 @@ mod tests {
                 .is_err()
         );
         assert!(sender.try_send(UiInput::Release).is_ok());
-        assert!(matches!(receiver.try_recv(), Ok(UiInput::Event(_))));
         assert!(matches!(receiver.try_recv(), Ok(UiInput::Release)));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -2468,18 +2787,7 @@ mod tests {
     }
 
     fn input_channels() -> (InputSender, InputReceiver) {
-        let (normal_tx, normal_rx) = mpsc::sync_channel(64);
-        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_INPUT_QUEUE_CAPACITY);
-        (
-            InputSender {
-                normal: normal_tx,
-                critical: critical_tx,
-            },
-            InputReceiver {
-                normal: normal_rx,
-                critical: critical_rx,
-            },
-        )
+        super::input_channels(64)
     }
 
     fn key_event(down: bool) -> UiInput {
@@ -2498,12 +2806,12 @@ mod tests {
     /// connection dropped arrives with no matching release.
     #[test]
     fn input_queued_during_a_reconnect_is_discarded_before_the_next_session() {
-        let (sender, receiver) = input_channels();
+        let (sender, mut receiver) = input_channels();
         assert!(sender.try_send(key_event(true)).is_ok());
         assert!(sender.try_send(key_event(false)).is_ok());
         assert!(sender.try_send(UiInput::SelectDisplay(2)).is_ok());
 
-        assert!(!discard_stale_input(&receiver), "no stop was requested");
+        assert!(!discard_stale_input(&mut receiver), "no stop was requested");
         assert!(
             receiver.try_recv().is_err(),
             "the next session must start from an empty input queue"
@@ -2515,11 +2823,11 @@ mod tests {
     /// rather than start another attempt.
     #[test]
     fn a_stop_requested_during_a_reconnect_survives_the_discard() {
-        let (sender, receiver) = input_channels();
+        let (sender, mut receiver) = input_channels();
         assert!(sender.try_send(key_event(true)).is_ok());
         assert!(sender.try_send(UiInput::Stop).is_ok());
 
-        assert!(discard_stale_input(&receiver));
+        assert!(discard_stale_input(&mut receiver));
         assert!(receiver.try_recv().is_err());
     }
 

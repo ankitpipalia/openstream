@@ -156,22 +156,39 @@ async fn websocket_bridge_with_direct_readiness(
         let (to_first, mut first_queue) = mpsc::channel::<Message>(128);
         let (to_second, mut second_queue) = mpsc::channel::<Message>(128);
 
+        // The ICE readiness epoch is always announced, because the service
+        // always announces it once both role sockets exist, and a peer
+        // establishing over ICE now refuses to send any record until it
+        // arrives. A direct-path test simply ignores a vocabulary it is not
+        // listening for, which is also what a real peer does.
+        let mut readiness = vec![Message::Text(
+            serde_json::json!({
+                "type": "ice_peer_ready",
+                "establishment_generation": 1,
+            })
+            .to_string(),
+        )];
         if publish_direct_readiness {
-            let readiness = Message::Text(
-                serde_json::json!({
-                    "type": "peer_ready",
-                    "establishment_generation": 1,
-                })
-                .to_string(),
+            readiness.insert(
+                0,
+                Message::Text(
+                    serde_json::json!({
+                        "type": "peer_ready",
+                        "establishment_generation": 1,
+                    })
+                    .to_string(),
+                ),
             );
+        }
+        for record in readiness {
             to_first
-                .send(readiness.clone())
+                .send(record.clone())
                 .await
-                .expect("queue direct readiness for first peer");
+                .expect("queue readiness for first peer");
             to_second
-                .send(readiness)
+                .send(record)
                 .await
-                .expect("queue direct readiness for second peer");
+                .expect("queue readiness for second peer");
         }
 
         let first_writer = tokio::spawn(async move {

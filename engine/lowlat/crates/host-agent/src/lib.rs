@@ -7,15 +7,15 @@
 
 use openstream_app_core::AppErrorCode;
 use openstream_local_ipc::RequestId;
-use openstream_settings::{AppConfig, CaptureMode};
+use openstream_settings::{AppConfig, CaptureMode, host_config_revision};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Hard upper bound for one child argument.
 const MAX_ARGUMENT_BYTES: usize = 4096;
@@ -27,6 +27,20 @@ const MAX_PROGRAM_BYTES: usize = 4096;
 const MAX_BACKEND_BYTES: usize = 128;
 const MAX_PAIRING_FILE_BYTES: u64 = 64 * 1024;
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(2);
+/// A host child is only healthy while its encoded-frame heartbeat is fresh.
+const FRAME_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Consecutive non-live observations required before a ready child is
+/// restarted for frame-liveness.
+///
+/// One observation is not evidence. The heartbeat is a file written by
+/// another process, so a single read can come back stale or unreadable for
+/// reasons that have nothing to do with the capture pipeline -- a slow
+/// filesystem, a transient permission error, a publisher that has not
+/// completed its first write. Restarting a working stream on one such read is
+/// worse than noticing a real stall one tick later, and
+/// [`FRAME_HEARTBEAT_TIMEOUT`] already means each observation covers three
+/// seconds of missing frames.
+const FRAME_LIVENESS_STRIKES: u32 = 3;
 /// The oldest supported host-agent IPC protocol version.
 pub const HOST_AGENT_PROTOCOL_VERSION: u32 = 1;
 
@@ -40,6 +54,7 @@ pub enum HostErrorCode {
     StopFailed,
     LifetimeExceeded,
     PreflightUnavailable,
+    FrameLivenessTimeout,
 }
 
 impl HostErrorCode {
@@ -57,6 +72,7 @@ impl HostErrorCode {
             }
             Self::RestartLimit | Self::StopFailed => AppErrorCode::Internal,
             Self::PreflightUnavailable => AppErrorCode::DeviceUnavailable,
+            Self::FrameLivenessTimeout => AppErrorCode::Unavailable,
         }
     }
 }
@@ -108,6 +124,7 @@ pub enum ChildExitReason {
     Signal(i32),
     Unknown,
     LifetimeExceeded,
+    FrameLivenessTimeout,
 }
 
 impl From<ChildExit> for ChildExitReason {
@@ -128,7 +145,11 @@ impl ChildExitReason {
     const fn should_restart(self) -> bool {
         matches!(
             self,
-            Self::ExitCode(_) | Self::Signal(_) | Self::Unknown | Self::LifetimeExceeded
+            Self::ExitCode(_)
+                | Self::Signal(_)
+                | Self::Unknown
+                | Self::LifetimeExceeded
+                | Self::FrameLivenessTimeout
         )
     }
 }
@@ -402,6 +423,8 @@ pub struct HostAgentConfig {
     backend: String,
     startup_grace_ms: u64,
     max_child_lifetime_ms: Option<u64>,
+    frame_heartbeat_file: Option<PathBuf>,
+    config_revision: String,
 }
 
 impl HostAgentConfig {
@@ -413,6 +436,8 @@ impl HostAgentConfig {
             backend: "ffmpeg-fallback".to_string(),
             startup_grace_ms: 5_000,
             max_child_lifetime_ms: None,
+            frame_heartbeat_file: None,
+            config_revision: "unversioned".to_string(),
         };
         config.validate()?;
         Ok(config)
@@ -427,39 +452,129 @@ impl HostAgentConfig {
         executable: impl Into<PathBuf>,
     ) -> Result<Self, AgentError> {
         settings.validate().map_err(|_| AgentError::InvalidConfig)?;
+        let effective = settings.effective();
         let mut child = ChildSpec::new(executable)?;
         child = child.env(
             "OPENSTREAM_SIGNAL_ORIGIN",
-            settings.client.signal_origin.clone(),
+            effective.client.signal_origin.clone(),
         )?;
-        child = child.env("OPENSTREAM_WIDTH", settings.video.width.to_string())?;
-        child = child.env("OPENSTREAM_HEIGHT", settings.video.height.to_string())?;
-        child = child.env("OPENSTREAM_FPS", settings.video.fps.to_string())?;
+        child = child.env("OPENSTREAM_WIDTH", effective.video.width.to_string())?;
+        child = child.env("OPENSTREAM_HEIGHT", effective.video.height.to_string())?;
+        child = child.env("OPENSTREAM_FPS", effective.video.fps.to_string())?;
         child = child.env(
             "OPENSTREAM_VIDEO_MBPS",
-            format!("{:.6}", settings.video.bitrate_mbps),
+            format!("{:.6}", effective.video.bitrate_mbps),
         )?;
         child = child.env(
             "OPENSTREAM_VIDEO_MIN_MBPS",
-            format!("{:.6}", settings.video.min_bitrate_mbps),
+            format!("{:.6}", effective.video.min_bitrate_mbps),
         )?;
-        child = child.env("OPENSTREAM_AUDIO", bool_text(settings.audio.enabled))?;
-        child = child.env("OPENSTREAM_ENABLE_INPUT", bool_text(settings.input.enabled))?;
+        child = child.env("OPENSTREAM_VIDEO_CODEC", mode_text(&effective.video.codec)?)?;
+        child = child.env(
+            "OPENSTREAM_PIXEL_FORMAT",
+            mode_text(&effective.video.pixel_format)?,
+        )?;
+        child = child.env("OPENSTREAM_AUDIO", bool_text(effective.audio.enabled))?;
+        child = child.env("OPENSTREAM_AUDIO_CODEC", mode_text(&effective.audio.codec)?)?;
+        child = child.env(
+            "OPENSTREAM_AUDIO_BITRATE_KBPS",
+            effective.audio.bitrate_kbps.to_string(),
+        )?;
+        child = child.env(
+            "OPENSTREAM_AUDIO_LATENCY",
+            mode_text(&effective.audio.latency_mode)?,
+        )?;
+        child = child.env("OPENSTREAM_HOST_NAME", effective.host.name.clone())?;
+        child = child.env(
+            "OPENSTREAM_STAY_AWAKE",
+            bool_text(effective.host.stay_awake),
+        )?;
+        child = child.env(
+            "OPENSTREAM_MAX_GUESTS",
+            effective.host.max_guests.to_string(),
+        )?;
+        child = child.env("OPENSTREAM_APPROVAL", mode_text(&effective.host.approval)?)?;
+        child = child.env(
+            "OPENSTREAM_ENABLE_INPUT",
+            bool_text(effective.input.enabled),
+        )?;
+        child = child.env(
+            "OPENSTREAM_ENABLE_KEYBOARD",
+            bool_text(effective.input.enabled && effective.input.keyboard),
+        )?;
+        child = child.env(
+            "OPENSTREAM_ENABLE_MOUSE",
+            bool_text(effective.input.enabled && effective.input.mouse),
+        )?;
+        child = child.env(
+            "OPENSTREAM_GAMEPAD",
+            bool_text(effective.input.enabled && effective.input.gamepad),
+        )?;
+        child = child.env(
+            "OPENSTREAM_CLIPBOARD",
+            bool_text(effective.input.enabled && effective.input.clipboard),
+        )?;
+        child = child.env(
+            "OPENSTREAM_MIC",
+            bool_text(effective.input.enabled && effective.input.microphone),
+        )?;
+        child = child.env(
+            "OPENSTREAM_HOST_PORT",
+            effective
+                .network
+                .host_start_port
+                .or(effective.network.udp_port)
+                .map_or_else(|| "0".to_string(), |port| port.to_string()),
+        )?;
+        child = child.env("OPENSTREAM_UPNP", bool_text(effective.network.upnp))?;
+        child = child.env("OPENSTREAM_ICE", bool_text(effective.network.ice))?;
+        child = child.env(
+            "OPENSTREAM_FORCE_RELAY",
+            bool_text(effective.network.force_relay),
+        )?;
+        child = child.env(
+            "OPENSTREAM_CONGESTION",
+            mode_text(&effective.network.congestion)?,
+        )?;
+        child = child.env(
+            "OPENSTREAM_FFMPEG_RECONFIGURE",
+            if effective.advanced.ffmpeg_reconfigure {
+                "restart"
+            } else {
+                "disabled"
+            },
+        )?;
+        if let Some(cap) = effective.host.aggregate_bandwidth_cap_mbps {
+            child = child.env("OPENSTREAM_HOST_BANDWIDTH_MBPS", format!("{cap:.6}"))?;
+        }
+        if let Some(display) = &effective.host.selected_display {
+            child = child.env("OPENSTREAM_DISPLAY", display.clone())?;
+        }
         child = child.env(
             "OPENSTREAM_HOST_SECONDS",
-            settings.advanced.max_session_seconds.to_string(),
+            effective.advanced.max_session_seconds.to_string(),
         )?;
-        if !matches!(settings.host.capture, CaptureMode::Auto) {
+        if let Some(ffmpeg) = &effective.advanced.ffmpeg_path {
+            child = child.env("OPENSTREAM_FFMPEG", ffmpeg.clone())?;
+        }
+        if !matches!(effective.host.capture, CaptureMode::Auto) {
             child = child.env(
                 "OPENSTREAM_CAPTURE_BACKEND",
-                mode_text(&settings.host.capture)?,
+                mode_text(&effective.host.capture)?,
             )?;
         }
         child = child.env(
             "OPENSTREAM_VIDEO_ENCODER",
-            mode_text(&settings.host.encoder)?,
+            mode_text(&effective.host.encoder)?,
         )?;
-        Self::new(child)
+        let mut config = Self::new(child)?;
+        config.config_revision = host_config_revision(settings);
+        config.child.env.insert(
+            "OPENSTREAM_CONFIG_REVISION".to_string(),
+            config.config_revision.clone(),
+        );
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn with_policy(mut self, policy: ChildPolicy) -> Result<Self, AgentError> {
@@ -510,6 +625,37 @@ impl HostAgentConfig {
         Ok(self)
     }
 
+    /// Require the child to update a private heartbeat after encoded frames
+    /// are emitted. A missing or stale heartbeat keeps the agent in Starting
+    /// and then triggers bounded restart rather than reporting process-only
+    /// readiness. The path itself is metadata, never secret material.
+    pub fn with_frame_heartbeat_file(mut self, path: impl AsRef<Path>) -> Result<Self, AgentError> {
+        let path = validate_private_runtime_path(path.as_ref())?;
+        self.child.env.insert(
+            "OPENSTREAM_FRAME_HEARTBEAT_FILE".to_string(),
+            path.to_string(),
+        );
+        self.frame_heartbeat_file = Some(PathBuf::from(path));
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Override the revision for a configuration assembled by a service
+    /// broker. Revisions are labels only; the settings file remains the source
+    /// of actual values and secrets are never placed in this field.
+    pub fn with_config_revision(mut self, revision: impl Into<String>) -> Result<Self, AgentError> {
+        self.config_revision = revision.into();
+        if self.config_revision.is_empty() || self.config_revision.len() > 128 {
+            return Err(AgentError::InvalidConfig);
+        }
+        self.child.env.insert(
+            "OPENSTREAM_CONFIG_REVISION".to_string(),
+            self.config_revision.clone(),
+        );
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<(), AgentError> {
         self.child.validate()?;
         self.policy.validate()?;
@@ -520,6 +666,8 @@ impl HostAgentConfig {
             || self
                 .max_child_lifetime_ms
                 .is_some_and(|value| !(1..=86_400_000).contains(&value))
+            || self.config_revision.is_empty()
+            || self.config_revision.len() > 128
         {
             return Err(AgentError::InvalidConfig);
         }
@@ -537,6 +685,54 @@ impl HostAgentConfig {
     pub fn backend(&self) -> &str {
         &self.backend
     }
+
+    pub fn frame_heartbeat_file(&self) -> Option<&Path> {
+        self.frame_heartbeat_file.as_deref()
+    }
+
+    pub fn config_revision(&self) -> &str {
+        &self.config_revision
+    }
+}
+
+fn validate_private_runtime_path(path: &Path) -> Result<String, AgentError> {
+    if !path.is_absolute()
+        || path.as_os_str().to_string_lossy().len() > MAX_ARGUMENT_BYTES
+        || path
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(AgentError::InvalidConfig);
+    }
+    let parent = path.parent().ok_or(AgentError::InvalidConfig)?;
+    if parent.exists() {
+        let metadata = parent
+            .symlink_metadata()
+            .map_err(|_| AgentError::InvalidConfig)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AgentError::InvalidConfig);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(AgentError::InvalidConfig);
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(AgentError::InvalidConfig);
+            }
+        }
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or(AgentError::InvalidConfig)
 }
 
 fn bool_text(value: bool) -> &'static str {
@@ -820,9 +1016,25 @@ pub enum HostAgentEvent {
 }
 
 /// Commands accepted by the host-agent Unix-socket service.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is deliberately absent: `StartWithSettings` carries an `AppConfig`,
+/// which holds floating-point bitrate and gain values. `PartialEq` is enough
+/// for the comparisons this type is actually used for, and claiming a total
+/// equivalence over IEEE-754 would be wrong rather than merely unnecessary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AgentIpcCommand {
     Start,
+    /// Start using a validated, secret-free product configuration supplied by
+    /// the desktop shell. Pairing/private identity material is never part of
+    /// this message; the agent still obtains it only through its protected
+    /// file/provider boundary.
+    ///
+    /// Boxed so one large variant does not set the size of every command in
+    /// this enum -- `Health` and `Tick` are the ones sent constantly. `Box`
+    /// is transparent to serde, so the IPC JSON is unchanged.
+    StartWithSettings {
+        settings: Box<AppConfig>,
+    },
     Stop,
     Tick,
     Health,
@@ -830,11 +1042,25 @@ pub enum AgentIpcCommand {
 }
 
 /// One bounded local request. It contains no credentials or user content.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`, for the reason given on [`AgentIpcCommand`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentIpcRequest {
     pub version: u32,
     pub request_id: RequestId,
     pub command: AgentIpcCommand,
+}
+
+/// Truth state for the child-produced frame heartbeat. Process state alone is
+/// intentionally insufficient: a compositor or capture source can be dead
+/// while FFmpeg remains alive and accepting no bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameLiveness {
+    NotConfigured,
+    Waiting,
+    Live,
+    Stale,
 }
 
 /// One bounded local response. Errors carry only typed status.
@@ -877,6 +1103,10 @@ pub struct HostHealth {
     pub next_restart_in_ms: Option<u64>,
     pub last_exit: Option<ChildExitReason>,
     pub last_error: Option<HostErrorCode>,
+    pub config_revision: String,
+    pub frame_liveness: FrameLiveness,
+    pub frames_seen: u64,
+    pub last_frame_age_ms: Option<u64>,
 }
 
 /// Host child supervisor. F is public only to make deterministic factories
@@ -895,6 +1125,18 @@ pub struct HostAgent<F: ChildFactory = TokioChildFactory> {
     stop_deadline: Option<Instant>,
     pending_termination: Option<ChildExitReason>,
     force_kill_sent: bool,
+    frames_seen: u64,
+    /// When the frame counter last moved to a *higher* value.
+    ///
+    /// Kept separately from the heartbeat file's freshness because they are
+    /// different facts. The publisher rewrites the file on a timer whether or
+    /// not the encoder produced anything, so a fresh file proves the child is
+    /// alive and says nothing about frames flowing. This is the second half:
+    /// the same rule the client's `Liveness` already follows -- progress is
+    /// the counter advancing, not the counter being republished.
+    frames_advanced_at: Option<Instant>,
+    /// Consecutive non-live heartbeat observations. Reset by any live one.
+    liveness_strikes: u32,
 }
 
 impl<F: ChildFactory> fmt::Debug for HostAgent<F> {
@@ -934,6 +1176,9 @@ impl<F: ChildFactory> HostAgent<F> {
             stop_deadline: None,
             pending_termination: None,
             force_kill_sent: false,
+            frames_seen: 0,
+            frames_advanced_at: None,
+            liveness_strikes: 0,
         })
     }
 
@@ -960,6 +1205,33 @@ impl<F: ChildFactory> HostAgent<F> {
         self.last_error = None;
         self.stop_requested = false;
         self.spawn(now)
+    }
+
+    /// Replace the child configuration while no child is running. This is the
+    /// only configuration mutation path: a running or stopping child must be
+    /// fully reaped before a new configuration can be applied, preventing a
+    /// quick UI Stop/Start sequence from leaving two differently configured
+    /// hosts alive at once.
+    pub fn replace_config(&mut self, config: HostAgentConfig) -> Result<(), AgentError> {
+        if self.child.is_some() || self.state == ChildState::Stopping {
+            return Err(AgentError::InvalidConfig);
+        }
+        config.validate()?;
+        self.config = config;
+        self.state = ChildState::Stopped;
+        self.restart_count = 0;
+        self.next_restart_at = None;
+        self.started_at = None;
+        self.last_exit = None;
+        self.last_error = None;
+        self.stop_requested = false;
+        self.stop_deadline = None;
+        self.pending_termination = None;
+        self.force_kill_sent = false;
+        self.frames_seen = 0;
+        self.frames_advanced_at = None;
+        self.liveness_strikes = 0;
+        Ok(())
     }
 
     pub fn stop(&mut self, now: Instant) -> Result<Vec<HostAgentEvent>, AgentError> {
@@ -1012,14 +1284,41 @@ impl<F: ChildFactory> HostAgent<F> {
                 return self.handle_lifetime(now);
             }
 
-            if self.state == ChildState::Starting
-                && self.started_at.is_some_and(|started| {
+            let heartbeat_live = if let Some((age, frames)) = self.heartbeat_observation() {
+                // Record advancement first: the verdict below asks when the
+                // counter last moved, not what it currently reads.
+                if frames > self.frames_seen {
+                    self.frames_seen = frames;
+                    self.frames_advanced_at = Some(now);
+                }
+                self.judge_liveness(age, frames, now) == FrameLiveness::Live
+            } else {
+                true
+            };
+            if heartbeat_live {
+                self.liveness_strikes = 0;
+            } else {
+                self.liveness_strikes = self.liveness_strikes.saturating_add(1);
+            }
+            if self.state == ChildState::Starting {
+                if heartbeat_live {
+                    self.state = ChildState::Ready;
+                    return Ok(vec![HostAgentEvent::Ready]);
+                }
+                if self.started_at.is_some_and(|started| {
                     now.saturating_duration_since(started)
                         >= Duration::from_millis(self.config.startup_grace_ms)
-                })
+                }) {
+                    self.last_error = Some(HostErrorCode::FrameLivenessTimeout);
+                    self.begin_stopping(now, Some(ChildExitReason::FrameLivenessTimeout))?;
+                }
+            } else if self.state == ChildState::Ready
+                && self.liveness_strikes >= FRAME_LIVENESS_STRIKES
             {
-                self.state = ChildState::Ready;
-                return Ok(vec![HostAgentEvent::Ready]);
+                // A ready child is streaming until several consecutive
+                // observations say otherwise. See [`FRAME_LIVENESS_STRIKES`].
+                self.last_error = Some(HostErrorCode::FrameLivenessTimeout);
+                self.begin_stopping(now, Some(ChildExitReason::FrameLivenessTimeout))?;
             }
         }
         Ok(Vec::new())
@@ -1046,6 +1345,15 @@ impl<F: ChildFactory> HostAgent<F> {
         self.stop_deadline = None;
         self.pending_termination = None;
         self.force_kill_sent = false;
+        self.frames_seen = 0;
+        self.frames_advanced_at = None;
+        self.liveness_strikes = 0;
+        if let Some(path) = self.config.frame_heartbeat_file.as_deref() {
+            // A previous child must not make a newly spawned child look live.
+            // The child recreates this bounded metadata file on its first
+            // encoded frame.
+            let _ = std::fs::remove_file(path);
+        }
         Ok(vec![HostAgentEvent::Started { pid }])
     }
 
@@ -1144,7 +1452,12 @@ impl<F: ChildFactory> HostAgent<F> {
                 if was_long_running {
                     self.restart_count = 0;
                 }
-                self.schedule_restart(now, HostErrorCode::LifetimeExceeded, &mut events);
+                let error = match reason {
+                    ChildExitReason::LifetimeExceeded => HostErrorCode::LifetimeExceeded,
+                    ChildExitReason::FrameLivenessTimeout => HostErrorCode::FrameLivenessTimeout,
+                    _ => HostErrorCode::ChildFailed,
+                };
+                self.schedule_restart(now, error, &mut events);
                 return Ok(events);
             }
             self.state = ChildState::Stopped;
@@ -1209,6 +1522,7 @@ impl<F: ChildFactory> HostAgent<F> {
                 .try_into()
                 .unwrap_or(u64::MAX)
         });
+        let (frame_liveness, last_frame_age_ms, heartbeat_frames) = self.heartbeat_status(now);
         HostHealth {
             state: self.state,
             backend: self.config.backend.clone(),
@@ -1217,7 +1531,108 @@ impl<F: ChildFactory> HostAgent<F> {
             next_restart_in_ms,
             last_exit: self.last_exit,
             last_error: self.last_error,
+            config_revision: self.config.config_revision.clone(),
+            frame_liveness,
+            frames_seen: self.frames_seen.max(heartbeat_frames),
+            last_frame_age_ms,
         }
+    }
+
+    /// One reading of the heartbeat file: how fresh it is, and what count it
+    /// carries. Deliberately reports observations rather than a verdict --
+    /// the verdict needs history this cannot see.
+    fn heartbeat_observation(&self) -> Option<(Option<u64>, u64)> {
+        let path = self.config.frame_heartbeat_file.as_deref()?;
+        let Ok(link_metadata) = std::fs::symlink_metadata(path) else {
+            return Some((None, 0));
+        };
+        if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+            return Some((None, 0));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+            if link_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                // Same answer as the symlink and wrong-ownership rejections
+                // above: the path exists but is not a heartbeat file this
+                // agent will read, so there is no age and no count to report.
+                return Some((None, 0));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let uid = unsafe { libc::geteuid() };
+            if link_metadata.uid() != uid || link_metadata.mode() & 0o077 != 0 {
+                return Some((None, 0));
+            }
+        }
+        let age = link_metadata
+            .modified()
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        let mut contents = String::new();
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let frames = options
+            .open(path)
+            .and_then(|file| file.take(64).read_to_string(&mut contents))
+            .ok()
+            .and_then(|_| contents.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        Some((age, frames))
+    }
+
+    /// Judge frame liveness from an observation plus the recorded history.
+    ///
+    /// Two separate conditions, because they answer two separate questions:
+    ///
+    /// ```text
+    /// publisher alive = the heartbeat file is fresh
+    /// frames flowing  = the counter advanced within the timeout
+    /// ```
+    ///
+    /// Only the second is what `Ready` is supposed to mean. The publisher
+    /// rewrites the file on a timer regardless of whether the encoder
+    /// produced anything, so treating a fresh file as proof of frames would
+    /// report a host as healthy forever after its first frame -- which is
+    /// exactly the failure this heartbeat exists to catch.
+    fn judge_liveness(&self, age: Option<u64>, frames: u64, now: Instant) -> FrameLiveness {
+        let timeout_ms = u64::try_from(FRAME_HEARTBEAT_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let publisher_fresh = age.is_some_and(|age| age <= timeout_ms);
+        if frames == 0 {
+            return FrameLiveness::Waiting;
+        }
+        let advanced_recently = self.frames_advanced_at.is_some_and(|at| {
+            u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
+                <= timeout_ms
+        });
+        if publisher_fresh && advanced_recently {
+            FrameLiveness::Live
+        } else {
+            FrameLiveness::Stale
+        }
+    }
+
+    fn heartbeat_status(&self, now: Instant) -> (FrameLiveness, Option<u64>, u64) {
+        let Some((age, frames)) = self.heartbeat_observation() else {
+            return (FrameLiveness::NotConfigured, None, self.frames_seen);
+        };
+        let liveness = self.judge_liveness(age, frames, now);
+        (liveness, age, frames)
     }
 
     pub fn app_error_code(&self) -> Option<AppErrorCode> {
@@ -1240,6 +1655,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1440,6 +1856,252 @@ mod tests {
         );
         assert_eq!(agent.health(now).state, ChildState::Ready);
         assert_eq!(factory.spawned.lock().expect("spawn lock").len(), 1);
+    }
+
+    /// A private runtime directory and heartbeat path for one test.
+    ///
+    /// The suffix comes from a counter rather than a clock. These tests run
+    /// concurrently and each one deletes its own directory at the end, so two
+    /// of them sharing a name means one removes the other's heartbeat file
+    /// mid-run. A counter cannot collide; an elapsed-time reading taken
+    /// immediately after `Instant::now()` is always zero and always does.
+    fn heartbeat_config() -> (HostAgentConfig, PathBuf, PathBuf) {
+        static NEXT_HEARTBEAT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "openstream-heartbeat-test-{}-{}",
+            std::process::id(),
+            NEXT_HEARTBEAT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("heartbeat test directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                .expect("private heartbeat directory");
+        }
+        let path = directory.join("frames");
+        let config = config()
+            .with_frame_heartbeat_file(&path)
+            .expect("heartbeat config");
+        (config, path, directory)
+    }
+
+    fn publish_frames(path: &PathBuf, frames: u64) {
+        fs::write(path, format!("{frames}\n")).expect("publish heartbeat");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("private heartbeat file");
+        }
+    }
+
+    /// A live process that never emits a frame is not a ready host.
+    #[test]
+    fn a_child_that_publishes_no_frames_never_reaches_ready() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(11)));
+        let (config, _path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        // Past the startup grace with no heartbeat at all: the process is
+        // alive, and that is explicitly not evidence of a working capture.
+        agent
+            .tick(now + Duration::from_millis(50))
+            .expect("liveness tick");
+        assert_ne!(agent.health(now).state, ChildState::Ready);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// One unreadable observation must not restart a working stream.
+    ///
+    /// The heartbeat is a file written by another process. A single read can
+    /// come back stale for reasons that have nothing to do with capture, and
+    /// tearing down a live session for one of them is worse than noticing a
+    /// real stall a tick later.
+    #[test]
+    fn a_ready_child_survives_a_single_stale_heartbeat_observation() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(12)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_frames(&path, 1);
+        assert_eq!(
+            agent
+                .tick(now + Duration::from_millis(20))
+                .expect("becomes ready"),
+            vec![HostAgentEvent::Ready]
+        );
+
+        // Remove the file to simulate the worst observation available: no
+        // count at all.
+        fs::remove_file(&path).expect("remove heartbeat");
+        agent
+            .tick(now + Duration::from_millis(30))
+            .expect("first stale observation");
+        assert_eq!(
+            agent.health(now).state,
+            ChildState::Ready,
+            "one stale read must not stop a ready child"
+        );
+
+        // A fresh count clears the strike, so a recovered stall leaves no
+        // residue behind.
+        publish_frames(&path, 2);
+        agent
+            .tick(now + Duration::from_millis(40))
+            .expect("recovered observation");
+        assert_eq!(agent.health(now).state, ChildState::Ready);
+        fs::remove_file(&path).expect("remove heartbeat again");
+        agent
+            .tick(now + Duration::from_millis(50))
+            .expect("stale after recovery");
+        assert_eq!(
+            agent.health(now).state,
+            ChildState::Ready,
+            "a recovered stall must not carry its strike forward"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A republished-but-unchanging count is a stall, however fresh the file.
+    ///
+    /// The publisher rewrites the heartbeat on a timer whether or not the
+    /// encoder produced anything, so a fresh file proves only that the child
+    /// process is alive. Treating that as frame liveness would report a host
+    /// as healthy forever after its very first frame, which is precisely the
+    /// failure this heartbeat exists to catch.
+    #[test]
+    fn a_frozen_frame_counter_is_a_stall_even_while_the_file_stays_fresh() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(14)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        // One frame, then the encoder stops. The publisher keeps going.
+        publish_frames(&path, 1);
+        assert_eq!(
+            agent
+                .tick(now + Duration::from_millis(20))
+                .expect("becomes ready"),
+            vec![HostAgentEvent::Ready]
+        );
+        assert_eq!(agent.health(now).state, ChildState::Ready);
+
+        // Republish the same count, keeping the file's mtime fresh, and let
+        // the clock pass the frame-liveness timeout.
+        let stalled_from = now + super::FRAME_HEARTBEAT_TIMEOUT + Duration::from_millis(100);
+        for strike in 0..super::FRAME_LIVENESS_STRIKES {
+            publish_frames(&path, 1);
+            agent
+                .tick(stalled_from + Duration::from_millis(u64::from(strike)))
+                .expect("stalled observation");
+        }
+        assert_ne!(
+            agent.health(stalled_from).state,
+            ChildState::Ready,
+            "a fresh heartbeat file carrying a frozen count is still a stall"
+        );
+        assert_eq!(
+            agent.health(stalled_from).last_error,
+            Some(HostErrorCode::FrameLivenessTimeout)
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A counter that keeps advancing keeps the child ready.
+    #[test]
+    fn an_advancing_frame_counter_keeps_the_child_ready() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(15)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        publish_frames(&path, 1);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        for step in 1..=6_u64 {
+            publish_frames(&path, 1 + step);
+            agent
+                .tick(now + Duration::from_millis(20 + step * 1_000))
+                .expect("advancing observation");
+            assert_eq!(
+                agent.health(now).state,
+                ChildState::Ready,
+                "an advancing counter must keep the child ready at step {step}"
+            );
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A real stall still stops the child, just not on the first read.
+    #[test]
+    fn a_ready_child_stops_after_consecutive_stale_heartbeats() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(13)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_frames(&path, 1);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        assert_eq!(agent.health(now).state, ChildState::Ready);
+
+        fs::remove_file(&path).expect("remove heartbeat");
+        for strike in 1..super::FRAME_LIVENESS_STRIKES {
+            agent
+                .tick(now + Duration::from_millis(30 + u64::from(strike)))
+                .expect("stale observation");
+            assert_eq!(
+                agent.health(now).state,
+                ChildState::Ready,
+                "stopped after only {strike} stale observation(s)"
+            );
+        }
+        agent
+            .tick(now + Duration::from_millis(60))
+            .expect("final stale observation");
+        assert_ne!(
+            agent.health(now).state,
+            ChildState::Ready,
+            "a sustained stall must still stop the child"
+        );
+        assert_eq!(
+            agent.health(now).last_error,
+            Some(HostErrorCode::FrameLivenessTimeout)
+        );
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

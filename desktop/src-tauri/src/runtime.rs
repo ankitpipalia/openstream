@@ -1,10 +1,11 @@
 use openstream_app_core::{
-    AppCommand, AppError, AppErrorCode, AppEvent, AppModel, AppSnapshot, DiagnosticSnapshot,
-    HostStatus, PermissionSet, MAX_REQUEST_ID_BYTES,
+    AppCommand, AppError, AppErrorCode, AppEvent, AppModel, AppSnapshot, AppState, DeviceSummary,
+    DeviceTrustState, Diagnostic, DiagnosticSnapshot, DiagnosticState, HostStatus, PermissionSet,
+    MAX_REQUEST_ID_BYTES,
 };
 use openstream_settings::{
-    default_config, load, save_atomic, setting_descriptors, AppConfig, SettingApplyMode,
-    SettingDescriptor, SettingsError,
+    default_config, host_config_revision, load, save_atomic, setting_descriptors, AppConfig,
+    SettingApplyMode, SettingDescriptor, SettingsError,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -16,7 +17,8 @@ use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::host_agent::HostAgentBridgeError;
-use openstream_host_agent::{ChildState, HostAgentEvent, HostErrorCode, HostHealth};
+use crate::session::{SessionHealth, SessionProcessState};
+use openstream_host_agent::{ChildState, FrameLiveness, HostAgentEvent, HostErrorCode, HostHealth};
 
 /// Errors crossing the desktop runtime boundary contain stable categories and
 /// codes, never app-core's free-form diagnostics.
@@ -63,6 +65,7 @@ impl From<AppError> for RuntimeError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeCommand {
     SignIn,
+    SignOut,
     Connect {
         device_id: String,
         requested: PermissionSet,
@@ -80,6 +83,9 @@ pub enum RuntimeCommand {
     ClearFailure,
     EnableHosting,
     DisableHosting,
+    /// Stop and start the persistent host agent so RestartHost settings are
+    /// applied as one serialized lifecycle transaction.
+    RestartHosting,
 }
 
 /// Map a host-agent bridge failure to a fixed, typed description. Only a
@@ -164,6 +170,9 @@ fn describe_host_error(code: Option<HostErrorCode>) -> &'static str {
         Some(HostErrorCode::StopFailed) => "the host process could not be stopped",
         Some(HostErrorCode::LifetimeExceeded) => "the host process exceeded its lifetime limit",
         Some(HostErrorCode::PreflightUnavailable) => "no usable host capture backend was found",
+        Some(HostErrorCode::FrameLivenessTimeout) => {
+            "the host process stopped producing encoded frames"
+        }
         None => "the host process failed",
     }
 }
@@ -212,6 +221,7 @@ fn generate_request_id() -> String {
 /// descriptor needs a matching arm here to ever appear as pending.
 fn setting_value_changed(key: &str, before: &AppConfig, after: &AppConfig) -> bool {
     match key {
+        "client.signal_origin" => before.client.signal_origin != after.client.signal_origin,
         "client.profile" => before.client.profile != after.client.profile,
         "client.window_mode" => before.client.window_mode != after.client.window_mode,
         "client.renderer" => before.client.renderer != after.client.renderer,
@@ -221,10 +231,20 @@ fn setting_value_changed(key: &str, before: &AppConfig, after: &AppConfig) -> bo
         "client.chroma" => before.client.chroma != after.client.chroma,
         "client.bit_depth" => before.client.bit_depth != after.client.bit_depth,
         "client.immersive" => before.client.immersive != after.client.immersive,
+        "client.show_warnings" => before.client.show_warnings != after.client.show_warnings,
+        "client.overlay" => before.client.overlay != after.client.overlay,
         "host.enabled" => before.host.enabled != after.host.enabled,
         "host.name" => before.host.name != after.host.name,
         "host.capture.drm" | "host.capture.x11" => before.host.capture != after.host.capture,
         "host.stay_awake" => before.host.stay_awake != after.host.stay_awake,
+        "host.encoder" => before.host.encoder != after.host.encoder,
+        "host.approval" => before.host.approval != after.host.approval,
+        "host.max_guests" => before.host.max_guests != after.host.max_guests,
+        "host.aggregate_bandwidth_cap_mbps" => {
+            before.host.aggregate_bandwidth_cap_mbps != after.host.aggregate_bandwidth_cap_mbps
+        }
+        "host.selected_display" => before.host.selected_display != after.host.selected_display,
+        "input.enabled" => before.input.enabled != after.input.enabled,
         "input.keyboard" => before.input.keyboard != after.input.keyboard,
         "input.mouse" => before.input.mouse != after.input.mouse,
         "input.gamepad" => before.input.gamepad != after.input.gamepad,
@@ -236,7 +256,130 @@ fn setting_value_changed(key: &str, before: &AppConfig, after: &AppConfig) -> bo
         }
         "network.upnp" => before.network.upnp != after.network.upnp,
         "network.turn" => before.network.turn != after.network.turn,
+        "network.ice" => before.network.ice != after.network.ice,
+        "network.force_relay" => before.network.force_relay != after.network.force_relay,
+        "network.congestion" => before.network.congestion != after.network.congestion,
         _ => false,
+    }
+}
+
+fn parse_mode<T>(key: &str, value: serde_json::Value) -> Result<T, RuntimeError>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    serde_json::from_value(value).map_err(|_| {
+        let _ = key;
+        RuntimeError::InvalidSettings
+    })
+}
+
+fn parse_bool(key: &str, value: serde_json::Value) -> Result<bool, RuntimeError> {
+    match value {
+        serde_json::Value::Bool(value) => Ok(value),
+        serde_json::Value::String(value) => match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" => Ok(true),
+            "0" | "false" | "off" => Ok(false),
+            _ => {
+                let _ = key;
+                Err(RuntimeError::InvalidSettings)
+            }
+        },
+        _ => {
+            let _ = key;
+            Err(RuntimeError::InvalidSettings)
+        }
+    }
+}
+
+fn parse_string(key: &str, value: serde_json::Value) -> Result<String, RuntimeError> {
+    let value = value.as_str().ok_or_else(|| {
+        let _ = key;
+        RuntimeError::InvalidSettings
+    })?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(RuntimeError::InvalidSettings);
+    }
+    Ok(value.to_string())
+}
+
+fn parse_optional_port(key: &str, value: serde_json::Value) -> Result<Option<u16>, RuntimeError> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) if value.eq_ignore_ascii_case("auto") => Ok(None),
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| *value != 0)
+            .map(Some)
+            .ok_or_else(|| {
+                let _ = key;
+                RuntimeError::InvalidSettings
+            }),
+        serde_json::Value::String(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|value| *value != 0)
+            .map(Some)
+            .ok_or_else(|| {
+                let _ = key;
+                RuntimeError::InvalidSettings
+            }),
+        _ => {
+            let _ = key;
+            Err(RuntimeError::InvalidSettings)
+        }
+    }
+}
+
+fn parse_u8(key: &str, value: serde_json::Value) -> Result<u8, RuntimeError> {
+    let number = match value {
+        serde_json::Value::Number(value) => value.as_u64(),
+        serde_json::Value::String(value) => value.parse::<u64>().ok(),
+        _ => None,
+    };
+    number
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or_else(|| {
+            let _ = key;
+            RuntimeError::InvalidSettings
+        })
+}
+
+fn parse_optional_rate(key: &str, value: serde_json::Value) -> Result<Option<f64>, RuntimeError> {
+    let rate = match value {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::String(value) if value.eq_ignore_ascii_case("auto") => return Ok(None),
+        serde_json::Value::Number(value) => value.as_f64(),
+        serde_json::Value::String(value) => value.parse::<f64>().ok(),
+        _ => None,
+    };
+    match rate {
+        Some(rate) if rate.is_finite() && rate > 0.0 => Ok(Some(rate)),
+        _ => {
+            let _ = key;
+            Err(RuntimeError::InvalidSettings)
+        }
+    }
+}
+
+fn parse_optional_string(
+    key: &str,
+    value: serde_json::Value,
+) -> Result<Option<String>, RuntimeError> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) if value.eq_ignore_ascii_case("auto") => Ok(None),
+        serde_json::Value::String(value) => {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                Err(RuntimeError::InvalidSettings)
+            } else {
+                Ok(Some(value))
+            }
+        }
+        _ => {
+            let _ = key;
+            Err(RuntimeError::InvalidSettings)
+        }
     }
 }
 
@@ -270,25 +413,40 @@ pub struct RuntimeState {
     descriptors: Vec<SettingDescriptor>,
     /// Values in force for `SettingApplyMode::Reconnect` keys.
     ///
-    /// Nothing advances this yet: a reconnect picks the new values up, and
-    /// the session runner that would perform one does not exist (R-01). A
-    /// `Reconnect`-classed change therefore stays pending for the life of
-    /// the process, which is the honest answer while no session can be
-    /// established at all. When the runner lands, it advances this the way
-    /// `note_host_started` advances the host baseline.
+    /// The native session runner advances this baseline after it accepts a
+    /// new session descriptor. A reconnect policy is still deliberately
+    /// explicit: persisting a setting does not silently tear down a live
+    /// session, so the key remains pending until the operator reconnects.
     applied_reconnect: AppConfig,
     /// Values in force for `SettingApplyMode::RestartHost` keys.
     ///
-    /// Nothing advances this yet either, and for a sharper reason than the
-    /// reconnect baseline: the agent cannot say which configuration its
-    /// child is running. See
-    /// [`Self::host_config_revision_is_proven`].
+    /// This advances only when the host agent echoes a matching
+    /// `host_config_revision` in `HostHealth`.
     applied_host: AppConfig,
     /// Values in force for `SettingApplyMode::RestartApplication` keys and
     /// for the deployment mode. Only a process restart advances this, and a
     /// process restart rebuilds `RuntimeState` from the settings file, so
     /// it is simply whatever was loaded at construction.
     applied_application: AppConfig,
+    trusted_devices: Vec<TrustedDeviceSnapshot>,
+    /// Runtime-owned diagnostics. Keeping this alongside the app model makes
+    /// `runtime_snapshot` reflect the last real host/session observations
+    /// instead of rebuilding a fresh all-pending value on every poll.
+    diagnostics: DiagnosticSnapshot,
+}
+
+/// Public device data safe to send to the product shell. The raw public key is
+/// intentionally omitted; the short fingerprint is enough for a user to
+/// identify a device without turning the UI snapshot into an identity export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TrustedDeviceSnapshot {
+    pub device_id: String,
+    pub name: String,
+    pub platform: String,
+    pub enrolled_at_ms: u64,
+    pub trust: DeviceTrustState,
+    pub last_seen_ms: Option<u64>,
+    pub public_key_fingerprint: String,
 }
 
 /// Secret-free state returned to the product shell.
@@ -304,6 +462,7 @@ pub struct RuntimeSnapshot {
     /// Keys, from `descriptors` plus the deployment mode, whose persisted
     /// value is not yet reflected in the running application.
     pub pending_settings: Vec<String>,
+    pub trusted_devices: Vec<TrustedDeviceSnapshot>,
 }
 
 /// Result of an accepted runtime command.
@@ -335,6 +494,8 @@ impl RuntimeState {
             settings,
             settings_path: path,
             descriptors: setting_descriptors(),
+            trusted_devices: Vec::new(),
+            diagnostics: DiagnosticSnapshot::default(),
         })
     }
 
@@ -345,6 +506,151 @@ impl RuntimeState {
 
     pub fn settings(&self) -> &AppConfig {
         &self.settings
+    }
+
+    /// Whether the current deployment is the explicitly configured local
+    /// mode. The shell uses this only to decide whether a local developer
+    /// pairing may be auto-approved; secure mode always requires an
+    /// authenticated control-plane approval.
+    pub(crate) fn is_local_mode(&self) -> bool {
+        self.app.is_local_mode()
+    }
+
+    pub(crate) fn app_state(&self) -> &AppState {
+        self.app.state()
+    }
+
+    pub(crate) fn host_status(&self) -> HostStatus {
+        self.app.host_status()
+    }
+
+    /// Add a secret-free device observation supplied by the Rust control
+    /// plane. The WebView cannot manufacture a device by sending an outcome
+    /// command; only this internal bootstrap/reconciliation path can do it.
+    pub(crate) fn add_device(&mut self, device: DeviceSummary) {
+        self.app.add_device(device);
+    }
+
+    pub(crate) fn set_trusted_devices(&mut self, devices: Vec<TrustedDeviceSnapshot>) {
+        self.trusted_devices = devices;
+    }
+
+    pub(crate) fn replace_devices(&mut self, devices: Vec<DeviceSummary>) {
+        self.app.replace_devices(devices);
+    }
+
+    /// Apply the outcome of a real control-plane authentication request. The
+    /// browser may request authentication, but only this Rust-side outcome
+    /// can move the state machine into `Ready`.
+    pub(crate) fn authentication_succeeded(
+        &mut self,
+    ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        let events = self
+            .app
+            .dispatch(AppCommand::AuthenticationSucceeded)
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
+    }
+
+    pub(crate) fn authentication_failed(
+        &mut self,
+        retryable: bool,
+    ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        let events = self
+            .app
+            .dispatch(AppCommand::AuthenticationFailed { retryable })
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
+    }
+
+    pub(crate) fn begin_session_negotiation(
+        &mut self,
+    ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        let events = self
+            .app
+            .dispatch(AppCommand::ConnectionNegotiating)
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
+    }
+
+    pub(crate) fn session_established(
+        &mut self,
+        session_id: String,
+        generation: u64,
+    ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        let events = self
+            .app
+            .dispatch(AppCommand::ConnectionEstablished {
+                session_id,
+                generation,
+            })
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
+    }
+
+    pub(crate) fn session_failed(
+        &mut self,
+        retryable: bool,
+    ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        let events = self
+            .app
+            .dispatch(AppCommand::ConnectionFailed { retryable })
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
+    }
+
+    pub(crate) fn complete_disconnect(&mut self) -> Result<RuntimeDispatchResult, RuntimeError> {
+        let events = self
+            .app
+            .dispatch(AppCommand::Disconnected)
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
+    }
+
+    /// Record the reconnect-class settings that the next native session
+    /// runner has actually received. Persisting a reconnect setting alone is
+    /// not proof that an already-running session uses it; the session bridge
+    /// calls this only after the child accepted the effective configuration.
+    pub(crate) fn mark_reconnect_applied(&mut self) {
+        self.applied_reconnect = self.settings.clone();
+    }
+
+    pub(crate) fn approve_local_request(
+        &mut self,
+        request_id: String,
+        available: PermissionSet,
+    ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        self.require_pending_request(&request_id)?;
+        let events = self
+            .app
+            .dispatch(AppCommand::ApproveRequest {
+                request_id,
+                available,
+                now_ms: current_time_ms(),
+            })
+            .map_err(RuntimeError::from)?;
+        Ok(RuntimeDispatchResult {
+            snapshot: self.snapshot(),
+            events,
+        })
     }
 
     pub fn update_settings(&mut self, settings: AppConfig) -> Result<(), RuntimeError> {
@@ -363,6 +669,86 @@ impl RuntimeState {
         // moment this assignment lands.
         self.settings = settings;
         Ok(())
+    }
+
+    /// Update exactly one shell-visible setting. Keeping this conversion in
+    /// Rust prevents the WebView from replacing an entire configuration with
+    /// an object that omitted fields, changed schema versions, or smuggled in
+    /// an unsupported enum. The full-config command remains available for
+    /// migrations and tests; normal UI controls use this narrow operation.
+    pub fn update_setting(
+        &mut self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<RuntimeSnapshot, RuntimeError> {
+        if !self
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.key == key)
+        {
+            return Err(RuntimeError::InvalidSettings);
+        }
+        let mut settings = self.settings.clone();
+        match key {
+            "client.signal_origin" => settings.client.signal_origin = parse_string(key, value)?,
+            "client.profile" => settings.client.profile = parse_mode(key, value)?,
+            "client.window_mode" => settings.client.window_mode = parse_mode(key, value)?,
+            "client.renderer" => settings.client.renderer = parse_mode(key, value)?,
+            "client.vsync" => settings.client.vsync = parse_mode(key, value)?,
+            "client.decoder" => settings.client.decoder = parse_mode(key, value)?,
+            "client.codec" => settings.client.codec = parse_mode(key, value)?,
+            "client.chroma" => settings.client.chroma = parse_mode(key, value)?,
+            "client.bit_depth" => settings.client.bit_depth = parse_mode(key, value)?,
+            "client.immersive" => settings.client.immersive = parse_bool(key, value)?,
+            "client.show_warnings" => settings.client.show_warnings = parse_bool(key, value)?,
+            "client.overlay" => settings.client.overlay = parse_bool(key, value)?,
+            "host.enabled" => settings.host.enabled = parse_bool(key, value)?,
+            "host.name" => settings.host.name = parse_string(key, value)?,
+            "host.capture.drm" => {
+                settings.host.capture = if parse_bool(key, value)? {
+                    openstream_settings::CaptureMode::Drm
+                } else {
+                    openstream_settings::CaptureMode::Auto
+                };
+            }
+            "host.capture.x11" => {
+                settings.host.capture = if parse_bool(key, value)? {
+                    openstream_settings::CaptureMode::X11
+                } else {
+                    openstream_settings::CaptureMode::Auto
+                };
+            }
+            "host.stay_awake" => settings.host.stay_awake = parse_bool(key, value)?,
+            "host.encoder" => settings.host.encoder = parse_mode(key, value)?,
+            "host.approval" => settings.host.approval = parse_mode(key, value)?,
+            "host.max_guests" => settings.host.max_guests = parse_u8(key, value)?,
+            "host.aggregate_bandwidth_cap_mbps" => {
+                settings.host.aggregate_bandwidth_cap_mbps = parse_optional_rate(key, value)?
+            }
+            "host.selected_display" => {
+                settings.host.selected_display = parse_optional_string(key, value)?
+            }
+            "input.enabled" => settings.input.enabled = parse_bool(key, value)?,
+            "input.keyboard" => settings.input.keyboard = parse_bool(key, value)?,
+            "input.mouse" => settings.input.mouse = parse_bool(key, value)?,
+            "input.gamepad" => settings.input.gamepad = parse_bool(key, value)?,
+            "input.clipboard" => settings.input.clipboard = parse_bool(key, value)?,
+            "input.microphone" => settings.input.microphone = parse_bool(key, value)?,
+            "network.client_port" => {
+                settings.network.client_port = parse_optional_port(key, value)?
+            }
+            "network.host_start_port" => {
+                settings.network.host_start_port = parse_optional_port(key, value)?;
+            }
+            "network.upnp" => settings.network.upnp = parse_bool(key, value)?,
+            "network.turn" => settings.network.turn = parse_bool(key, value)?,
+            "network.ice" => settings.network.ice = parse_bool(key, value)?,
+            "network.force_relay" => settings.network.force_relay = parse_bool(key, value)?,
+            "network.congestion" => settings.network.congestion = parse_mode(key, value)?,
+            _ => return Err(RuntimeError::InvalidSettings),
+        }
+        self.update_settings(settings)?;
+        Ok(self.snapshot())
     }
 
     /// The baseline a key's apply mode is measured against.
@@ -415,41 +801,22 @@ impl RuntimeState {
             .any(|descriptor| setting_value_changed(descriptor.key, baseline, &self.settings))
     }
 
-    /// Whether the agent has proved which configuration its child is
-    /// running.
-    ///
-    /// It has not, and cannot yet. `HostReady` says a child reached a ready
-    /// state; it says nothing about what that child was configured with.
-    /// The agent builds its `HostAgentConfig` once, at daemon startup, from
-    /// `default_config()` plus environment overrides -- it never reads this
-    /// shell's `settings.json`, and an IPC `Start` carries no settings --
-    /// so a stop/start cycle re-runs the child under the agent's original
-    /// configuration, not the edited one.
-    ///
-    /// Advancing `applied_host` on `HostReady` therefore reports a
-    /// restart-host setting as applied while the running child still has
-    /// the old value: the exact false "already in effect" state these
-    /// baselines exist to prevent, just one step further along. Until the
-    /// agent can report the configuration revision it actually consumed,
-    /// the honest answer is that the change is still pending, so nothing
-    /// advances this baseline.
-    ///
-    /// The mechanism that would close this is a config revision carried
-    /// through `Start` and echoed in `HostHealth`; that belongs with the
-    /// runtime controller in R-01, which is where configuration application
-    /// stops being inferred from process state.
-    const fn host_config_revision_is_proven() -> bool {
-        false
+    /// Whether the agent has proved which host configuration its child is
+    /// running. Client-only edits deliberately do not affect this digest.
+    fn host_config_revision_is_proven(&self, health: &HostHealth) -> bool {
+        health.state == ChildState::Ready
+            && health.config_revision == host_config_revision(&self.settings)
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
         RuntimeSnapshot {
-            app: self.app.snapshot(DiagnosticSnapshot::default()),
+            app: self.app.snapshot(self.diagnostics.clone()),
             settings: self.settings.clone(),
             descriptors: self.descriptors.clone(),
             restart_required: self.restart_required(),
             host_restart_required: self.host_restart_required(),
             pending_settings: self.pending_setting_keys().into_iter().collect(),
+            trusted_devices: self.trusted_devices.clone(),
         }
     }
 
@@ -491,6 +858,7 @@ impl RuntimeState {
         let now_ms = current_time_ms();
         match command {
             RuntimeCommand::SignIn => Ok(AppCommand::BeginAuthentication),
+            RuntimeCommand::SignOut => Ok(AppCommand::SignOut),
             RuntimeCommand::Connect {
                 device_id,
                 requested,
@@ -519,6 +887,10 @@ impl RuntimeState {
             RuntimeCommand::ClearFailure => Ok(AppCommand::ClearFailure),
             RuntimeCommand::EnableHosting => Ok(AppCommand::EnableHosting),
             RuntimeCommand::DisableHosting => Ok(AppCommand::DisableHosting),
+            RuntimeCommand::RestartHosting => Err(RuntimeError::CommandRejected {
+                code: AppErrorCode::InvalidCommand,
+                retryable: false,
+            }),
         }
     }
 
@@ -575,13 +947,10 @@ impl RuntimeState {
 
     /// Dispatch one host-lifecycle command.
     ///
-    /// A `HostReady` deliberately does not advance the host settings
-    /// baseline; see [`Self::host_config_revision_is_proven`] for why a
-    /// ready child is not evidence that it consumed the edited settings.
+    /// A `HostReady` event alone does not advance the host settings baseline;
+    /// the health reconciler must also observe the exact configuration
+    /// revision echoed by the ready child.
     fn apply_host_command(&mut self, command: AppCommand) -> Result<Vec<AppEvent>, RuntimeError> {
-        if matches!(command, AppCommand::HostReady) && Self::host_config_revision_is_proven() {
-            self.applied_host = self.settings.clone();
-        }
         self.app.dispatch(command).map_err(RuntimeError::from)
     }
 
@@ -605,6 +974,10 @@ impl RuntimeState {
         &mut self,
         health: &HostHealth,
     ) -> Result<RuntimeDispatchResult, RuntimeError> {
+        self.reconcile_host_diagnostics(health);
+        if self.host_config_revision_is_proven(health) {
+            self.applied_host = self.settings.clone();
+        }
         let status = self.app.host_status();
         let commands: Vec<AppCommand> = match health.state {
             ChildState::Ready => match status {
@@ -648,6 +1021,141 @@ impl RuntimeState {
         })
     }
 
+    /// Translate host-agent observations into the shell's closed diagnostic
+    /// vocabulary. A surviving child is not enough to mark capture/encoding
+    /// healthy: the child-produced heartbeat must also show that frames are
+    /// flowing. This is intentionally conservative for untested adapters.
+    fn reconcile_host_diagnostics(&mut self, health: &HostHealth) {
+        let (capture_state, capture_detail) = match (health.state, health.frame_liveness) {
+            (ChildState::Ready, FrameLiveness::Live) => (
+                DiagnosticState::Available,
+                format!(
+                    "{} is producing encoded frames ({} observed).",
+                    health.backend, health.frames_seen
+                ),
+            ),
+            (ChildState::Ready, FrameLiveness::Stale) => (
+                DiagnosticState::Unavailable,
+                "The host process is alive but its frame heartbeat is stale.".to_string(),
+            ),
+            (ChildState::Ready, FrameLiveness::Waiting | FrameLiveness::NotConfigured) => (
+                DiagnosticState::Pending,
+                format!(
+                    "{} is ready; waiting for a client session to produce frames.",
+                    health.backend
+                ),
+            ),
+            (ChildState::Starting | ChildState::Backoff, _) => (
+                DiagnosticState::Pending,
+                "The host agent is starting or waiting to retry.".to_string(),
+            ),
+            (ChildState::Stopping, _) => (
+                DiagnosticState::Pending,
+                "The host agent is stopping the current pipeline.".to_string(),
+            ),
+            (ChildState::Stopped | ChildState::Failed, _) => (
+                DiagnosticState::Unavailable,
+                "The host agent is not running a capture pipeline.".to_string(),
+            ),
+        };
+        self.diagnostics.capture_backend = Diagnostic::new(capture_state, capture_detail);
+        self.diagnostics.encoder = Diagnostic::new(
+            capture_state,
+            if capture_state == DiagnosticState::Available {
+                format!("{} is producing encoded output.", health.backend)
+            } else {
+                "Encoder readiness is withheld until frame liveness is proven.".to_string()
+            },
+        );
+        self.diagnostics.input = if self.settings.input.enabled {
+            Diagnostic::pending("Input is enabled; adapter readiness is checked by the host.")
+        } else {
+            Diagnostic::unavailable("Input forwarding is disabled in host settings.")
+        };
+        self.diagnostics.audio = if self.settings.audio.enabled {
+            Diagnostic::pending("Audio is enabled; physical endpoint readiness is not yet proven.")
+        } else {
+            Diagnostic::unavailable("Audio forwarding is disabled in host settings.")
+        };
+        self.diagnostics.last_error = health.last_error.map(|_| AppErrorCode::Unavailable);
+    }
+
+    /// Reconcile the product diagnostics with the native session runner. The
+    /// runner only reports lifecycle and secret-free status; it does not send
+    /// media through Tauri. A connected FFmpeg/BGRA runner is therefore
+    /// reported as experimental rather than as native hardware decode or
+    /// zero-copy presentation, both of which remain separate backends.
+    pub(crate) fn reconcile_session_health(&mut self, health: &SessionHealth) {
+        let stale = health.status_age_ms.is_some_and(|age| age > 5_000);
+        match health.state {
+            SessionProcessState::Connected if !stale => {
+                self.diagnostics.decoder = Diagnostic::new(
+                    DiagnosticState::Experimental,
+                    "FFmpeg fallback decoding is active; VideoToolbox is not wired yet.",
+                );
+                self.diagnostics.renderer = Diagnostic::new(
+                    DiagnosticState::Experimental,
+                    "wgpu presentation is active; decoded BGRA is uploaded to the GPU.",
+                );
+                self.diagnostics.input = if self.settings.input.enabled {
+                    Diagnostic::new(
+                        DiagnosticState::Experimental,
+                        "Authenticated input forwarding is active; raw immersive input is not verified.",
+                    )
+                } else {
+                    Diagnostic::unavailable("Input forwarding is disabled in client settings.")
+                };
+                self.diagnostics.audio = if self.settings.audio.enabled {
+                    Diagnostic::new(
+                        DiagnosticState::Experimental,
+                        "Opus session audio is enabled; a physical endpoint test is still required.",
+                    )
+                } else {
+                    Diagnostic::unavailable("Audio forwarding is disabled in client settings.")
+                };
+                self.diagnostics.last_error = None;
+            }
+            SessionProcessState::Connected => {
+                self.diagnostics.decoder = Diagnostic::unavailable(
+                    "The session status is stale; decoder health cannot be trusted.",
+                );
+                self.diagnostics.renderer = Diagnostic::unavailable(
+                    "The session status is stale; renderer health cannot be trusted.",
+                );
+                self.diagnostics.last_error = Some(AppErrorCode::Unavailable);
+            }
+            SessionProcessState::Starting | SessionProcessState::Running => {
+                self.diagnostics.decoder = Diagnostic::pending(
+                    "The session runner is starting; decoder readiness is not proven.",
+                );
+                self.diagnostics.renderer = Diagnostic::pending(
+                    "The session runner is starting; renderer readiness is not proven.",
+                );
+            }
+            SessionProcessState::Stopping => {
+                self.diagnostics.decoder = Diagnostic::pending("The session runner is stopping.");
+                self.diagnostics.renderer = Diagnostic::pending("The session runner is stopping.");
+            }
+            SessionProcessState::Failed => {
+                self.diagnostics.decoder = Diagnostic::unavailable(
+                    "The session runner failed before decoder health was proven.",
+                );
+                self.diagnostics.renderer = Diagnostic::unavailable(
+                    "The session runner failed before renderer health was proven.",
+                );
+                self.diagnostics.last_error = Some(AppErrorCode::Unavailable);
+            }
+            SessionProcessState::Idle => {
+                self.diagnostics.decoder = Diagnostic::pending(
+                    "No session is active; decoder readiness will be checked at connection time.",
+                );
+                self.diagnostics.renderer = Diagnostic::pending(
+                    "No session is active; renderer readiness will be checked at connection time.",
+                );
+            }
+        }
+    }
+
     /// Apply the real outcome of a `HostAgentClient::stop()` call.
     /// `DisableHosting`'s intent phase has already moved `host_status` to
     /// `Disabled` unconditionally -- app-core has no "stopping" state -- so
@@ -674,11 +1182,14 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_time_ms, AppCommand, AppErrorCode, AppEvent, HostAgentBridgeError, HostAgentEvent,
-        HostErrorCode, RuntimeCommand, RuntimeError, RuntimeState,
+        current_time_ms, AppCommand, AppErrorCode, AppEvent, DiagnosticState, HostAgentBridgeError,
+        HostAgentEvent, HostErrorCode, RuntimeCommand, RuntimeError, RuntimeState,
     };
+    use crate::session::{SessionHealth, SessionProcessState};
     use openstream_app_core::{ConnectionRejectReason, DeviceSummary, HostStatus, PermissionSet};
-    use openstream_settings::{load, CaptureMode, StreamProfile, CURRENT_SCHEMA_VERSION};
+    use openstream_settings::{
+        load, CaptureMode, StreamProfile, WindowMode, CURRENT_SCHEMA_VERSION,
+    };
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -868,21 +1379,41 @@ mod tests {
         );
     }
 
-    /// FIX 3: a `live`-classed setting is already in effect the moment the
-    /// snapshot reflects it; nothing about it is left pending.
+    /// A `reconnect`-classed setting is pending until the next session, and
+    /// asks for nothing heavier than that.
+    ///
+    /// This used to assert a `live`-classed setting was never pending. No
+    /// setting is classified `live` any more, and that is the honest
+    /// classification rather than a regression: every value now reaches a
+    /// separate process through its environment -- the session runner or the
+    /// host child -- so none of them can take effect without restarting the
+    /// process that read it. What still has to hold is that the three
+    /// remaining classes stay distinguishable, because the shell renders a
+    /// different promise for each.
     #[test]
-    fn live_setting_change_needs_no_restart_and_is_not_pending() {
-        let path = temp_path("live-setting");
+    fn reconnect_setting_is_pending_without_demanding_a_restart() {
+        let path = temp_path("reconnect-setting");
         let mut state = RuntimeState::from_settings_path(Some(path)).unwrap();
         let mut updated = state.settings().clone();
-        updated.host.name = "New host name".to_string();
+        updated.client.window_mode = WindowMode::Fullscreen;
         state.update_settings(updated).unwrap();
 
         let snapshot = state.snapshot();
-        assert_eq!(snapshot.settings.host.name, "New host name");
-        assert!(!snapshot.restart_required);
-        assert!(!snapshot.host_restart_required);
-        assert!(snapshot.pending_settings.is_empty());
+        assert_eq!(snapshot.settings.client.window_mode, WindowMode::Fullscreen);
+        assert!(
+            snapshot
+                .pending_settings
+                .contains(&"client.window_mode".to_string()),
+            "a reconnect-classed change is pending until the next session"
+        );
+        assert!(
+            !snapshot.host_restart_required,
+            "a client setting must not ask the host to restart"
+        );
+        assert!(
+            !snapshot.restart_required,
+            "a reconnect-classed change must not ask the application to restart"
+        );
     }
 
     /// FIX 3: a `restart_host`-classed setting is persisted immediately but
@@ -1197,5 +1728,31 @@ mod tests {
                 retryable: true,
             }
         );
+    }
+
+    #[test]
+    fn connected_fallback_session_is_experimental_not_native_media_evidence() {
+        let mut state = ready_state_for_test();
+        state.reconcile_session_health(&SessionHealth {
+            state: SessionProcessState::Connected,
+            pid: Some(42),
+            device_id: Some("host-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            generation: Some(1),
+            last_exit_code: None,
+            status_age_ms: Some(0),
+        });
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.app.diagnostics.decoder.state,
+            DiagnosticState::Experimental
+        );
+        assert_eq!(
+            snapshot.app.diagnostics.renderer.state,
+            DiagnosticState::Experimental
+        );
+        assert!(snapshot.app.diagnostics.decoder.detail.contains("FFmpeg"));
+        assert!(snapshot.app.diagnostics.renderer.detail.contains("BGRA"));
     }
 }

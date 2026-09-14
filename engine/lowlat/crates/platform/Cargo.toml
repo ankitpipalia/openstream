@@ -9,5 +9,12 @@ authors = ["OpenStream contributors"]
 
 [dependencies]
 
+[dev-dependencies]
+# Test-only. The capability report and the injector must agree about which
+# grants a policy actually produces, and that can only be asserted with both
+# in scope. It stays a dev-dependency so the portable platform crate does not
+# gain a runtime edge to a Linux-first injector.
+lowlat-inject.workspace = true
+
 [lints]
 workspace = true

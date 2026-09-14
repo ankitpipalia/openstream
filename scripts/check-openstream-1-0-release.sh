@@ -413,8 +413,22 @@ sbom_relative="$(evidence_path_for sbom 2>/dev/null || true)"
 if [[ -n "$sbom_relative" && -s "$artifact_root/$sbom_relative" ]]; then
     sbom_file="$artifact_root/$sbom_relative"
 fi
-if [[ -n "$sbom_file" ]] && ! grep -Eq '"(spdxVersion|bomFormat)"[[:space:]]*:' "$sbom_file"; then
-    fail "SBOM evidence is not recognizable as SPDX or CycloneDX JSON: $sbom_file"
+if [[ -n "$sbom_file" ]]; then
+    # A grep for `spdxVersion` is not validation: a two-line file satisfies it.
+    # Nor is a comment: a document can claim to cover a dependency graph in
+    # prose while listing none of it. The only proof of coverage is the set of
+    # package identities, compared against the lockfiles the release is
+    # actually built from.
+    if ! command -v python3 >/dev/null 2>&1; then
+        fail "python3 is required to validate SBOM evidence"
+    elif ! python3 "$repo_dir/scripts/validate-sbom.py" \
+        --sbom "$sbom_file" \
+        --cargo-lock "$repo_dir/engine/lowlat/Cargo.lock" \
+        --cargo-lock "$repo_dir/desktop/src-tauri/Cargo.lock" \
+        --npm-lock "$repo_dir/desktop/package-lock.json"
+    then
+        fail "SBOM evidence is incomplete or malformed: $sbom_file"
+    fi
 fi
 
 signing_file=''

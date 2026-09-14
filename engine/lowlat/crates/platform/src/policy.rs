@@ -344,10 +344,15 @@ impl HostPolicy {
     pub fn from_env() -> Self {
         let flag = |name: &str| std::env::var(name).as_deref() == Ok("1");
         let input = flag("OPENSTREAM_ENABLE_INPUT");
+        let keyboard = input || flag("OPENSTREAM_ENABLE_KEYBOARD");
+        let mouse = input || flag("OPENSTREAM_ENABLE_MOUSE");
         Self {
-            input,
-            keyboard: input || flag("OPENSTREAM_ENABLE_KEYBOARD"),
-            mouse: input || flag("OPENSTREAM_ENABLE_MOUSE"),
+            // `input` is the adapter-level grant. Explicit keyboard/mouse
+            // grants are also input grants so a caller can revoke one class
+            // without accidentally disabling the other class at discovery.
+            input: input || keyboard || mouse,
+            keyboard,
+            mouse,
             clipboard: flag("OPENSTREAM_CLIPBOARD"),
             gamepad: flag("OPENSTREAM_GAMEPAD"),
             microphone: flag("OPENSTREAM_MIC"),
@@ -406,6 +411,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What the capability report advertises and what the injector will act
+    /// on must agree, for every reachable policy.
+    ///
+    /// The interesting case is a gamepad-only grant: `input` on with
+    /// `keyboard` and `mouse` both off. That is a configuration an operator
+    /// can actually set, the report advertises gamepad for it, and the
+    /// injector previously discarded the grant -- so the host negotiated a
+    /// capability it would then refuse to use.
+    #[test]
+    fn advertised_gamepad_support_matches_the_injector_grant() {
+        let policy = HostPolicy {
+            input: true,
+            keyboard: false,
+            mouse: false,
+            clipboard: false,
+            gamepad: true,
+            microphone: false,
+            approval: Approval::Auto,
+        };
+        let capabilities = HostDeviceCapabilities::discover(
+            policy,
+            HostCapabilityProbes {
+                input: RuntimeAvailability::Available,
+                clipboard: RuntimeAvailability::Unavailable(UnavailableReason::DisabledByPolicy),
+                microphone: RuntimeAvailability::Unavailable(UnavailableReason::DisabledByPolicy),
+            },
+        );
+
+        // The gamepad adapter only exists on Linux, so this is the only
+        // platform on which the report can advertise it at all.
+        if cfg!(target_os = "linux") {
+            assert!(
+                capabilities.gamepad.can_advertise(),
+                "a gamepad-only policy advertises gamepad support"
+            );
+        }
+
+        // Whatever the report says, the injector must agree. The host adapter
+        // applies the master input gate to each grant, exactly as here.
+        let permissions = lowlat_inject::event::Permissions::from_keyboard_pointer_grants(
+            policy.input && policy.keyboard,
+            policy.input && policy.mouse,
+            policy.input && policy.gamepad,
+        );
+        assert!(
+            permissions.gamepad,
+            "the injector must act on the gamepad grant the report advertised"
+        );
+        assert!(!permissions.keyboard);
+        assert!(!permissions.pointer);
     }
 
     #[test]

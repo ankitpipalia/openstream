@@ -21,9 +21,12 @@ pub(crate) enum DisplayMode {
 }
 
 impl DisplayMode {
-    /// Parse `OPENSTREAM_DISPLAY_MODE` (`windowed`/`borderless`/`fullscreen`).
+    /// Parse `OPENSTREAM_WINDOW_MODE` (the product setting) and retain
+    /// `OPENSTREAM_DISPLAY_MODE` as a compatibility spelling for headless
+    /// launchers.
     pub(crate) fn from_env() -> Self {
-        std::env::var("OPENSTREAM_DISPLAY_MODE")
+        std::env::var("OPENSTREAM_WINDOW_MODE")
+            .or_else(|_| std::env::var("OPENSTREAM_DISPLAY_MODE"))
             .ok()
             .map(|mode| Self::parse(&mode))
             .unwrap_or_default()

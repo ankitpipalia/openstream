@@ -18,6 +18,7 @@ import type {
   SessionState,
   SettingItem,
   SettingSection,
+  TrustedDevice,
 } from "../model";
 import { capability, createLocalAdapter } from "./productAdapter";
 import type { ProductAdapter } from "./productAdapter";
@@ -115,11 +116,14 @@ interface AppSnapshot {
 export type AppEvent =
   | "AuthenticationStarted"
   | "AuthenticationRequired"
+  | { AuthenticationFailed: { retryable: boolean } }
+  | "SignedOut"
   | { ApprovalRequired: ConnectionRequest }
   | { ConnectionApproved: { request_id: string; permissions: PermissionSet } }
   | { ConnectionRejected: { request_id: string; reason: "Denied" | "Expired" } }
   | "ConnectionNegotiationStarted"
   | { ConnectionReady: { session_id: string; generation: number } }
+  | { ConnectionFailed: { retryable: boolean } }
   | "ReconnectStarted"
   | "DisconnectRequested"
   | "Disconnected"
@@ -248,6 +252,18 @@ export interface RuntimeSnapshot {
   host_restart_required: boolean;
   /** Setting keys whose persisted value is not yet reflected in the running application. */
   pending_settings: string[];
+  /** Secret-free enrolled-device records loaded by the Rust runtime. */
+  trusted_devices?: RuntimeTrustedDevice[];
+}
+
+export interface RuntimeTrustedDevice {
+  device_id: string;
+  name: string;
+  platform: string;
+  enrolled_at_ms: number;
+  trust: "pending" | "trusted" | "revoked";
+  last_seen_ms: number | null;
+  public_key_fingerprint: string;
 }
 
 export interface RuntimeDispatchResult {
@@ -282,6 +298,12 @@ const SETTING_SECTIONS: SettingSectionSpec[] = [
     label: "Experience",
     description: "Display and rendering preferences applied by the connected client.",
     fields: [
+      {
+        key: "client.signal_origin",
+        label: "Control-plane endpoint",
+        description: "HTTPS endpoint used for account authentication and host discovery.",
+        value: (settings) => settings.client.signal_origin,
+      },
       {
         key: "client.profile",
         label: "Stream profile",
@@ -344,6 +366,18 @@ const SETTING_SECTIONS: SettingSectionSpec[] = [
         description: "Hide window chrome while a session is active.",
         value: (settings) => settings.client.immersive,
       },
+      {
+        key: "client.show_warnings",
+        label: "Overlay warnings",
+        description: "Show typed network, capture, encode, and decode warnings in the session overlay.",
+        value: (settings) => settings.client.show_warnings,
+      },
+      {
+        key: "client.overlay",
+        label: "Session overlay",
+        description: "Show transport and media diagnostics in the native session window.",
+        value: (settings) => settings.client.overlay,
+      },
     ],
   },
   {
@@ -369,6 +403,38 @@ const SETTING_SECTIONS: SettingSectionSpec[] = [
         description: "Prevent the system from sleeping while a guest is connected.",
         value: (settings) => settings.host.stay_awake,
       },
+      {
+        key: "host.encoder",
+        label: "Host encoder",
+        description: "Select the encoder backend after the host preflight proves it works.",
+        value: (settings) => settings.host.encoder,
+        options: ["auto", "software", "h264_nvenc", "hevc_nvenc", "h264_vaapi", "hevc_vaapi"],
+      },
+      {
+        key: "host.approval",
+        label: "Connection approval",
+        description: "Require an explicit host decision before a guest can control the session.",
+        value: (settings) => settings.host.approval,
+        options: ["auto", "prompt"],
+      },
+      {
+        key: "host.max_guests",
+        label: "Maximum guests",
+        description: "Bound the number of admitted guests for this host.",
+        value: (settings) => settings.host.max_guests,
+      },
+      {
+        key: "host.aggregate_bandwidth_cap_mbps",
+        label: "Host bandwidth cap",
+        description: "Share one aggregate wire-rate ceiling across connected guests.",
+        value: (settings) => settings.host.aggregate_bandwidth_cap_mbps ?? "auto",
+      },
+      {
+        key: "host.selected_display",
+        label: "Display",
+        description: "Select a host display by stable adapter identifier, or leave automatic.",
+        value: (settings) => settings.host.selected_display ?? "auto",
+      },
     ],
   },
   {
@@ -376,6 +442,12 @@ const SETTING_SECTIONS: SettingSectionSpec[] = [
     label: "Input and audio",
     description: "Permissions a host can grant to a connected guest.",
     fields: [
+      {
+        key: "input.enabled",
+        label: "Remote input",
+        description: "Enable the host input adapter before granting individual input categories.",
+        value: (settings) => settings.input.enabled,
+      },
       {
         key: "input.keyboard",
         label: "Keyboard input",
@@ -437,6 +509,25 @@ const SETTING_SECTIONS: SettingSectionSpec[] = [
         description: "Allow a TURN relay when a direct path is unavailable.",
         value: (settings) => settings.network.turn,
       },
+      {
+        key: "network.ice",
+        label: "ICE traversal",
+        description: "Use standards-based ICE checks when direct candidate probing is insufficient.",
+        value: (settings) => settings.network.ice,
+      },
+      {
+        key: "network.force_relay",
+        label: "Force relay",
+        description: "Use a configured relay for diagnostics or networks that block direct UDP.",
+        value: (settings) => settings.network.force_relay,
+      },
+      {
+        key: "network.congestion",
+        label: "Congestion policy",
+        description: "Choose response behavior without replacing the shared transport controller.",
+        value: (settings) => settings.network.congestion,
+        options: ["low_latency", "balanced", "throughput"],
+      },
     ],
   },
 ];
@@ -470,6 +561,11 @@ function mapSettings(settings: AppConfig, descriptors: SettingDescriptor[]): Set
       };
       if (field.options) {
         item.options = field.options;
+      }
+      if (descriptor) {
+        item.scope = descriptor.scope;
+        item.applyMode = descriptor.apply_mode;
+        item.visibility = descriptor.visibility;
       }
       return item;
     }),
@@ -536,7 +632,7 @@ function mapComputers(devices: DeviceSummary[]): Computer[] {
   });
 }
 
-function mapAccess(app: AppSnapshot): AccessSnapshot {
+function mapAccess(app: AppSnapshot, devices: RuntimeTrustedDevice[] = []): AccessSnapshot {
   const pairing =
     app.mode === "Local"
       ? { state: "not-configured" as const, detail: "This desktop runs in local mode and does not require pairing." }
@@ -551,7 +647,16 @@ function mapAccess(app: AppSnapshot): AccessSnapshot {
         ? capability("control-plane", "Control plane", "pending", "Waiting for account authentication.")
         : capability("control-plane", "Control plane", "available", "Signed in to the control plane.");
 
-  return { pairing, controlPlane, trustedDevices: [] };
+  const trustedDevices: TrustedDevice[] = devices.map((device) => ({
+    id: device.device_id,
+    name: device.name,
+    platform: device.platform,
+    addedAt: new Date(device.enrolled_at_ms).toLocaleString(),
+    status: device.trust,
+    fingerprint: device.public_key_fingerprint,
+  }));
+
+  return { pairing, controlPlane, trustedDevices };
 }
 
 /// Translate Rust's diagnostic state into the shell's capability state.
@@ -684,7 +789,7 @@ function mapCapabilities(app: AppSnapshot, controlPlane: Capability): Capability
 
 export function mapRuntimeSnapshot(snapshot: RuntimeSnapshot): ProductSnapshot {
   const app = snapshot.app;
-  const access = mapAccess(app);
+  const access = mapAccess(app, snapshot.trusted_devices ?? []);
 
   return {
     product: { name: "OpenStream", version: PRODUCT_VERSION, channel: "Desktop shell" },
@@ -752,6 +857,26 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
     },
     updateSettings: async (settings: unknown) => {
       const raw = (await invokeFn("runtime_update_settings", { settings })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    updateSetting: async (key, value) => {
+      const raw = (await invokeFn("runtime_update_setting", { key, value })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    setDeviceTrust: async (deviceId, trust) => {
+      const raw = (await invokeFn("device_store_set_trust", { device_id: deviceId, trust })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    signIn: async (username, password) => {
+      const raw = (await invokeFn("control_plane_sign_in", { username, password })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    registerAccount: async (username, password) => {
+      const raw = (await invokeFn("control_plane_register", { username, password })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    signOut: async () => {
+      const raw = (await invokeFn("control_plane_sign_out")) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
     },
   };

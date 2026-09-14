@@ -1,14 +1,24 @@
+use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use control_plane::{ControlPlaneClient, ControlPlaneError, DeviceTrust as ServerDeviceTrust};
+use device_store::{DeviceStore, DeviceStoreError};
 use host_agent::{HostAgentBridgeError, HostAgentClient};
 use openstream_host_agent::HostHealth;
 use openstream_settings::AppConfig;
-use runtime::{RuntimeCommand, RuntimeDispatchResult, RuntimeError, RuntimeSnapshot, RuntimeState};
+use runtime::{
+    RuntimeCommand, RuntimeDispatchResult, RuntimeError, RuntimeSnapshot, RuntimeState,
+    TrustedDeviceSnapshot,
+};
+use session::{SessionError, SessionHealth, SessionProcessState, SessionSupervisor};
 use tauri::Manager;
 
+pub mod control_plane;
+pub mod device_store;
 pub mod host_agent;
 pub mod runtime;
+pub mod session;
 
 /// How often the background reconciler asks the host agent what it is
 /// actually doing. The agent supervises its child on its own clock -- it
@@ -17,6 +27,8 @@ pub mod runtime;
 /// the shell's `HostStatus` only ever changes when the operator happens to
 /// press a button.
 const HOST_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const SESSION_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HOST_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serialises every operation that may start or stop the host agent.
 ///
@@ -39,6 +51,17 @@ type SharedRuntime = Arc<Mutex<RuntimeState>>;
 /// The lifecycle lock, shared the same way.
 type SharedHostLock = Arc<HostLifecycleLock>;
 
+/// Owns the native session runner. Its mutex is asynchronous because process
+/// start/stop and status polling must never hold the synchronous app-state
+/// mutex across an await.
+type SharedSession = Arc<tokio::sync::Mutex<SessionSupervisor>>;
+
+type SharedDeviceStore = Arc<Mutex<DeviceStore>>;
+
+/// Holds short-lived control-plane credentials in Rust memory only. The
+/// WebView receives account/device observations, never the bearer values.
+type SharedControlPlane = Arc<tokio::sync::Mutex<ControlPlaneClient>>;
+
 #[tauri::command]
 fn runtime_snapshot(
     state: tauri::State<'_, SharedRuntime>,
@@ -54,44 +77,551 @@ fn runtime_settings(state: tauri::State<'_, SharedRuntime>) -> Result<AppConfig,
 }
 
 #[tauri::command]
-fn runtime_update_settings(
+async fn runtime_update_settings(
     state: tauri::State<'_, SharedRuntime>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
     settings: AppConfig,
 ) -> Result<RuntimeSnapshot, RuntimeError> {
+    let (previous, origin_changed, snapshot) = {
+        let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        let previous = runtime.settings().clone();
+        if previous.client.signal_origin != settings.client.signal_origin
+            && !matches!(
+                runtime.app_state(),
+                openstream_app_core::AppState::SignedOut | openstream_app_core::AppState::Ready
+            )
+        {
+            return Err(RuntimeError::CommandRejected {
+                code: openstream_app_core::AppErrorCode::InvalidState,
+                retryable: false,
+            });
+        }
+        runtime.update_settings(settings)?;
+        let origin_changed =
+            previous.client.signal_origin != runtime.settings().client.signal_origin;
+        (previous, origin_changed, runtime.snapshot())
+    };
+    if origin_changed {
+        let origin = snapshot.settings.client.signal_origin.clone();
+        let result = {
+            let mut client = control_plane.lock().await;
+            client.reconfigure(&origin)
+        };
+        if let Err(error) = result {
+            let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+            runtime.update_settings(previous)?;
+            return Err(control_plane_error_runtime(error));
+        }
+        let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        if matches!(runtime.app_state(), openstream_app_core::AppState::Ready) {
+            let _ = runtime.dispatch(RuntimeCommand::SignOut)?;
+            runtime.replace_devices(Vec::new());
+            runtime.set_trusted_devices(Vec::new());
+        }
+        return Ok(runtime.snapshot());
+    }
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn runtime_update_setting(
+    state: tauri::State<'_, SharedRuntime>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+    key: String,
+    value: serde_json::Value,
+) -> Result<RuntimeSnapshot, RuntimeError> {
+    let (previous, origin_changed, snapshot) = {
+        let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        let previous = runtime.settings().clone();
+        if key == "client.signal_origin"
+            && !matches!(
+                runtime.app_state(),
+                openstream_app_core::AppState::SignedOut | openstream_app_core::AppState::Ready
+            )
+        {
+            return Err(RuntimeError::CommandRejected {
+                code: openstream_app_core::AppErrorCode::InvalidState,
+                retryable: false,
+            });
+        }
+        let snapshot = runtime.update_setting(&key, value)?;
+        let origin_changed =
+            previous.client.signal_origin != snapshot.settings.client.signal_origin;
+        (previous, origin_changed, snapshot)
+    };
+    if !origin_changed {
+        return Ok(snapshot);
+    }
+    let origin = snapshot.settings.client.signal_origin.clone();
+    let result = {
+        let mut client = control_plane.lock().await;
+        client.reconfigure(&origin)
+    };
+    if let Err(error) = result {
+        let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        runtime.update_settings(previous)?;
+        return Err(control_plane_error_runtime(error));
+    }
     let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
-    runtime.update_settings(settings)?;
+    if matches!(runtime.app_state(), openstream_app_core::AppState::Ready) {
+        let _ = runtime.dispatch(RuntimeCommand::SignOut)?;
+        runtime.replace_devices(Vec::new());
+        runtime.set_trusted_devices(Vec::new());
+    }
     Ok(runtime.snapshot())
+}
+
+fn control_plane_retryable(error: ControlPlaneError) -> bool {
+    matches!(
+        error,
+        ControlPlaneError::Transport
+            | ControlPlaneError::ServerUnavailable
+            | ControlPlaneError::RateLimited
+    )
+}
+
+fn control_plane_error_runtime(error: ControlPlaneError) -> RuntimeError {
+    let (code, retryable) = match error {
+        ControlPlaneError::InvalidOrigin | ControlPlaneError::InvalidInput => {
+            (openstream_app_core::AppErrorCode::InvalidRequest, false)
+        }
+        ControlPlaneError::IdentityUnavailable => {
+            (openstream_app_core::AppErrorCode::Unavailable, false)
+        }
+        ControlPlaneError::Unauthorized | ControlPlaneError::NotAuthenticated => (
+            openstream_app_core::AppErrorCode::AuthenticationRequired,
+            false,
+        ),
+        ControlPlaneError::NotFound => {
+            (openstream_app_core::AppErrorCode::DeviceUnavailable, false)
+        }
+        ControlPlaneError::Conflict | ControlPlaneError::Forbidden => {
+            (openstream_app_core::AppErrorCode::PermissionDenied, false)
+        }
+        ControlPlaneError::RateLimited
+        | ControlPlaneError::ServerUnavailable
+        | ControlPlaneError::Transport => (openstream_app_core::AppErrorCode::Transport, true),
+        ControlPlaneError::InvalidResponse => (openstream_app_core::AppErrorCode::Internal, false),
+    };
+    RuntimeError::CommandRejected { code, retryable }
+}
+
+fn control_plane_runtime_error(_error: RuntimeError) -> ControlPlaneError {
+    ControlPlaneError::Transport
+}
+
+fn device_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unknown"
+    }
+}
+
+fn configured_device_name(state: &Mutex<RuntimeState>) -> Result<String, ControlPlaneError> {
+    let runtime = state.lock().map_err(|_| ControlPlaneError::Transport)?;
+    Ok(runtime.settings().device.name.clone())
+}
+
+fn to_runtime_trusted_device(device: &control_plane::PublicDevice) -> TrustedDeviceSnapshot {
+    let trust = match device.trust {
+        ServerDeviceTrust::Pending => openstream_app_core::DeviceTrustState::Pending,
+        ServerDeviceTrust::Trusted => openstream_app_core::DeviceTrustState::Trusted,
+        ServerDeviceTrust::Revoked => openstream_app_core::DeviceTrustState::Revoked,
+    };
+    TrustedDeviceSnapshot {
+        device_id: device.device_id.clone(),
+        name: device.name.clone(),
+        platform: device.platform.clone(),
+        enrolled_at_ms: device.enrolled_at_ms,
+        trust,
+        last_seen_ms: device.last_seen_ms,
+        public_key_fingerprint: device.public_key_fingerprint.clone(),
+    }
+}
+
+fn to_directory_device(device: &control_plane::PublicDevice) -> openstream_app_core::DeviceSummary {
+    // The account/device API does not yet expose host presence. Keep the
+    // record visible for trust management but deliberately mark it offline so
+    // the shell cannot offer a connection that has not been discovered.
+    let mut summary =
+        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone());
+    summary.platform = device.platform.clone();
+    summary
+}
+
+fn apply_control_plane_devices(
+    runtime: &mut RuntimeState,
+    devices: &[control_plane::PublicDevice],
+) {
+    runtime.set_trusted_devices(devices.iter().map(to_runtime_trusted_device).collect());
+    runtime.replace_devices(devices.iter().map(to_directory_device).collect());
+}
+
+async fn authenticate_account(
+    runtime: &Mutex<RuntimeState>,
+    control_plane: &SharedControlPlane,
+    username: String,
+    password: String,
+    register: bool,
+) -> Result<RuntimeSnapshot, ControlPlaneError> {
+    let device_name = configured_device_name(runtime)?;
+    {
+        let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+        state
+            .dispatch(RuntimeCommand::SignIn)
+            .map_err(control_plane_runtime_error)?;
+    }
+
+    let auth = {
+        let mut client = control_plane.lock().await;
+        if register {
+            client
+                .register(&username, &password, &device_name, device_platform())
+                .await
+        } else {
+            client
+                .sign_in(&username, &password, &device_name, device_platform())
+                .await
+        }
+    };
+    let _account = match auth {
+        Ok(account) => account,
+        Err(error) => {
+            let mut client = control_plane.lock().await;
+            client.clear_credentials();
+            drop(client);
+            let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+            let _ = state.authentication_failed(control_plane_retryable(error));
+            return Err(error);
+        }
+    };
+
+    let devices = {
+        let mut client = control_plane.lock().await;
+        client.devices().await
+    };
+    let devices = match devices {
+        Ok(devices) => devices,
+        Err(error) => {
+            // Authentication is not complete until the initial account
+            // reconciliation succeeds. Do not leave valid bearer values in
+            // the runtime while AppModel is returned to SignedOut.
+            {
+                let mut client = control_plane.lock().await;
+                client.clear_credentials();
+            }
+            let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+            let _ = state.authentication_failed(control_plane_retryable(error));
+            return Err(error);
+        }
+    };
+    let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+    let _ = state
+        .authentication_succeeded()
+        .map_err(control_plane_runtime_error)?;
+    apply_control_plane_devices(&mut state, &devices);
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+async fn control_plane_sign_in(
+    runtime: tauri::State<'_, SharedRuntime>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+    username: String,
+    password: String,
+) -> Result<RuntimeSnapshot, ControlPlaneError> {
+    authenticate_account(
+        runtime.inner(),
+        control_plane.inner(),
+        username,
+        password,
+        false,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn control_plane_register(
+    runtime: tauri::State<'_, SharedRuntime>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+    username: String,
+    password: String,
+) -> Result<RuntimeSnapshot, ControlPlaneError> {
+    authenticate_account(
+        runtime.inner(),
+        control_plane.inner(),
+        username,
+        password,
+        true,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn control_plane_refresh_devices(
+    runtime: tauri::State<'_, SharedRuntime>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+) -> Result<RuntimeSnapshot, ControlPlaneError> {
+    let devices = {
+        let mut client = control_plane.lock().await;
+        client.devices().await
+    }?;
+    let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+    apply_control_plane_devices(&mut state, &devices);
+    Ok(state.snapshot())
+}
+
+#[tauri::command]
+async fn control_plane_sign_out(
+    runtime: tauri::State<'_, SharedRuntime>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+) -> Result<RuntimeSnapshot, ControlPlaneError> {
+    {
+        let state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+        if !matches!(state.app_state(), openstream_app_core::AppState::Ready) {
+            return Err(ControlPlaneError::InvalidInput);
+        }
+    }
+    {
+        let mut client = control_plane.lock().await;
+        client.clear_credentials();
+    }
+    let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
+    state
+        .dispatch(RuntimeCommand::SignOut)
+        .map_err(control_plane_runtime_error)?;
+    state.replace_devices(Vec::new());
+    state.set_trusted_devices(Vec::new());
+    Ok(state.snapshot())
 }
 
 /// The single entry point for every user-intent command, hosting included.
 /// `EnableHosting`/`DisableHosting` are not a thin pass-through to
 /// `RuntimeState::dispatch`: they must also drive the real host agent, so
-/// this command is `async` and delegates to `dispatch_command`, which never
-/// holds the state mutex across an `.await`.
+/// this command is `async` and delegates to `dispatch_command_with_session`,
+/// which never holds the state mutex across an `.await`.
 #[tauri::command]
 async fn runtime_dispatch(
     state: tauri::State<'_, SharedRuntime>,
     host_lock: tauri::State<'_, SharedHostLock>,
+    session: tauri::State<'_, SharedSession>,
     command: RuntimeCommand,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
-    dispatch_command(state.inner(), host_lock.inner(), command).await
+    dispatch_command_with_session(state.inner(), host_lock.inner(), session.inner(), command).await
 }
 
-/// Tauri-independent core of `runtime_dispatch`, so it can be exercised
-/// directly in tests without a running Tauri application.
-async fn dispatch_command(
+/// The one dispatch path. Tauri-independent so it can be exercised directly
+/// in tests without a running Tauri application.
+async fn dispatch_command_with_session(
     state: &Mutex<RuntimeState>,
     host_lock: &HostLifecycleLock,
+    session: &SharedSession,
     command: RuntimeCommand,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     match command {
         RuntimeCommand::EnableHosting => dispatch_host_lifecycle(state, host_lock, true).await,
         RuntimeCommand::DisableHosting => dispatch_host_lifecycle(state, host_lock, false).await,
+        RuntimeCommand::RestartHosting => dispatch_restart_hosting(state, host_lock).await,
+        RuntimeCommand::Connect {
+            device_id,
+            requested,
+        } => {
+            let mut result = {
+                let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                runtime.dispatch(RuntimeCommand::Connect {
+                    device_id: device_id.clone(),
+                    requested,
+                })?
+            };
+            let local_mode = {
+                let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                runtime.is_local_mode()
+            };
+            if local_mode {
+                let request_id = result
+                    .snapshot
+                    .app
+                    .pending_request
+                    .as_ref()
+                    .map(|request| request.request_id.clone())
+                    .ok_or(RuntimeError::StateUnavailable)?;
+                let available = local_permissions(state)?;
+                let approved = {
+                    let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                    runtime.approve_local_request(request_id, available)?
+                };
+                result.events.extend(approved.events);
+                result.snapshot = approved.snapshot;
+            } else {
+                // Secure deployments need a control-plane request/approval
+                // round trip before a session runner may receive a pairing
+                // file or touch the network. The control-plane broker is not
+                // part of this local shell bridge yet; leave the model in
+                // WaitingForApproval rather than starting a runner behind an
+                // unapproved request.
+                return Ok(result);
+            }
+            let started = start_session_if_connecting(state, session, &device_id).await;
+            match started {
+                Ok(()) => {
+                    let negotiated = {
+                        let mut runtime =
+                            state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                        runtime.begin_session_negotiation()?
+                    };
+                    result.events.extend(negotiated.events);
+                    result.snapshot = negotiated.snapshot;
+                    Ok(result)
+                }
+                Err(error) => {
+                    let failed = {
+                        let mut runtime =
+                            state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                        runtime.session_failed(false)?
+                    };
+                    result.events.extend(failed.events);
+                    result.snapshot = failed.snapshot;
+                    Err(session_error_to_runtime(error))
+                }
+            }
+        }
+        RuntimeCommand::ApproveRequest {
+            request_id,
+            available,
+        } => {
+            let result = {
+                let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                runtime.dispatch(RuntimeCommand::ApproveRequest {
+                    request_id,
+                    available,
+                })?
+            };
+            if let Some(device_id) = connecting_device(state)? {
+                start_session_if_connecting(state, session, &device_id)
+                    .await
+                    .map_err(session_error_to_runtime)?;
+                let negotiated = {
+                    let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                    runtime.begin_session_negotiation()?
+                };
+                return Ok(RuntimeDispatchResult {
+                    snapshot: negotiated.snapshot,
+                    events: result.events.into_iter().chain(negotiated.events).collect(),
+                });
+            }
+            Ok(result)
+        }
+        RuntimeCommand::Disconnect => {
+            let stop_result = {
+                let mut supervisor = session.lock().await;
+                supervisor.disconnect().await
+            };
+            let mut result = {
+                let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                runtime.dispatch(RuntimeCommand::Disconnect)?
+            };
+            if let Err(error) = stop_result {
+                return Err(session_error_to_runtime(error));
+            }
+            let should_complete = {
+                let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                matches!(
+                    runtime.app_state(),
+                    openstream_app_core::AppState::Disconnecting { .. }
+                )
+            };
+            if should_complete {
+                let completed = {
+                    let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                    runtime.complete_disconnect()?
+                };
+                result.events.extend(completed.events);
+                result.snapshot = completed.snapshot;
+            }
+            Ok(result)
+        }
         other => {
             let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
             runtime.dispatch(other)
         }
     }
+}
+
+fn session_error_to_runtime(error: SessionError) -> RuntimeError {
+    let (code, retryable) = match error {
+        SessionError::PairingUnavailable | SessionError::PairingInsecure => {
+            (openstream_app_core::AppErrorCode::PermissionDenied, false)
+        }
+        SessionError::RunnerUnavailable
+        | SessionError::AlreadyActive
+        | SessionError::SpawnFailed
+        | SessionError::StopFailed
+        | SessionError::StatusInvalid => (openstream_app_core::AppErrorCode::Unavailable, true),
+    };
+    RuntimeError::CommandRejected { code, retryable }
+}
+
+fn local_permissions(
+    state: &Mutex<RuntimeState>,
+) -> Result<openstream_app_core::PermissionSet, RuntimeError> {
+    let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+    let input = &runtime.settings().input;
+    Ok(openstream_app_core::PermissionSet {
+        view: true,
+        keyboard: input.enabled && input.keyboard,
+        mouse: input.enabled && input.mouse,
+        gamepad: input.enabled && input.gamepad,
+        clipboard: input.enabled && input.clipboard,
+        microphone: input.enabled && input.microphone,
+        tablet: false,
+        virtual_usb: false,
+    })
+}
+
+fn connecting_device(state: &Mutex<RuntimeState>) -> Result<Option<String>, RuntimeError> {
+    let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+    Ok(match runtime.app_state() {
+        openstream_app_core::AppState::Connecting { device_id }
+        | openstream_app_core::AppState::Negotiating { device_id } => Some(device_id.clone()),
+        _ => None,
+    })
+}
+
+async fn start_session_if_connecting(
+    state: &Mutex<RuntimeState>,
+    session: &SharedSession,
+    device_id: &str,
+) -> Result<(), SessionError> {
+    let settings = {
+        let runtime = state.lock().map_err(|_| SessionError::StatusInvalid)?;
+        runtime.settings().clone()
+    };
+    let mut supervisor = session.lock().await;
+    if matches!(
+        supervisor.health().state,
+        SessionProcessState::Starting
+            | SessionProcessState::Running
+            | SessionProcessState::Connected
+            | SessionProcessState::Stopping
+    ) {
+        return Err(SessionError::AlreadyActive);
+    }
+    supervisor
+        .connect(&settings, device_id.to_string())
+        .await
+        .map(|_| ())?;
+    let mut runtime = state.lock().map_err(|_| SessionError::StatusInvalid)?;
+    runtime.mark_reconnect_applied();
+    Ok(())
 }
 
 /// Enable or disable hosting through the one path that may start or stop
@@ -102,7 +632,44 @@ async fn dispatch_host_lifecycle(
     host_lock: &HostLifecycleLock,
     enable: bool,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
-    dispatch_host_lifecycle_with(state, host_lock, enable, HostAgentClient::new).await
+    let settings = {
+        let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        runtime.settings().clone()
+    };
+    dispatch_host_lifecycle_with_settings(
+        state,
+        host_lock,
+        enable,
+        HostAgentClient::new,
+        Some(settings),
+    )
+    .await
+}
+
+/// Apply RestartHost settings without ever allowing two host children to
+/// overlap. The ordinary stop path waits until the agent has reaped its
+/// child; only then does the start-with-settings request replace the child
+/// configuration and spawn the new process.
+async fn dispatch_restart_hosting(
+    state: &Mutex<RuntimeState>,
+    host_lock: &HostLifecycleLock,
+) -> Result<RuntimeDispatchResult, RuntimeError> {
+    let hosting_active = {
+        let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        !matches!(
+            runtime.host_status(),
+            openstream_app_core::HostStatus::Disabled
+        )
+    };
+    if !hosting_active {
+        return Err(RuntimeError::CommandRejected {
+            code: openstream_app_core::AppErrorCode::InvalidState,
+            retryable: false,
+        });
+    }
+
+    let _stopped = dispatch_host_lifecycle(state, host_lock, false).await?;
+    dispatch_host_lifecycle(state, host_lock, true).await
 }
 
 /// Apply the intent, drop the mutex guard, await the host-agent call built
@@ -120,11 +687,28 @@ async fn dispatch_host_lifecycle(
 /// substitute a factory that targets a private, unreachable endpoint
 /// instead of the process-default socket, without adding any Tauri command
 /// parameter that would let the web UI choose one.
+/// Test seam: the host-lifecycle cases exercise enable/disable ordering and
+/// want neither a settings payload nor a real agent socket. Production goes
+/// through [`dispatch_host_lifecycle`], which always carries the settings.
+#[cfg(test)]
 async fn dispatch_host_lifecycle_with<F>(
     state: &Mutex<RuntimeState>,
     host_lock: &HostLifecycleLock,
     enable: bool,
     client_factory: F,
+) -> Result<RuntimeDispatchResult, RuntimeError>
+where
+    F: FnOnce() -> Result<HostAgentClient, HostAgentBridgeError>,
+{
+    dispatch_host_lifecycle_with_settings(state, host_lock, enable, client_factory, None).await
+}
+
+async fn dispatch_host_lifecycle_with_settings<F>(
+    state: &Mutex<RuntimeState>,
+    host_lock: &HostLifecycleLock,
+    enable: bool,
+    client_factory: F,
+    settings: Option<AppConfig>,
 ) -> Result<RuntimeDispatchResult, RuntimeError>
 where
     F: FnOnce() -> Result<HostAgentClient, HostAgentBridgeError>,
@@ -144,9 +728,15 @@ where
     let outcome = match &client {
         Ok(client) => {
             if enable {
-                client.start().await
+                match settings.as_ref() {
+                    Some(settings) => client.start_with_settings(settings).await,
+                    None => client.start().await,
+                }
             } else {
-                client.stop().await
+                match client.stop().await {
+                    Ok(events) => wait_for_host_stopped(client).await.map(|()| events),
+                    Err(error) => Err(error),
+                }
             }
         }
         Err(error) => Err(*error),
@@ -183,6 +773,24 @@ where
     Ok(RuntimeDispatchResult { snapshot, events })
 }
 
+/// `HostAgentClient::stop` acknowledges the stop request, not necessarily the
+/// final child reap. Keep the shell's completion semantics honest by waiting
+/// for the agent's authoritative `Stopped` health state before returning.
+async fn wait_for_host_stopped(client: &HostAgentClient) -> Result<(), HostAgentBridgeError> {
+    let deadline = tokio::time::Instant::now() + HOST_STOP_WAIT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(HostAgentBridgeError::Timeout);
+        }
+        let health = client.health().await?;
+        if health.state == openstream_host_agent::ChildState::Stopped {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50).min(remaining)).await;
+    }
+}
+
 /// Poll the host agent forever, adopting its state into `AppModel`.
 ///
 /// This is the only thing that notices a host that died, restarted, or
@@ -217,6 +825,92 @@ async fn reconcile_host_health_forever(state: SharedRuntime, host_lock: SharedHo
     }
 }
 
+/// Poll the native session runner and reflect only its secret-free lifecycle
+/// observations into `AppModel`. The runner owns all media and network
+/// buffers; this task never receives a frame and never forwards a bearer
+/// credential through Tauri.
+async fn reconcile_session_forever(state: SharedRuntime, session: SharedSession) {
+    let mut ticker = tokio::time::interval(SESSION_HEALTH_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let health = {
+            let mut supervisor = session.lock().await;
+            match supervisor.poll().await {
+                Ok(health) => health,
+                Err(_) => continue,
+            }
+        };
+        let Ok(mut runtime) = state.lock() else {
+            continue;
+        };
+        runtime.reconcile_session_health(&health);
+        let active = matches!(
+            runtime.app_state(),
+            openstream_app_core::AppState::RequestingConnection { .. }
+                | openstream_app_core::AppState::WaitingForApproval { .. }
+                | openstream_app_core::AppState::Connecting { .. }
+                | openstream_app_core::AppState::Negotiating { .. }
+                | openstream_app_core::AppState::Connected { .. }
+                | openstream_app_core::AppState::Reconnecting { .. }
+                | openstream_app_core::AppState::Disconnecting { .. }
+        );
+        match health.state {
+            SessionProcessState::Connected => {
+                if matches!(
+                    runtime.app_state(),
+                    openstream_app_core::AppState::Connecting { .. }
+                        | openstream_app_core::AppState::Negotiating { .. }
+                        | openstream_app_core::AppState::Reconnecting { .. }
+                ) {
+                    if let (Some(session_id), Some(generation)) =
+                        (health.session_id.clone(), health.generation)
+                    {
+                        let _ = runtime.session_established(session_id, generation);
+                    }
+                }
+            }
+            SessionProcessState::Failed if active => {
+                let _ = runtime.session_failed(false);
+            }
+            SessionProcessState::Idle
+                if matches!(
+                    runtime.app_state(),
+                    openstream_app_core::AppState::Disconnecting { .. }
+                ) =>
+            {
+                let _ = runtime.complete_disconnect();
+            }
+            SessionProcessState::Idle
+            | SessionProcessState::Starting
+            | SessionProcessState::Running
+            | SessionProcessState::Stopping
+            | SessionProcessState::Failed => {}
+        }
+    }
+}
+
+fn bootstrap_local_directory(runtime: &mut RuntimeState) {
+    if !runtime.is_local_mode() {
+        return;
+    }
+    let id = env::var("OPENSTREAM_TARGET_DEVICE_ID").ok().or_else(|| {
+        env::var_os("OPENSTREAM_PAIRING_FILE")
+            .filter(|path| !path.is_empty())
+            .map(|_| "paired-host".to_string())
+    });
+    let Some(id) = id else {
+        return;
+    };
+    let name =
+        env::var("OPENSTREAM_TARGET_DEVICE_NAME").unwrap_or_else(|_| "OpenStream host".to_string());
+    let platform =
+        env::var("OPENSTREAM_TARGET_DEVICE_PLATFORM").unwrap_or_else(|_| "unknown".to_string());
+    let mut device = openstream_app_core::DeviceSummary::online(id, name);
+    device.platform = platform;
+    runtime.add_device(device);
+}
+
 // `host_agent_health` takes no frontend-supplied endpoint: the client
 // always derives the process-default socket, so the web UI has no way to
 // redirect it elsewhere. `host_agent_start`/`host_agent_stop` are
@@ -235,6 +929,114 @@ async fn host_agent_health() -> Result<HostHealth, HostAgentBridgeError> {
     HostAgentClient::new()?.health().await
 }
 
+#[tauri::command]
+async fn session_health(
+    session: tauri::State<'_, SharedSession>,
+) -> Result<SessionHealth, RuntimeError> {
+    let mut supervisor = session.lock().await;
+    supervisor
+        .poll()
+        .await
+        .map_err(|_| RuntimeError::StateUnavailable)
+}
+
+#[tauri::command]
+fn device_store_snapshot(
+    store: tauri::State<'_, SharedDeviceStore>,
+) -> Result<Vec<TrustedDeviceSnapshot>, RuntimeError> {
+    let store = store.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+    Ok(store
+        .snapshots()
+        .into_iter()
+        .map(|device| TrustedDeviceSnapshot {
+            device_id: device.device_id,
+            name: device.name,
+            platform: device.platform,
+            enrolled_at_ms: device.enrolled_at_ms,
+            trust: device.trust,
+            last_seen_ms: device.last_seen_ms,
+            public_key_fingerprint: device.public_key_fingerprint,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn device_store_set_trust(
+    runtime: tauri::State<'_, SharedRuntime>,
+    store: tauri::State<'_, SharedDeviceStore>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+    device_id: String,
+    trust: openstream_app_core::DeviceTrustState,
+) -> Result<RuntimeSnapshot, RuntimeError> {
+    let server_trust = match trust {
+        openstream_app_core::DeviceTrustState::Pending => ServerDeviceTrust::Pending,
+        openstream_app_core::DeviceTrustState::Trusted => ServerDeviceTrust::Trusted,
+        openstream_app_core::DeviceTrustState::Revoked => ServerDeviceTrust::Revoked,
+    };
+    let authenticated = {
+        let client = control_plane.lock().await;
+        client.is_authenticated()
+    };
+    if authenticated {
+        // Once an account is active the control plane is authoritative. Do
+        // not silently mutate a local shadow record and tell the operator the
+        // remote device was revoked; update the server first, then reconcile
+        // the complete public device list into the runtime snapshot.
+        let devices = {
+            let mut client = control_plane.lock().await;
+            client
+                .set_device_trust(&device_id, server_trust)
+                .await
+                .map_err(control_plane_error_runtime)?;
+            client
+                .devices()
+                .await
+                .map_err(control_plane_error_runtime)?
+        };
+        let mut runtime = runtime.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        apply_control_plane_devices(&mut runtime, &devices);
+        return Ok(runtime.snapshot());
+    }
+
+    // Local mode has no account server. Its protected device store remains a
+    // useful development/test fallback, but it is never used after a remote
+    // account has been authenticated.
+    let now = current_time_ms_for_command();
+    let snapshots = {
+        let mut store = store.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        store
+            .set_trust(&device_id, trust, Some(now))
+            .map_err(device_store_error)?;
+        store
+            .snapshots()
+            .into_iter()
+            .map(|device| TrustedDeviceSnapshot {
+                device_id: device.device_id,
+                name: device.name,
+                platform: device.platform,
+                enrolled_at_ms: device.enrolled_at_ms,
+                trust: device.trust,
+                last_seen_ms: device.last_seen_ms,
+                public_key_fingerprint: device.public_key_fingerprint,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut runtime = runtime.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+    runtime.set_trusted_devices(snapshots);
+    Ok(runtime.snapshot())
+}
+
+fn current_time_ms_for_command() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn device_store_error(_error: DeviceStoreError) -> RuntimeError {
+    RuntimeError::InvalidSettings
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -244,26 +1046,73 @@ pub fn run() {
                 .app_config_dir()
                 .map_err(|_| RuntimeError::SettingsUnavailable)?
                 .join("settings.json");
-            let runtime: SharedRuntime = Arc::new(Mutex::new(RuntimeState::from_settings_path(
-                Some(settings_path),
-            )?));
+            let device_store_path = settings_path
+                .parent()
+                .ok_or(RuntimeError::SettingsUnavailable)?
+                .join("devices.json");
+            let device_store = DeviceStore::open(device_store_path).map_err(device_store_error)?;
+            let mut runtime_state = RuntimeState::from_settings_path(Some(settings_path))?;
+            let control_plane =
+                ControlPlaneClient::new(&runtime_state.settings().client.signal_origin)
+                    .map_err(|_| RuntimeError::InvalidSettings)?;
+            let trusted_devices = device_store
+                .snapshots()
+                .into_iter()
+                .map(|device| TrustedDeviceSnapshot {
+                    device_id: device.device_id,
+                    name: device.name,
+                    platform: device.platform,
+                    enrolled_at_ms: device.enrolled_at_ms,
+                    trust: device.trust,
+                    last_seen_ms: device.last_seen_ms,
+                    public_key_fingerprint: device.public_key_fingerprint,
+                })
+                .collect();
+            runtime_state.set_trusted_devices(trusted_devices);
+            bootstrap_local_directory(&mut runtime_state);
+            let runtime: SharedRuntime = Arc::new(Mutex::new(runtime_state));
+            let device_store: SharedDeviceStore = Arc::new(Mutex::new(device_store));
             let host_lock: SharedHostLock = Arc::new(HostLifecycleLock::default());
+            let session_dir = app
+                .path()
+                .app_local_data_dir()
+                .map_err(|_| RuntimeError::SettingsUnavailable)?
+                .join("session");
+            let session: SharedSession = Arc::new(tokio::sync::Mutex::new(
+                SessionSupervisor::new(session_dir)
+                    .map_err(|_| RuntimeError::SettingsUnavailable)?,
+            ));
             app.manage(Arc::clone(&runtime));
             app.manage(Arc::clone(&host_lock));
+            app.manage(Arc::clone(&session));
+            app.manage(Arc::clone(&device_store));
+            app.manage(Arc::new(tokio::sync::Mutex::new(control_plane)) as SharedControlPlane);
             // Adopt whatever the agent is already doing, then keep adopting
             // it. A shell that has just opened over a running agent would
             // otherwise report hosting as disabled until someone pressed a
             // button, and a child that crashed after being reported ready
             // would never be reported as anything else.
-            tauri::async_runtime::spawn(reconcile_host_health_forever(runtime, host_lock));
+            tauri::async_runtime::spawn(reconcile_host_health_forever(
+                Arc::clone(&runtime),
+                Arc::clone(&host_lock),
+            ));
+            tauri::async_runtime::spawn(reconcile_session_forever(runtime, session));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             runtime_snapshot,
             runtime_settings,
             runtime_update_settings,
+            runtime_update_setting,
             runtime_dispatch,
-            host_agent_health
+            control_plane_sign_in,
+            control_plane_register,
+            control_plane_refresh_devices,
+            control_plane_sign_out,
+            host_agent_health,
+            session_health,
+            device_store_snapshot,
+            device_store_set_trust
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenStream desktop shell");
@@ -362,6 +1211,11 @@ mod tests {
                                         next_restart_in_ms: None,
                                         last_exit: None,
                                         last_error: None,
+                                        config_revision: "test".into(),
+                                        frame_liveness:
+                                            openstream_host_agent::FrameLiveness::NotConfigured,
+                                        frames_seen: 0,
+                                        last_frame_age_ms: None,
                                     },
                                 }
                             }

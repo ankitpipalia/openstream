@@ -46,6 +46,10 @@ fn sample_health() -> HostHealth {
         next_restart_in_ms: None,
         last_exit: None,
         last_error: None,
+        config_revision: "test".into(),
+        frame_liveness: openstream_host_agent::FrameLiveness::NotConfigured,
+        frames_seen: 0,
+        last_frame_age_ms: None,
     }
 }
 
@@ -107,6 +111,10 @@ async fn health_round_trip_uses_typed_ipc_without_secret_fields() {
             next_restart_in_ms: None,
             last_exit: None,
             last_error: None,
+            config_revision: "test".into(),
+            frame_liveness: openstream_host_agent::FrameLiveness::NotConfigured,
+            frames_seen: 0,
+            last_frame_age_ms: None,
         },
     })
     .await;

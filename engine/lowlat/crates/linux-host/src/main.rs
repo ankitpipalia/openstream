@@ -109,6 +109,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!("{}", device_capabilities.log_line());
     let input_enabled = device_capabilities.input.can_advertise();
+    let keyboard_enabled = host_policy.keyboard && input_enabled;
+    let mouse_enabled = host_policy.mouse && input_enabled;
     let gamepad_enabled = device_capabilities.gamepad.can_advertise();
     let microphone_enabled = device_capabilities.microphone.can_advertise();
     let audio_requested = env::var("OPENSTREAM_AUDIO").as_deref() == Ok("1");
@@ -242,7 +244,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
         let mut devices = Devices::create("openstream")?;
         injector.set_permissions(
-            Permissions::from_host_grants(input_enabled, gamepad_enabled),
+            Permissions::from_keyboard_pointer_grants(
+                keyboard_enabled,
+                mouse_enabled,
+                gamepad_enabled,
+            ),
             &mut devices,
         );
         Some((injector, devices))
@@ -328,6 +334,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &payload,
                                     injector,
                                     devices,
+                                    keyboard_enabled,
+                                    mouse_enabled,
                                     gamepad_enabled,
                                     &mut input_lease,
                                     started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
@@ -397,6 +405,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &packet.payload,
                     injector,
                     devices,
+                    keyboard_enabled,
+                    mouse_enabled,
                     gamepad_enabled,
                     &mut input_lease,
                     started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
@@ -870,18 +880,26 @@ mod tests {
     fn native_input_rejects_unimplemented_advanced_events() {
         assert!(input_event_allowed(
             InputEvent::keyboard(4, 0, true, 0),
+            true,
+            false,
             false
         ));
         assert!(!input_event_allowed(
             InputEvent::gamepad_button(0, 0, true, 0),
+            false,
+            false,
             false
         ));
         assert!(input_event_allowed(
             InputEvent::gamepad_button(0, 0, true, 0),
+            false,
+            false,
             true
         ));
         assert!(!input_event_allowed(
             InputEvent::pen_motion(0, 100, 100, 0, false, 0),
+            false,
+            false,
             true
         ));
     }
@@ -943,12 +961,14 @@ fn apply_input_payload(
     payload: &[u8],
     injector: &mut lowlat_inject::event::Injector,
     devices: &mut lowlat_inject::uinput::Devices,
+    keyboard_enabled: bool,
+    mouse_enabled: bool,
     gamepad_enabled: bool,
     input_lease: &mut openstream_media::input::InputLease,
     now_us: u64,
 ) {
     if let Ok(event) = openstream_media::input::InputEvent::decode(payload) {
-        if !input_event_allowed(event, gamepad_enabled) {
+        if !input_event_allowed(event, keyboard_enabled, mouse_enabled, gamepad_enabled) {
             eprintln!("OpenStream rejected an input event without a local adapter");
             return;
         }
@@ -1004,9 +1024,21 @@ fn input_lease_timeout_us() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn input_event_allowed(event: openstream_media::input::InputEvent, gamepad_enabled: bool) -> bool {
+fn input_event_allowed(
+    event: openstream_media::input::InputEvent,
+    keyboard_enabled: bool,
+    mouse_enabled: bool,
+    gamepad_enabled: bool,
+) -> bool {
     match event.kind.capability() {
-        openstream_media::input::InputCapability::BasicInput => true,
+        openstream_media::input::InputCapability::BasicInput => match event.kind {
+            openstream_media::input::InputKind::Keyboard => keyboard_enabled,
+            openstream_media::input::InputKind::PointerMotion
+            | openstream_media::input::InputKind::PointerButton
+            | openstream_media::input::InputKind::Wheel => mouse_enabled,
+            openstream_media::input::InputKind::Release => true,
+            _ => false,
+        },
         openstream_media::input::InputCapability::Gamepad => gamepad_enabled,
         openstream_media::input::InputCapability::Tablet => false,
     }

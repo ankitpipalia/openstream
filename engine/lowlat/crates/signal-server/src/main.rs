@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use futures_util::{Sink, SinkExt, StreamExt};
 use openstream_protocol::relay;
@@ -25,7 +25,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
+mod control_plane;
 mod turn;
+use control_plane::{
+    AccountPrincipal, AccountStore, ControlPlaneError, DeviceRegistration, DeviceTrust,
+    IssuedTokens, PublicDevice, PublicUser,
+};
 
 /// Relay-ticket issuance and verification (H11).
 ///
@@ -211,7 +216,10 @@ const MAX_PENDING_MESSAGES: usize = 128;
 // A fresh socket receives its proof before its pending queue. Reserve one
 // additional slot so a full pending queue can still be transferred without
 // turning a valid reconnect into fail-closed admission failure.
-const MAX_OUTBOUND_MESSAGES: usize = MAX_PENDING_MESSAGES + 1;
+// A fresh primary socket receives the relay proof and both server-authoritative
+// establishment readiness records before its queued generic signaling. Keep
+// those control records reserved even when the pending queue is full.
+const MAX_OUTBOUND_MESSAGES: usize = MAX_PENDING_MESSAGES + 3;
 const MAX_DIRECT_CANDIDATES: u64 = 32;
 const RESET_REASON_ROLE_REPLACED: &str = "role_replaced";
 const RESET_REASON_PEER_DISCONNECTED: &str = "peer_disconnected";
@@ -224,6 +232,62 @@ const TERMINAL_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PENDING_BYTES: usize = 1024 * 1024;
 const MAX_SESSION_CREATES_PER_MINUTE: usize = 60;
 const SESSION_CREATE_WINDOW: Duration = Duration::from_secs(60);
+/// Password verification is deliberately expensive, which makes an
+/// unauthenticated request a lever on server CPU: one `/v1/auth/login` call
+/// costs a PBKDF2 run at [`control_plane`]'s iteration count, and the store
+/// is behind one mutex, so concurrent attempts serialize behind each other.
+/// Without a bound, an attacker with a trickle of requests keeps the control
+/// plane permanently busy.
+///
+/// This is a service-wide bound, matching [`CreationLimiter`]: the service
+/// does not track per-source state, and inventing an unauthenticated identity
+/// to bucket on would be its own spoofing problem. The consequence is honest
+/// and worth stating -- a flood can exhaust the window and make legitimate
+/// sign-in fail while it lasts -- but a refused login is recoverable, and an
+/// exhausted control plane is not. Interactive sign-in is rare enough that
+/// this bound is far above real use.
+const MAX_AUTH_ATTEMPTS_PER_MINUTE: usize = 30;
+const AUTH_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+/// Refresh has its own budget.
+///
+/// It is cheap -- a digest and a store write, no key derivation -- and it is
+/// what a signed-in client does routinely. Sharing the password budget would
+/// mean a stranger spending the login allowance could also stop every
+/// legitimate session from renewing its credentials, which turns a nuisance
+/// into an outage.
+const MAX_REFRESH_ATTEMPTS_PER_MINUTE: usize = 240;
+// Checked at compile time: renewal is the cheap, routine operation and its
+// budget must never be the scarce one. Inverting these would let password
+// spam starve every signed-in client's ability to stay signed in.
+const _: () = assert!(MAX_REFRESH_ATTEMPTS_PER_MINUTE > MAX_AUTH_ATTEMPTS_PER_MINUTE);
+/// Per-source budgets, applied alongside the service-wide ones.
+///
+/// The service-wide budget bounds total cost; it does not stop one source
+/// spending the whole allowance and locking everyone else out. These are the
+/// share any single source gets, and they are deliberately a small fraction
+/// of the service total: a real operator signs in occasionally, and a source
+/// that needs more than this is not a real operator.
+const MAX_AUTH_ATTEMPTS_PER_SOURCE: usize = 6;
+const MAX_REFRESH_ATTEMPTS_PER_SOURCE: usize = 60;
+// Checked at compile time: a per-source share that equalled the service total
+// would not be a share at all -- one source could still spend everything.
+const _: () = assert!(MAX_AUTH_ATTEMPTS_PER_SOURCE < MAX_AUTH_ATTEMPTS_PER_MINUTE);
+const _: () = assert!(MAX_REFRESH_ATTEMPTS_PER_SOURCE < MAX_REFRESH_ATTEMPTS_PER_MINUTE);
+/// How many distinct sources are tracked at once.
+///
+/// Bounded because the keys come from unauthenticated requests: an attacker
+/// with a range of addresses would otherwise grow this map for free. When it
+/// is full the oldest-used entry is evicted, which costs that source its
+/// history and nothing else -- the service-wide budget is still underneath.
+const MAX_TRACKED_AUTH_SOURCES: usize = 4096;
+
+/// Concurrent password derivations.
+///
+/// Each one is hundreds of milliseconds of CPU. They no longer hold the
+/// account-store lock, so without a bound an accepted burst would simply
+/// occupy every blocking thread instead. Two at a time keeps sign-in
+/// responsive while leaving the machine to the media path.
+const MAX_CONCURRENT_PASSWORD_DERIVATIONS: usize = 2;
 /// Default cap on admitted guest tokens per session (active + parked).
 const DEFAULT_MAX_GUESTS: usize = 4;
 /// Hard ceiling for the per-session guest cap.
@@ -349,6 +413,25 @@ fn ct_eq(a: &str, b: &str) -> bool {
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     session_creates: Arc<Mutex<CreationLimiter>>,
+    /// Bounds unauthenticated password-verification work. See
+    /// [`MAX_AUTH_ATTEMPTS_PER_MINUTE`].
+    auth_attempts: Arc<Mutex<RateWindow>>,
+    /// Separate budget for credential renewal. See
+    /// [`MAX_REFRESH_ATTEMPTS_PER_MINUTE`].
+    refresh_attempts: Arc<Mutex<RateWindow>>,
+    /// Per-source shares of the two budgets above, so one source cannot
+    /// spend the whole service allowance.
+    auth_sources: Arc<Mutex<SourceLimiter>>,
+    refresh_sources: Arc<Mutex<SourceLimiter>>,
+    /// Reverse proxies whose forwarding header may be believed.
+    trusted_proxies: Arc<Vec<IpAddr>>,
+    /// Admission control for concurrent key derivations. See
+    /// [`MAX_CONCURRENT_PASSWORD_DERIVATIONS`].
+    password_derivations: Arc<tokio::sync::Semaphore>,
+    /// Whether an unauthenticated caller may create an account. See
+    /// [`authorize_registration`].
+    open_registration: bool,
+    accounts: Arc<Mutex<AccountStore>>,
     admin_token: Option<String>,
     /// Explicit loopback development mode. With no admin token and without
     /// this flag, management endpoints refuse every request.
@@ -370,6 +453,8 @@ impl core::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("sessions", &self.sessions)
             .field("session_creates", &self.session_creates)
+            .field("open_registration", &self.open_registration)
+            .field("accounts", &"[redacted durable store]")
             // Tokens and the relay secret never render in logs.
             .field(
                 "admin_token",
@@ -394,6 +479,94 @@ impl CreationLimiter {
         self.events
             .retain(|created| now.saturating_duration_since(*created) < SESSION_CREATE_WINDOW);
         if self.events.len() >= MAX_SESSION_CREATES_PER_MINUTE {
+            return false;
+        }
+        self.events.push_back(now);
+        true
+    }
+}
+
+/// Per-source fixed-window counters, bounded in number.
+///
+/// Keyed by the caller's address rather than by anything the caller asserts
+/// about itself, except where an operator has said a hop may be believed --
+/// see [`request_source`].
+#[derive(Debug, Default)]
+struct SourceLimiter {
+    sources: HashMap<IpAddr, (RateWindow, Instant)>,
+}
+
+impl SourceLimiter {
+    fn allow(&mut self, source: IpAddr, now: Instant, limit: usize, window: Duration) -> bool {
+        if self.sources.len() >= MAX_TRACKED_AUTH_SOURCES && !self.sources.contains_key(&source) {
+            // Drop whichever source has been quiet longest. Evicting on
+            // last-use rather than insertion means an active attacker cannot
+            // push out an active operator by churning through addresses.
+            if let Some(stalest) = self
+                .sources
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(address, _)| *address)
+            {
+                self.sources.remove(&stalest);
+            }
+        }
+        let entry = self
+            .sources
+            .entry(source)
+            .or_insert_with(|| (RateWindow::default(), now));
+        entry.1 = now;
+        entry.0.allow(now, limit, window)
+    }
+}
+
+/// The address a request is attributed to for rate limiting.
+///
+/// The peer address by default. `X-Forwarded-For` is believed only when the
+/// peer is one of the operator's configured trusted proxies, and then only
+/// its last entry -- the hop the trusted proxy itself observed. Believing the
+/// header from an arbitrary peer would be worse than having no per-source
+/// limiting at all: every attacker would get an unlimited supply of identities
+/// simply by choosing a new value.
+fn request_source(peer: IpAddr, headers: &HeaderMap, trusted_proxies: &[IpAddr]) -> IpAddr {
+    if !trusted_proxies.contains(&peer) {
+        return peer;
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
+}
+
+/// Trusted reverse proxies, from `OPENSTREAM_TRUSTED_PROXIES`.
+///
+/// Exact addresses only, comma separated. Empty by default, which means no
+/// forwarding header is ever believed.
+fn trusted_proxies_from_environment() -> Vec<IpAddr> {
+    std::env::var("OPENSTREAM_TRUSTED_PROXIES")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|entry| entry.trim().parse::<IpAddr>().ok())
+        .collect()
+}
+
+/// A fixed-window counter with an explicit bound and window.
+///
+/// Same shape as [`CreationLimiter`], parameterised because the auth window
+/// needs different limits. Bounded by construction: the retained events can
+/// never exceed the limit, so a flood cannot grow this.
+#[derive(Debug, Default)]
+struct RateWindow {
+    events: VecDeque<Instant>,
+}
+
+impl RateWindow {
+    fn allow(&mut self, now: Instant, limit: usize, window: Duration) -> bool {
+        self.events
+            .retain(|event| now.saturating_duration_since(*event) < window);
+        if self.events.len() >= limit {
             return false;
         }
         self.events.push_back(now);
@@ -944,9 +1117,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(format!("failed to read OPENSTREAM_ADMIN_TOKEN: {error}").into()),
     };
+    let account_path = control_plane::default_store_path();
+    let accounts = AccountStore::open(&account_path).map_err(|error| {
+        format!(
+            "failed to open control-plane state store {}: {error}",
+            account_path.display()
+        )
+    })?;
+    // The count, not the contents. An operator needs to know whether the
+    // durable store was actually found -- an empty one after a restart means
+    // the path moved, and that looks identical to a working service until
+    // someone tries to sign in.
+    eprintln!(
+        "control-plane state store {} loaded with {} account(s)",
+        account_path.display(),
+        accounts.account_count()
+    );
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+        auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+        refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+        auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+        refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+        trusted_proxies: Arc::new(trusted_proxies_from_environment()),
+        password_derivations: Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+        )),
+        open_registration: std::env::var("OPENSTREAM_ALLOW_OPEN_REGISTRATION").as_deref()
+            == Ok("1"),
+        accounts: Arc::new(Mutex::new(accounts)),
         admin_token,
         allow_no_auth: std::env::var("OPENSTREAM_ALLOW_NO_AUTH").as_deref() == Ok("1"),
         local_no_auth: std::env::var("OPENSTREAM_LOCAL_NO_AUTH").as_deref() == Ok("1"),
@@ -980,6 +1180,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/auth/register", post(register_account))
+        .route("/v1/auth/login", post(login_account))
+        .route("/v1/auth/refresh", post(refresh_account))
+        .route(
+            "/v1/devices",
+            get(list_account_devices).post(enroll_account_device),
+        )
+        .route(
+            "/v1/devices/{device_id}/trust",
+            patch(set_account_device_trust),
+        )
         .route("/v1/session", post(create_session))
         .route(
             "/v1/session/{session_id}",
@@ -996,6 +1207,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::routing::delete(kick_guest),
         )
         .route("/v1/signal/{session_id}/{role}", get(signal_socket))
+        // Authentication and registration bodies are small by construction:
+        // no endpoint in this service accepts arbitrary file or media data.
+        .layer(DefaultBodyLimit::max(32 * 1024))
         .with_state(state.clone());
 
     println!("openstream-signal-server listening on http://{address}");
@@ -1023,9 +1237,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_signal().await;
         let _ = signal_tx.send(true);
     });
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
-        .await;
+    // `into_make_service_with_connect_info` is what makes the peer address
+    // available to the handlers. Without it the `ConnectInfo` extractor in the
+    // authentication routes cannot resolve and those requests fail.
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx))
+    .await;
     let _ = shutdown_tx.send(true);
     if let Some(task) = relay_task {
         let _ = task.await;
@@ -1067,6 +1287,464 @@ async fn shutdown_signal() {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountCredentials {
+    username: String,
+    password: String,
+    #[serde(default)]
+    device: Option<DeviceRegistrationRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshAccount {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceRegistrationRequest {
+    device_id: String,
+    name: String,
+    platform: String,
+    /// Public identity keys cross the JSON boundary as hex. The raw key is
+    /// accepted only by the authenticated control-plane request and is never
+    /// copied into a UI snapshot or diagnostic record.
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTrustRequest {
+    trust: DeviceTrust,
+}
+
+#[derive(Debug, Serialize)]
+struct AccountAuthResponse {
+    access_token: String,
+    refresh_token: String,
+    access_expires_in_seconds: u64,
+    refresh_expires_in_seconds: u64,
+    user: PublicUser,
+    device: Option<PublicDevice>,
+}
+
+impl From<IssuedTokens> for AccountAuthResponse {
+    fn from(tokens: IssuedTokens) -> Self {
+        Self {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            access_expires_in_seconds: tokens.access_expires_in_seconds,
+            refresh_expires_in_seconds: tokens.refresh_expires_in_seconds,
+            user: tokens.user,
+            device: tokens.device,
+        }
+    }
+}
+
+fn decode_public_key(value: &str) -> Result<[u8; 32], ControlPlaneError> {
+    let bytes =
+        hex::decode(value).map_err(|_| ControlPlaneError::InvalidInput("public key is invalid"))?;
+    bytes
+        .try_into()
+        .map_err(|_| ControlPlaneError::InvalidInput("public key is invalid"))
+}
+
+fn device_registration(
+    request: DeviceRegistrationRequest,
+) -> Result<DeviceRegistration, ControlPlaneError> {
+    Ok(DeviceRegistration {
+        device_id: request.device_id,
+        name: request.name,
+        platform: request.platform,
+        public_key: decode_public_key(&request.public_key)?,
+    })
+}
+
+fn control_error_response(error: ControlPlaneError) -> Response {
+    let status = match error {
+        ControlPlaneError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        ControlPlaneError::AlreadyExists => StatusCode::CONFLICT,
+        ControlPlaneError::NotFound => StatusCode::NOT_FOUND,
+        ControlPlaneError::Unauthorized => StatusCode::UNAUTHORIZED,
+        ControlPlaneError::DevicePending | ControlPlaneError::DeviceRevoked => {
+            StatusCode::FORBIDDEN
+        }
+        ControlPlaneError::InvalidStore | ControlPlaneError::Io(_) | ControlPlaneError::Json(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    // A store fault is the operator's problem to fix and they cannot fix what
+    // they cannot see, so the cause goes to the service log. It never goes to
+    // the client: a 5xx is all a caller can act on, and the alternative leaks
+    // store paths and parser offsets to an unauthenticated request.
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        let cause = std::error::Error::source(&error)
+            .map_or_else(|| error.to_string(), ToString::to_string);
+        eprintln!("control-plane store failure: {cause}");
+    }
+    // Keep password, token, path and parser details out of a network error.
+    // The status code is enough for the client to select a safe recovery path.
+    (status, "control-plane request failed\n").into_response()
+}
+
+fn unauthorized_response() -> Response {
+    (StatusCode::UNAUTHORIZED, "account authorization required\n").into_response()
+}
+
+/// Consume one slot from the unauthenticated password-verification budget.
+///
+/// Applied before the store lock is taken, so a refused attempt costs nothing
+/// beyond the counter and cannot queue behind an in-flight PBKDF2 run.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the finished axum Response this handler will return; \
+boxing it would allocate once per refused request to move bytes that are \
+constructed either way"
+)]
+async fn allow_auth_attempt(state: &AppState, source: IpAddr) -> Result<(), Response> {
+    let now = Instant::now();
+    // Both budgets, service-wide first: the per-source share is a fairness
+    // control, not a replacement for the total cost bound.
+    if state.auth_attempts.lock().await.allow(
+        now,
+        MAX_AUTH_ATTEMPTS_PER_MINUTE,
+        AUTH_ATTEMPT_WINDOW,
+    ) && state.auth_sources.lock().await.allow(
+        source,
+        now,
+        MAX_AUTH_ATTEMPTS_PER_SOURCE,
+        AUTH_ATTEMPT_WINDOW,
+    ) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::TOO_MANY_REQUESTS,
+        "authentication rate limit exceeded\n",
+    )
+        .into_response())
+}
+
+/// Consume one slot from the credential-renewal budget.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the finished axum Response this handler will return; \
+boxing it would allocate once per refused request to move bytes that are \
+constructed either way"
+)]
+async fn allow_refresh_attempt(state: &AppState, source: IpAddr) -> Result<(), Response> {
+    let now = Instant::now();
+    if state.refresh_attempts.lock().await.allow(
+        now,
+        MAX_REFRESH_ATTEMPTS_PER_MINUTE,
+        AUTH_ATTEMPT_WINDOW,
+    ) && state.refresh_sources.lock().await.allow(
+        source,
+        now,
+        MAX_REFRESH_ATTEMPTS_PER_SOURCE,
+        AUTH_ATTEMPT_WINDOW,
+    ) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::TOO_MANY_REQUESTS,
+        "credential renewal rate limit exceeded\n",
+    )
+        .into_response())
+}
+
+/// Run a synchronous, CPU-bound step without stalling the executor.
+///
+/// On the multi-threaded runtime the service actually runs on,
+/// `block_in_place` hands the current worker's other tasks to a sibling
+/// thread first, so a key derivation cannot stall unrelated WebSocket
+/// forwarding that happens to share a worker.
+///
+/// `block_in_place` panics on a current-thread runtime, which is what
+/// `#[tokio::test]` builds by default, so the flavor is checked rather than
+/// assumed. Running inline there is correct: a test has no co-scheduled
+/// session traffic to protect.
+fn without_blocking_the_executor<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
+/// Derive a password verifier under admission control, holding no store lock.
+///
+/// This is the expensive half of authentication and it is deliberately
+/// performed between two short locked sections rather than inside one. Two
+/// things follow: a burst of accepted attempts does not serialize behind the
+/// account store, so device listing and session creation stay responsive
+/// while someone is signing in; and the number of simultaneous derivations is
+/// bounded, so an accepted burst cannot occupy every blocking thread.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the finished axum Response this handler will return; \
+boxing it would allocate once per refused request to move bytes that are \
+constructed either way"
+)]
+async fn derive_password_bounded(
+    state: &AppState,
+    password: &str,
+    salt: [u8; 16],
+) -> Result<[u8; 32], Response> {
+    let Ok(_permit) = state.password_derivations.clone().acquire_owned().await else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "control plane is shutting down\n",
+        )
+            .into_response());
+    };
+    Ok(without_blocking_the_executor(|| {
+        control_plane::derive_password(password, &salt)
+    }))
+}
+
+/// On what basis a request is allowed to create an account.
+///
+/// Carried rather than collapsed to a `bool` because the basis has to be
+/// re-checked when the registration actually completes. Authorization happens
+/// under one lock, the key derivation happens with no lock at all, and the
+/// insertion happens under a later one -- so a condition that was true at the
+/// first step is only a claim by the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationAuthorization {
+    /// The administrator capability was presented.
+    Admin,
+    /// The operator deliberately runs an open endpoint.
+    ExplicitlyOpen,
+    /// The store was empty: this is a first-run bootstrap, and it stays valid
+    /// only while the store is *still* empty at insertion time.
+    Bootstrap,
+}
+
+impl RegistrationAuthorization {
+    /// Whether completion must re-prove an empty store.
+    const fn requires_empty_store(self) -> bool {
+        matches!(self, Self::Bootstrap)
+    }
+}
+
+/// On what basis, if any, this request may create an account.
+///
+/// Registration is closed by default. An open endpoint on a reachable service
+/// lets a stranger create accounts and, because a 409 distinguishes a taken
+/// username from a free one, enumerate the ones that already exist -- a
+/// channel no amount of constant-time password comparison closes.
+///
+/// Two ways remain open, both deliberate:
+///
+/// - an empty store accepts the first account, so a freshly installed
+///   self-hosted service can be bootstrapped by whoever reaches it first,
+///   which is the same trust model as the rest of first-run setup;
+/// - `OPENSTREAM_ALLOW_OPEN_REGISTRATION=1` restores an open endpoint for a
+///   deployment that actually wants one.
+///
+/// Otherwise the administrator capability is required, and the 409 is only
+/// ever visible to someone already holding it.
+async fn authorize_registration(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<RegistrationAuthorization> {
+    if admin_allowed(state, headers) {
+        return Some(RegistrationAuthorization::Admin);
+    }
+    if state.open_registration {
+        return Some(RegistrationAuthorization::ExplicitlyOpen);
+    }
+    (state.accounts.lock().await.account_count() == 0)
+        .then_some(RegistrationAuthorization::Bootstrap)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the finished axum Response this handler will return; \
+boxing it would allocate once per refused request to move bytes that are \
+constructed either way"
+)]
+async fn account_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AccountPrincipal, Response> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(unauthorized_response());
+    };
+    let mut accounts = state.accounts.lock().await;
+    accounts
+        .authorize_access(token, control_plane::now_ms())
+        .ok_or_else(unauthorized_response)
+}
+
+async fn register_account(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<AccountCredentials>,
+) -> Response {
+    let source = request_source(peer.ip(), &headers, &state.trusted_proxies);
+    let Some(authorization) = authorize_registration(&state, &headers).await else {
+        return (StatusCode::FORBIDDEN, "account registration is closed\n").into_response();
+    };
+    if let Err(response) = allow_auth_attempt(&state, source).await {
+        return response;
+    }
+    let device = match request.device.map(device_registration).transpose() {
+        Ok(device) => device,
+        Err(error) => return control_error_response(error),
+    };
+    if let Err(error) = control_plane::validate_password(&request.password) {
+        return control_error_response(error);
+    }
+    let salt = match AccountStore::registration_salt() {
+        Ok(salt) => salt,
+        Err(error) => return control_error_response(error),
+    };
+    // Derived with no lock held; see `derive_password_bounded`.
+    let derived = match derive_password_bounded(&state, &request.password, salt).await {
+        Ok(derived) => derived,
+        Err(response) => return response,
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.register_derived(
+        &request.username,
+        salt,
+        derived,
+        device,
+        authorization.requires_empty_store(),
+        control_plane::now_ms(),
+    ) {
+        Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn login_account(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<AccountCredentials>,
+) -> Response {
+    let source = request_source(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = allow_auth_attempt(&state, source).await {
+        return response;
+    }
+    let device = match request.device.map(device_registration).transpose() {
+        Ok(device) => device,
+        Err(error) => return control_error_response(error),
+    };
+    if let Err(error) = control_plane::validate_password(&request.password) {
+        return control_error_response(error);
+    }
+    // Three steps: read the challenge under the lock, derive without it, then
+    // verify and mutate under it again. The expensive middle step is what
+    // must not be serialized behind the store.
+    let salt = {
+        let accounts = state.accounts.lock().await;
+        accounts.password_challenge(&request.username)
+    };
+    let derived = match derive_password_bounded(&state, &request.password, salt).await {
+        Ok(derived) => derived,
+        Err(response) => return response,
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.login_derived(
+        &request.username,
+        salt,
+        derived,
+        device,
+        control_plane::now_ms(),
+    ) {
+        Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn refresh_account(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<RefreshAccount>,
+) -> Response {
+    let source = request_source(peer.ip(), &headers, &state.trusted_proxies);
+    // Its own budget: renewal is cheap and routine, and must not be starved
+    // by someone spending the password allowance.
+    if let Err(response) = allow_refresh_attempt(&state, source).await {
+        return response;
+    }
+    let mut accounts = state.accounts.lock().await;
+    match accounts.refresh(&request.refresh_token, control_plane::now_ms()) {
+        Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn list_account_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let accounts = state.accounts.lock().await;
+    if let Err(error) = accounts.can_manage_devices(&principal) {
+        return control_error_response(error);
+    }
+    match accounts.list_devices(&principal.account_id) {
+        Ok(devices) => Json(devices).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn enroll_account_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceRegistrationRequest>,
+) -> Response {
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let registration = match device_registration(request) {
+        Ok(registration) => registration,
+        Err(error) => return control_error_response(error),
+    };
+    let mut accounts = state.accounts.lock().await;
+    if let Err(error) = accounts.can_manage_devices(&principal) {
+        return control_error_response(error);
+    }
+    match accounts.enroll_device(&principal.account_id, registration, control_plane::now_ms()) {
+        Ok(device) => Json(device).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn set_account_device_trust(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+    Json(request): Json<DeviceTrustRequest>,
+) -> Response {
+    if request.trust == DeviceTrust::Pending {
+        return control_error_response(ControlPlaneError::InvalidInput(
+            "pending is assigned by enrollment",
+        ));
+    }
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let mut accounts = state.accounts.lock().await;
+    if let Err(error) = accounts.can_manage_devices(&principal) {
+        return control_error_response(error);
+    }
+    match accounts.set_device_trust(
+        &principal.account_id,
+        &device_id,
+        request.trust,
+        control_plane::now_ms(),
+    ) {
+        Ok(device) => Json(device).into_response(),
+        Err(error) => control_error_response(error),
+    }
 }
 
 /// Remove expired sessions independently of request and relay traffic.
@@ -1129,7 +1807,14 @@ async fn create_session(
     Json(request): Json<CreateSession>,
 ) -> Response {
     if !admin_allowed(&state, &headers) {
-        return (StatusCode::UNAUTHORIZED, "admin authorization required\n").into_response();
+        let principal = match account_principal(&state, &headers).await {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
+        let accounts = state.accounts.lock().await;
+        if let Err(error) = accounts.can_create_session(&principal) {
+            return control_error_response(error);
+        }
     }
     if !state.session_creates.lock().await.allow(Instant::now()) {
         return (
@@ -1562,6 +2247,29 @@ fn direct_reset_message(generation: u64, reason: &'static str) -> Message {
     )
 }
 
+fn ice_ready_message(generation: u64) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "ice_peer_ready",
+            "establishment_generation": generation,
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+fn ice_reset_message(generation: u64, reason: &'static str) -> Message {
+    Message::Text(
+        serde_json::json!({
+            "type": "ice_peer_reset",
+            "establishment_generation": generation,
+            "reason": reason,
+        })
+        .to_string()
+        .into(),
+    )
+}
+
 fn direct_message_generation(message: &Message) -> Option<u64> {
     let Message::Text(text) = message else {
         return None;
@@ -1580,8 +2288,26 @@ fn direct_message_generation(message: &Message) -> Option<u64> {
     })
 }
 
+fn ice_message_generation(message: &Message) -> Option<u64> {
+    let Message::Text(text) = message else {
+        return None;
+    };
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let message_type = value.get("type").and_then(serde_json::Value::as_str)?;
+    matches!(
+        message_type,
+        "ice_credentials_v2" | "ice_candidate_v2" | "ice_candidate_done_v2" | "ice_key_v2"
+    )
+    .then(|| {
+        value
+            .get("establishment_generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    })
+}
+
 fn prune_direct_queue(queue: &mut VecDeque<Message>, queued_bytes: &mut usize) {
-    queue.retain(|message| !is_direct_establishment_message(message));
+    queue.retain(|message| !is_establishment_message(message));
     *queued_bytes = queue.iter().map(message_len).sum();
 }
 
@@ -1655,10 +2381,14 @@ fn publish_ready(session: &mut Session) -> Result<u64, ReadinessError> {
 
     let mut accepted_host = false;
     let mut accepted_client = false;
-    if host.try_send(direct_ready_message(generation)).is_ok() {
+    if host.try_send(direct_ready_message(generation)).is_ok()
+        && host.try_send(ice_ready_message(generation)).is_ok()
+    {
         accepted_host = true;
     }
-    if client.try_send(direct_ready_message(generation)).is_ok() {
+    if client.try_send(direct_ready_message(generation)).is_ok()
+        && client.try_send(ice_ready_message(generation)).is_ok()
+    {
         accepted_client = true;
     }
     if accepted_host && accepted_client {
@@ -1675,14 +2405,16 @@ fn publish_ready(session: &mut Session) -> Result<u64, ReadinessError> {
     // next epoch can only be formed by a clean pair of sockets.
     if accepted_host {
         let reset = direct_reset_message(generation, RESET_REASON_DELIVERY_FAILED);
-        if host.try_send(reset).is_err() {
+        let ice_reset = ice_reset_message(generation, RESET_REASON_DELIVERY_FAILED);
+        if host.try_send(reset).is_err() || host.try_send(ice_reset).is_err() {
             close_sender(&host);
         }
         close_sender(&host);
     }
     if accepted_client {
         let reset = direct_reset_message(generation, RESET_REASON_DELIVERY_FAILED);
-        if client.try_send(reset).is_err() {
+        let ice_reset = ice_reset_message(generation, RESET_REASON_DELIVERY_FAILED);
+        if client.try_send(reset).is_err() || client.try_send(ice_reset).is_err() {
             close_sender(&client);
         }
         close_sender(&client);
@@ -1720,6 +2452,9 @@ fn invalidate_ready_epoch(
             reason,
         ))
         .is_err()
+        || sender
+            .try_send(ice_reset_message(previous.establishment_generation, reason))
+            .is_err()
     {
         close_primary_pair(session);
         return Err(ReadinessError::DeliveryFailed);
@@ -2307,7 +3042,9 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                 }
 
                 let message = Message::Text(text);
-                if let Some(establishment_generation) = direct_message_generation(&message) {
+                if let Some(establishment_generation) = direct_message_generation(&message)
+                    .or_else(|| ice_message_generation(&message))
+                {
                     let dispatch = {
                         let mut sessions = state.sessions.lock().await;
                         if sessions
@@ -2333,7 +3070,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                                         establishment_generation,
                                     ),
                                     // Guests use the legacy client fan-out path and
-                                    // cannot participate in direct-v2 establishment.
+                                    // cannot participate in primary establishment.
                                     Role::Guest(_) => DirectRoute::NotReady,
                                 };
                                 match route {
@@ -2359,7 +3096,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         | DirectDispatch::SendFailed => break 'socket,
                         DirectDispatch::NotReady => {
                             let error = Message::Text(
-                                "{\"type\":\"error\",\"reason\":\"direct_establishment_not_ready\"}"
+                                "{\"type\":\"error\",\"reason\":\"establishment_not_ready\"}"
                                     .into(),
                             );
                             if let Some(sender) = terminal_tx.take() {
@@ -2375,7 +3112,7 @@ async fn handle_socket(state: AppState, session_id: String, role: Role, socket: 
                         }
                         DirectDispatch::Future => {
                             let error = Message::Text(
-                                "{\"type\":\"error\",\"reason\":\"direct_generation_future\"}"
+                                "{\"type\":\"error\",\"reason\":\"establishment_generation_future\"}"
                                     .into(),
                             );
                             if let Some(sender) = terminal_tx.take() {
@@ -2528,7 +3265,8 @@ fn validate_signal_message(text: &str) -> Result<(), &'static str> {
         .ok_or("message_type_missing")?;
 
     match message_type {
-        "peer_ready" | "peer_reset" | "relay_ticket_proof" => {
+        "peer_ready" | "peer_reset" | "ice_peer_ready" | "ice_peer_reset"
+        | "relay_ticket_proof" => {
             return Err("server_generated_message");
         }
         // The historical untyped direct envelopes are deliberately not a
@@ -2636,30 +3374,64 @@ fn validate_signal_message(text: &str) -> Result<(), &'static str> {
                 return Err("path_candidate_port_invalid");
             }
         }
-        "key" => {
-            if !valid_hex_field(object, "public_key", 32)
+        "key" | "ice_credentials" | "ice_candidate" | "ice_candidate_done" => {
+            return Err("legacy_ice_establishment_unsupported");
+        }
+        "ice_credentials_v2" => {
+            if object.len() != 4
+                || !valid_establishment_generation(object, "establishment_generation")
+                || !bounded_string_field(object, "ufrag", 1, 32)
+                || !bounded_string_field(object, "pwd", 1, 256)
+            {
+                return Err("ice_credentials_v2_invalid");
+            }
+        }
+        "ice_candidate_v2" => {
+            if object.len() != 3
+                || !valid_establishment_generation(object, "establishment_generation")
+                || !bounded_string_field(object, "candidate", 1, 4096)
+            {
+                return Err("ice_candidate_v2_invalid");
+            }
+        }
+        "ice_candidate_done_v2" => {
+            if object.len() != 3
+                || !valid_establishment_generation(object, "establishment_generation")
+                || object
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none()
+                || object
+                    .get("count")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count > MAX_DIRECT_CANDIDATES)
+            {
+                return Err("ice_candidate_done_v2_invalid");
+            }
+        }
+        "ice_key_v2" => {
+            if object.len() != 5
+                || !valid_establishment_generation(object, "establishment_generation")
+                || !valid_hex_field(object, "public_key", 32)
                 || !valid_hex_field(object, "identity_public_key", 32)
                 || !valid_hex_field(object, "signature", 64)
             {
-                return Err("key_encoding_invalid");
+                return Err("ice_key_v2_invalid");
             }
         }
-        "ice_credentials" => {
-            if !bounded_string_field(object, "ufrag", 1, 32)
-                || !bounded_string_field(object, "pwd", 1, 256)
-            {
-                return Err("ice_credentials_invalid");
-            }
-        }
-        "ice_candidate" => {
-            if !bounded_string_field(object, "candidate", 1, 4096) {
-                return Err("ice_candidate_invalid");
-            }
-        }
-        "ice_candidate_done" => {}
         _ => return Err("unsupported_message_type"),
     }
     Ok(())
+}
+
+fn valid_establishment_generation(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> bool {
+    object
+        .get(name)
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|generation| generation > 0)
 }
 
 fn bounded_string_field(
@@ -2807,7 +3579,7 @@ fn message_len(message: &Message) -> usize {
 /// count or byte bound: evicting the oldest would flush handshake-critical
 /// messages a malicious or buggy peer could then re-trigger forever.
 fn queue_pending(queue: &mut VecDeque<Message>, queued_bytes: &mut usize, message: Message) {
-    if is_direct_establishment_message(&message) {
+    if is_establishment_message(&message) {
         return;
     }
     let size = message_len(&message);
@@ -2818,7 +3590,14 @@ fn queue_pending(queue: &mut VecDeque<Message>, queued_bytes: &mut usize, messag
     queue.push_back(message);
 }
 
-fn is_direct_establishment_message(message: &Message) -> bool {
+/// Whether a queued record belongs to an establishment epoch.
+///
+/// Both families are named here on purpose. These records are scoped to one
+/// server-authoritative generation, so they must be dropped when the epoch
+/// is invalidated; every other signaling message is generation-independent
+/// and has to survive, which is why this is an explicit allow-list rather
+/// than a prefix test.
+fn is_establishment_message(message: &Message) -> bool {
     let Message::Text(text) = message else {
         return false;
     };
@@ -2831,7 +3610,13 @@ fn is_direct_establishment_message(message: &Message) -> bool {
                 .map(|message_type| {
                     matches!(
                         message_type,
-                        "direct_candidate" | "direct_candidate_done" | "direct_key"
+                        "direct_candidate"
+                            | "direct_candidate_done"
+                            | "direct_key"
+                            | "ice_credentials_v2"
+                            | "ice_candidate_v2"
+                            | "ice_candidate_done_v2"
+                            | "ice_key_v2"
                     )
                 })
         })
@@ -3043,16 +3828,20 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
 
 #[cfg(test)]
 mod tests {
+    use super::control_plane::AccountStore;
     use super::{
-        AdmissionError, AppState, AuthMode, CreationLimiter, DirectRoute, GenericDispatch, Guest,
-        MAX_GUESTS_CEILING, MAX_SESSION_CREATES_PER_MINUTE, PrimaryRole, RELAY_BYTES_PER_SECOND,
-        RELAY_PACKETS_PER_SECOND, ReadinessError, RelaySlot, Role, SESSION_CREATE_WINDOW, Session,
-        admin_allowed, admit_primary_socket as admit_primary_socket_with_cancel, authorized,
-        bearer_token, cleanup_primary_socket, close_primary_pair, direct_message_route,
-        dispatch_generic_message, is_private_lan_address, max_guests_for_new_session,
-        prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
-        relay_owner_for_ticket, relay_ticket, signal_socket, supplied_token_is_host,
-        validate_signal_message, validate_startup_auth,
+        AUTH_ATTEMPT_WINDOW, AdmissionError, AppState, AuthMode, CreationLimiter, DirectRoute,
+        GenericDispatch, Guest, MAX_AUTH_ATTEMPTS_PER_MINUTE, MAX_AUTH_ATTEMPTS_PER_SOURCE,
+        MAX_CONCURRENT_PASSWORD_DERIVATIONS, MAX_GUESTS_CEILING, MAX_REFRESH_ATTEMPTS_PER_MINUTE,
+        MAX_SESSION_CREATES_PER_MINUTE, MAX_TRACKED_AUTH_SOURCES, PrimaryRole,
+        RELAY_BYTES_PER_SECOND, RELAY_PACKETS_PER_SECOND, RateWindow, ReadinessError,
+        RegistrationAuthorization, RelaySlot, Role, SESSION_CREATE_WINDOW, Session, SourceLimiter,
+        admin_allowed, admit_primary_socket as admit_primary_socket_with_cancel,
+        authorize_registration, authorized, bearer_token, cleanup_primary_socket,
+        close_primary_pair, direct_message_route, dispatch_generic_message, is_private_lan_address,
+        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
+        queue_pending, reap_expired_sessions, relay_owner_for_ticket, relay_ticket, request_source,
+        signal_socket, supplied_token_is_host, validate_signal_message, validate_startup_auth,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -3066,6 +3855,7 @@ mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use std::collections::{HashMap, VecDeque};
     use std::convert::Infallible;
+    use std::net::IpAddr;
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -3101,6 +3891,23 @@ mod tests {
             guests: std::collections::VecDeque::new(),
             max_guests: 1,
         }
+    }
+
+    /// An account store in a directory of this test's own.
+    ///
+    /// The store takes ownership of its parent -- it chmods it to 0700 -- so
+    /// the parent must never be the shared temp directory itself.
+    fn test_accounts() -> Arc<Mutex<AccountStore>> {
+        let path = std::env::temp_dir()
+            .join(format!(
+                "openstream-signal-account-test-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ))
+            .join("control-state.json");
+        Arc::new(Mutex::new(
+            AccountStore::open(path).expect("test account store"),
+        ))
     }
 
     fn admit_primary_socket(
@@ -3186,22 +3993,58 @@ mod tests {
         }
     }
 
-    fn assert_peer_ready(message: Message, generation: u64) {
-        let text = message_text(message);
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&text)
-                .expect("peer_ready JSON")
-                .get("type")
-                .and_then(serde_json::Value::as_str),
-            Some("peer_ready")
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&text)
-                .expect("peer_ready JSON")
-                .get("establishment_generation")
-                .and_then(serde_json::Value::as_u64),
-            Some(generation)
-        );
+    /// Consume one socket's readiness announcement.
+    ///
+    /// One epoch is announced as two records, `peer_ready` and
+    /// `ice_peer_ready`, carrying the same generation. Both establishment
+    /// vocabularies are separate on the wire -- a direct key and an ICE key
+    /// are signed over different transcript domains, so a record from one
+    /// must never be readable as the other -- but they describe the same
+    /// server-authoritative pair. Taking both here keeps every following
+    /// "and nothing else was queued" assertion meaningful.
+    fn assert_peer_ready(receiver: &mut mpsc::Receiver<Message>, generation: u64) {
+        for expected in ["peer_ready", "ice_peer_ready"] {
+            let message = receiver
+                .try_recv()
+                .unwrap_or_else(|error| panic!("{expected} readiness record: {error}"));
+            let text = message_text(message);
+            let value = serde_json::from_str::<serde_json::Value>(&text).expect("readiness JSON");
+            assert_eq!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some(expected)
+            );
+            assert_eq!(
+                value
+                    .get("establishment_generation")
+                    .and_then(serde_json::Value::as_u64),
+                Some(generation)
+            );
+        }
+    }
+
+    /// Consume one socket's epoch-invalidation announcement.
+    ///
+    /// The mirror of [`assert_peer_ready`]: an invalidated epoch is also
+    /// announced once per establishment vocabulary, so both records have to
+    /// be taken before a test can claim the queue is empty.
+    fn assert_peer_reset(receiver: &mut mpsc::Receiver<Message>, generation: u64) {
+        for expected in ["peer_reset", "ice_peer_reset"] {
+            let message = receiver
+                .try_recv()
+                .unwrap_or_else(|error| panic!("{expected} record: {error}"));
+            let text = message_text(message);
+            let value = serde_json::from_str::<serde_json::Value>(&text).expect("reset JSON");
+            assert_eq!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some(expected)
+            );
+            assert_eq!(
+                value
+                    .get("establishment_generation")
+                    .and_then(serde_json::Value::as_u64),
+                Some(generation)
+            );
+        }
     }
 
     fn assert_relay_proof(message: Message, generation: u64) {
@@ -3415,6 +4258,16 @@ mod tests {
         let mut state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: true,
@@ -3717,6 +4570,16 @@ mod tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -3771,7 +4634,7 @@ mod tests {
             .expect("websocket frame is valid");
         assert!(matches!(
             response,
-            ClientMessage::Text(text) if text.contains("direct_establishment_not_ready")
+            ClientMessage::Text(text) if text.contains("establishment_not_ready")
         ));
         let _ = timeout(Duration::from_secs(1), socket.next())
             .await
@@ -3898,6 +4761,16 @@ mod tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -3982,9 +4855,7 @@ mod tests {
         .expect("replacement generation is installed");
 
         stale_socket
-            .send(ClientMessage::Text(
-                r#"{"type":"ice_candidate_done"}"#.into(),
-            ))
+            .send(ClientMessage::Text(r#"{"type":"path_candidate","generation":2,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct_udp","ip":"127.0.0.1","port":4001}"#.into()))
             .await
             .expect("stale socket can submit a frame");
         assert!(
@@ -3994,9 +4865,7 @@ mod tests {
         );
 
         current_socket
-            .send(ClientMessage::Text(
-                r#"{"type":"ice_candidate_done"}"#.into(),
-            ))
+            .send(ClientMessage::Text(r#"{"type":"path_candidate","generation":2,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"direct_udp","ip":"127.0.0.1","port":4001}"#.into()))
             .await
             .expect("current socket can submit a frame");
         assert!(matches!(
@@ -4004,7 +4873,7 @@ mod tests {
                 .await
                 .expect("current socket forwards")
                 .expect("host receiver remains connected"),
-            Message::Text(text) if text.contains("ice_candidate_done")
+            Message::Text(text) if text.contains("path_candidate")
         ));
 
         state
@@ -4015,9 +4884,7 @@ mod tests {
             .expect("test session")
             .host = None;
         stale_socket
-            .send(ClientMessage::Text(
-                r#"{"type":"ice_candidate","candidate":"candidate:1"}"#.into(),
-            ))
+            .send(ClientMessage::Text(r#"{"type":"path_candidate","generation":3,"token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","kind":"direct_udp","ip":"127.0.0.1","port":4002}"#.into()))
             .await
             .expect("stale socket can submit another frame");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -4043,12 +4910,338 @@ mod tests {
         assert!(limiter.allow(start + SESSION_CREATE_WINDOW + Duration::from_secs(1)));
     }
 
+    /// Password verification is the most expensive thing an unauthenticated
+    /// caller can ask this service to do, so the budget has to be real and
+    /// has to recover on its own.
+    #[test]
+    fn auth_attempts_are_bounded_and_the_window_recovers() {
+        let start = Instant::now();
+        let mut window = RateWindow::default();
+        for _ in 0..MAX_AUTH_ATTEMPTS_PER_MINUTE {
+            assert!(window.allow(start, MAX_AUTH_ATTEMPTS_PER_MINUTE, AUTH_ATTEMPT_WINDOW));
+        }
+        assert!(
+            !window.allow(start, MAX_AUTH_ATTEMPTS_PER_MINUTE, AUTH_ATTEMPT_WINDOW),
+            "the budget must actually refuse once it is exhausted"
+        );
+        // Retained events are bounded by the limit, so a sustained flood
+        // cannot grow this structure.
+        assert_eq!(window.events.len(), MAX_AUTH_ATTEMPTS_PER_MINUTE);
+        assert!(window.allow(
+            start + AUTH_ATTEMPT_WINDOW,
+            MAX_AUTH_ATTEMPTS_PER_MINUTE,
+            AUTH_ATTEMPT_WINDOW
+        ));
+        assert_eq!(window.events.len(), 1);
+    }
+
+    /// Renewal must not be starvable by password-attempt spam.
+    ///
+    /// These are different budgets because they protect different things: one
+    /// bounds expensive key derivation from strangers, the other keeps
+    /// already-signed-in clients able to renew. Sharing them turns a nuisance
+    /// into an outage.
+    #[test]
+    fn refresh_has_its_own_budget_and_outlives_an_exhausted_auth_budget() {
+        // The ordering of the two budgets is asserted at compile time beside
+        // the constants themselves; what this checks is that they are
+        // genuinely independent windows.
+        let start = Instant::now();
+        let mut auth = RateWindow::default();
+        let mut refresh = RateWindow::default();
+        for _ in 0..MAX_AUTH_ATTEMPTS_PER_MINUTE {
+            assert!(auth.allow(start, MAX_AUTH_ATTEMPTS_PER_MINUTE, AUTH_ATTEMPT_WINDOW));
+        }
+        assert!(!auth.allow(start, MAX_AUTH_ATTEMPTS_PER_MINUTE, AUTH_ATTEMPT_WINDOW));
+        assert!(
+            refresh.allow(start, MAX_REFRESH_ATTEMPTS_PER_MINUTE, AUTH_ATTEMPT_WINDOW),
+            "an exhausted password budget must not block credential renewal"
+        );
+    }
+
+    /// One noisy source must not spend everyone else's allowance.
+    #[test]
+    fn a_single_source_cannot_exhaust_the_shared_authentication_budget() {
+        let start = Instant::now();
+        let mut sources = SourceLimiter::default();
+        let noisy: IpAddr = "203.0.113.10".parse().expect("address");
+        let quiet: IpAddr = "203.0.113.11".parse().expect("address");
+
+        for _ in 0..MAX_AUTH_ATTEMPTS_PER_SOURCE {
+            assert!(sources.allow(
+                noisy,
+                start,
+                MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                AUTH_ATTEMPT_WINDOW
+            ));
+        }
+        assert!(
+            !sources.allow(
+                noisy,
+                start,
+                MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                AUTH_ATTEMPT_WINDOW
+            ),
+            "a source must be cut off at its own share"
+        );
+        assert!(
+            sources.allow(
+                quiet,
+                start,
+                MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                AUTH_ATTEMPT_WINDOW
+            ),
+            "another source must be unaffected by the first one's spending"
+        );
+    }
+
+    /// The tracking table is bounded, and eviction favours active sources.
+    #[test]
+    fn source_tracking_is_bounded_and_evicts_the_stalest_entry() {
+        let start = Instant::now();
+        let mut sources = SourceLimiter::default();
+        let active: IpAddr = "198.51.100.1".parse().expect("address");
+        assert!(sources.allow(
+            active,
+            start,
+            MAX_AUTH_ATTEMPTS_PER_SOURCE,
+            AUTH_ATTEMPT_WINDOW
+        ));
+
+        // Fill the table with distinct sources, keeping the first one in use
+        // so it is never the stalest.
+        for index in 0..MAX_TRACKED_AUTH_SOURCES + 64 {
+            // Masked to a byte each way, so the conversion cannot truncate
+            // anything the address needs.
+            let octet = |shift: usize| {
+                u8::try_from((index >> shift) & 0xff).expect("a masked byte fits in u8")
+            };
+            let filler = IpAddr::from([10, octet(16), octet(8), octet(0)]);
+            let now = start + Duration::from_millis(index as u64 + 1);
+            sources.allow(
+                filler,
+                now,
+                MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                AUTH_ATTEMPT_WINDOW,
+            );
+            sources.allow(
+                active,
+                now,
+                MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                AUTH_ATTEMPT_WINDOW,
+            );
+        }
+        assert!(
+            sources.sources.len() <= MAX_TRACKED_AUTH_SOURCES,
+            "unauthenticated requests must not grow this table without bound"
+        );
+        assert!(
+            sources.sources.contains_key(&active),
+            "churning through addresses must not evict a source that is still active"
+        );
+    }
+
+    /// A forwarding header is believed only from a configured proxy.
+    ///
+    /// Believing it from anyone would hand every attacker an unlimited supply
+    /// of identities, which is worse than having no per-source limit at all.
+    #[test]
+    fn forwarded_headers_are_believed_only_from_a_trusted_proxy() {
+        let proxy: IpAddr = "192.0.2.7".parse().expect("address");
+        let stranger: IpAddr = "192.0.2.8".parse().expect("address");
+        let claimed: IpAddr = "198.51.100.42".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "10.0.0.1, 198.51.100.42".parse().expect("header"),
+        );
+
+        assert_eq!(
+            request_source(stranger, &headers, &[proxy]),
+            stranger,
+            "an untrusted peer's forwarding header must be ignored"
+        );
+        assert_eq!(
+            request_source(proxy, &headers, &[proxy]),
+            claimed,
+            "a trusted proxy's last hop is the source"
+        );
+        assert_eq!(
+            request_source(proxy, &HeaderMap::new(), &[proxy]),
+            proxy,
+            "a trusted proxy with no header is itself the source"
+        );
+        assert_eq!(
+            request_source(proxy, &headers, &[]),
+            proxy,
+            "with no configured proxies no header is ever believed"
+        );
+    }
+
+    /// Registration is closed unless something explicitly opens it.
+    ///
+    /// An open endpoint is not only an account-creation problem: a 409 for a
+    /// taken username enumerates every account on the service, which no
+    /// amount of constant-time password comparison closes.
+    #[tokio::test]
+    async fn registration_is_closed_unless_bootstrapping_or_explicitly_opened() {
+        let mut state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: false,
+            accounts: test_accounts(),
+            admin_token: Some("a-sufficiently-long-admin-token".to_string()),
+            allow_no_auth: false,
+            local_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"relay-secret-value".to_vec(),
+        };
+        let anonymous = HeaderMap::new();
+
+        // An empty store bootstraps its first account.
+        assert_eq!(
+            authorize_registration(&state, &anonymous).await,
+            Some(RegistrationAuthorization::Bootstrap)
+        );
+        {
+            let mut accounts = state.accounts.lock().await;
+            accounts
+                .register_derived(
+                    "first-operator",
+                    [7; 16],
+                    [9; 32],
+                    None,
+                    true,
+                    super::control_plane::now_ms(),
+                )
+                .expect("bootstrap account");
+        }
+
+        // Once an account exists, an anonymous caller is refused.
+        assert_eq!(
+            authorize_registration(&state, &anonymous).await,
+            None,
+            "registration must close after the first account exists"
+        );
+
+        // The administrator capability still gets through.
+        let mut admin = HeaderMap::new();
+        admin.insert(
+            "authorization",
+            "Bearer a-sufficiently-long-admin-token"
+                .parse()
+                .expect("authorization header"),
+        );
+        assert_eq!(
+            authorize_registration(&state, &admin).await,
+            Some(RegistrationAuthorization::Admin)
+        );
+
+        // And an operator can deliberately run an open endpoint.
+        state.open_registration = true;
+        assert_eq!(
+            authorize_registration(&state, &anonymous).await,
+            Some(RegistrationAuthorization::ExplicitlyOpen)
+        );
+    }
+
+    /// Two anonymous registrations that both observed an empty store must not
+    /// both succeed.
+    ///
+    /// This reproduces the interleaving deterministically rather than racing
+    /// threads: both requests are authorized while the store is empty -- which
+    /// is exactly what happens when the first request is still deriving its
+    /// password -- and only then does either one insert. The second must be
+    /// refused, because the basis it was authorized on no longer holds.
+    #[tokio::test]
+    async fn only_one_of_two_concurrent_bootstrap_registrations_succeeds() {
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: false,
+            accounts: test_accounts(),
+            admin_token: Some("a-sufficiently-long-admin-token".to_string()),
+            allow_no_auth: false,
+            local_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"relay-secret-value".to_vec(),
+        };
+        let anonymous = HeaderMap::new();
+
+        // Both requests reach authorization before either inserts.
+        let first = authorize_registration(&state, &anonymous)
+            .await
+            .expect("first is authorized to bootstrap");
+        let second = authorize_registration(&state, &anonymous)
+            .await
+            .expect("second is authorized while the store is still empty");
+        assert_eq!(first, RegistrationAuthorization::Bootstrap);
+        assert_eq!(second, RegistrationAuthorization::Bootstrap);
+
+        let mut accounts = state.accounts.lock().await;
+        accounts
+            .register_derived(
+                "operator-one",
+                [1; 16],
+                [1; 32],
+                None,
+                first.requires_empty_store(),
+                super::control_plane::now_ms(),
+            )
+            .expect("the first bootstrap succeeds");
+        let second_result = accounts.register_derived(
+            "operator-two",
+            [2; 16],
+            [2; 32],
+            None,
+            second.requires_empty_store(),
+            super::control_plane::now_ms(),
+        );
+        assert!(
+            second_result.is_err(),
+            "a second bootstrap registration must be refused once an account exists"
+        );
+        assert_eq!(
+            accounts.account_count(),
+            1,
+            "exactly one account may be created by bootstrap"
+        );
+    }
+
     #[tokio::test]
     async fn expired_sessions_are_removed_and_their_sockets_are_closed() {
         let (sender, mut receiver) = mpsc::channel(2);
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -4099,6 +5292,16 @@ mod tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -4222,6 +5425,16 @@ mod tests {
         let state = AppState {
             sessions: Arc::new(Mutex::new(HashMap::from([("session-1".into(), session)]))),
             session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -4387,25 +5600,62 @@ mod tests {
         ))
         .is_ok());
         assert!(
+            validate_signal_message(
+                r#"{"type":"ice_credentials_v2","establishment_generation":1,"ufrag":"short","pwd":"long-password"}"#
+            )
+            .is_ok()
+        );
+        assert!(validate_signal_message(
+            r#"{"type":"ice_candidate_v2","establishment_generation":1,"candidate":"candidate:1 1 udp 1 127.0.0.1 4000 typ host"}"#
+        )
+        .is_ok());
+        assert!(
+            validate_signal_message(
+                r#"{"type":"ice_candidate_done_v2","establishment_generation":1,"count":2}"#
+            )
+            .is_ok()
+        );
+        assert!(
             validate_signal_message(&format!(
-                r#"{{"type":"key","public_key":"{}","identity_public_key":"{}","signature":"{}"}}"#,
+                r#"{{"type":"ice_key_v2","establishment_generation":1,"public_key":"{}","identity_public_key":"{}","signature":"{}"}}"#,
                 "aa".repeat(32),
                 "bb".repeat(32),
                 "cc".repeat(64),
             ))
             .is_ok()
         );
+    }
+
+    /// The pre-epoch ICE vocabulary is refused outright rather than treated
+    /// as an older dialect.
+    ///
+    /// Those envelopes carry no establishment generation, so the service
+    /// cannot tell a record from the current pair of sockets from one a
+    /// reconnect left behind -- which is the ambiguity the epoch exists to
+    /// remove. Accepting them "for compatibility" would reintroduce it for
+    /// any peer that simply omitted the field.
+    #[test]
+    fn signaling_validator_rejects_the_pre_epoch_ice_vocabulary() {
+        for message in [
+            r#"{"type":"ice_credentials","ufrag":"short","pwd":"long-password"}"#,
+            r#"{"type":"ice_candidate","candidate":"candidate:1 1 udp 1 127.0.0.1 4000 typ host"}"#,
+            r#"{"type":"ice_candidate_done"}"#,
+        ] {
+            assert!(
+                validate_signal_message(message).is_err(),
+                "accepted pre-epoch envelope {message}"
+            );
+        }
         assert!(
-            validate_signal_message(
-                r#"{"type":"ice_credentials","ufrag":"short","pwd":"long-password"}"#
-            )
-            .is_ok()
+            validate_signal_message(&format!(
+                r#"{{"type":"key","public_key":"{}","identity_public_key":"{}","signature":"{}"}}"#,
+                "aa".repeat(32),
+                "bb".repeat(32),
+                "cc".repeat(64),
+            ))
+            .is_err(),
+            "accepted the pre-epoch key envelope"
         );
-        assert!(validate_signal_message(
-            r#"{"type":"ice_candidate","candidate":"candidate:1 1 udp 1 127.0.0.1 4000 typ host"}"#
-        )
-        .is_ok());
-        assert!(validate_signal_message(r#"{"type":"ice_candidate_done"}"#).is_ok());
     }
 
     #[test]
@@ -4539,8 +5789,8 @@ mod tests {
         );
         assert_eq!(session.establishment_generation, 1);
         assert_relay_proof(client_rx.try_recv().expect("client proof"), 1);
-        assert_peer_ready(host_rx.try_recv().expect("host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("client readiness"), 1);
+        assert_peer_ready(&mut host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
         assert!(host_rx.try_recv().is_err());
         assert!(client_rx.try_recv().is_err());
     }
@@ -4564,8 +5814,8 @@ mod tests {
             window_bytes: 0,
             window_packets: 0,
         });
-        assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
+        assert_peer_ready(&mut old_host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
 
         let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
         assert_eq!(
@@ -4591,17 +5841,9 @@ mod tests {
         assert!(session.relay_host.is_none());
 
         assert_relay_proof(new_host_rx.try_recv().expect("replacement host proof"), 2);
-        let reset = message_text(client_rx.try_recv().expect("reset reaches survivor"));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON")["type"],
-            "peer_reset"
-        );
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON")["establishment_generation"],
-            1
-        );
-        assert_peer_ready(client_rx.try_recv().expect("next readiness"), 2);
-        assert_peer_ready(new_host_rx.try_recv().expect("replacement readiness"), 2);
+        assert_peer_reset(&mut client_rx, 1);
+        assert_peer_ready(&mut client_rx, 2);
+        assert_peer_ready(&mut new_host_rx, 2);
         assert!(client_rx.try_recv().is_err());
         assert!(old_host_rx.try_recv().is_ok());
     }
@@ -4646,12 +5888,8 @@ mod tests {
         assert!(session.client.is_none());
         assert!(session.relay_host.is_none());
         assert!(session.relay_client.is_none());
-        assert_peer_ready(host_rx.try_recv().expect("accepted readiness"), 1);
-        let reset = message_text(host_rx.try_recv().expect("compensating reset"));
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON")["type"],
-            "peer_reset"
-        );
+        assert_peer_ready(&mut host_rx, 1);
+        assert_peer_reset(&mut host_rx, 1);
         assert!(matches!(host_rx.try_recv(), Ok(Message::Close(None))));
     }
 
@@ -4684,8 +5922,8 @@ mod tests {
         });
         assert_relay_proof(old_host_rx.try_recv().expect("initial host proof"), 1);
         assert_relay_proof(client_rx.try_recv().expect("initial client proof"), 1);
-        assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
+        assert_peer_ready(&mut old_host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
         for _ in 0..8 {
             client_tx
                 .try_send(Message::Text("full".into()))
@@ -4713,8 +5951,8 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
         assert_relay_proof(old_host_rx.try_recv().expect("initial host proof"), 1);
         assert_relay_proof(client_rx.try_recv().expect("initial client proof"), 1);
-        assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
+        assert_peer_ready(&mut old_host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
         session
             .pending_host
             .push_back(Message::Text(r#"{"type":"ice_candidate_done"}"#.into()));
@@ -4751,9 +5989,7 @@ mod tests {
         assert!(session.relay_host.is_none());
         assert!(session.relay_client.is_none());
         assert!(matches!(old_host_rx.try_recv(), Ok(Message::Close(None))));
-        assert!(
-            matches!(client_rx.try_recv(), Ok(Message::Text(text)) if text.contains("peer_reset"))
-        );
+        assert_peer_reset(&mut client_rx, 1);
         assert!(matches!(client_rx.try_recv(), Ok(Message::Close(None))));
         assert!(matches!(replacement_rx.try_recv(), Ok(Message::Text(text)) if text == "full"));
     }
@@ -4834,14 +6070,18 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
         assert_relay_proof(old_host_rx.try_recv().expect("initial host proof"), 1);
         assert_relay_proof(client_rx.try_recv().expect("initial client proof"), 1);
-        assert_peer_ready(old_host_rx.try_recv().expect("initial host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("initial client readiness"), 1);
+        assert_peer_ready(&mut old_host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
         let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
         admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx).expect("replacement");
-        let _ = client_rx.try_recv();
-        let _ = client_rx.try_recv();
-        let _ = new_host_rx.try_recv();
-        let _ = new_host_rx.try_recv();
+        // The surviving client sees the old epoch invalidated and the new one
+        // published; the replacement socket sees its relay proof and the new
+        // epoch. Drain all of it so the assertions below describe what the
+        // stale cleanup did, not what admission had already queued.
+        assert_peer_reset(&mut client_rx, 1);
+        assert_peer_ready(&mut client_rx, 2);
+        assert_relay_proof(new_host_rx.try_recv().expect("replacement proof"), 2);
+        assert_peer_ready(&mut new_host_rx, 2);
 
         assert!(!cleanup_primary_socket(&mut session, PrimaryRole::Host, 1));
         assert_eq!(session.host_generation, 2);
@@ -4897,8 +6137,8 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
         assert_relay_proof(old_host_rx.try_recv().expect("host proof"), 1);
         assert_relay_proof(client_rx.try_recv().expect("client proof"), 1);
-        assert_peer_ready(old_host_rx.try_recv().expect("host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("client readiness"), 1);
+        assert_peer_ready(&mut old_host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
 
         // The old host has received peer_ready but has not completed its
         // candidate exchange yet. A replacement must invalidate that epoch
@@ -4925,11 +6165,8 @@ mod tests {
         ));
 
         assert_relay_proof(new_host_rx.try_recv().expect("replacement proof"), 2);
-        let reset = message_text(client_rx.try_recv().expect("one reset"));
-        let reset = serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON");
-        assert_eq!(reset["type"], "peer_reset");
-        assert_eq!(reset["establishment_generation"], 1);
-        assert_peer_ready(client_rx.try_recv().expect("next readiness"), 2);
+        assert_peer_reset(&mut client_rx, 1);
+        assert_peer_ready(&mut client_rx, 2);
         assert!(client_rx.try_recv().is_err());
     }
 
@@ -4942,8 +6179,8 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Client, &old_client_tx).expect("client");
         assert_relay_proof(host_rx.try_recv().expect("host proof"), 1);
         assert_relay_proof(old_client_rx.try_recv().expect("client proof"), 1);
-        assert_peer_ready(host_rx.try_recv().expect("host readiness"), 1);
-        assert_peer_ready(old_client_rx.try_recv().expect("client readiness"), 1);
+        assert_peer_ready(&mut host_rx, 1);
+        assert_peer_ready(&mut old_client_rx, 1);
 
         let candidate_done = Message::Text(
             r#"{"type":"direct_candidate_done","establishment_generation":1,"count":1}"#.into(),
@@ -4979,12 +6216,9 @@ mod tests {
         ));
 
         assert_relay_proof(new_client_rx.try_recv().expect("replacement proof"), 2);
-        let reset = message_text(host_rx.try_recv().expect("one reset"));
-        let reset = serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON");
-        assert_eq!(reset["type"], "peer_reset");
-        assert_eq!(reset["establishment_generation"], 1);
-        assert_peer_ready(host_rx.try_recv().expect("next readiness"), 2);
-        assert_peer_ready(new_client_rx.try_recv().expect("replacement readiness"), 2);
+        assert_peer_reset(&mut host_rx, 1);
+        assert_peer_ready(&mut host_rx, 2);
+        assert_peer_ready(&mut new_client_rx, 2);
         assert!(host_rx.try_recv().is_err());
         assert!(new_client_rx.try_recv().is_err());
     }
@@ -4998,8 +6232,8 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
         assert_relay_proof(old_host_rx.try_recv().expect("host proof"), 1);
         assert_relay_proof(client_rx.try_recv().expect("client proof"), 1);
-        assert_peer_ready(old_host_rx.try_recv().expect("host readiness"), 1);
-        assert_peer_ready(client_rx.try_recv().expect("client readiness"), 1);
+        assert_peer_ready(&mut old_host_rx, 1);
+        assert_peer_ready(&mut client_rx, 1);
 
         let signed_old_key = signed_direct_key_message("session-1", 1);
         let signed_old_key_text = message_text(signed_old_key);
@@ -5009,8 +6243,8 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Host, &new_host_tx)
             .expect("replacement host");
         assert_relay_proof(new_host_rx.try_recv().expect("replacement proof"), 2);
-        let _ = client_rx.try_recv(); // peer_reset
-        assert_peer_ready(client_rx.try_recv().expect("replacement readiness"), 2);
+        assert_peer_reset(&mut client_rx, 1);
+        assert_peer_ready(&mut client_rx, 2);
 
         // The signature is valid for session-1/host/epoch-1, but the socket
         // generation is no longer current. It must not reach the client.
@@ -5034,7 +6268,7 @@ mod tests {
         admit_primary_socket(&mut session, PrimaryRole::Client, &client_tx).expect("client");
         for receiver in [&mut old_host_rx, &mut client_rx] {
             let _ = receiver.try_recv(); // relay proof
-            let _ = receiver.try_recv(); // peer_ready(1)
+            assert_peer_ready(receiver, 1);
         }
 
         let (new_host_tx, mut new_host_rx) = mpsc::channel(8);
@@ -5050,11 +6284,8 @@ mod tests {
         );
         assert_relay_proof(new_host_rx.try_recv().expect("new proof"), 2);
 
-        let reset = message_text(client_rx.try_recv().expect("reset exactly once"));
-        let reset = serde_json::from_str::<serde_json::Value>(&reset).expect("reset JSON");
-        assert_eq!(reset["type"], "peer_reset");
-        assert_eq!(reset["establishment_generation"], 1);
-        assert_peer_ready(client_rx.try_recv().expect("ready exactly once"), 2);
+        assert_peer_reset(&mut client_rx, 1);
+        assert_peer_ready(&mut client_rx, 2);
         assert!(client_rx.try_recv().is_err());
 
         // A stale cleanup of the old socket is a no-op and cannot publish a
@@ -5085,7 +6316,7 @@ mod tests {
             session
                 .pending_host
                 .iter()
-                .all(|message| !super::is_direct_establishment_message(message))
+                .all(|message| !super::is_establishment_message(message))
         );
         assert_eq!(
             session.pending_host_bytes,
