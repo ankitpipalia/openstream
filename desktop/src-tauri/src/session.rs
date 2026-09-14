@@ -126,6 +126,10 @@ pub struct SessionSupervisor {
     generation: Option<u64>,
     status_file: PathBuf,
     state: SessionProcessState,
+    /// What to settle to once cleanup completes, when the runner exited by
+    /// itself rather than being asked to stop. Retained across retries so a
+    /// later poll settles to the same verdict the exit deserved.
+    exit_state: SessionProcessState,
     last_exit_code: Option<i32>,
     /// Escalation budgets, as fields so a test can force the drain to fail
     /// without needing a process that survives SIGKILL.
@@ -145,6 +149,7 @@ impl SessionSupervisor {
             generation: None,
             status_file: runtime_dir.join("session-status.json"),
             state: SessionProcessState::Idle,
+            exit_state: SessionProcessState::Idle,
             last_exit_code: None,
             sweep_grace: GROUP_SWEEP_GRACE,
             drain_timeout: GROUP_DRAIN_TIMEOUT,
@@ -311,6 +316,7 @@ impl SessionSupervisor {
         self.session_id = Some(pairing.session_id);
         self.generation = None;
         self.state = SessionProcessState::Starting;
+        self.exit_state = SessionProcessState::Idle;
         self.last_exit_code = None;
         Ok(self.health())
     }
@@ -322,7 +328,7 @@ impl SessionSupervisor {
             // group, and the whole point of keeping the cleanup target is
             // that this call retries it rather than declaring victory.
             self.state = SessionProcessState::Stopping;
-            return self.settle().await;
+            return self.settle(SessionProcessState::Idle).await;
         }
         self.state = SessionProcessState::Stopping;
         let mut child = self.child.take().ok_or(SessionError::StopFailed)?;
@@ -358,7 +364,7 @@ impl SessionSupervisor {
         // look nothing like this one. Sweep the group before declaring the
         // session stopped.
         self.last_exit_code = status.code();
-        self.settle().await
+        self.settle(SessionProcessState::Idle).await
     }
 
     /// Prove the session's processes are gone, and only then report `Idle`.
@@ -368,7 +374,14 @@ impl SessionSupervisor {
     /// the cleanup target and the session's identity are both kept: the
     /// operator needs to see *which* session will not stop, and the next
     /// `poll` or `disconnect` needs something to retry with.
-    async fn settle(&mut self) -> Result<SessionHealth, SessionError> {
+    ///
+    /// `settled` is the state to adopt once the session really is over. An
+    /// explicit stop settles to `Idle`; a runner that exited by itself
+    /// settles to whatever its exit status deserves.
+    async fn settle(
+        &mut self,
+        settled: SessionProcessState,
+    ) -> Result<SessionHealth, SessionError> {
         if let Some(target) = self.cleanup.clone() {
             if let Err(error) = target.sweep(self.sweep_grace, self.drain_timeout).await {
                 self.state = SessionProcessState::Failed;
@@ -379,49 +392,43 @@ impl SessionSupervisor {
         self.device_id = None;
         self.session_id = None;
         self.generation = None;
-        self.state = SessionProcessState::Idle;
+        self.state = settled;
         let _ = std::fs::remove_file(&self.status_file);
         Ok(self.health())
     }
 
     pub async fn poll(&mut self) -> Result<SessionHealth, SessionError> {
+        let mut just_exited = false;
         if let Some(child) = self.child.as_mut() {
             if let Some(status) = child.try_wait().map_err(|_| SessionError::StatusInvalid)? {
                 self.last_exit_code = status.code();
                 self.child = None;
                 // The leader exiting on its own is the case most likely to
                 // leave orphans, because nothing asked its children to stop
-                // first. Forgetting the group here -- which is what this used
-                // to do -- leaks an FFmpeg process on every crash of the
-                // runner, and the leak is invisible because the supervisor
-                // goes straight to Idle.
-                let swept = self.cleanup.clone();
-                let drained = match swept {
-                    Some(target) => target.sweep(self.sweep_grace, self.drain_timeout).await,
-                    None => Ok(()),
+                // first.
+                self.exit_state = if status.success() {
+                    SessionProcessState::Idle
+                } else {
+                    SessionProcessState::Failed
                 };
-                match drained {
-                    Ok(()) => {
-                        self.cleanup = None;
-                        self.state = if status.success() {
-                            SessionProcessState::Idle
-                        } else {
-                            SessionProcessState::Failed
-                        };
-                        self.device_id = None;
-                        self.session_id = None;
-                        self.generation = None;
-                        let _ = std::fs::remove_file(&self.status_file);
-                    }
-                    Err(_) => {
-                        // Something is still running. Keep the target so a
-                        // later call retries, keep the identity so the
-                        // operator can see which session it belongs to, and
-                        // do not report this as a finished session.
-                        self.state = SessionProcessState::Failed;
-                    }
-                }
+                just_exited = true;
             }
+        }
+        // The same settle path `disconnect` uses, and on every poll rather
+        // than only the one where the runner exited. A sweep that failed
+        // leaves the target in place precisely so it can be retried, and a
+        // supervisor whose only retry is an explicit disconnect does not
+        // retry at all in the case that matters -- a background poll loop
+        // watching a session nobody is looking at.
+        //
+        // The cost is paid only while something is genuinely still running:
+        // the sweep's first act is a signal-0 probe, and an empty group
+        // returns immediately.
+        if self.child.is_none() && (just_exited || self.cleanup.is_some()) {
+            // The error is deliberately not raised. `poll` reports health,
+            // and a failed sweep has already recorded itself as `Failed`
+            // with the cleanup target kept for the next attempt.
+            let _ = self.settle(self.exit_state).await;
         }
         if self.child.is_some() {
             if let Some(status) = self.read_status()? {
@@ -966,6 +973,88 @@ mod tests {
         assert!(!health.cleanup_pending);
         assert_eq!(health.session_id, None);
         assert!(!process_group_has_members(group));
+    }
+
+    /// A failed sweep must be retried by polling, not only by disconnect.
+    ///
+    /// The invariant held before this -- `Idle` was never reported and a new
+    /// session was refused -- but the only thing that could actually retry
+    /// was an explicit `disconnect`. A background poll loop watching a
+    /// session nobody is looking at would never recover, which is the case
+    /// where recovery matters most.
+    #[tokio::test]
+    async fn polling_retries_a_cleanup_that_failed() {
+        let (mut supervisor, _directory) = supervisor();
+        let (child, group) = spawn_supervised_group_with_stubborn_descendant();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(process_group_has_members(group));
+
+        supervisor.child = Some(child);
+        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        supervisor.session_id = Some("session-3".to_string());
+        supervisor.state = SessionProcessState::Running;
+        supervisor.sweep_grace = Duration::ZERO;
+        supervisor.drain_timeout = Duration::ZERO;
+
+        // The runner has already exited; this poll observes that and tries to
+        // clean up with a budget too short to prove anything.
+        let health = supervisor.poll().await.expect("poll reports health");
+        assert_eq!(
+            health.state,
+            SessionProcessState::Failed,
+            "an unfinished cleanup is not a finished session"
+        );
+        assert!(health.cleanup_pending);
+        assert_eq!(health.session_id.as_deref(), Some("session-3"));
+
+        // Polling again -- with no disconnect in between -- must retry.
+        supervisor.sweep_grace = GROUP_SWEEP_GRACE;
+        supervisor.drain_timeout = GROUP_DRAIN_TIMEOUT;
+        let health = supervisor.poll().await.expect("poll retries the sweep");
+        assert_eq!(health.state, SessionProcessState::Idle);
+        assert!(!health.cleanup_pending);
+        assert_eq!(health.session_id, None);
+        assert!(!process_group_has_members(group));
+    }
+
+    /// A runner that exits badly settles to `Failed`, and stays there across
+    /// a retry rather than being upgraded to `Idle` by the retry itself.
+    #[tokio::test]
+    async fn an_unclean_exit_settles_to_failed_even_after_a_retry() {
+        let (mut supervisor, _directory) = supervisor();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sh -c 'trap \"\" TERM; while :; do sleep 1; done' & exit 3")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.as_std_mut().process_group(0);
+        let child = command.spawn().expect("spawn session group");
+        let group = i32::try_from(child.id().expect("live pid")).expect("group id");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        supervisor.child = Some(child);
+        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        supervisor.state = SessionProcessState::Running;
+        supervisor.sweep_grace = Duration::ZERO;
+        supervisor.drain_timeout = Duration::ZERO;
+        assert_eq!(
+            supervisor.poll().await.expect("poll").state,
+            SessionProcessState::Failed
+        );
+
+        supervisor.sweep_grace = GROUP_SWEEP_GRACE;
+        supervisor.drain_timeout = GROUP_DRAIN_TIMEOUT;
+        let health = supervisor.poll().await.expect("poll retries");
+        assert!(!health.cleanup_pending, "the group drained on the retry");
+        assert_eq!(
+            health.state,
+            SessionProcessState::Failed,
+            "the runner exited with status 3; cleaning up after it does not \
+             make that a clean session"
+        );
+        assert_eq!(health.last_exit_code, Some(3));
     }
 
     /// An idle supervisor with nothing to clean up still reports idle.

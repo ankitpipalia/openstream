@@ -4394,6 +4394,28 @@ fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
             .map_err(|_| Error::InvalidMessage("identity store directory is insecure".into()))?;
     }
 
+    // An identity that is already published is the answer, and the common
+    // case by far.
+    if path.exists() {
+        return load_identity_file(path);
+    }
+
+    // Publishing the name and the contents has to be one step.
+    //
+    // Creating the final path with `create_new` and then writing into it
+    // makes the file visible, under its real name, while it is still empty.
+    // A second process starting at the same moment -- two peers of one
+    // session on one machine, which is exactly what the ICE smoke test does
+    // -- sees `AlreadyExists`, reads the empty file, and fails with
+    // `InvalidKeyMaterial`. The window is small and entirely reachable.
+    //
+    // So the key is written to a private temporary file first and published
+    // by linking it into place. `link` fails if the destination exists, which
+    // makes publication atomic and gives exactly one winner: the loser
+    // discards its own freshly generated key and reads the winner's, so both
+    // processes end up with the same device identity rather than two.
+    let identity = IdentityKey::generate().map_err(Error::Identity)?;
+    let temporary = identity_staging_path(parent);
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(unix)]
@@ -4401,27 +4423,61 @@ fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    match options.open(path) {
-        Ok(mut file) => {
-            let identity = IdentityKey::generate().map_err(Error::Identity)?;
-            use std::io::Write;
-            file.write_all(identity.pkcs8())
-                .and_then(|_| file.sync_all())
-                .map_err(|_| Error::InvalidMessage("identity store could not be written".into()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                    |_| Error::InvalidMessage("identity store permissions could not be set".into()),
-                )?;
-            }
-            Ok(identity)
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| Error::InvalidMessage("identity store could not be created".into()))?;
+    let written = {
+        use std::io::Write;
+        file.write_all(identity.pkcs8())
+            .and_then(|()| file.sync_all())
+    };
+    drop(file);
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(Error::InvalidMessage(
+            "identity store could not be written".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(Error::InvalidMessage(
+                "identity store permissions could not be set".into(),
+            ));
         }
+    }
+
+    let published = std::fs::hard_link(&temporary, path);
+    let _ = std::fs::remove_file(&temporary);
+    match published {
+        Ok(()) => Ok(identity),
+        // Someone else published first. Their file is complete by
+        // construction, because they linked it only after writing it.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => load_identity_file(path),
+        Err(_) if path.exists() => load_identity_file(path),
         Err(_) => Err(Error::InvalidMessage(
-            "identity store could not be created".into(),
+            "identity store could not be published".into(),
         )),
     }
+}
+
+/// A private staging path beside the identity store.
+///
+/// Unique per process and per attempt, so two publishers never share a
+/// staging file, and dot-prefixed so it is not mistaken for a published
+/// identity. The counter rather than a clock: two calls in the same process
+/// can land in the same nanosecond, and a collision here would have one
+/// publisher truncating the other's staged key.
+fn identity_staging_path(parent: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    parent.join(format!(
+        ".device-identity.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn load_identity_file(path: &Path) -> Result<IdentityKey, Error> {
@@ -4710,6 +4766,91 @@ mod tests {
         let (outgoing, _outgoing_receiver) = mpsc::channel::<Message>(1);
         let (_incoming_sender, incoming) = mpsc::channel::<Result<Value, Error>>(1);
         Endpoint { outgoing, incoming }
+    }
+
+    /// Simultaneous loaders must agree on one identity, never observe a
+    /// half-written one.
+    ///
+    /// Publishing used to create the final path and then write into it, so a
+    /// second process could see the name, read an empty file, and fail with
+    /// `InvalidKeyMaterial`. That is what the full-ICE smoke hit: two peers
+    /// of one session starting together on one machine.
+    ///
+    /// Real threads with a shared start barrier rather than sequential calls,
+    /// because sequential calls cannot reach the window at all.
+    #[test]
+    fn simultaneous_loaders_agree_on_one_identity() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        const RACERS: usize = 8;
+
+        // Repeated, because a race that is lost by luck once is not evidence.
+        for _ in 0..12 {
+            let directory = std::env::temp_dir().join(format!(
+                "openstream-identity-race-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&directory).expect("identity directory");
+            let path = directory.join("device-identity.pk8");
+
+            let barrier = Arc::new(Barrier::new(RACERS));
+            let handles: Vec<_> = (0..RACERS)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        load_or_create_identity(&path)
+                    })
+                })
+                .collect();
+
+            let mut keys = Vec::new();
+            for handle in handles {
+                let identity = handle
+                    .join()
+                    .expect("loader thread")
+                    .expect("every simultaneous loader must get an identity");
+                keys.push(identity.public_key());
+            }
+            assert!(
+                keys.windows(2).all(|pair| pair[0] == pair[1]),
+                "simultaneous loaders must all end up with the same device identity"
+            );
+
+            // And the published file is the identity they agreed on.
+            let reloaded = load_identity_file(&path).expect("published identity is readable");
+            assert_eq!(reloaded.public_key(), keys[0]);
+
+            // No staging files are left behind.
+            let leftovers: Vec<_> = std::fs::read_dir(&directory)
+                .expect("read identity directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "staging files must not survive publication: {leftovers:?}"
+            );
+            let _ = std::fs::remove_dir_all(&directory);
+        }
+    }
+
+    /// A second load of an existing identity returns the same key.
+    #[test]
+    fn an_existing_identity_is_reused_rather_than_replaced() {
+        let directory =
+            std::env::temp_dir().join(format!("openstream-identity-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("identity directory");
+        let path = directory.join("device-identity.pk8");
+        let first = load_or_create_identity(&path).expect("first load creates");
+        let second = load_or_create_identity(&path).expect("second load reuses");
+        assert_eq!(first.public_key(), second.public_key());
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

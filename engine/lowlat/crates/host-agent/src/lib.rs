@@ -43,6 +43,22 @@ const FRAME_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 /// seconds of missing frames.
 const FRAME_LIVENESS_STRIKES: u32 = 3;
 
+/// How long a host that says it is streaming may go without a first frame.
+///
+/// Phases relax the frame deadline for a host that has not claimed to be
+/// streaming. Without a bound here that relaxation leaks into the streaming
+/// phase itself: a counter still at zero cannot have "stopped advancing", so
+/// a capture or encoder that never produces its first frame would read as
+/// healthy forever -- exactly the dead pipeline behind a live process that
+/// this heartbeat exists to catch.
+///
+/// Measured from the moment the host first reports [`HostPhase::Streaming`],
+/// not from process start, because a peer can arrive hours after the host
+/// does. Generous relative to [`FRAME_HEARTBEAT_TIMEOUT`] because it covers
+/// one-off costs an established stream never pays again: encoder
+/// initialisation, capture negotiation, the first keyframe.
+const FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(15);
+
 /// How much of the heartbeat file is read.
 ///
 /// The file is one short line. Bounded because it is written by another
@@ -1232,6 +1248,11 @@ pub struct HostAgent<F: ChildFactory = TokioChildFactory> {
     /// the same rule the client's `Liveness` already follows -- progress is
     /// the counter advancing, not the counter being republished.
     frames_advanced_at: Option<Instant>,
+    /// When the child first said it was streaming, for the first-frame
+    /// deadline. Cleared whenever it reports any other phase, so a host that
+    /// loses its peer and later regains one gets a fresh deadline rather than
+    /// one measured from a stream that already ended.
+    streaming_since: Option<Instant>,
     /// Consecutive non-live heartbeat observations. Reset by any live one.
     liveness_strikes: u32,
 }
@@ -1275,6 +1296,7 @@ impl<F: ChildFactory> HostAgent<F> {
             force_kill_sent: false,
             frames_seen: 0,
             frames_advanced_at: None,
+            streaming_since: None,
             liveness_strikes: 0,
         })
     }
@@ -1327,6 +1349,7 @@ impl<F: ChildFactory> HostAgent<F> {
         self.force_kill_sent = false;
         self.frames_seen = 0;
         self.frames_advanced_at = None;
+        self.streaming_since = None;
         self.liveness_strikes = 0;
         Ok(())
     }
@@ -1394,6 +1417,13 @@ impl<F: ChildFactory> HostAgent<F> {
                     self.frames_seen = observation.frames;
                     self.frames_advanced_at = Some(now);
                 }
+                // Record the phase transition before judging, so the verdict
+                // can ask how long this host has claimed to be streaming.
+                if observation.phase.expects_frames() {
+                    self.streaming_since.get_or_insert(now);
+                } else {
+                    self.streaming_since = None;
+                }
                 self.judge_liveness(observation, now).is_healthy()
             } else {
                 true
@@ -1457,6 +1487,7 @@ impl<F: ChildFactory> HostAgent<F> {
         self.force_kill_sent = false;
         self.frames_seen = 0;
         self.frames_advanced_at = None;
+        self.streaming_since = None;
         self.liveness_strikes = 0;
         if let Some(path) = self.config.frame_heartbeat_file.as_deref() {
             // A previous child must not make a newly spawned child look live.
@@ -1697,10 +1728,12 @@ impl<F: ChildFactory> HostAgent<F> {
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
-        // An unreadable or unparseable line is not "zero frames in an unknown
-        // phase". It is the absence of a report, and `Starting` is the phase
-        // that promises least, so nothing is inferred from it.
-        let (phase, frames) = options
+        // An unreadable or unparseable line is not "zero frames in the phase
+        // that promises least". It is the absence of a report, and it has to
+        // be represented as one -- keeping the file's fresh age while
+        // inventing a phase for it would make a host writing garbage four
+        // times a second look healthier than one writing nothing at all.
+        let Some((phase, frames)) = options
             .open(path)
             .and_then(|file| {
                 file.take(HEARTBEAT_READ_LIMIT)
@@ -1708,7 +1741,9 @@ impl<F: ChildFactory> HostAgent<F> {
             })
             .ok()
             .and_then(|_| host_heartbeat::parse(&contents))
-            .unwrap_or((HostPhase::Starting, 0));
+        else {
+            return Some(HeartbeatObservation::silent());
+        };
         Some(HeartbeatObservation { age, phase, frames })
     }
 
@@ -1745,7 +1780,19 @@ impl<F: ChildFactory> HostAgent<F> {
         // any useful sense, but it is also not faulty -- the first frame has
         // its own grace through the startup window.
         if observation.frames == 0 {
-            return FrameLiveness::Waiting;
+            // Bounded, unlike the wait for a peer. A host that has claimed
+            // the streaming phase has said capture and encode are running, so
+            // a counter still at zero is a pipeline that never started -- and
+            // "the counter stopped advancing" can never catch it, because it
+            // has nothing to advance from.
+            let overdue = self
+                .streaming_since
+                .is_some_and(|since| now.saturating_duration_since(since) > FIRST_FRAME_DEADLINE);
+            return if overdue {
+                FrameLiveness::Stale
+            } else {
+                FrameLiveness::Waiting
+            };
         }
         let advanced_recently = self.frames_advanced_at.is_some_and(|at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
@@ -1779,8 +1826,9 @@ impl<F: ChildFactory> HostAgent<F> {
 mod tests {
     use super::{
         AgentError, ChildExit, ChildExitReason, ChildFactory, ChildSpec, ChildState,
-        FRAME_LIVENESS_STRIKES, FrameLiveness, HostAgent, HostAgentConfig, HostAgentEvent,
-        HostErrorCode, HostPhase, ManagedChild, configure_child_environment, host_heartbeat,
+        FIRST_FRAME_DEADLINE, FRAME_LIVENESS_STRIKES, FrameLiveness, HostAgent, HostAgentConfig,
+        HostAgentEvent, HostErrorCode, HostPhase, ManagedChild, configure_child_environment,
+        host_heartbeat,
     };
     use openstream_settings::default_config;
     use std::collections::{BTreeMap, VecDeque};
@@ -2030,6 +2078,22 @@ mod tests {
         }
     }
 
+    /// Write raw bytes as the heartbeat, private-mode included.
+    ///
+    /// The permissions matter to the test, not just to the product: a file
+    /// left at the default mode is rejected before it ever reaches the
+    /// parser, so a malformed-content test that skipped this would pass
+    /// without exercising the parse path at all.
+    fn publish_raw(path: &PathBuf, contents: &str) {
+        fs::write(path, contents).expect("publish heartbeat");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("private heartbeat file");
+        }
+    }
+
     fn publish_phase(path: &PathBuf, phase: HostPhase, frames: u64) {
         fs::write(path, host_heartbeat::render(phase, frames)).expect("publish heartbeat");
         #[cfg(unix)]
@@ -2072,6 +2136,185 @@ mod tests {
             super::signal_process_group(None, 0),
             Err(AgentError::StopFailed)
         );
+    }
+
+    /// A host that claims to be streaming owes a first frame, on a clock.
+    ///
+    /// The phase relaxes the frame deadline for hosts that have not claimed
+    /// to be streaming. Without a bound that relaxation leaks into the
+    /// streaming phase: a counter still at zero cannot have "stopped
+    /// advancing", so a capture or encoder that never produces its first
+    /// frame would read as healthy forever -- a dead pipeline behind a live
+    /// process, which is what this heartbeat exists to catch.
+    #[test]
+    fn a_streaming_host_that_never_produces_a_first_frame_is_stopped() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(26)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        // Fresh heartbeats throughout: the publisher thread is alive and the
+        // host keeps insisting it is streaming. Only the frames never come.
+        publish_phase(&path, HostPhase::Streaming, 0);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        assert_eq!(
+            agent.health(now).state,
+            ChildState::Ready,
+            "the first frame gets a grace period, not an instant verdict"
+        );
+
+        // Still inside the deadline.
+        publish_phase(&path, HostPhase::Streaming, 0);
+        let inside = Duration::from_millis(20) + FIRST_FRAME_DEADLINE / 2;
+        agent.tick(now + inside).expect("within the deadline");
+        assert_eq!(agent.health(now + inside).state, ChildState::Ready);
+
+        // Past it, strikes start accumulating.
+        let mut elapsed = Duration::from_millis(20) + FIRST_FRAME_DEADLINE;
+        for strike in 1..FRAME_LIVENESS_STRIKES {
+            publish_phase(&path, HostPhase::Streaming, 0);
+            elapsed += Duration::from_secs(1);
+            agent.tick(now + elapsed).expect("overdue observation");
+            assert_eq!(
+                agent.health(now + elapsed).state,
+                ChildState::Ready,
+                "stopped after only {strike} overdue observation(s)"
+            );
+        }
+        publish_phase(&path, HostPhase::Streaming, 0);
+        elapsed += Duration::from_secs(1);
+        agent
+            .tick(now + elapsed)
+            .expect("final overdue observation");
+        assert_ne!(
+            agent.health(now + elapsed).state,
+            ChildState::Ready,
+            "a streaming host that never produced a frame must be stopped"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The deadline is measured from entering the streaming phase, not from
+    /// process start.
+    ///
+    /// A peer can arrive hours after the host does. Measuring from start
+    /// would put every such host past its first-frame deadline before capture
+    /// had been asked to produce anything.
+    #[test]
+    fn the_first_frame_deadline_runs_from_the_phase_not_from_process_start() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(27)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        // A long wait for a peer, far beyond the first-frame deadline.
+        let mut elapsed = Duration::from_millis(20);
+        for _ in 0..8 {
+            publish_phase(&path, HostPhase::WaitingForPeer, 0);
+            agent.tick(now + elapsed).expect("waiting observation");
+            elapsed += FIRST_FRAME_DEADLINE;
+        }
+        assert_eq!(agent.health(now + elapsed).state, ChildState::Ready);
+
+        // The peer finally arrives and the host starts streaming. Its first
+        // frame is late but inside the deadline, measured from here.
+        publish_phase(&path, HostPhase::Streaming, 0);
+        agent.tick(now + elapsed).expect("streaming begins");
+        elapsed += FIRST_FRAME_DEADLINE / 2;
+        publish_phase(&path, HostPhase::Streaming, 1);
+        agent.tick(now + elapsed).expect("first frame arrives");
+        assert_eq!(
+            agent.health(now + elapsed).state,
+            ChildState::Ready,
+            "the deadline must not have been spent while waiting for a peer"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Garbage written frequently must not outrank silence.
+    ///
+    /// A parse failure used to keep the file's fresh age and invent a phase
+    /// for it, which made a host writing junk four times a second look
+    /// healthier than one writing nothing at all. An unreadable line is the
+    /// absence of a report and has to be judged as one.
+    #[test]
+    fn a_fresh_but_unreadable_heartbeat_is_not_evidence_of_health() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(28)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        // Rewritten on every tick, so the file is always fresh.
+        let mut elapsed = Duration::from_millis(20);
+        for _ in 0..FRAME_LIVENESS_STRIKES {
+            publish_raw(&path, "not-a-heartbeat\n");
+            agent.tick(now + elapsed).expect("unreadable observation");
+            elapsed += Duration::from_millis(10);
+        }
+        assert_ne!(
+            agent.health(now + elapsed).state,
+            ChildState::Ready,
+            "a host that never publishes a readable heartbeat is not ready"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A host that was streaming and then starts writing garbage is stopped.
+    #[test]
+    fn a_ready_host_that_starts_writing_garbage_is_stopped() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(29)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_phase(&path, HostPhase::Streaming, 1);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        assert_eq!(agent.health(now).state, ChildState::Ready);
+
+        let mut elapsed = Duration::from_millis(30);
+        for strike in 1..FRAME_LIVENESS_STRIKES {
+            publish_raw(&path, "streaming not-a-number\n");
+            agent.tick(now + elapsed).expect("unreadable observation");
+            assert_eq!(
+                agent.health(now + elapsed).state,
+                ChildState::Ready,
+                "stopped after only {strike} unreadable observation(s)"
+            );
+            elapsed += Duration::from_millis(10);
+        }
+        publish_raw(&path, "streaming not-a-number\n");
+        agent
+            .tick(now + elapsed)
+            .expect("final unreadable observation");
+        assert_ne!(agent.health(now + elapsed).state, ChildState::Ready);
+        let _ = fs::remove_dir_all(&directory);
     }
 
     /// The reported blocker: a host with no client yet must not be restarted.

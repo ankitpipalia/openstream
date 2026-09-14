@@ -808,7 +808,9 @@ fn command_probe(program: &str, args: &[&str]) -> serde_json::Value {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{command_probe, decode_output_selection, input_event_allowed, native_topology};
+    use super::{
+        InputGrants, command_probe, decode_output_selection, input_event_allowed, native_topology,
+    };
     use lowlat::display::Selectable;
     use openstream_media::input::InputEvent;
 
