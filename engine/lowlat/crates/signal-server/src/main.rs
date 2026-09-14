@@ -1566,6 +1566,26 @@ async fn derive_password_bounded(
     password: &str,
     salt: [u8; 16],
 ) -> Result<[u8; 32], Response> {
+    derive_password_bounded_with(
+        state,
+        password,
+        salt,
+        control_plane::PasswordScheme::current(),
+    )
+    .await
+}
+
+/// Derive under an explicit scheme, still bounded and still off the executor.
+///
+/// Verification must reproduce the scheme the stored record was written with,
+/// so the cost cannot be a constant at this layer.
+#[allow(clippy::result_large_err, reason = "the error is an HTTP response")]
+async fn derive_password_bounded_with(
+    state: &AppState,
+    password: &str,
+    salt: [u8; 16],
+    scheme: control_plane::PasswordScheme,
+) -> Result<[u8; 32], Response> {
     let Ok(_permit) = state.password_derivations.clone().acquire_owned().await else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1574,7 +1594,7 @@ async fn derive_password_bounded(
             .into_response());
     };
     Ok(without_blocking_the_executor(|| {
-        control_plane::derive_password(password, &salt)
+        control_plane::derive_password_with(password, &salt, scheme)
     }))
 }
 
@@ -1716,25 +1736,53 @@ async fn login_account(
     // Three steps: read the challenge under the lock, derive without it, then
     // verify and mutate under it again. The expensive middle step is what
     // must not be serialized behind the store.
-    let salt = {
+    let (salt, scheme) = {
         let accounts = state.accounts.lock().await;
-        accounts.password_challenge(&request.username)
+        accounts.password_challenge_scheme(&request.username)
     };
-    let derived = match derive_password_bounded(&state, &request.password, salt).await {
+    // Verified with the scheme the stored record was made under, not with
+    // whatever this build would choose today. That is what makes the cost
+    // changeable at all: without it, raising the iteration count locks out
+    // every existing account.
+    let derived = match derive_password_bounded_with(&state, &request.password, salt, scheme).await
+    {
         Ok(derived) => derived,
         Err(response) => return response,
     };
+    let outdated = {
+        let mut accounts = state.accounts.lock().await;
+        let response = match accounts.login_derived(
+            &request.username,
+            salt,
+            derived,
+            device,
+            control_plane::now_ms(),
+        ) {
+            Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+            Err(error) => return control_error_response(error),
+        };
+        if !accounts.password_is_outdated(&request.username) {
+            return response;
+        }
+        response
+    };
+
+    // The sign-in has already succeeded. Rehashing is an upgrade performed
+    // on the way past, so every failure below is swallowed: turning a
+    // successful login into an error because a re-encode did not work would
+    // lock the user out of their account for the sake of tidiness.
+    let Ok(new_salt) = AccountStore::registration_salt() else {
+        return outdated;
+    };
+    let current = control_plane::PasswordScheme::current();
+    let Ok(rehashed) =
+        derive_password_bounded_with(&state, &request.password, new_salt, current).await
+    else {
+        return outdated;
+    };
     let mut accounts = state.accounts.lock().await;
-    match accounts.login_derived(
-        &request.username,
-        salt,
-        derived,
-        device,
-        control_plane::now_ms(),
-    ) {
-        Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
-        Err(error) => control_error_response(error),
-    }
+    let _ = accounts.rehash_password(&request.username, new_salt, rehashed, current);
+    outdated
 }
 
 async fn refresh_account(
