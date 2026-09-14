@@ -63,6 +63,13 @@ const DEFAULT_HEIGHT: usize = 720;
 /// A slow window must not let decoded frames or status messages accumulate
 /// without bound. New frames are dropped when the UI is behind; the next
 /// frame is still a complete decoded image.
+/// Channel for unreliable input.
+///
+/// Separate from the reliable control channel so a host can tell the two
+/// apart without inspecting the payload, and so congestion on one does not
+/// reorder the other.
+const INPUT_CHANNEL: u8 = 1;
+
 const UI_QUEUE_CAPACITY: usize = 8;
 /// Input is sampled at the UI rate and must remain bounded if the network
 /// worker is stalled. The queue is intentionally larger than the UI queue so
@@ -1812,7 +1819,23 @@ async fn network_session(
         while let Ok(input) = input_rx.try_recv() {
             match input {
                 UiInput::Event(event) => {
-                    reliable_control.send(&mut session, &event.encode()).await?;
+                    // Pointer motion goes on the unreliable path; everything
+                    // else stays reliable and ordered.
+                    //
+                    // A retransmitted position is a position the pointer has
+                    // already left, so retrying one is worse than dropping
+                    // it: it arrives late, moves the pointer backwards, and
+                    // the head-of-line wait it caused delayed every input
+                    // behind it. A key release is the opposite -- losing one
+                    // strands the key down on the remote desktop -- so those
+                    // keep their acknowledgements.
+                    if event.kind == InputKind::PointerMotion {
+                        session
+                            .send(Kind::Input, INPUT_CHANNEL, 0, &event.encode())
+                            .await?;
+                    } else {
+                        reliable_control.send(&mut session, &event.encode()).await?;
+                    }
                 }
                 UiInput::Release => {
                     reliable_control

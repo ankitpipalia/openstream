@@ -915,3 +915,126 @@ mod tests {
         );
     }
 }
+
+/// Rejects pointer motion that arrived out of order.
+///
+/// # Why this is needed only for absolute motion
+///
+/// Motion travels on an unreliable, unordered path: a stale position is worth
+/// nothing and retransmitting one puts the pointer somewhere it has already
+/// left, so the transport deliberately does not retry it. The cost of that
+/// choice is reordering, and the two kinds of motion react to it differently.
+///
+/// ```text
+/// absolute   "the pointer is at (x, y)"      order matters absolutely
+/// relative   "the pointer moved by (dx, dy)"  addition commutes
+/// ```
+///
+/// An absolute position applied after a newer one teleports the pointer
+/// backwards, and it stays there until the next event. A relative delta
+/// applied late still sums to the same place, so dropping one would *lose*
+/// movement that reordering did not actually damage.
+///
+/// So this gate drops stale absolute motion and passes everything else. The
+/// ordering key is the event's own timestamp, which the client already stamps
+/// monotonically -- no extra sequence number on the wire, and nothing to keep
+/// in step with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MotionGate {
+    newest_absolute_us: Option<u64>,
+}
+
+impl MotionGate {
+    /// Whether this event should be applied, recording it if so.
+    #[must_use]
+    pub fn admit(&mut self, event: InputEvent) -> bool {
+        let absolute_motion =
+            matches!(event.kind, InputKind::PointerMotion) && event.flags & FLAG_RELATIVE == 0;
+        if !absolute_motion {
+            return true;
+        }
+        match self.newest_absolute_us {
+            // Equal timestamps are admitted: two positions can share a
+            // microsecond, and refusing the second would drop a real move
+            // for a tie that says nothing about order.
+            Some(newest) if event.timestamp_us < newest => false,
+            _ => {
+                self.newest_absolute_us = Some(event.timestamp_us);
+                true
+            }
+        }
+    }
+
+    /// Forget the ordering history.
+    ///
+    /// Used when input is released or a session restarts: the next stream of
+    /// positions is unrelated to the last, and a retained high-water mark
+    /// would silently swallow the beginning of it.
+    pub fn reset(&mut self) {
+        self.newest_absolute_us = None;
+    }
+}
+
+#[cfg(test)]
+mod motion_gate_tests {
+    use super::{InputEvent, MotionGate};
+
+    /// A position that arrives late is dropped rather than teleporting the
+    /// pointer backwards.
+    #[test]
+    fn stale_absolute_motion_is_refused() {
+        let mut gate = MotionGate::default();
+        assert!(gate.admit(InputEvent::pointer_motion(false, 10, 10, 100)));
+        assert!(gate.admit(InputEvent::pointer_motion(false, 20, 20, 200)));
+        assert!(
+            !gate.admit(InputEvent::pointer_motion(false, 10, 10, 100)),
+            "an older position applied after a newer one teleports the \
+             pointer and leaves it there"
+        );
+        assert!(gate.admit(InputEvent::pointer_motion(false, 30, 30, 300)));
+    }
+
+    /// Relative deltas commute, so a late one is still applied.
+    ///
+    /// Dropping it would lose movement that reordering did not damage.
+    #[test]
+    fn relative_motion_is_never_refused_for_being_late() {
+        let mut gate = MotionGate::default();
+        assert!(gate.admit(InputEvent::pointer_motion(true, 5, 5, 300)));
+        assert!(gate.admit(InputEvent::pointer_motion(true, 5, 5, 100)));
+        assert!(gate.admit(InputEvent::pointer_motion(true, 5, 5, 200)));
+    }
+
+    /// Two positions in the same microsecond are both real.
+    #[test]
+    fn an_equal_timestamp_is_admitted() {
+        let mut gate = MotionGate::default();
+        assert!(gate.admit(InputEvent::pointer_motion(false, 1, 1, 100)));
+        assert!(gate.admit(InputEvent::pointer_motion(false, 2, 2, 100)));
+    }
+
+    /// Nothing but motion is gated. A key release that arrives late is still
+    /// a release, and swallowing it strands the key down on the host.
+    #[test]
+    fn only_absolute_motion_is_gated() {
+        let mut gate = MotionGate::default();
+        assert!(gate.admit(InputEvent::pointer_motion(false, 9, 9, 900)));
+        assert!(gate.admit(InputEvent::keyboard(4, 0, false, 100)));
+        assert!(gate.admit(InputEvent::pointer_button(1, false, 100)));
+        assert!(gate.admit(InputEvent::release(100)));
+        assert!(gate.admit(InputEvent::gamepad_button(0, 0, false, 100)));
+    }
+
+    /// A reset lets a new stream of positions start from anywhere.
+    #[test]
+    fn a_reset_forgets_the_high_water_mark() {
+        let mut gate = MotionGate::default();
+        assert!(gate.admit(InputEvent::pointer_motion(false, 1, 1, 9_000)));
+        assert!(!gate.admit(InputEvent::pointer_motion(false, 1, 1, 10)));
+        gate.reset();
+        assert!(
+            gate.admit(InputEvent::pointer_motion(false, 1, 1, 10)),
+            "a retained mark would swallow the start of the next session"
+        );
+    }
+}

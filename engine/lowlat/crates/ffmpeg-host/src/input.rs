@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use openstream_media::input::MotionGate;
 use openstream_media::input::{InputCapability, InputEvent, InputKind, RumbleEvent};
 use openstream_platform::policy::{
     DeviceCapability, HostPolicy, RuntimeAvailability, UnavailableReason,
@@ -153,12 +154,27 @@ impl HostInput {
         Err("host input is unsupported on this target".into())
     }
 
-    pub(crate) fn apply(&mut self, payload: &[u8]) -> Result<(), InputError> {
+    /// Apply one input event, gating pointer motion on arrival order.
+    ///
+    /// The gate is the caller's because it is per-session state, not per
+    /// adapter: a new session starts a new stream of positions, and a
+    /// retained high-water mark would swallow the beginning of it.
+    pub(crate) fn apply(
+        &mut self,
+        payload: &[u8],
+        motion: &mut MotionGate,
+    ) -> Result<(), InputError> {
         if matches!(self, Self::Disabled) {
             return Ok(());
         }
         let event = InputEvent::decode(payload)
             .map_err(|error| InputError::Malformed(error.to_string()))?;
+        // Motion rides an unreliable, unordered path, so a stale position can
+        // arrive after a newer one. Applying it would teleport the pointer
+        // backwards and leave it there until the next event.
+        if !motion.admit(event) {
+            return Ok(());
+        }
         validate_basic_input_permission(event.kind, self.keyboard_enabled(), self.mouse_enabled())?;
         validate_event_capability(
             event.kind,
