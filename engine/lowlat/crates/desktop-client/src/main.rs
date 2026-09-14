@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window};
+use minifb::{Key, MouseButton, MouseMode, Window};
 use openstream_client_core::{
     Capabilities, ConnectionPath, FlushOutcome, PeerSession, ReliableControl, Role, VideoCodec,
     load_pairing_from_environment, parse_stun_servers,
@@ -350,6 +350,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_HEIGHT,
         display_mode.window_options(),
     )?;
+    let keyboard_connected = Arc::new(AtomicBool::new(false));
+    window.set_input_callback(Box::new(KeyboardEvents {
+        input_tx: input_tx.clone(),
+        connected: Arc::clone(&keyboard_connected),
+    }));
     if display_mode.wants_whole_screen() && fullscreen::enter(window.get_window_handle()) {
         // Said out loud because the mode is otherwise indistinguishable from
         // a window that simply failed to resize.
@@ -463,6 +468,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     input,
                 }) => {
                     connected = true;
+                    // Only now may key transitions reach the host.
+                    keyboard_connected.store(true, Ordering::Relaxed);
                     base_title = format!(
                         "{width}x{height} @ {fps}fps -- {path:?} -- audio={audio} input={input}"
                     );
@@ -947,19 +954,6 @@ fn forward_input(
     // Strictly increasing, because the host orders pointer motion by this
     // and equal stamps would leave it breaking ties.
     let timestamp = monotonic_input_stamp();
-    for &(key, usage) in keyboard_usages() {
-        if window.is_key_pressed(key, KeyRepeat::No) {
-            let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
-                usage, 0, true, timestamp,
-            )));
-        }
-        if window.is_key_released(key) {
-            let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
-                usage, 0, false, timestamp,
-            )));
-        }
-    }
-
     // A held capture reports device motion whether or not the cursor is over
     // the window -- it is deliberately not over the window, since capture
     // decouples the two. Reading it must not be gated on a window-relative
@@ -1217,6 +1211,59 @@ fn axis_value(value: f32) -> i32 {
 /// needs to know which desktop window backend generated the event. Unknown
 /// keys are intentionally omitted instead of sending a platform-specific
 /// scan-code guess.
+/// Event-driven keyboard forwarding.
+///
+/// The frame loop samples key state once per presented frame. A press and its
+/// release that both land between two samples collapse into no observed
+/// change, so keystrokes shorter than a frame interval were dropped outright
+/// -- at 45 fps that is any press under about 22 ms, which ordinary fast
+/// typing produces. Measured on the acceptance rig: holding each key 200 ms
+/// delivered 13 of 13, and holding 30 ms delivered 3.
+///
+/// minifb reports every transition here as the platform delivers it, so
+/// delivery no longer depends on when the frame loop next looks.
+struct KeyboardEvents {
+    input_tx: InputSender,
+    /// Nothing is forwarded before the session is up, so keys pressed while
+    /// the window is still connecting are not replayed into the host.
+    connected: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for KeyboardEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyboardEvents").finish_non_exhaustive()
+    }
+}
+
+impl minifb::InputCallback for KeyboardEvents {
+    /// Text input is not forwarded: the host is sent HID usages and applies
+    /// its own layout, so a translated character here would arrive twice.
+    fn add_char(&mut self, _uni_char: u32) {}
+
+    fn set_key_state(&mut self, key: Key, state: bool) {
+        if !self.connected.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(usage) = usage_for_key(key) else {
+            return;
+        };
+        let _ = self.input_tx.try_send(UiInput::Event(InputEvent::keyboard(
+            usage,
+            0,
+            state,
+            monotonic_input_stamp(),
+        )));
+    }
+}
+
+/// HID usage for a window key, or `None` for keys this client does not map.
+fn usage_for_key(key: Key) -> Option<u32> {
+    keyboard_usages()
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, usage)| *usage)
+}
+
 fn keyboard_usages() -> &'static [(Key, u32)] {
     &[
         (Key::Key0, 0x27),
