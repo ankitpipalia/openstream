@@ -100,16 +100,37 @@ struct RunnerStatus {
 /// `Job(OwnedHandle)` variant when it is implemented. Until then
 /// [`sweep_process_group`] is a documented no-op off Unix, so this type names
 /// the seam rather than pretending the platform difference does not exist.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum CleanupTarget {
     /// Every process in the session runner's process group.
     ProcessGroup(i32),
+    /// Test-only: a target whose drain outcome the test decides.
+    ///
+    /// The supervisor's retry contract cannot be tested deterministically
+    /// against real processes. Provoking a failed drain means racing a
+    /// `SIGKILL`: the test has to observe the group *before* the kernel
+    /// reaps it, and whether it wins depends on scheduling. That is how the
+    /// first version of these tests passed here and failed in CI.
+    ///
+    /// So the state machine is tested against a target that fails on demand,
+    /// and the sweep itself is tested separately against real process groups
+    /// where the assertions are about draining rather than about timing.
+    #[cfg(test)]
+    Controlled(std::sync::Arc<std::sync::atomic::AtomicBool>),
 }
 
 impl CleanupTarget {
     async fn sweep(&self, grace: Duration, drain: Duration) -> Result<(), SessionError> {
         match self {
             Self::ProcessGroup(group) => sweep_process_group(*group, grace, drain).await,
+            #[cfg(test)]
+            Self::Controlled(drains) => {
+                if drains.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err(SessionError::StopFailed)
+                }
+            }
         }
     }
 }
@@ -840,10 +861,9 @@ mod tests {
         let status = child.wait().expect("runner exits");
         assert!(status.success(), "the runner exits cleanly by itself");
 
-        // Give the descendant a moment to be scheduled and install its trap.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for the descendant to be scheduled and install its trap.
         assert!(
-            process_group_has_members(group),
+            await_group_members(group).await,
             "the descendant should still be running; the test cannot prove \
              anything if the group is already empty"
         );
@@ -912,22 +932,50 @@ mod tests {
         (child, group)
     }
 
-    #[tokio::test]
-    async fn a_group_that_will_not_drain_is_never_reported_idle() {
-        let (mut supervisor, _directory) = supervisor();
-        let (mut child, group) = spawn_group_with_stubborn_descendant();
-        child.wait().expect("runner exits");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            process_group_has_members(group),
-            "the descendant must be running or this test proves nothing"
-        );
+    /// Wait until the group actually has members, or give up.
+    ///
+    /// A fixed sleep is a guess about how fast the machine is. These tests
+    /// need the descendant to be running before they assert anything, and a
+    /// loaded CI runner can take longer to get there than any constant a test
+    /// author would pick -- while a fast one makes the wait pure delay.
+    async fn await_group_members(group: i32) -> bool {
+        for _ in 0..200 {
+            if process_group_has_members(group) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
 
-        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+    /// A cleanup target that will not drain, under the test's control.
+    fn controlled() -> (CleanupTarget, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let drains = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            CleanupTarget::Controlled(std::sync::Arc::clone(&drains)),
+            drains,
+        )
+    }
+
+    fn set_drains(flag: &std::sync::atomic::AtomicBool, value: bool) {
+        flag.store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A group that will not drain is never reported as a finished session,
+    /// and the next attempt retries rather than forgetting.
+    ///
+    /// This is the reported bug in sequence. `disconnect` used to take the
+    /// child, and on a failed sweep left nothing behind to retry with -- so
+    /// the *next* call saw `child == None`, went straight to `Idle`, and the
+    /// orphan kept the pairing file and the UDP port while the UI said the
+    /// session had stopped.
+    #[tokio::test]
+    async fn a_cleanup_that_will_not_drain_is_never_reported_idle() {
+        let (mut supervisor, _directory) = supervisor();
+        let (target, drains) = controlled();
+        supervisor.cleanup = Some(target);
         supervisor.device_id = Some("rig".to_string());
         supervisor.session_id = Some("session-1".to_string());
-        supervisor.sweep_grace = Duration::ZERO;
-        supervisor.drain_timeout = Duration::ZERO;
 
         let error = supervisor
             .disconnect()
@@ -959,12 +1007,11 @@ mod tests {
             SessionError::CleanupPending
         );
 
-        // Second attempt, with a budget that allows the observation. The
-        // SIGKILL from the first attempt has landed by now, so this proves
-        // the retry path runs at all -- the old code could not have reached
-        // it, because it had already thrown the group away.
-        supervisor.sweep_grace = GROUP_SWEEP_GRACE;
-        supervisor.drain_timeout = GROUP_DRAIN_TIMEOUT;
+        // Still refused, and still retried, however many times it is asked.
+        assert!(supervisor.disconnect().await.is_err());
+        assert!(supervisor.health().cleanup_pending);
+
+        set_drains(&drains, true);
         let health = supervisor
             .disconnect()
             .await
@@ -972,7 +1019,6 @@ mod tests {
         assert_eq!(health.state, SessionProcessState::Idle);
         assert!(!health.cleanup_pending);
         assert_eq!(health.session_id, None);
-        assert!(!process_group_has_members(group));
     }
 
     /// A failed sweep must be retried by polling, not only by disconnect.
@@ -985,19 +1031,11 @@ mod tests {
     #[tokio::test]
     async fn polling_retries_a_cleanup_that_failed() {
         let (mut supervisor, _directory) = supervisor();
-        let (child, group) = spawn_supervised_group_with_stubborn_descendant();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(process_group_has_members(group));
-
-        supervisor.child = Some(child);
-        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        let (target, drains) = controlled();
+        supervisor.cleanup = Some(target);
         supervisor.session_id = Some("session-3".to_string());
         supervisor.state = SessionProcessState::Running;
-        supervisor.sweep_grace = Duration::ZERO;
-        supervisor.drain_timeout = Duration::ZERO;
 
-        // The runner has already exited; this poll observes that and tries to
-        // clean up with a budget too short to prove anything.
         let health = supervisor.poll().await.expect("poll reports health");
         assert_eq!(
             health.state,
@@ -1008,13 +1046,11 @@ mod tests {
         assert_eq!(health.session_id.as_deref(), Some("session-3"));
 
         // Polling again -- with no disconnect in between -- must retry.
-        supervisor.sweep_grace = GROUP_SWEEP_GRACE;
-        supervisor.drain_timeout = GROUP_DRAIN_TIMEOUT;
+        set_drains(&drains, true);
         let health = supervisor.poll().await.expect("poll retries the sweep");
         assert_eq!(health.state, SessionProcessState::Idle);
         assert!(!health.cleanup_pending);
         assert_eq!(health.session_id, None);
-        assert!(!process_group_has_members(group));
     }
 
     /// A runner that exits badly settles to `Failed`, and stays there across
@@ -1025,27 +1061,25 @@ mod tests {
         let mut command = tokio::process::Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("sh -c 'trap \"\" TERM; while :; do sleep 1; done' & exit 3")
+            .arg("exit 3")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command.as_std_mut().process_group(0);
-        let child = command.spawn().expect("spawn session group");
-        let group = i32::try_from(child.id().expect("live pid")).expect("group id");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut child = command.spawn().expect("spawn runner");
+        child.wait().await.expect("runner exits");
 
+        let (target, drains) = controlled();
         supervisor.child = Some(child);
-        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        supervisor.cleanup = Some(target);
         supervisor.state = SessionProcessState::Running;
-        supervisor.sweep_grace = Duration::ZERO;
-        supervisor.drain_timeout = Duration::ZERO;
         assert_eq!(
             supervisor.poll().await.expect("poll").state,
             SessionProcessState::Failed
         );
+        assert!(supervisor.health().cleanup_pending);
 
-        supervisor.sweep_grace = GROUP_SWEEP_GRACE;
-        supervisor.drain_timeout = GROUP_DRAIN_TIMEOUT;
+        set_drains(&drains, true);
         let health = supervisor.poll().await.expect("poll retries");
         assert!(!health.cleanup_pending, "the group drained on the retry");
         assert_eq!(
@@ -1075,9 +1109,25 @@ mod tests {
     #[tokio::test]
     async fn an_unexpected_runner_exit_still_sweeps_its_descendants() {
         let (mut supervisor, _directory) = supervisor();
-        let (child, group) = spawn_supervised_group_with_stubborn_descendant();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(process_group_has_members(group));
+        let (mut child, group) = spawn_supervised_group_with_stubborn_descendant();
+        // Two conditions, both required, and neither guaranteed by a sleep:
+        // the runner must have exited by itself (that is the case under
+        // test), and its descendant must still be running (or there is
+        // nothing for the sweep to prove). `try_wait` remembers the status,
+        // so the supervisor's own `poll` still observes the exit.
+        let mut exited = false;
+        for _ in 0..200 {
+            exited = exited || child.try_wait().expect("try_wait").is_some();
+            if exited && process_group_has_members(group) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(exited, "the runner should have exited on its own");
+        assert!(
+            process_group_has_members(group),
+            "the descendant must be running or this test proves nothing"
+        );
 
         supervisor.child = Some(child);
         supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
