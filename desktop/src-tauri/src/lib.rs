@@ -563,6 +563,11 @@ fn session_error_to_runtime(error: SessionError) -> RuntimeError {
         }
         SessionError::RunnerUnavailable
         | SessionError::AlreadyActive
+        // Retryable on purpose: the previous session's processes are being
+        // shut down, and a later attempt is expected to succeed once they
+        // are gone. Reporting it as permanent would tell the operator to
+        // restart the shell for something that clears itself.
+        | SessionError::CleanupPending
         | SessionError::SpawnFailed
         | SessionError::StopFailed
         | SessionError::StatusInvalid => (openstream_app_core::AppErrorCode::Unavailable, true),

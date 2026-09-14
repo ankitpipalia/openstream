@@ -39,6 +39,12 @@ pub struct SessionHealth {
     pub generation: Option<u64>,
     pub last_exit_code: Option<i32>,
     pub status_age_ms: Option<u64>,
+    /// Whether something from the last session is still being cleaned up.
+    ///
+    /// Separate from `state` because `Failed` alone cannot distinguish "the
+    /// runner exited badly" from "the runner is gone but its children are
+    /// not". Only the second one means the next connect will fail.
+    pub cleanup_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +53,7 @@ pub enum SessionError {
     PairingInsecure,
     RunnerUnavailable,
     AlreadyActive,
+    CleanupPending,
     SpawnFailed,
     StopFailed,
     StatusInvalid,
@@ -59,6 +66,7 @@ impl std::fmt::Display for SessionError {
             Self::PairingInsecure => "session pairing file is not private",
             Self::RunnerUnavailable => "session runner is unavailable",
             Self::AlreadyActive => "a session is already active",
+            Self::CleanupPending => "the previous session has processes that are still running",
             Self::SpawnFailed => "session runner could not be started",
             Self::StopFailed => "session runner could not be stopped",
             Self::StatusInvalid => "session runner status is invalid",
@@ -77,15 +85,52 @@ struct RunnerStatus {
     generation: Option<u64>,
 }
 
+/// What has to be proven gone before a session is over.
+///
+/// Held separately from the [`Child`], because the two have different
+/// lifetimes and conflating them is what lets an orphan survive a "stopped"
+/// session. `wait` reaps the runner and the handle is then worthless, but the
+/// runner is only the group leader -- the FFmpeg process it spawned is still
+/// holding the pairing file and the UDP port. The cleanup target outlives the
+/// handle and is cleared only once the group is observably empty.
+///
+/// Windows has no process groups. The equivalent container is a Job Object
+/// with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, which terminates the whole
+/// associated tree when the last handle closes; that belongs here as a
+/// `Job(OwnedHandle)` variant when it is implemented. Until then
+/// [`sweep_process_group`] is a documented no-op off Unix, so this type names
+/// the seam rather than pretending the platform difference does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupTarget {
+    /// Every process in the session runner's process group.
+    ProcessGroup(i32),
+}
+
+impl CleanupTarget {
+    async fn sweep(&self, grace: Duration, drain: Duration) -> Result<(), SessionError> {
+        match self {
+            Self::ProcessGroup(group) => sweep_process_group(*group, grace, drain).await,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionSupervisor {
     child: Option<Child>,
+    /// Set at spawn, cleared only when the session's processes are proven
+    /// gone. While this is `Some`, the supervisor is not idle whatever else
+    /// it knows.
+    cleanup: Option<CleanupTarget>,
     device_id: Option<String>,
     session_id: Option<String>,
     generation: Option<u64>,
     status_file: PathBuf,
     state: SessionProcessState,
     last_exit_code: Option<i32>,
+    /// Escalation budgets, as fields so a test can force the drain to fail
+    /// without needing a process that survives SIGKILL.
+    sweep_grace: Duration,
+    drain_timeout: Duration,
 }
 
 impl SessionSupervisor {
@@ -94,12 +139,15 @@ impl SessionSupervisor {
         ensure_private_runtime_dir(&runtime_dir)?;
         Ok(Self {
             child: None,
+            cleanup: None,
             device_id: None,
             session_id: None,
             generation: None,
             status_file: runtime_dir.join("session-status.json"),
             state: SessionProcessState::Idle,
             last_exit_code: None,
+            sweep_grace: GROUP_SWEEP_GRACE,
+            drain_timeout: GROUP_DRAIN_TIMEOUT,
         })
     }
 
@@ -111,6 +159,13 @@ impl SessionSupervisor {
         self.poll().await?;
         if self.child.is_some() {
             return Err(SessionError::AlreadyActive);
+        }
+        // A previous session whose processes are still running owns the
+        // pairing file and the UDP port. Starting a second runner on top of
+        // it produces a failure that looks like anything but this, so it is
+        // refused by name instead.
+        if self.cleanup.is_some() {
+            return Err(SessionError::CleanupPending);
         }
         let pairing_path = env::var_os("OPENSTREAM_PAIRING_FILE")
             .map(PathBuf::from)
@@ -244,6 +299,13 @@ impl SessionSupervisor {
         // proof that it exists.
         let _ = std::fs::remove_file(&self.status_file);
         let child = command.spawn().map_err(|_| SessionError::SpawnFailed)?;
+        // Recorded now, while the pid is certainly live. Taking it later --
+        // after `wait` has reaped the leader -- is how the group id gets lost
+        // precisely in the case where it is still needed.
+        self.cleanup = child
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .map(CleanupTarget::ProcessGroup);
         self.child = Some(child);
         self.device_id = Some(device_id.into());
         self.session_id = Some(pairing.session_id);
@@ -255,8 +317,12 @@ impl SessionSupervisor {
 
     pub async fn disconnect(&mut self) -> Result<SessionHealth, SessionError> {
         if self.child.is_none() {
-            self.state = SessionProcessState::Idle;
-            return Ok(self.health());
+            // No runner is not the same as nothing left to do. A previous
+            // stop can have reaped the leader and then failed to drain its
+            // group, and the whole point of keeping the cleanup target is
+            // that this call retries it rather than declaring victory.
+            self.state = SessionProcessState::Stopping;
+            return self.settle().await;
         }
         self.state = SessionProcessState::Stopping;
         let mut child = self.child.take().ok_or(SessionError::StopFailed)?;
@@ -270,9 +336,6 @@ impl SessionSupervisor {
         // On a platform with no graceful process-group signal,
         // `signal_process_group` is a no-op and the wait below simply times
         // out into the kill, which is the only mechanism available there.
-        // Remembered before waiting, because the runner is the group leader
-        // and its pid is the group id -- and `wait` reaps it.
-        let group = child.id().and_then(|pid| i32::try_from(pid).ok());
         signal_process_group(&child, false);
         let status = match tokio::time::timeout(STOP_TIMEOUT, child.wait()).await {
             Ok(Ok(status)) => status,
@@ -295,16 +358,23 @@ impl SessionSupervisor {
         // look nothing like this one. Sweep the group before declaring the
         // session stopped.
         self.last_exit_code = status.code();
-        if let Some(group) = group {
-            // Something in the session's group outliving SIGKILL means the
-            // session is not stopped and must not be reported as idle. The
-            // supervisor keeps its identifying state: the operator needs to
-            // see which session failed to stop, and a later `poll` or
-            // `disconnect` can retry.
-            if let Err(error) = sweep_process_group(group).await {
+        self.settle().await
+    }
+
+    /// Prove the session's processes are gone, and only then report `Idle`.
+    ///
+    /// Every path that ends a session goes through here, so there is one
+    /// answer to "is it actually over" rather than one per caller. On failure
+    /// the cleanup target and the session's identity are both kept: the
+    /// operator needs to see *which* session will not stop, and the next
+    /// `poll` or `disconnect` needs something to retry with.
+    async fn settle(&mut self) -> Result<SessionHealth, SessionError> {
+        if let Some(target) = self.cleanup.clone() {
+            if let Err(error) = target.sweep(self.sweep_grace, self.drain_timeout).await {
                 self.state = SessionProcessState::Failed;
                 return Err(error);
             }
+            self.cleanup = None;
         }
         self.device_id = None;
         self.session_id = None;
@@ -319,15 +389,38 @@ impl SessionSupervisor {
             if let Some(status) = child.try_wait().map_err(|_| SessionError::StatusInvalid)? {
                 self.last_exit_code = status.code();
                 self.child = None;
-                self.state = if status.success() {
-                    SessionProcessState::Idle
-                } else {
-                    SessionProcessState::Failed
+                // The leader exiting on its own is the case most likely to
+                // leave orphans, because nothing asked its children to stop
+                // first. Forgetting the group here -- which is what this used
+                // to do -- leaks an FFmpeg process on every crash of the
+                // runner, and the leak is invisible because the supervisor
+                // goes straight to Idle.
+                let swept = self.cleanup.clone();
+                let drained = match swept {
+                    Some(target) => target.sweep(self.sweep_grace, self.drain_timeout).await,
+                    None => Ok(()),
                 };
-                self.device_id = None;
-                self.session_id = None;
-                self.generation = None;
-                let _ = std::fs::remove_file(&self.status_file);
+                match drained {
+                    Ok(()) => {
+                        self.cleanup = None;
+                        self.state = if status.success() {
+                            SessionProcessState::Idle
+                        } else {
+                            SessionProcessState::Failed
+                        };
+                        self.device_id = None;
+                        self.session_id = None;
+                        self.generation = None;
+                        let _ = std::fs::remove_file(&self.status_file);
+                    }
+                    Err(_) => {
+                        // Something is still running. Keep the target so a
+                        // later call retries, keep the identity so the
+                        // operator can see which session it belongs to, and
+                        // do not report this as a finished session.
+                        self.state = SessionProcessState::Failed;
+                    }
+                }
             }
         }
         if self.child.is_some() {
@@ -355,6 +448,7 @@ impl SessionSupervisor {
             generation: self.generation,
             last_exit_code: self.last_exit_code,
             status_age_ms: self.status_age_ms(),
+            cleanup_pending: self.cleanup.is_some(),
         }
     }
 
@@ -561,7 +655,6 @@ fn signal_process_group(_child: &Child, _force: bool) {}
 /// Short on purpose: the group has already had the full [`STOP_TIMEOUT`] to
 /// respond to the first SIGTERM by the time this runs. This is the grace for
 /// a process that only started shutting down when its parent went away.
-#[cfg(unix)]
 const GROUP_SWEEP_GRACE: Duration = Duration::from_millis(500);
 
 /// How long to wait for a SIGKILLed group to actually disappear.
@@ -570,7 +663,6 @@ const GROUP_SWEEP_GRACE: Duration = Duration::from_millis(500);
 /// It is bounded because "wait until it is gone" must not become "wait
 /// forever" when something is unkillable -- a process stuck in uninterruptible
 /// I/O, or one this user may signal but not reap.
-#[cfg(unix)]
 const GROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Make sure nothing is left running in the session's process group.
@@ -594,7 +686,11 @@ const GROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// orphaned decoder every time a descendant ignores SIGTERM, which is a
 /// certainty rather than a race.
 #[cfg(unix)]
-async fn sweep_process_group(group: i32) -> Result<(), SessionError> {
+async fn sweep_process_group(
+    group: i32,
+    grace: Duration,
+    drain: Duration,
+) -> Result<(), SessionError> {
     if !is_signallable_group(group) {
         // Not a group this may sweep. See `is_signallable_group`: negating 1
         // or 0 would reach far beyond this session.
@@ -606,11 +702,11 @@ async fn sweep_process_group(group: i32) -> Result<(), SessionError> {
     // Signal 0 above proved something is still there. Ask it to leave, then
     // insist.
     unsafe { libc::kill(-group, libc::SIGTERM) };
-    if drain_process_group(group, GROUP_SWEEP_GRACE).await {
+    if drain_process_group(group, grace).await {
         return Ok(());
     }
     unsafe { libc::kill(-group, libc::SIGKILL) };
-    if drain_process_group(group, GROUP_DRAIN_TIMEOUT).await {
+    if drain_process_group(group, drain).await {
         return Ok(());
     }
     Err(SessionError::StopFailed)
@@ -654,19 +750,58 @@ fn process_group_has_members(group: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// No containment primitive is wired up off Unix yet.
+///
+/// This returns `Ok` because the supervisor must still be able to end a
+/// session on those platforms, but it proves nothing: `kill_on_drop` and
+/// `Child::kill` reach the runner alone, so a descendant it spawned survives.
+/// A Windows Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is
+/// the equivalent guarantee and is what should replace this, at which point
+/// [`CleanupTarget`] gains the variant that owns its handle.
 #[cfg(not(unix))]
-async fn sweep_process_group(_group: i32) -> Result<(), SessionError> {
+async fn sweep_process_group(
+    _group: i32,
+    _grace: Duration,
+    _drain: Duration,
+) -> Result<(), SessionError> {
     Ok(())
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        is_signallable_group, process_group_has_members, sweep_process_group, GROUP_SWEEP_GRACE,
+        is_signallable_group, process_group_has_members, sweep_process_group, CleanupTarget,
+        SessionError, SessionProcessState, SessionSupervisor, GROUP_DRAIN_TIMEOUT,
+        GROUP_SWEEP_GRACE,
     };
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::Duration;
+
+    /// A private runtime directory that removes itself.
+    ///
+    /// The suffix is a counter rather than a clock reading: these tests run
+    /// concurrently and each one deletes its own directory, so two of them
+    /// sharing a name means one removes the other's status file mid-run.
+    struct RuntimeDir(std::path::PathBuf);
+
+    impl Drop for RuntimeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn supervisor() -> (SessionSupervisor, RuntimeDir) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "openstream-session-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let supervisor = SessionSupervisor::new(&path).expect("supervisor");
+        (supervisor, RuntimeDir(path))
+    }
 
     /// A runner that exits immediately while leaving a descendant that
     /// ignores SIGTERM, all inside one process group.
@@ -706,7 +841,7 @@ mod tests {
              anything if the group is already empty"
         );
 
-        sweep_process_group(group)
+        sweep_process_group(group, GROUP_SWEEP_GRACE, GROUP_DRAIN_TIMEOUT)
             .await
             .expect("the sweep proves the group drained");
 
@@ -740,6 +875,139 @@ mod tests {
         assert!(!process_group_has_members(1));
     }
 
+    /// A group that will not drain must never be reported as a finished
+    /// session, and the second attempt must retry rather than forget.
+    ///
+    /// This is the reported bug in sequence. `disconnect` used to take the
+    /// child, and on a failed sweep left nothing behind to retry with -- so
+    /// the *next* call saw `child == None`, went straight to `Idle`, and the
+    /// orphan kept the pairing file and the UDP port while the UI said the
+    /// session had stopped.
+    ///
+    /// The drain budget is zeroed rather than using a process that survives
+    /// SIGKILL, because no such process can be created on purpose. Zero
+    /// budget means the sweep sends its signals and then refuses to claim an
+    /// outcome it has not observed, which is the same failure the timeout
+    /// produces.
+    /// The same shape as [`spawn_group_with_stubborn_descendant`], but owned
+    /// by Tokio so the supervisor can hold it as its own child.
+    fn spawn_supervised_group_with_stubborn_descendant() -> (tokio::process::Child, i32) {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sh -c 'trap \"\" TERM; while :; do sleep 1; done' & exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.as_std_mut().process_group(0);
+        let child = command.spawn().expect("spawn session group");
+        let group = i32::try_from(child.id().expect("live pid")).expect("group id");
+        (child, group)
+    }
+
+    #[tokio::test]
+    async fn a_group_that_will_not_drain_is_never_reported_idle() {
+        let (mut supervisor, _directory) = supervisor();
+        let (mut child, group) = spawn_group_with_stubborn_descendant();
+        child.wait().expect("runner exits");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            process_group_has_members(group),
+            "the descendant must be running or this test proves nothing"
+        );
+
+        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        supervisor.device_id = Some("rig".to_string());
+        supervisor.session_id = Some("session-1".to_string());
+        supervisor.sweep_grace = Duration::ZERO;
+        supervisor.drain_timeout = Duration::ZERO;
+
+        let error = supervisor
+            .disconnect()
+            .await
+            .expect_err("a sweep that cannot prove the group is empty must fail");
+        assert_eq!(error, SessionError::StopFailed);
+
+        let health = supervisor.health();
+        assert_eq!(
+            health.state,
+            SessionProcessState::Failed,
+            "an unfinished cleanup is not an idle supervisor"
+        );
+        assert!(
+            health.cleanup_pending,
+            "the cleanup target must survive the failure so it can be retried"
+        );
+        assert_eq!(
+            health.session_id.as_deref(),
+            Some("session-1"),
+            "the operator has to be able to see which session will not stop"
+        );
+
+        // A new session must not be started on top of the old one's
+        // processes: they still hold the pairing file and the UDP port.
+        let settings = openstream_settings::default_config();
+        assert_eq!(
+            supervisor.connect(&settings, "rig").await.unwrap_err(),
+            SessionError::CleanupPending
+        );
+
+        // Second attempt, with a budget that allows the observation. The
+        // SIGKILL from the first attempt has landed by now, so this proves
+        // the retry path runs at all -- the old code could not have reached
+        // it, because it had already thrown the group away.
+        supervisor.sweep_grace = GROUP_SWEEP_GRACE;
+        supervisor.drain_timeout = GROUP_DRAIN_TIMEOUT;
+        let health = supervisor
+            .disconnect()
+            .await
+            .expect("the retry proves the group drained");
+        assert_eq!(health.state, SessionProcessState::Idle);
+        assert!(!health.cleanup_pending);
+        assert_eq!(health.session_id, None);
+        assert!(!process_group_has_members(group));
+    }
+
+    /// An idle supervisor with nothing to clean up still reports idle.
+    #[tokio::test]
+    async fn disconnect_without_a_session_is_idle() {
+        let (mut supervisor, _directory) = supervisor();
+        let health = supervisor.disconnect().await.expect("nothing to stop");
+        assert_eq!(health.state, SessionProcessState::Idle);
+        assert!(!health.cleanup_pending);
+    }
+
+    /// The runner exiting by itself is the case most likely to leave orphans,
+    /// because nothing asked its children to stop first.
+    ///
+    /// `poll` used to drop the child handle and go straight to a terminal
+    /// state, which leaked an FFmpeg process on every runner crash and hid it
+    /// behind an `Idle` supervisor.
+    #[tokio::test]
+    async fn an_unexpected_runner_exit_still_sweeps_its_descendants() {
+        let (mut supervisor, _directory) = supervisor();
+        let (child, group) = spawn_supervised_group_with_stubborn_descendant();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(process_group_has_members(group));
+
+        supervisor.child = Some(child);
+        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        supervisor.session_id = Some("session-2".to_string());
+        supervisor.state = SessionProcessState::Running;
+
+        let health = supervisor.poll().await.expect("poll observes the exit");
+        assert_eq!(
+            health.state,
+            SessionProcessState::Idle,
+            "the runner exited cleanly and its group drained"
+        );
+        assert!(!health.cleanup_pending);
+        assert!(
+            !process_group_has_members(group),
+            "poll must sweep the group, not merely forget the child"
+        );
+    }
+
     #[tokio::test]
     async fn sweeping_an_empty_group_is_a_no_op() {
         let mut command = Command::new("/bin/sh");
@@ -756,7 +1024,7 @@ mod tests {
 
         // Nothing to signal, and nothing to wait for.
         let started = std::time::Instant::now();
-        sweep_process_group(group)
+        sweep_process_group(group, GROUP_SWEEP_GRACE, GROUP_DRAIN_TIMEOUT)
             .await
             .expect("an empty group sweeps cleanly");
         assert!(

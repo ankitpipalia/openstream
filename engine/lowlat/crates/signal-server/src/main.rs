@@ -523,21 +523,62 @@ impl SourceLimiter {
 /// The address a request is attributed to for rate limiting.
 ///
 /// The peer address by default. `X-Forwarded-For` is believed only when the
-/// peer is one of the operator's configured trusted proxies, and then only
-/// its last entry -- the hop the trusted proxy itself observed. Believing the
-/// header from an arbitrary peer would be worse than having no per-source
-/// limiting at all: every attacker would get an unlimited supply of identities
-/// simply by choosing a new value.
+/// direct peer is one of the operator's configured trusted proxies. Believing
+/// it from an arbitrary peer would be worse than having no per-source limiting
+/// at all: an attacker would get an unlimited supply of identities simply by
+/// choosing a new header value.
+///
+/// # Why the whole list, walked from the right
+///
+/// `X-Forwarded-For` can arrive as several header fields, and each field can
+/// carry several comma-separated hops. HTTP says repeated fields are one list
+/// in order, so reading a single field -- which is what this did -- silently
+/// ignores every hop recorded by a proxy that appended its own field instead
+/// of extending the first.
+///
+/// The entries the client controls are on the *left*: it can send whatever
+/// prefix it likes, and each proxy appends the address it actually observed.
+/// Only the rightmost entries, contributed by hops the operator trusts, mean
+/// anything. So the list is walked right to left, skipping trusted proxies,
+/// and the first address that is not a trusted proxy is the attribution -- it
+/// is the closest hop that a trusted proxy vouched for.
+///
+/// With `client -> Cloudflare -> nginx -> OpenStream`, taking only the last
+/// entry attributes every request to nginx, which collapses the whole
+/// internet into one rate-limit bucket. Walking past both trusted hops
+/// reaches the client.
+///
+/// A malformed entry stops the walk rather than being skipped: past it the
+/// list can no longer be trusted to be what a proxy wrote, and attributing
+/// the request to the last hop that was still verifiable is the conservative
+/// answer.
 fn request_source(peer: IpAddr, headers: &HeaderMap, trusted_proxies: &[IpAddr]) -> IpAddr {
     if !trusted_proxies.contains(&peer) {
         return peer;
     }
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.rsplit(',').next())
-        .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        .unwrap_or(peer)
+    let forwarded: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .collect();
+    let mut attributed = peer;
+    for entry in forwarded.iter().rev() {
+        // Parsed during the right-to-left walk, never before it. Rejecting
+        // the whole list up front would let a client put one unparseable
+        // entry at the left -- the end it controls -- and force every request
+        // back onto the proxy's own shared bucket, which is the limiter
+        // failing open.
+        let Ok(candidate) = entry.parse::<IpAddr>() else {
+            break;
+        };
+        attributed = candidate;
+        if !trusted_proxies.contains(&candidate) {
+            break;
+        }
+    }
+    attributed
 }
 
 /// Trusted reverse proxies, from `OPENSTREAM_TRUSTED_PROXIES`.
@@ -5076,6 +5117,99 @@ mod tests {
             proxy,
             "with no configured proxies no header is ever believed"
         );
+    }
+
+    /// A chain of trusted proxies is walked past, not stopped at.
+    ///
+    /// `client -> Cloudflare -> nginx -> OpenStream`. Taking only the last
+    /// entry attributes every request in the world to nginx, which puts the
+    /// entire internet in one rate-limit bucket -- the limiter present but
+    /// useless.
+    #[test]
+    fn a_chain_of_trusted_proxies_is_walked_through_to_the_client() {
+        let edge: IpAddr = "192.0.2.7".parse().expect("address");
+        let inner: IpAddr = "192.0.2.8".parse().expect("address");
+        let client: IpAddr = "198.51.100.42".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.42, 192.0.2.7".parse().expect("header"),
+        );
+        assert_eq!(
+            request_source(inner, &headers, &[edge, inner]),
+            client,
+            "the first non-proxy hop from the right is the client"
+        );
+    }
+
+    /// Repeated header fields are one list, in order.
+    ///
+    /// A proxy may append its own field rather than extending the first one.
+    /// Reading a single field silently drops every hop the others recorded,
+    /// which is how the rightmost -- the only trustworthy -- end gets lost.
+    #[test]
+    fn repeated_forwarding_fields_are_read_as_one_list() {
+        let edge: IpAddr = "192.0.2.7".parse().expect("address");
+        let inner: IpAddr = "192.0.2.8".parse().expect("address");
+        let client: IpAddr = "198.51.100.42".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "198.51.100.42".parse().expect("header"));
+        headers.append("x-forwarded-for", "192.0.2.7".parse().expect("header"));
+        assert_eq!(request_source(inner, &headers, &[edge, inner]), client);
+    }
+
+    /// A client cannot disown itself by poisoning the end of the list it owns.
+    ///
+    /// The entries on the left are whatever the client sent. If one unparseable
+    /// entry there could discard the whole list, every attacker would send one
+    /// and be attributed to the proxy instead -- landing everybody in a single
+    /// shared bucket, which is the limiter failing open.
+    #[test]
+    fn client_supplied_junk_cannot_move_attribution_off_the_client() {
+        let proxy: IpAddr = "192.0.2.7".parse().expect("address");
+        let client: IpAddr = "198.51.100.42".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "not-an-address, <script>, 198.51.100.42"
+                .parse()
+                .expect("header"),
+        );
+        assert_eq!(
+            request_source(proxy, &headers, &[proxy]),
+            client,
+            "the rightmost verifiable hop is still the attribution"
+        );
+    }
+
+    /// Junk on the right stops the walk at the last hop that was verifiable.
+    #[test]
+    fn junk_nearer_the_proxy_stops_the_walk_conservatively() {
+        let proxy: IpAddr = "192.0.2.7".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.42, not-an-address".parse().expect("header"),
+        );
+        assert_eq!(
+            request_source(proxy, &headers, &[proxy]),
+            proxy,
+            "past an unreadable entry the list proves nothing"
+        );
+    }
+
+    /// An all-proxy list attributes to the outermost proxy rather than
+    /// falling back to the peer.
+    #[test]
+    fn a_list_of_only_proxies_attributes_to_the_outermost_one() {
+        let edge: IpAddr = "192.0.2.7".parse().expect("address");
+        let inner: IpAddr = "192.0.2.8".parse().expect("address");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "192.0.2.7, 192.0.2.8".parse().expect("header"),
+        );
+        assert_eq!(request_source(inner, &headers, &[edge, inner]), edge);
     }
 
     /// Registration is closed unless something explicitly opens it.

@@ -1022,9 +1022,14 @@ impl RuntimeState {
     }
 
     /// Translate host-agent observations into the shell's closed diagnostic
-    /// vocabulary. A surviving child is not enough to mark capture/encoding
-    /// healthy: the child-produced heartbeat must also show that frames are
-    /// flowing. This is intentionally conservative for untested adapters.
+    /// vocabulary.
+    ///
+    /// A surviving child is not enough to mark capture/encoding `Available`:
+    /// the child-produced heartbeat must also show that frames are flowing.
+    /// But "not producing frames" is `Pending`, not `Unavailable` -- a host
+    /// waiting for a client has no frames to produce and is working
+    /// correctly. Only a host that has stopped reporting, or that claims to
+    /// be streaming while its counter has frozen, is `Unavailable`.
     fn reconcile_host_diagnostics(&mut self, health: &HostHealth) {
         let (capture_state, capture_detail) = match (health.state, health.frame_liveness) {
             (ChildState::Ready, FrameLiveness::Live) => (
@@ -1037,6 +1042,13 @@ impl RuntimeState {
             (ChildState::Ready, FrameLiveness::Stale) => (
                 DiagnosticState::Unavailable,
                 "The host process is alive but its frame heartbeat is stale.".to_string(),
+            ),
+            (ChildState::Ready, FrameLiveness::Negotiating) => (
+                DiagnosticState::Pending,
+                format!(
+                    "{} is ready; a client is connecting and the session is being established.",
+                    health.backend
+                ),
             ),
             (ChildState::Ready, FrameLiveness::Waiting | FrameLiveness::NotConfigured) => (
                 DiagnosticState::Pending,
@@ -1741,6 +1753,7 @@ mod tests {
             generation: Some(1),
             last_exit_code: None,
             status_age_ms: Some(0),
+            cleanup_pending: false,
         });
 
         let snapshot = state.snapshot();

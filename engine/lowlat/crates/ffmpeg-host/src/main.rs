@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
@@ -32,6 +32,7 @@ use openstream_media::{
 };
 use openstream_platform::clipboard as platform_clipboard;
 use openstream_platform::clipboard_policy::ClipboardPolicy;
+use openstream_platform::host_heartbeat::{self, HostPhase};
 use openstream_platform::policy::{
     HostCapabilityProbes, HostDeviceCapabilities, RuntimeAvailability, UnavailableReason,
 };
@@ -101,6 +102,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Started before anything that can block, and in particular before
+    // waiting for a peer. The supervisor's only evidence that this process is
+    // alive is this file, and establishment is allowed to take as long as it
+    // likes -- so a heartbeat that only begins once a peer has arrived leaves
+    // the supervisor with nothing to read during precisely the wait it is
+    // supposed to tolerate.
+    let frame_heartbeat = FrameHeartbeat::from_environment();
     let origin =
         env::var("OPENSTREAM_SIGNAL_ORIGIN").unwrap_or_else(|_| DEFAULT_SIGNAL_ORIGIN.to_string());
     let pairing = load_pairing_from_environment()?;
@@ -111,9 +119,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(spec) => parse_stun_servers(&spec)?,
         Err(_) => Vec::new(),
     };
+    // No deadline attached, here or in the agent: a host is routinely started
+    // long before its client, and that wait is the protocol working.
+    frame_heartbeat.set_phase(HostPhase::WaitingForPeer);
     let mut session =
         PeerSession::establish_configured(&origin, &pairing, Role::Host, bind, &stun_servers)
             .await?;
+    frame_heartbeat.set_phase(HostPhase::Negotiating);
     eprintln!(
         "OpenStream selected data path: {:?}",
         session.connection_path()
@@ -281,7 +293,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         session.path_generation(),
         0,
     );
-    let frame_heartbeat = FrameHeartbeat::from_environment();
+    // Capture and encode are up from here, so a counter that stops advancing
+    // now is a real stall and the agent may act on it.
+    frame_heartbeat.set_phase(HostPhase::Streaming);
     let restart_policy = reconfigure::RestartPolicy::from_env();
     let mut last_restart: Option<Instant> = None;
     // `AdaptiveBitrate::tick` emits one-shot decisions. Keep one pending when
@@ -899,6 +913,13 @@ fn configured_limits() -> (u16, u16, u16) {
 #[derive(Debug)]
 struct FrameHeartbeat {
     frames: Arc<AtomicU64>,
+    /// The phase the agent is told about, as [`HostPhase::as_u8`].
+    ///
+    /// Atomic rather than locked because the publisher thread reads it on
+    /// every tick and the session loop writes it at a handful of transitions;
+    /// a lock here would put the session loop behind a wedged filesystem,
+    /// which is the exact coupling this thread exists to avoid.
+    phase: Arc<AtomicU8>,
     stopping: Arc<AtomicBool>,
     publisher: Option<std::thread::JoinHandle<()>>,
 }
@@ -906,14 +927,17 @@ struct FrameHeartbeat {
 impl FrameHeartbeat {
     fn from_environment() -> Self {
         let frames = Arc::new(AtomicU64::new(0));
+        let phase = Arc::new(AtomicU8::new(HostPhase::Starting.as_u8()));
         let Some(path) = env::var_os("OPENSTREAM_FRAME_HEARTBEAT_FILE").map(PathBuf::from) else {
             return Self {
                 frames,
+                phase,
                 stopping: Arc::new(AtomicBool::new(false)),
                 publisher: None,
             };
         };
         let published = Arc::clone(&frames);
+        let published_phase = Arc::clone(&phase);
         let stopping = Arc::new(AtomicBool::new(false));
         let stop_signal = Arc::clone(&stopping);
         // A plain thread, not a Tokio task. Publishing is blocking file I/O,
@@ -929,7 +953,8 @@ impl FrameHeartbeat {
                 let mut reported_failure = false;
                 while !stop_signal.load(Ordering::Relaxed) {
                     let frames = published.load(Ordering::Relaxed);
-                    match publish_frame_heartbeat(&path, frames) {
+                    let phase = HostPhase::from_u8(published_phase.load(Ordering::Relaxed));
+                    match publish_frame_heartbeat(&path, phase, frames) {
                         Ok(()) => reported_failure = false,
                         Err(error) => {
                             // Once per failure run, not once per tick: a
@@ -950,9 +975,20 @@ impl FrameHeartbeat {
             .ok();
         Self {
             frames,
+            phase,
             stopping,
             publisher,
         }
+    }
+
+    /// Tell the supervisor what this host is doing.
+    ///
+    /// The transitions matter more than the values: until this reports
+    /// [`HostPhase::Streaming`], the agent must not hold the host to a
+    /// frame-progress deadline, because a host waiting for a peer has no
+    /// frames to produce and is not faulty for having none.
+    fn set_phase(&self, phase: HostPhase) {
+        self.phase.store(phase.as_u8(), Ordering::Relaxed);
     }
 
     /// Count one encoded access unit. This is the only thing the media loop
@@ -979,7 +1015,11 @@ impl Drop for FrameHeartbeat {
 /// The temporary file carries the process id so two hosts sharing a runtime
 /// directory cannot collide, and the rename replaces the published file in
 /// one step.
-fn publish_frame_heartbeat(path: &std::path::Path, frames: u64) -> io::Result<()> {
+fn publish_frame_heartbeat(
+    path: &std::path::Path,
+    phase: HostPhase,
+    frames: u64,
+) -> io::Result<()> {
     validate_heartbeat_path(path)?;
     let parent = path
         .parent()
@@ -1006,7 +1046,7 @@ fn publish_frame_heartbeat(path: &std::path::Path, frames: u64) -> io::Result<()
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
         let mut file = options.open(&temporary)?;
-        writeln!(file, "{frames}")?;
+        write!(file, "{}", host_heartbeat::render(phase, frames))?;
         // Flushed, but deliberately not `sync_data`. A frame counter is not
         // durable state: after a crash it means nothing, and forcing a device
         // flush four times a second buys nothing for it.

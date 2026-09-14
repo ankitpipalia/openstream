@@ -7,6 +7,7 @@
 
 use openstream_app_core::AppErrorCode;
 use openstream_local_ipc::RequestId;
+use openstream_platform::host_heartbeat::{self, HostPhase};
 use openstream_settings::{AppConfig, CaptureMode, host_config_revision};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -41,6 +42,13 @@ const FRAME_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`FRAME_HEARTBEAT_TIMEOUT`] already means each observation covers three
 /// seconds of missing frames.
 const FRAME_LIVENESS_STRIKES: u32 = 3;
+
+/// How much of the heartbeat file is read.
+///
+/// The file is one short line. Bounded because it is written by another
+/// process and this one must not be led into reading an arbitrary amount by
+/// whatever is at that path.
+const HEARTBEAT_READ_LIMIT: u64 = 64;
 /// The oldest supported host-agent IPC protocol version.
 pub const HOST_AGENT_PROTOCOL_VERSION: u32 = 1;
 
@@ -925,18 +933,54 @@ impl ManagedChild for TokioManagedChild {
     }
 }
 
+/// Whether a group id may be signalled with a negated pid.
+///
+/// **A safety gate, not a validation nicety.** `kill` gives two pid values a
+/// meaning that has nothing to do with the number itself:
+///
+/// ```text
+/// kill(-1, sig)   every process the caller may signal
+/// kill(0, sig)    the caller's own process group -- including the caller
+/// ```
+///
+/// So negating a group id of 1 does not target "process group 1"; it targets
+/// every process this user is running, the agent and the desktop shell
+/// included. A group id of 0 would take out the agent itself. Neither can be
+/// a real child's group, so both are refused here rather than at each call
+/// site, where one of them will eventually be forgotten.
+///
+/// The same gate exists in the desktop session supervisor. Both are kept
+/// because both call `kill` with a negated pid; neither can rely on the other
+/// having checked.
+#[cfg(unix)]
+const fn is_signallable_group(group: i32) -> bool {
+    group > 1
+}
+
 #[cfg(unix)]
 fn signal_process_group(pid: Option<u32>, signal: i32) -> Result<(), AgentError> {
     let pid = pid.ok_or(AgentError::StopFailed)?;
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
+    // Checked, not `as`. A pid that does not fit in an `i32` would wrap to a
+    // negative value, and negating that produces a positive number naming
+    // some unrelated process -- a truncation bug that presents as signalling
+    // a stranger.
+    let group = i32::try_from(pid).map_err(|_| AgentError::StopFailed)?;
+    if !is_signallable_group(group) {
+        return Err(AgentError::StopFailed);
     }
-    let result = unsafe { kill(-(pid as i32), signal) };
+    // SAFETY: `group` is a positive pid greater than 1, so negating it names
+    // the child's process group and nothing else. See `is_signallable_group`.
+    let result = unsafe { libc::kill(-group, signal) };
     if result == 0 {
-        Ok(())
-    } else {
-        Err(AgentError::StopFailed)
+        return Ok(());
     }
+    // ESRCH means the group is already gone, which is the outcome this was
+    // asking for. Reporting it as a failure to stop makes a clean exit look
+    // like a stuck child.
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(AgentError::StopFailed)
 }
 
 impl ChildFactory for TokioChildFactory {
@@ -1057,10 +1101,63 @@ pub struct AgentIpcRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameLiveness {
+    /// No heartbeat file is configured, so nothing is being claimed.
     NotConfigured,
+    /// The host is up and reporting, but is not streaming yet -- it is
+    /// starting, or waiting for a peer that has not arrived.
+    ///
+    /// This is a healthy state and may persist indefinitely. A host is
+    /// routinely started long before its client, and the establishment
+    /// protocol has no deadline of its own, so neither can this.
     Waiting,
+    /// A peer is present and the session is being established.
+    Negotiating,
+    /// Streaming, with a frame counter that is advancing.
     Live,
+    /// The host stopped reporting, or claims to be streaming while its frame
+    /// counter has stopped advancing. This is the only faulty reading.
     Stale,
+}
+
+/// One reading of the heartbeat file: facts only, no verdict.
+///
+/// Kept as a struct rather than a tuple because the three fields are easy to
+/// transpose and two of them are numbers; a caller that swapped age and
+/// frames would still compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeartbeatObservation {
+    /// How long ago the file was written, or `None` if that cannot be read.
+    age: Option<u64>,
+    phase: HostPhase,
+    frames: u64,
+}
+
+impl HeartbeatObservation {
+    /// The reading for a heartbeat file that exists in name only -- missing,
+    /// or rejected for not being a file this agent will read.
+    ///
+    /// No age, so it is judged stale, which is the right answer: a host that
+    /// is not writing its heartbeat is not reporting, whatever it is doing.
+    const fn silent() -> Self {
+        Self {
+            age: None,
+            phase: HostPhase::Starting,
+            frames: 0,
+        }
+    }
+}
+
+impl FrameLiveness {
+    /// Whether this reading is evidence of a working host.
+    ///
+    /// Everything except [`Self::Stale`] is. The distinction matters because
+    /// the supervisor used to require [`Self::Live`], which made every
+    /// non-streaming phase indistinguishable from a dead capture and got a
+    /// host waiting for its client killed at the end of the startup grace.
+    #[must_use]
+    pub const fn is_healthy(self) -> bool {
+        !matches!(self, Self::Stale)
+    }
 }
 
 /// One bounded local response. Errors carry only typed status.
@@ -1284,24 +1381,34 @@ impl<F: ChildFactory> HostAgent<F> {
                 return self.handle_lifetime(now);
             }
 
-            let heartbeat_live = if let Some((age, frames)) = self.heartbeat_observation() {
+            // Two questions, deliberately not one. "Is the host working?" is
+            // what the supervisor acts on; "is it streaming?" is only one of
+            // the ways it can be working. Collapsing them is what made a host
+            // waiting for its client indistinguishable from a dead capture,
+            // and got it killed at the end of the startup grace for doing
+            // exactly what the establishment protocol allows.
+            let healthy = if let Some(observation) = self.heartbeat_observation() {
                 // Record advancement first: the verdict below asks when the
                 // counter last moved, not what it currently reads.
-                if frames > self.frames_seen {
-                    self.frames_seen = frames;
+                if observation.frames > self.frames_seen {
+                    self.frames_seen = observation.frames;
                     self.frames_advanced_at = Some(now);
                 }
-                self.judge_liveness(age, frames, now) == FrameLiveness::Live
+                self.judge_liveness(observation, now).is_healthy()
             } else {
                 true
             };
-            if heartbeat_live {
+            if healthy {
                 self.liveness_strikes = 0;
             } else {
                 self.liveness_strikes = self.liveness_strikes.saturating_add(1);
             }
             if self.state == ChildState::Starting {
-                if heartbeat_live {
+                if healthy {
+                    // Ready means the service is up and reporting, not that
+                    // pixels are moving. A host with no peer yet is ready in
+                    // every sense the supervisor can act on, and it may stay
+                    // that way for hours.
                     self.state = ChildState::Ready;
                     return Ok(vec![HostAgentEvent::Ready]);
                 }
@@ -1309,13 +1416,16 @@ impl<F: ChildFactory> HostAgent<F> {
                     now.saturating_duration_since(started)
                         >= Duration::from_millis(self.config.startup_grace_ms)
                 }) {
+                    // Nothing was ever published here. The startup grace
+                    // covers a slow start; a host that has not written its
+                    // heartbeat by the end of it is not starting slowly.
                     self.last_error = Some(HostErrorCode::FrameLivenessTimeout);
                     self.begin_stopping(now, Some(ChildExitReason::FrameLivenessTimeout))?;
                 }
             } else if self.state == ChildState::Ready
                 && self.liveness_strikes >= FRAME_LIVENESS_STRIKES
             {
-                // A ready child is streaming until several consecutive
+                // A ready child is working until several consecutive
                 // observations say otherwise. See [`FRAME_LIVENESS_STRIKES`].
                 self.last_error = Some(HostErrorCode::FrameLivenessTimeout);
                 self.begin_stopping(now, Some(ChildExitReason::FrameLivenessTimeout))?;
@@ -1541,13 +1651,13 @@ impl<F: ChildFactory> HostAgent<F> {
     /// One reading of the heartbeat file: how fresh it is, and what count it
     /// carries. Deliberately reports observations rather than a verdict --
     /// the verdict needs history this cannot see.
-    fn heartbeat_observation(&self) -> Option<(Option<u64>, u64)> {
+    fn heartbeat_observation(&self) -> Option<HeartbeatObservation> {
         let path = self.config.frame_heartbeat_file.as_deref()?;
         let Ok(link_metadata) = std::fs::symlink_metadata(path) else {
-            return Some((None, 0));
+            return Some(HeartbeatObservation::silent());
         };
         if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
-            return Some((None, 0));
+            return Some(HeartbeatObservation::silent());
         }
         #[cfg(windows)]
         {
@@ -1557,7 +1667,7 @@ impl<F: ChildFactory> HostAgent<F> {
                 // Same answer as the symlink and wrong-ownership rejections
                 // above: the path exists but is not a heartbeat file this
                 // agent will read, so there is no age and no count to report.
-                return Some((None, 0));
+                return Some(HeartbeatObservation::silent());
             }
         }
         #[cfg(unix)]
@@ -1565,7 +1675,7 @@ impl<F: ChildFactory> HostAgent<F> {
             use std::os::unix::fs::MetadataExt;
             let uid = unsafe { libc::geteuid() };
             if link_metadata.uid() != uid || link_metadata.mode() & 0o077 != 0 {
-                return Some((None, 0));
+                return Some(HeartbeatObservation::silent());
             }
         }
         let age = link_metadata
@@ -1587,13 +1697,19 @@ impl<F: ChildFactory> HostAgent<F> {
             const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
             options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
-        let frames = options
+        // An unreadable or unparseable line is not "zero frames in an unknown
+        // phase". It is the absence of a report, and `Starting` is the phase
+        // that promises least, so nothing is inferred from it.
+        let (phase, frames) = options
             .open(path)
-            .and_then(|file| file.take(64).read_to_string(&mut contents))
+            .and_then(|file| {
+                file.take(HEARTBEAT_READ_LIMIT)
+                    .read_to_string(&mut contents)
+            })
             .ok()
-            .and_then(|_| contents.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        Some((age, frames))
+            .and_then(|_| host_heartbeat::parse(&contents))
+            .unwrap_or((HostPhase::Starting, 0));
+        Some(HeartbeatObservation { age, phase, frames })
     }
 
     /// Judge frame liveness from an observation plus the recorded history.
@@ -1610,17 +1726,32 @@ impl<F: ChildFactory> HostAgent<F> {
     /// produced anything, so treating a fresh file as proof of frames would
     /// report a host as healthy forever after its first frame -- which is
     /// exactly the failure this heartbeat exists to catch.
-    fn judge_liveness(&self, age: Option<u64>, frames: u64, now: Instant) -> FrameLiveness {
+    fn judge_liveness(&self, observation: HeartbeatObservation, now: Instant) -> FrameLiveness {
         let timeout_ms = u64::try_from(FRAME_HEARTBEAT_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
-        let publisher_fresh = age.is_some_and(|age| age <= timeout_ms);
-        if frames == 0 {
+        // Is the host reporting at all? This is the one question that applies
+        // in every phase: a process that has stopped writing its heartbeat is
+        // wedged whatever it last claimed to be doing.
+        if !observation.age.is_some_and(|age| age <= timeout_ms) {
+            return FrameLiveness::Stale;
+        }
+        if !observation.phase.expects_frames() {
+            return match observation.phase {
+                HostPhase::Negotiating => FrameLiveness::Negotiating,
+                _ => FrameLiveness::Waiting,
+            };
+        }
+        // Streaming, so the counter is now load-bearing. A host that has said
+        // it is streaming and produced nothing at all is not yet streaming in
+        // any useful sense, but it is also not faulty -- the first frame has
+        // its own grace through the startup window.
+        if observation.frames == 0 {
             return FrameLiveness::Waiting;
         }
         let advanced_recently = self.frames_advanced_at.is_some_and(|at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
                 <= timeout_ms
         });
-        if publisher_fresh && advanced_recently {
+        if advanced_recently {
             FrameLiveness::Live
         } else {
             FrameLiveness::Stale
@@ -1628,11 +1759,11 @@ impl<F: ChildFactory> HostAgent<F> {
     }
 
     fn heartbeat_status(&self, now: Instant) -> (FrameLiveness, Option<u64>, u64) {
-        let Some((age, frames)) = self.heartbeat_observation() else {
+        let Some(observation) = self.heartbeat_observation() else {
             return (FrameLiveness::NotConfigured, None, self.frames_seen);
         };
-        let liveness = self.judge_liveness(age, frames, now);
-        (liveness, age, frames)
+        let liveness = self.judge_liveness(observation, now);
+        (liveness, observation.age, observation.frames)
     }
 
     pub fn app_error_code(&self) -> Option<AppErrorCode> {
@@ -1647,8 +1778,9 @@ impl<F: ChildFactory> HostAgent<F> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentError, ChildExit, ChildExitReason, ChildFactory, ChildSpec, ChildState, HostAgent,
-        HostAgentConfig, HostAgentEvent, HostErrorCode, ManagedChild, configure_child_environment,
+        AgentError, ChildExit, ChildExitReason, ChildFactory, ChildSpec, ChildState,
+        FRAME_LIVENESS_STRIKES, FrameLiveness, HostAgent, HostAgentConfig, HostAgentEvent,
+        HostErrorCode, HostPhase, ManagedChild, configure_child_environment, host_heartbeat,
     };
     use openstream_settings::default_config;
     use std::collections::{BTreeMap, VecDeque};
@@ -1887,6 +2019,8 @@ mod tests {
     }
 
     fn publish_frames(path: &PathBuf, frames: u64) {
+        // Deliberately the legacy bare-count format, so the existing suite
+        // keeps proving an older host binary is still read correctly.
         fs::write(path, format!("{frames}\n")).expect("publish heartbeat");
         #[cfg(unix)]
         {
@@ -1896,9 +2030,261 @@ mod tests {
         }
     }
 
-    /// A live process that never emits a frame is not a ready host.
+    fn publish_phase(path: &PathBuf, phase: HostPhase, frames: u64) {
+        fs::write(path, host_heartbeat::render(phase, frames)).expect("publish heartbeat");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("private heartbeat file");
+        }
+    }
+
+    /// The two pid values `kill` reserves must never be treated as a child's
+    /// process group.
+    ///
+    /// Asserted by inspection only. A test that actually called the helper
+    /// with one of these would signal every process this user is running.
+    #[cfg(unix)]
     #[test]
-    fn a_child_that_publishes_no_frames_never_reaches_ready() {
+    fn the_agent_never_signals_a_reserved_process_group() {
+        assert!(!super::is_signallable_group(-1));
+        assert!(!super::is_signallable_group(0));
+        assert!(
+            !super::is_signallable_group(1),
+            "negating 1 is kill's every-process wildcard, not process group 1"
+        );
+        assert!(super::is_signallable_group(2));
+
+        // Signal 0 delivers nothing, so these calls are inert even if the
+        // guard were wrong about the value -- but the guard is what is being
+        // asserted, and it rejects before reaching `kill`.
+        assert_eq!(
+            super::signal_process_group(Some(u32::MAX), 0),
+            Err(AgentError::StopFailed),
+            "a pid that does not fit an i32 must be refused, not truncated"
+        );
+        assert_eq!(
+            super::signal_process_group(Some(1), 0),
+            Err(AgentError::StopFailed)
+        );
+        assert_eq!(
+            super::signal_process_group(None, 0),
+            Err(AgentError::StopFailed)
+        );
+    }
+
+    /// The reported blocker: a host with no client yet must not be restarted.
+    ///
+    /// The establishment protocol deliberately lets a host wait for a peer
+    /// indefinitely -- that is the whole point of starting a host before the
+    /// person who will connect to it. The supervisor used to require
+    /// `FrameLiveness::Live`, which no waiting host can produce, so it struck
+    /// once per tick and killed the child the moment the startup grace ran
+    /// out. This drives well past that deadline.
+    #[test]
+    fn a_host_waiting_for_a_peer_stays_ready_indefinitely() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(21)));
+        let (config, path, directory) = heartbeat_config();
+        let grace = config.startup_grace_ms;
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+
+        // Zero frames, forever, because there is nobody to send them to.
+        publish_phase(&path, HostPhase::WaitingForPeer, 0);
+        assert_eq!(
+            agent
+                .tick(now + Duration::from_millis(20))
+                .expect("becomes ready"),
+            vec![HostAgentEvent::Ready],
+            "a host that is up and reporting is ready, peer or no peer"
+        );
+
+        for step in 1..=20_u64 {
+            publish_phase(&path, HostPhase::WaitingForPeer, 0);
+            let elapsed = Duration::from_millis(20 + step * (grace / 2 + 1));
+            agent.tick(now + elapsed).expect("waiting observation");
+            let health = agent.health(now + elapsed);
+            assert_eq!(
+                health.state,
+                ChildState::Ready,
+                "a host waiting for a peer must not be restarted at step {step}, \
+                 well past the {grace}ms startup grace"
+            );
+            assert_eq!(health.frame_liveness, FrameLiveness::Waiting);
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Waiting for a peer is healthy; ceasing to report is not.
+    ///
+    /// The phase must not become a way for a wedged host to excuse itself. A
+    /// process that stops writing the file entirely is stale whatever it last
+    /// claimed to be doing.
+    #[test]
+    fn a_host_that_stops_reporting_is_stale_even_while_waiting_for_a_peer() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(22)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_phase(&path, HostPhase::WaitingForPeer, 0);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        assert_eq!(agent.health(now).state, ChildState::Ready);
+
+        // The host process wedges: the file stops being refreshed.
+        fs::remove_file(&path).expect("remove heartbeat");
+        for strike in 1..FRAME_LIVENESS_STRIKES {
+            agent
+                .tick(now + Duration::from_millis(30 + u64::from(strike) * 10))
+                .expect("stale observation");
+            assert_eq!(
+                agent.health(now).state,
+                ChildState::Ready,
+                "stopped after only {strike} silent observation(s)"
+            );
+        }
+        agent
+            .tick(now + Duration::from_millis(1_000))
+            .expect("final silent observation");
+        assert_ne!(
+            agent.health(now).state,
+            ChildState::Ready,
+            "a host that stopped reporting is not healthy just because it was waiting"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Establishment is its own phase, and it is healthy.
+    #[test]
+    fn a_negotiating_host_is_healthy_and_reported_as_negotiating() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(23)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_phase(&path, HostPhase::Negotiating, 0);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        let health = agent.health(now);
+        assert_eq!(health.state, ChildState::Ready);
+        assert_eq!(health.frame_liveness, FrameLiveness::Negotiating);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Frame enforcement still applies once the host says it is streaming.
+    ///
+    /// The phase relaxes the deadline for hosts that have not claimed to be
+    /// streaming. It must not relax it for one that has -- that would undo
+    /// the stall detection this heartbeat exists for.
+    #[test]
+    fn a_streaming_host_with_a_frozen_counter_is_still_stopped() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(24)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_phase(&path, HostPhase::Streaming, 1);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+        assert_eq!(agent.health(now).state, ChildState::Ready);
+
+        // The file stays fresh -- the publisher thread is alive -- while the
+        // counter never moves again. This is a dead capture behind a live
+        // process, which is exactly what must still be caught. Ticking stops
+        // at the transition so the fake factory is never asked for a
+        // replacement child it was not given.
+        for strike in 1..FRAME_LIVENESS_STRIKES {
+            publish_phase(&path, HostPhase::Streaming, 1);
+            agent
+                .tick(now + Duration::from_millis(20 + u64::from(strike) * 5_000))
+                .expect("frozen observation");
+            assert_eq!(
+                agent.health(now).state,
+                ChildState::Ready,
+                "stopped after only {strike} frozen observation(s)"
+            );
+        }
+        publish_phase(&path, HostPhase::Streaming, 1);
+        agent
+            .tick(now + Duration::from_millis(60_000))
+            .expect("final frozen observation");
+        assert_ne!(
+            agent.health(now).state,
+            ChildState::Ready,
+            "a streaming host whose counter stopped must still be stopped"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A host that reaches streaming and then goes back to waiting for a peer
+    /// is not stalling; it lost its client.
+    #[test]
+    fn returning_to_waiting_after_a_peer_leaves_is_not_a_stall() {
+        let factory = FakeFactory::default();
+        factory
+            .outcomes
+            .lock()
+            .expect("outcome lock")
+            .push_back(FakeSpawnOutcome::Child(FakeChild::running(25)));
+        let (config, path, directory) = heartbeat_config();
+        let now = instant();
+        let mut agent = HostAgent::with_factory(config, factory).expect("agent");
+        agent.start(now).expect("start");
+        publish_phase(&path, HostPhase::Streaming, 5);
+        agent
+            .tick(now + Duration::from_millis(20))
+            .expect("becomes ready");
+
+        // The peer disconnects. The counter is frozen at its last value, and
+        // under a phase-blind rule that alone would restart the host.
+        for step in 1..=8_u64 {
+            publish_phase(&path, HostPhase::WaitingForPeer, 5);
+            let elapsed = Duration::from_millis(20 + step * 5_000);
+            agent.tick(now + elapsed).expect("post-peer observation");
+            assert_eq!(
+                agent.health(now + elapsed).state,
+                ChildState::Ready,
+                "losing a peer is not a capture fault (step {step})"
+            );
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A live process that never publishes a heartbeat at all is not a ready
+    /// host.
+    ///
+    /// Note what this does *not* say. It is about a host that reports
+    /// nothing, not a host that reports no frames -- a host waiting for a
+    /// peer legitimately has no frames and is covered by
+    /// `a_host_waiting_for_a_peer_stays_ready_indefinitely`.
+    #[test]
+    fn a_child_that_publishes_no_heartbeat_never_reaches_ready() {
         let factory = FakeFactory::default();
         factory
             .outcomes

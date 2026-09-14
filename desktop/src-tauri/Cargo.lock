@@ -2864,6 +2864,7 @@ dependencies = [
  "lowlat-host",
  "openstream-app-core",
  "openstream-local-ipc",
+ "openstream-platform",
  "openstream-settings",
  "serde",
  "serde_json",
@@ -2880,6 +2881,10 @@ dependencies = [
  "serde_json",
  "tokio",
 ]
+
+[[package]]
+name = "openstream-platform"
+version = "0.1.0"
 
 [[package]]
 name = "openstream-protocol"
