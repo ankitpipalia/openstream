@@ -13,6 +13,7 @@ pub mod displays;
 pub mod frame_age;
 pub mod input;
 pub mod latency;
+pub mod latest_frame;
 pub mod metrics;
 pub mod microphone;
 pub mod probe;
