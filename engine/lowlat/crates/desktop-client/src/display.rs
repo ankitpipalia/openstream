@@ -53,6 +53,12 @@ impl DisplayMode {
         matches!(self, Self::Fullscreen)
     }
 
+    /// Whether this mode asks for the whole screen rather than a window.
+    /// Both non-windowed modes do; they differ only in how they scale.
+    pub(crate) const fn wants_whole_screen(self) -> bool {
+        matches!(self, Self::Borderless | Self::Fullscreen)
+    }
+
     pub(crate) fn window_options(self) -> WindowOptions {
         let mut options = WindowOptions {
             resize: true,

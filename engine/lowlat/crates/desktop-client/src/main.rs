@@ -52,6 +52,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 mod display;
+mod fullscreen;
 mod mic;
 mod raw_pointer;
 mod render;
@@ -349,6 +350,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_HEIGHT,
         display_mode.window_options(),
     )?;
+    if display_mode.wants_whole_screen() && fullscreen::enter(window.get_window_handle()) {
+        // Said out loud because the mode is otherwise indistinguishable from
+        // a window that simply failed to resize.
+        println!("OpenStream run window=fullscreen requested from the platform");
+    }
     let render_backend = render::RenderBackend::from_env();
     let mut native_presenter = if render_backend.is_native() {
         match render::GpuPresenter::new(&window, render_backend) {
