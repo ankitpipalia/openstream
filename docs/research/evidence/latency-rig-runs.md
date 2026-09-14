@@ -213,3 +213,21 @@ call is 11 ms per frame, and 1/0.011 is about 90/s, so it does not explain
 26/s on its own. **Where the rate is actually lost is not established.** The
 host side is still `not-observable`, and no host-side rate was published in
 this run.
+
+## Outstanding: no run yet on the corrected release stamps
+
+Runs A-E all predate three fixes, so nothing here measures the branch as it
+now stands:
+
+- the reassembly release stamp is now taken as each frame leaves the
+  assembler, instead of after a reliable keyframe-request round trip and the
+  previous frame's decoder write, so `LastFragmentReceived -> Reassembled`
+  should be re-measured before its tail is quoted at all;
+- the helper's heartbeat is now start-to-start, so its requested and achieved
+  upload rates are comparable for the first time;
+- a probe timeout now invalidates the session's interaction measurement
+  instead of re-arming, so an interaction figure from a run that timed out is
+  no longer produced.
+
+Every number above was taken before those changes. Run F is the first one
+that will describe the current branch.
