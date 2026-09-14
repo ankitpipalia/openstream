@@ -19,7 +19,7 @@ production-ready 1.0 while any required row remains unverified.
 
 | case | status | evidence | notes |
 | --- | --- | --- | --- |
-| linux-nvidia-to-apple-silicon | PARTIAL | 2026-09-15, see "Run of 2026-09-15" below | Video, keyboard, absolute pointer, audio, and clean disconnect all confirmed. Held back by two cases the run could not satisfy: raw/relative pointer is not implemented, and the macOS window cannot go borderless. Note the capture path was the xdg-desktop-portal PipeWire node, not X11: Xwayland is rootless, so x11grab on this host captures nothing |
+| linux-nvidia-to-apple-silicon | PARTIAL | 2026-09-15, see "Run of 2026-09-15" below | Video, keyboard, absolute pointer, audio, and clean disconnect all confirmed. Raw pointer capture has since been implemented for macOS and verified: a 1750 px sweep across a 1280 px window is delivered, where the clamped path stopped at the edge. One case still blocks the row: the macOS window cannot go borderless, because minifb 0.27 implements that option for Wayland, X11 and Windows but not for macOS, where it is silently dropped. Note the capture path was the xdg-desktop-portal PipeWire node, not X11: Xwayland is rootless, so x11grab on this host captures nothing |
 | apple-silicon-videotoolbox-metal | PARTIAL | 2026-09-15, see "Run of 2026-09-15" below | Metal presentation confirmed, and the FFmpeg decode fallback with it. VideoToolbox decode is still not wired up, so the decoder half of this row is unproven |
 | input-release-watchdog | UNVERIFIED |  | focus loss, close, network loss, and permission revocation release every held key/button |
 | background-host-restart | UNVERIFIED |  | host agent survives UI exit and restarts without two children |
@@ -66,9 +66,10 @@ macOS screen itself (`screencapture`).
 | presentation | Metal presented 45.6 fps with a 2.2 ms mean present call, against 32.1 fps and 9.3 ms for the software path |
 | disconnect | Both ends ran their shutdown reporting to completion; no error path, no orphaned child |
 
-Not established by this run: raw/relative pointer input, VideoToolbox decode,
-borderless or exclusive fullscreen on macOS, and every WAN row other than
-`direct-udp`.
+Not established by this run: VideoToolbox decode, borderless or exclusive
+fullscreen on macOS, and every WAN row other than `direct-udp`. Raw pointer
+capture was not part of this run but has since been implemented and verified
+separately, as noted in the physical row above.
 
 ## Release policy
 
