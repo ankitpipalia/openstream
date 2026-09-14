@@ -2845,6 +2845,7 @@ dependencies = [
  "openstream-client-core",
  "openstream-host-agent",
  "openstream-local-ipc",
+ "openstream-platform",
  "openstream-settings",
  "reqwest",
  "serde",
@@ -2885,6 +2886,10 @@ dependencies = [
 [[package]]
 name = "openstream-platform"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "openstream-protocol"
