@@ -409,6 +409,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rumble_effects: HashMap::new(),
         immersive: env::var("OPENSTREAM_IMMERSIVE").as_deref() == Ok("1"),
     };
+    // Optional pixel-level diagnostic; off unless the operator asks for it.
+    let mut frame_dump = FrameDump::from_env();
     let mut connected = false;
     let mut base_title = String::from("OpenStream");
     let mut displays = Vec::<RemoteDisplay>::new();
@@ -462,6 +464,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     buffer_width = width;
                     buffer_height = height;
                     buffer = frame.into_pixels();
+                    if let Some(dump) = frame_dump.as_mut() {
+                        dump.offer(width, height, &buffer);
+                    }
 
                     // Everything below this stamp is the presenter's own
                     // time: texture upload, surface acquisition, or a
@@ -679,6 +684,105 @@ struct PresentedRect {
     y: usize,
     width: usize,
     height: usize,
+}
+
+/// Diagnostic capture of decoded frames, enabled by `OPENSTREAM_DUMP_FRAMES`.
+///
+/// Presenting is the last point where this process still owns the picture as
+/// pixels. Counters can report a frame as presented while the window shows
+/// nothing, so "the screen is blank" cannot be settled from telemetry alone.
+/// Writing the pixels here separates "the decoder produced a picture" from
+/// "the window displayed it", which is the split that tells a capture or
+/// encode fault apart from a presentation fault.
+///
+/// Frames are written as binary PPM: no image encoder is needed and every
+/// common image tool reads it.
+#[derive(Debug)]
+struct FrameDump {
+    directory: PathBuf,
+    every: u64,
+    limit: u64,
+    seen: u64,
+    written: u64,
+}
+
+impl FrameDump {
+    /// `OPENSTREAM_DUMP_FRAMES` names the destination directory and turns the
+    /// capture on. `OPENSTREAM_DUMP_FRAME_EVERY` keeps one frame in N
+    /// (default 30) and `OPENSTREAM_DUMP_FRAME_LIMIT` caps how many are
+    /// written (default 8), so a long session cannot fill the disk.
+    fn from_env() -> Option<Self> {
+        let directory = PathBuf::from(env::var("OPENSTREAM_DUMP_FRAMES").ok()?);
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            eprintln!(
+                "OpenStream frame dump disabled: {} is not usable: {error}",
+                directory.display()
+            );
+            return None;
+        }
+        Some(Self {
+            directory,
+            every: env_u64("OPENSTREAM_DUMP_FRAME_EVERY", 30).max(1),
+            limit: env_u64("OPENSTREAM_DUMP_FRAME_LIMIT", 8),
+            seen: 0,
+            written: 0,
+        })
+    }
+
+    /// Offer one frame that passed validation and is about to be presented.
+    /// Sampling and the write both happen on the UI thread, which is why the
+    /// default cadence is coarse: this is a diagnostic, not a recorder.
+    fn offer(&mut self, width: usize, height: usize, pixels: &[u32]) {
+        let index = self.seen;
+        self.seen += 1;
+        if self.written >= self.limit || index % self.every != 0 {
+            return;
+        }
+        let path = self.directory.join(format!("frame-{index:06}.ppm"));
+        match Self::write_ppm(&path, width, height, pixels) {
+            Ok(()) => {
+                self.written += 1;
+                println!(
+                    "OpenStream dumped frame {index} ({width}x{height}) to {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                // One failed write means the destination is not usable.
+                // Stop rather than repeat the same error every frame.
+                eprintln!("OpenStream frame dump stopped: {error}");
+                self.limit = 0;
+            }
+        }
+    }
+
+    fn write_ppm(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        pixels: &[u32],
+    ) -> io::Result<()> {
+        let mut out = Vec::with_capacity(32 + pixels.len() * 3);
+        out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+        for pixel in pixels {
+            // The decoder packs BGRA bytes into a little-endian word, so the
+            // native byte order is already blue, green, red, alpha.
+            let [blue, green, red, _alpha] = pixel.to_le_bytes();
+            out.push(red);
+            out.push(green);
+            out.push(blue);
+        }
+        std::fs::write(path, out)
+    }
+}
+
+/// Read a non-negative integer from the environment, falling back when the
+/// variable is absent or does not parse.
+fn env_u64(name: &str, fallback: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(fallback)
 }
 
 /// Compute the rectangle the picture occupies.
@@ -2760,6 +2864,55 @@ fn monotonic_input_stamp() -> u64 {
 impl From<io::Error> for UiMessage {
     fn from(error: io::Error) -> Self {
         Self::Error(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod frame_dump_tests {
+    use super::FrameDump;
+
+    fn dump(directory: &std::path::Path, every: u64, limit: u64) -> FrameDump {
+        FrameDump {
+            directory: directory.to_path_buf(),
+            every,
+            limit,
+            seen: 0,
+            written: 0,
+        }
+    }
+
+    #[test]
+    fn ppm_carries_the_pixels_in_red_green_blue_order() {
+        let directory =
+            std::env::temp_dir().join(format!("openstream-dump-order-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        let path = directory.join("one.ppm");
+        // A single pixel packed the way the decoder packs BGRA: blue in the
+        // low byte, red in bits 16-23.
+        FrameDump::write_ppm(&path, 1, 1, &[0x00_11_22_33]).expect("write");
+        let written = std::fs::read(&path).expect("read back");
+        assert_eq!(&written[..11], b"P6\n1 1\n255\n");
+        assert_eq!(&written[11..], &[0x11, 0x22, 0x33]);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn sampling_keeps_one_frame_in_every_n_and_stops_at_the_limit() {
+        let directory =
+            std::env::temp_dir().join(format!("openstream-dump-cadence-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        let mut dump = dump(&directory, 3, 2);
+        for _ in 0..12 {
+            dump.offer(1, 1, &[0]);
+        }
+        // Frames 0 and 3 are written; the limit stops 6 and 9 rather than
+        // letting a long session fill the disk.
+        assert_eq!(dump.written, 2);
+        assert_eq!(dump.seen, 12);
+        assert!(directory.join("frame-000000.ppm").exists());
+        assert!(directory.join("frame-000003.ppm").exists());
+        assert!(!directory.join("frame-000006.ppm").exists());
+        std::fs::remove_dir_all(&directory).ok();
     }
 }
 
