@@ -1,0 +1,19 @@
+[package]
+name = "openstream-probe-helper"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[[bin]]
+name = "openstream-probe-helper"
+path = "src/main.rs"
+
+[dependencies]
+minifb.workspace = true
+openstream-media = { path = "../media" }
+
+[lints]
+workspace = true

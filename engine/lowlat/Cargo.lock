@@ -1948,6 +1948,14 @@ name = "openstream-platform"
 version = "0.1.0"
 
 [[package]]
+name = "openstream-probe-helper"
+version = "0.1.0"
+dependencies = [
+ "minifb",
+ "openstream-media",
+]
+
+[[package]]
 name = "openstream-protocol"
 version = "0.1.0"
 dependencies = [

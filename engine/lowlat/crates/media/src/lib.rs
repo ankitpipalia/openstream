@@ -10,9 +10,12 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 pub mod clipboard;
 pub mod displays;
+pub mod frame_age;
 pub mod input;
+pub mod latency;
 pub mod metrics;
 pub mod microphone;
+pub mod probe;
 pub mod telemetry;
 
 use openstream_protocol::MAX_PLAINTEXT;
@@ -116,6 +119,75 @@ pub struct Fragment {
     pub presentation_time_us: u64,
     pub keyframe: bool,
     pub payload: Vec<u8>,
+}
+
+/// What one fragment did to the reassembly state.
+///
+/// `push` used to return `Result<Option<EncodedFrame>, Error>`, and that
+/// `None` meant four different things: the fragment was a duplicate, the
+/// frame is still incomplete, the frame completed but is held behind an
+/// older one, or the frame completed and was discarded as too late to be
+/// decodable in order. A caller could not tell them apart, and the `Some`
+/// case is no better -- the frame returned is the one that became
+/// *releasable*, which is frequently an older frame than the one this
+/// fragment just completed.
+///
+/// That cost the first instrumented rig run its reassembly measurement:
+/// timing keyed on `Some` stamped only the frames that happened to be
+/// immediately releasable, so every frame held in the reorder buffer --
+/// exactly the interesting population -- was silently absent from the span
+/// meant to expose reorder waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushOutcome {
+    /// The frame whose last missing fragment this was, if any.
+    ///
+    /// A different question from [`Self::ready`]. A frame is *complete* when
+    /// its final fragment arrives and *releasable* only once every older
+    /// frame has been released or given up on. The interval between the two
+    /// is reorder buffering.
+    pub completed: Option<u32>,
+    /// The frame released in presentation order by this push, if any. Often
+    /// an older frame than [`Self::completed`].
+    pub ready: Option<EncodedFrame>,
+    /// Frames the assembler gave up on during this push: incomplete ones
+    /// evicted to stay bounded, and completed ones discarded as too late to
+    /// decode in order. Nothing further will arrive for them, so a caller
+    /// tracking them can stop.
+    ///
+    /// Empty in the ordinary case, and an empty `Vec` does not allocate.
+    pub dropped: Vec<u32>,
+    /// What became of the fragment itself.
+    pub fragment: FragmentOutcome,
+}
+
+impl PushOutcome {
+    fn new(fragment: FragmentOutcome) -> Self {
+        Self {
+            completed: None,
+            ready: None,
+            dropped: Vec::new(),
+            fragment,
+        }
+    }
+
+    /// The released frame, discarding the lifecycle detail. For callers that
+    /// only decode and do not measure.
+    #[must_use]
+    pub fn into_ready(self) -> Option<EncodedFrame> {
+        self.ready
+    }
+}
+
+/// What became of one pushed fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentOutcome {
+    /// Stored; the frame is still missing at least one fragment.
+    AcceptedIncomplete,
+    /// Stored, and it was the last one missing.
+    Completed,
+    /// A retransmission of a fragment already held, or of a frame already
+    /// assembled. Nothing changed, and no frame began or advanced.
+    Duplicate,
 }
 
 /// A completed encoded frame.
@@ -459,8 +531,12 @@ impl Assembler {
         }
     }
 
-    /// Add one fragment. A complete frame is returned exactly once.
-    pub fn push(&mut self, fragment: Fragment) -> Result<Option<EncodedFrame>, Error> {
+    /// Add one fragment, reporting everything it changed.
+    ///
+    /// See [`PushOutcome`] for why the lifecycle is explicit rather than
+    /// collapsed into `Option<EncodedFrame>`. Callers that only decode can
+    /// use [`PushOutcome::into_ready`].
+    pub fn push(&mut self, fragment: Fragment) -> Result<PushOutcome, Error> {
         let count = usize::from(fragment.fragment_count);
         if count == 0 || usize::from(fragment.fragment_index) >= count {
             return Err(Error::FragmentIndexOutOfRange);
@@ -477,10 +553,11 @@ impl Assembler {
         // referring to the same logical frame. Retain a bounded completion
         // history so it cannot be emitted twice after the first assembly.
         if self.completed.contains(&fragment.frame_id) {
-            return Ok(None);
+            return Ok(PushOutcome::new(FragmentOutcome::Duplicate));
         }
+        let mut dropped = Vec::new();
         if !self.frames.contains_key(&fragment.frame_id) {
-            self.evict_if_needed();
+            self.evict_if_needed(&mut dropped);
             self.order = self.order.wrapping_add(1);
             self.frames.insert(
                 fragment.frame_id,
@@ -506,7 +583,9 @@ impl Assembler {
         }
         let slot = &mut frame.parts[usize::from(fragment.fragment_index)];
         if slot.is_some() {
-            return Ok(None);
+            let mut outcome = PushOutcome::new(FragmentOutcome::Duplicate);
+            outcome.dropped = dropped;
+            return Ok(outcome);
         }
         frame.bytes = frame.bytes.saturating_add(fragment.payload.len());
         if frame.bytes > self.max_frame_bytes {
@@ -515,7 +594,9 @@ impl Assembler {
         }
         *slot = Some(fragment.payload);
         if frame.parts.iter().any(Option::is_none) {
-            return Ok(None);
+            let mut outcome = PushOutcome::new(FragmentOutcome::AcceptedIncomplete);
+            outcome.dropped = dropped;
+            return Ok(outcome);
         }
         let frame = self
             .frames
@@ -540,16 +621,25 @@ impl Assembler {
         // not retain such late frames in the reorder map until its eviction
         // limit happens to run; a delayed attacker could otherwise keep the
         // queue occupied indefinitely.
+        let mut outcome = PushOutcome::new(FragmentOutcome::Completed);
+        outcome.completed = Some(fragment.frame_id);
         if self
             .next_ready
             .is_some_and(|next| sequence_before(fragment.frame_id, next))
         {
-            return Ok(None);
+            // Complete, and immediately given up on. Both facts are
+            // reported: its last fragment did arrive, and it will never be
+            // released.
+            dropped.push(fragment.frame_id);
+            outcome.dropped = dropped;
+            return Ok(outcome);
         }
         self.next_ready.get_or_insert(fragment.frame_id);
         self.ready.entry(fragment.frame_id).or_insert(encoded);
-        self.evict_ready_if_needed();
-        Ok(self.pop_ready())
+        self.evict_ready_if_needed(&mut dropped);
+        outcome.ready = self.pop_ready();
+        outcome.dropped = dropped;
+        Ok(outcome)
     }
 
     /// Pop the next frame in presentation order. If a bounded reorder window
@@ -631,7 +721,7 @@ impl Assembler {
         self.frames.len()
     }
 
-    fn evict_if_needed(&mut self) {
+    fn evict_if_needed(&mut self, dropped: &mut Vec<u32>) {
         while self.frames.len() >= self.max_inflight {
             let Some(oldest) = self
                 .frames
@@ -642,10 +732,11 @@ impl Assembler {
                 break;
             };
             self.frames.remove(&oldest);
+            dropped.push(oldest);
         }
     }
 
-    fn evict_ready_if_needed(&mut self) {
+    fn evict_ready_if_needed(&mut self, dropped: &mut Vec<u32>) {
         let limit = self.max_inflight.saturating_mul(4).max(2);
         while self.ready.len() > limit {
             let Some(expected) = self.next_ready else {
@@ -660,6 +751,7 @@ impl Assembler {
                 break;
             };
             self.ready.remove(&farthest);
+            dropped.push(farthest);
         }
     }
 }
@@ -917,7 +1009,8 @@ mod tests {
         for bytes in encoded.into_iter().rev() {
             complete = assembler
                 .push(Fragment::decode(&bytes).expect("decode"))
-                .expect("assemble");
+                .expect("assemble")
+                .into_ready();
         }
         let frame = complete.expect("complete frame");
         assert_eq!(frame.frame_id, 7);
@@ -932,12 +1025,21 @@ mod tests {
             fragment_frame(1, 0, false, &[0x11; MAX_FRAGMENT_BYTES + 1]).expect("fragment");
         let fragment = Fragment::decode(&encoded[0]).expect("decode");
         let mut assembler = Assembler::new(4096, 2);
-        assert_eq!(assembler.push(fragment.clone()).expect("first"), None);
-        assert_eq!(assembler.push(fragment).expect("duplicate"), None);
+        let first = assembler.push(fragment.clone()).expect("first");
+        assert_eq!(first.fragment, FragmentOutcome::AcceptedIncomplete);
+        assert_eq!(first.ready, None);
+        let duplicate = assembler.push(fragment).expect("duplicate");
+        assert_eq!(
+            duplicate.fragment,
+            FragmentOutcome::Duplicate,
+            "a retransmitted fragment must be reported as ignored, not as progress"
+        );
+        assert_eq!(duplicate.completed, None);
         assert_eq!(
             assembler
                 .push(Fragment::decode(&encoded[1]).expect("decode"))
                 .expect("complete")
+                .into_ready()
                 .expect("frame"),
             EncodedFrame {
                 frame_id: 1,
@@ -947,8 +1049,15 @@ mod tests {
             }
         );
         assert_eq!(assembler.inflight(), 0);
-        let duplicate = Fragment::decode(&encoded[0]).expect("decode duplicate");
-        assert_eq!(assembler.push(duplicate).expect("late duplicate"), None);
+        let late = Fragment::decode(&encoded[0]).expect("decode duplicate");
+        let outcome = assembler.push(late).expect("late duplicate");
+        assert_eq!(
+            outcome.fragment,
+            FragmentOutcome::Duplicate,
+            "a retransmission of an assembled frame must not look like a new frame"
+        );
+        assert_eq!(outcome.completed, None);
+        assert_eq!(outcome.ready, None);
     }
 
     #[test]
@@ -971,6 +1080,7 @@ mod tests {
             assembler
                 .push(Fragment::decode(&first[0]).expect("decode"))
                 .expect("assemble")
+                .ready
                 .is_some()
         );
         assert!(!assembler.take_keyframe_request());
@@ -996,12 +1106,109 @@ mod tests {
         assert!(!assembler.take_keyframe_request());
     }
 
+    /// A frame that completes while an older one is missing must still
+    /// report when it completed, and the wait before release must be
+    /// visible in the telemetry.
+    ///
+    /// This is the case the first instrumented rig run could not see.
+    /// Stamping completion only when `push` returned a frame timed the
+    /// immediately-releasable frames and silently omitted every held one --
+    /// so the span that exists to expose reorder waiting was measured on a
+    /// population selected to have none, and reported a 3 microsecond mean.
+    #[test]
+    fn a_frame_held_in_the_reorder_buffer_reports_its_own_completion() {
+        use crate::latency::{Client, ClientRecorder, ClientStage, Stamp};
+        use std::time::{Duration, Instant};
+
+        let base = Instant::now();
+        let at = |ms: u64| Stamp::<Client>::from_instant(base + Duration::from_millis(ms));
+        let single = |id: u32| {
+            let bytes = fragment_frame(id, u64::from(id), id == 10, b"payload").expect("fragment");
+            Fragment::decode(&bytes[0]).expect("decode")
+        };
+
+        let mut assembler = Assembler::new(4096, 2);
+        let mut stages = ClientRecorder::new(&ClientStage::ORDER);
+
+        // Frame 10 arrives and is released at once; the reorder point moves
+        // to 11.
+        let first = assembler.push(single(10)).expect("push 10");
+        stages.begin(10, at(0));
+        stages.mark(10, ClientStage::LastFragmentReceived, at(0));
+        assert_eq!(first.completed, Some(10));
+        assert_eq!(first.ready.as_ref().map(|frame| frame.frame_id), Some(10));
+        stages.mark(10, ClientStage::Reassembled, at(0));
+        stages.finish(10);
+
+        // Frame 12 completes while 11 is still missing. It is held: complete
+        // but not releasable.
+        let held = assembler.push(single(12)).expect("push 12");
+        stages.begin(12, at(5));
+        assert_eq!(held.completed, Some(12), "its last fragment did arrive");
+        assert_eq!(held.ready, None, "and it cannot be released yet");
+        assert_eq!(held.fragment, FragmentOutcome::Completed);
+        stages.mark(12, ClientStage::LastFragmentReceived, at(5));
+
+        // 11 arrives 40ms later and unblocks the queue.
+        let unblocking = assembler.push(single(11)).expect("push 11");
+        stages.begin(11, at(45));
+        assert_eq!(unblocking.completed, Some(11));
+        assert_eq!(
+            unblocking.ready.as_ref().map(|frame| frame.frame_id),
+            Some(11),
+            "the released frame is 11, not the 12 that completed first"
+        );
+        stages.mark(11, ClientStage::LastFragmentReceived, at(45));
+        stages.mark(11, ClientStage::Reassembled, at(45));
+        stages.finish(11);
+
+        let released = assembler.pop_ready().expect("12 releases behind 11");
+        assert_eq!(released.frame_id, 12);
+        stages.mark(12, ClientStage::Reassembled, at(45));
+        stages.finish(12);
+
+        // The measurement that used to be missing.
+        let span = stages
+            .span_histogram(ClientStage::LastFragmentReceived, ClientStage::Reassembled)
+            .expect("histogram exists");
+        assert_eq!(span.count(), 3, "every frame contributed a sample");
+        assert_eq!(
+            span.max_us(),
+            40_000,
+            "frame 12 waited 40ms in the reorder buffer and the span says so"
+        );
+    }
+
+    /// Frames the assembler gives up on are named, so a caller tracking them
+    /// can stop rather than leaving a timeline open forever.
+    #[test]
+    fn frames_the_assembler_abandons_are_reported() {
+        let mut assembler = Assembler::new(1024, 2);
+        let mut dropped = Vec::new();
+        for id in 0..3 {
+            let bytes = fragment_frame(id, 0, false, b"frame").expect("fragment");
+            let mut fragment = Fragment::decode(&bytes[0]).expect("decode");
+            fragment.fragment_count = 2;
+            let outcome = assembler.push(fragment).expect("store");
+            assert_eq!(outcome.fragment, FragmentOutcome::AcceptedIncomplete);
+            dropped.extend(outcome.dropped);
+        }
+        assert_eq!(assembler.inflight(), 2);
+        assert_eq!(
+            dropped,
+            vec![0],
+            "the evicted incomplete frame is named, not silently forgotten"
+        );
+    }
+
     #[test]
     fn oversized_frame_is_rejected_before_allocation() {
         let mut assembler = Assembler::new(MAX_FRAGMENT_BYTES, 1);
         let bytes = fragment_frame(1, 0, false, &[0_u8; MAX_FRAGMENT_BYTES + 1]).expect("fragment");
         assert_eq!(
-            assembler.push(Fragment::decode(&bytes[0]).expect("decode")),
+            assembler
+                .push(Fragment::decode(&bytes[0]).expect("decode"))
+                .map(PushOutcome::into_ready),
             Ok(None)
         );
         assert_eq!(

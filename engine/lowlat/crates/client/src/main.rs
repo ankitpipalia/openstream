@@ -190,8 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let mut ready_frames = Vec::new();
         match assembler.push(fragment) {
-            Ok(Some(frame)) => ready_frames.push(frame),
-            Ok(None) => {}
+            Ok(outcome) => ready_frames.extend(outcome.into_ready()),
             Err(error) => {
                 eprintln!("OpenStream dropped malformed video frame: {error}");
                 continue;
