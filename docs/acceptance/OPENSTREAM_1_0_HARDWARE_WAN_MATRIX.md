@@ -19,7 +19,7 @@ production-ready 1.0 while any required row remains unverified.
 
 | case | status | evidence | notes |
 | --- | --- | --- | --- |
-| linux-nvidia-to-apple-silicon | PARTIAL | 2026-09-15, see "Run of 2026-09-15" below | Video, keyboard, absolute pointer, audio, and clean disconnect all confirmed. Raw pointer capture has since been implemented for macOS and verified: a 1750 px sweep across a 1280 px window is delivered, where the clamped path stopped at the edge. One case still blocks the row: the macOS window cannot go borderless, because minifb 0.27 implements that option for Wayland, X11 and Windows but not for macOS, where it is silently dropped. Note the capture path was the xdg-desktop-portal PipeWire node, not X11: Xwayland is rootless, so x11grab on this host captures nothing |
+| linux-nvidia-to-apple-silicon | PASS | 2026-09-15, see "Run of 2026-09-15" below | Picture, keyboard, raw pointer, audio, fullscreen and a clean release on disconnect all observed in one session. Raw pointer capture and macOS fullscreen were implemented to close this row; keyboard delivery was fixed after the run found presses shorter than a frame being dropped. Capture is through the xdg-desktop-portal PipeWire node, not X11: Xwayland is rootless here, so x11grab sees nothing |
 | apple-silicon-videotoolbox-metal | PARTIAL | 2026-09-15, see "Run of 2026-09-15" below | Metal presentation confirmed, and the FFmpeg decode fallback with it. VideoToolbox decode is still not wired up, so the decoder half of this row is unproven |
 | input-release-watchdog | UNVERIFIED |  | focus loss, close, network loss, and permission revocation release every held key/button |
 | background-host-restart | UNVERIFIED |  | host agent survives UI exit and restarts without two children |
@@ -66,10 +66,21 @@ macOS screen itself (`screencapture`).
 | presentation | Metal presented 45.6 fps with a 2.2 ms mean present call, against 32.1 fps and 9.3 ms for the software path |
 | disconnect | Both ends ran their shutdown reporting to completion; no error path, no orphaned child |
 
-Not established by this run: VideoToolbox decode, borderless or exclusive
-fullscreen on macOS, and every WAN row other than `direct-udp`. Raw pointer
-capture was not part of this run but has since been implemented and verified
-separately, as noted in the physical row above.
+### Second session, after the fixes
+
+The run above exposed three gaps, each of which was fixed and then confirmed
+in a single further session that exercised everything at once:
+
+| capability | evidence |
+| --- | --- |
+| fullscreen | `run window=fullscreen requested from the platform`; the stream fills the display with no title bar and no menu bar |
+| raw pointer | `run pointer=raw device capture`; a 1620 px sweep delivered across a 1280 px window, which the clamped path could not have produced |
+| keyboard | 13 key codes at a 30 ms hold produced exactly `openstream ok`, with the editor's own column counter at 1:14. The same 30 ms hold delivered 3 of 13 before the fix |
+| audio | host test tone recovered from decoded PCM at 440 Hz |
+| disconnect | the session ended on its own and the client released pointer capture and keyboard while its window was still open; another application took focus normally |
+
+Still not established: VideoToolbox decode (the client decodes through FFmpeg
+and presents through Metal), and every WAN row other than `direct-udp`.
 
 ## Release policy
 
