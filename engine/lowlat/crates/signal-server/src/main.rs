@@ -1976,7 +1976,7 @@ fn connect_error_response(error: connect::ConnectError) -> Response {
         // yours" turns request ids into an existence oracle: a caller could
         // enumerate ids and learn which ones belong to somebody else.
         ConnectError::NotFound | ConnectError::Forbidden => StatusCode::NOT_FOUND,
-        ConnectError::InvalidState | ConnectError::AlreadyTaken => StatusCode::CONFLICT,
+        ConnectError::InvalidState => StatusCode::CONFLICT,
         ConnectError::TargetOffline | ConnectError::TargetNotConnectable => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -2182,23 +2182,19 @@ async fn connect_approve(
         // The session could not be published, so the approval must not stand:
         // leaving it would hand out credentials for a session that does not
         // exist, which the client cannot distinguish from a network fault.
-        let _ = state.connect.lock().await.take_host_credential(
-            &request_id,
-            &account_id,
-            &device_id,
-            now,
-        );
-        let _ = state.connect.lock().await.take_client_credential(
-            &request_id,
-            &account_id,
-            &approved.requester_device_id,
-            now,
-        );
+        state.connect.lock().await.withdraw(&request_id);
         return response;
     }
 
     let mut broker = state.connect.lock().await;
-    match broker.take_host_credential(&request_id, &account_id, &device_id, now) {
+    match broker.collect_host_credential(
+        &request_id,
+        connect::Party {
+            account_id: &account_id,
+            device_id: &device_id,
+        },
+        now,
+    ) {
         Ok((session_id, token)) => Json(ConnectCredential {
             websocket_path: format!("/v1/signal/{session_id}/host"),
             relay_ticket: relay_ticket::mint(&state.relay_secret, &session_id, "host", "host", 1),
@@ -2252,7 +2248,14 @@ async fn connect_observe(
     if observed != connect::ConnectState::Approved {
         return Json(ConnectObserved { state: observed }).into_response();
     }
-    match broker.take_client_credential(&request_id, &account_id, &device_id, now) {
+    match broker.collect_client_credential(
+        &request_id,
+        connect::Party {
+            account_id: &account_id,
+            device_id: &device_id,
+        },
+        now,
+    ) {
         Ok((session_id, token)) => Json(ConnectCredential {
             websocket_path: format!("/v1/signal/{session_id}/client"),
             relay_ticket: relay_ticket::mint(
@@ -7288,10 +7291,10 @@ mod tests {
         assert_eq!(session.client_token, client_capability);
     }
 
-    /// Neither end can take the other's capability, and neither can take its
-    /// own twice.
+    /// Neither end can take the other's capability, and a retry of one's own
+    /// is answered rather than refused.
     #[tokio::test]
-    async fn a_role_capability_cannot_be_taken_by_the_wrong_party_or_twice() {
+    async fn a_role_capability_reaches_only_its_party_and_survives_a_retry() {
         let app = connect_router(connect_test_state());
         let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
@@ -7340,8 +7343,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
-        // The client collects once...
-        let (status, _) = call(
+        // The client collects...
+        let (status, first) = call(
             &app,
             "GET",
             &format!("/v1/connect/{request_id}"),
@@ -7350,9 +7353,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        // ...and a second collection finds nothing, because a capability that
-        // can be fetched twice can be replayed from any log that saw one.
-        let (status, _) = call(
+
+        // ...and can collect again if it never received that answer. A
+        // dropped connection must not leave a good session with one end
+        // permanently unable to join it.
+        let (status, again) = call(
             &app,
             "GET",
             &format!("/v1/connect/{request_id}"),
@@ -7360,7 +7365,8 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first, again, "a retry gets the same credential");
     }
 
     /// An untrusted or unknown device is not connectable.

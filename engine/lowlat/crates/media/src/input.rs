@@ -954,10 +954,13 @@ impl MotionGate {
             return true;
         }
         match self.newest_absolute_us {
-            // Equal timestamps are admitted: two positions can share a
-            // microsecond, and refusing the second would drop a real move
-            // for a tie that says nothing about order.
-            Some(newest) if event.timestamp_us < newest => false,
+            // Strictly greater. An equal timestamp is not evidence of order:
+            // two positions produced in the same microsecond can arrive
+            // either way round, and admitting both made the rule depend on
+            // arrival rather than on the stamp. Refusing the tie costs at
+            // most one position per microsecond -- imperceptible -- and buys
+            // a verdict that is the same however the packets are reordered.
+            Some(newest) if event.timestamp_us <= newest => false,
             _ => {
                 self.newest_absolute_us = Some(event.timestamp_us);
                 true
@@ -1005,12 +1008,54 @@ mod motion_gate_tests {
         assert!(gate.admit(InputEvent::pointer_motion(true, 5, 5, 200)));
     }
 
-    /// Two positions in the same microsecond are both real.
+    /// A tie is not evidence of order, so the verdict does not depend on
+    /// which of the two arrived first.
+    ///
+    /// Admitting both made the outcome depend on arrival order, which is
+    /// exactly what an unreliable path does not preserve: the same two
+    /// packets could leave the pointer in either place.
     #[test]
-    fn an_equal_timestamp_is_admitted() {
-        let mut gate = MotionGate::default();
-        assert!(gate.admit(InputEvent::pointer_motion(false, 1, 1, 100)));
-        assert!(gate.admit(InputEvent::pointer_motion(false, 2, 2, 100)));
+    fn an_equal_timestamp_is_refused_so_the_rule_is_deterministic() {
+        let first = InputEvent::pointer_motion(false, 1, 1, 100);
+        let second = InputEvent::pointer_motion(false, 2, 2, 100);
+
+        let mut forwards = MotionGate::default();
+        assert!(forwards.admit(first));
+        assert!(!forwards.admit(second));
+
+        let mut backwards = MotionGate::default();
+        assert!(backwards.admit(second));
+        assert!(!backwards.admit(first));
+    }
+
+    /// The gate's verdict is independent of delivery order.
+    ///
+    /// Whatever order a set of positions arrives in, the pointer ends up at
+    /// the newest one: the gate admits a position only if it is strictly
+    /// newer than everything already admitted.
+    #[test]
+    fn the_final_admitted_position_is_the_newest_whatever_the_order() {
+        let stamps = [10_u64, 40, 20, 50, 30];
+        for rotation in 0..stamps.len() {
+            let mut gate = MotionGate::default();
+            let mut newest_admitted = None;
+            for offset in 0..stamps.len() {
+                let stamp = stamps[(rotation + offset) % stamps.len()];
+                let event = InputEvent::pointer_motion(false, 0, 0, stamp);
+                if gate.admit(event) {
+                    assert!(
+                        newest_admitted.is_none_or(|previous| stamp > previous),
+                        "admitted {stamp} after {newest_admitted:?}"
+                    );
+                    newest_admitted = Some(stamp);
+                }
+            }
+            assert_eq!(
+                newest_admitted,
+                Some(50),
+                "the newest position must always be the one left standing"
+            );
+        }
     }
 
     /// Nothing but motion is gated. A key release that arrives late is still

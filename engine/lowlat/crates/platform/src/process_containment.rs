@@ -27,6 +27,26 @@
 //! that difference visible rather than hiding it behind one API that would be
 //! a lie on one platform or the other.
 //!
+//! # The Windows ordering hazard
+//!
+//! On Windows the child is created first and assigned second, and between
+//! those two steps it is running. A session runner that reaches its first
+//! `CreateProcess` in that gap spawns FFmpeg *outside* the job, and that
+//! descendant is then not covered by anything -- so the leak this type exists
+//! to stop happens anyway, intermittently, under load.
+//!
+//! The child is therefore created suspended, assigned, and only then resumed.
+//! It cannot run at all, let alone spawn anything, until it is contained. If
+//! assignment fails the process is killed while still suspended, which is the
+//! only point at which "kill the runner" and "kill the tree" are the same
+//! thing.
+//!
+//! [`prepare_command`] applies whatever each platform needs to the
+//! `Command` before it is spawned, so callers need no platform branch of
+//! their own -- the Tauri shell that uses this cannot be compiled for Windows
+//! on a developer machine or in CI, and a `cfg` there would be verified
+//! nowhere.
+//!
 //! # What this does not do
 //!
 //! It does not decide policy: how long to wait, when to escalate, whether a
@@ -86,10 +106,21 @@ mod platform {
         group: i32,
     }
 
+    /// Put the child in its own process group at spawn.
+    pub fn prepare_command(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     impl Containment {
         /// Nothing to create before spawning on Unix.
         pub const fn prepare() -> Result<Option<Self>, ContainmentError> {
             Ok(None)
+        }
+
+        /// Nothing to resume: the child was never suspended.
+        pub const fn resume(&self) -> Result<(), ContainmentError> {
+            Ok(())
         }
 
         /// Name the group a spawned child leads.
@@ -150,6 +181,9 @@ mod platform {
     use super::ContainmentError;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -157,8 +191,21 @@ mod platform {
         QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        CREATE_SUSPENDED, OpenProcess, OpenThread, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        ResumeThread, THREAD_SUSPEND_RESUME,
     };
+
+    /// Create the child suspended, so it cannot spawn anything before it is
+    /// contained.
+    ///
+    /// Without this there is a window between `CreateProcess` and
+    /// `AssignProcessToJobObject` in which the runner is running: a
+    /// descendant started in that window does not join the job, and the leak
+    /// this module exists to stop happens anyway, intermittently.
+    pub fn prepare_command(command: &mut std::process::Command) {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_SUSPENDED);
+    }
 
     /// A Windows job object owning a session's process tree.
     ///
@@ -170,6 +217,9 @@ mod platform {
     #[derive(Debug)]
     pub struct Containment {
         job: OwnedHandle,
+        /// The process assigned into the job, recorded so [`Self::resume`]
+        /// knows whose thread to start.
+        contained_pid: Option<u32>,
     }
 
     impl Containment {
@@ -205,7 +255,10 @@ mod platform {
             if set == 0 {
                 return Err(ContainmentError::Os);
             }
-            Ok(Some(Self { job }))
+            Ok(Some(Self {
+                job,
+                contained_pid: None,
+            }))
         }
 
         /// Not how containment is obtained on Windows.
@@ -246,9 +299,67 @@ mod platform {
         /// uncontained session is exactly the leak this type exists to stop,
         /// and it would only be discovered when the next connect failed.
         pub fn bind(prepared: Option<Self>, pid: u32) -> Result<Self, ContainmentError> {
-            let job = prepared.ok_or(ContainmentError::Unusable)?;
+            let mut job = prepared.ok_or(ContainmentError::Unusable)?;
             job.adopt_process(pid)?;
+            job.contained_pid = Some(pid);
             Ok(job)
+        }
+
+        /// Let the contained child start running.
+        ///
+        /// Called only after assignment has succeeded. A freshly created
+        /// suspended process has exactly one thread, so this resumes the one
+        /// thread belonging to the job's process. Rust's `Child` does not
+        /// expose the initial thread handle, which is why the snapshot is
+        /// necessary rather than merely convenient.
+        pub fn resume(&self) -> Result<(), ContainmentError> {
+            let pid = self.contained_pid.ok_or(ContainmentError::Unusable)?;
+            // SAFETY: a thread snapshot over all processes; closed below.
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot.is_null() {
+                return Err(ContainmentError::Os);
+            }
+            // SAFETY: an all-zero entry is the documented starting state; the
+            // size field below is what the API validates.
+            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            let Ok(size) = u32::try_from(std::mem::size_of::<THREADENTRY32>()) else {
+                // SAFETY: closing the snapshot taken above.
+                unsafe { CloseHandle(snapshot) };
+                return Err(ContainmentError::Os);
+            };
+            entry.dwSize = size;
+            let mut resumed = false;
+            // SAFETY: `entry` is sized as the API requires and lives for the
+            // whole walk.
+            let mut more = unsafe { Thread32First(snapshot, &raw mut entry) };
+            while more != 0 {
+                if entry.th32OwnerProcessID == pid {
+                    // SAFETY: opening a thread of the process just created.
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if !thread.is_null() {
+                        // SAFETY: a valid handle with the right access,
+                        // closed immediately after.
+                        let previous = unsafe { ResumeThread(thread) };
+                        // SAFETY: closing the handle opened just above.
+                        unsafe { CloseHandle(thread) };
+                        if previous != u32::MAX {
+                            resumed = true;
+                        }
+                    }
+                }
+                // SAFETY: same invariants as `Thread32First`.
+                more = unsafe { Thread32Next(snapshot, &raw mut entry) };
+            }
+            // SAFETY: closing the snapshot taken above.
+            unsafe { CloseHandle(snapshot) };
+            if resumed {
+                Ok(())
+            } else {
+                // The child is still suspended and contained. The caller
+                // kills it rather than leaving a process that will never run.
+                Err(ContainmentError::Os)
+            }
         }
 
         /// Terminate every process in the job.
@@ -308,9 +419,15 @@ mod platform {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Containment;
 
+    /// Nothing this platform can do to a command before it is spawned.
+    pub fn prepare_command(_command: &mut std::process::Command) {}
+
     impl Containment {
         pub const fn prepare() -> Result<Option<Self>, ContainmentError> {
             Ok(None)
+        }
+        pub const fn resume(&self) -> Result<(), ContainmentError> {
+            Err(ContainmentError::Unusable)
         }
         pub const fn adopt(_pid: u32) -> Result<Self, ContainmentError> {
             Err(ContainmentError::Unusable)
@@ -328,7 +445,7 @@ mod platform {
     }
 }
 
-pub use platform::Containment;
+pub use platform::{Containment, prepare_command};
 
 #[cfg(test)]
 mod tests {

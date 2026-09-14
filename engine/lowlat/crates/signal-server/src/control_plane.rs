@@ -309,6 +309,14 @@ pub(crate) struct AccountStore {
 #[derive(Debug, Clone)]
 struct AccessTokenRecord {
     principal: AccountPrincipal,
+    /// The refresh family this access token was issued alongside.
+    ///
+    /// Without it, condemning a family has to fall back to revoking by
+    /// device, which is wrong in both directions: it takes down unrelated
+    /// families signed in on the same device, and it takes down nothing at
+    /// all for a sign-in that has no device. Revocation has to reach exactly
+    /// the credentials descended from the compromised sign-in.
+    family_id: String,
     expires_at_ms: u64,
 }
 
@@ -675,24 +683,24 @@ impl AccountStore {
     /// issued from being used for the rest of their lifetime, which is the
     /// window an attacker would otherwise still hold.
     fn revoke_refresh_family(&mut self, account_id: &str, family_id: &str) {
+        // By family, not by device. Revoking by device was wrong in both
+        // directions: it took down unrelated families signed in on the same
+        // device, and it took down nothing at all for a sign-in with no
+        // device, leaving the condemned family's access token live for the
+        // rest of its lifetime -- which is precisely the window an attacker
+        // holding it would use.
+        self.access_tokens.retain(|_, token| {
+            token.principal.account_id != account_id || token.family_id != family_id
+        });
         let Some(account) = self.accounts.get_mut(account_id) else {
             return;
         };
-        let condemned: Vec<Option<String>> = account
-            .refresh_tokens
-            .iter()
-            .filter(|record| record.family_id == family_id)
-            .map(|record| record.device_id.clone())
-            .collect();
         account
             .refresh_tokens
             .retain(|record| record.family_id != family_id);
         account
             .retired_refresh_tokens
             .retain(|retired| retired.family_id != family_id);
-        for device_id in condemned.into_iter().flatten() {
-            self.invalidate_device_tokens(account_id, &device_id);
-        }
     }
 
     /// Forget tombstones whose families can no longer be presented.
@@ -917,6 +925,7 @@ impl AccountStore {
                     account_id: account_id.to_string(),
                     device_id: device_id.clone(),
                 },
+                family_id: family.family_id.clone(),
                 expires_at_ms: access_expires_at,
             },
         );
@@ -1454,6 +1463,84 @@ mod tests {
         assert!(
             store.refresh(&other, now).is_ok(),
             "an unrelated sign-in must survive another family's compromise"
+        );
+        cleanup(&directory);
+    }
+
+    /// Two sign-ins on one device are two families, and condemning one must
+    /// not take the other down.
+    ///
+    /// Revocation used to fall back to "every credential on this device",
+    /// which signed the user out of a session that had nothing to do with the
+    /// compromise.
+    #[test]
+    fn a_replay_does_not_revoke_another_family_on_the_same_device() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let compromised = registered(&mut store, now);
+
+        // A second sign-in from the same device: same account, same device,
+        // different family.
+        let (salt, scheme) = store.password_challenge_scheme("operator");
+        let derived = derive_password_with(PASSWORD, &salt, scheme);
+        let innocent = store
+            .login_derived(
+                "operator",
+                salt,
+                derived,
+                Some(test_device("device-1", 0x11)),
+                now,
+            )
+            .expect("second sign-in on the same device");
+
+        store.refresh(&compromised, now).expect("rotate");
+        store
+            .refresh(&compromised, now)
+            .expect_err("replay is refused");
+
+        assert!(
+            store
+                .authorize_access(&innocent.access_token, now)
+                .is_some(),
+            "the other family's access token must survive"
+        );
+        assert!(
+            store.refresh(&innocent.refresh_token, now).is_ok(),
+            "the other family's refresh token must survive"
+        );
+        cleanup(&directory);
+    }
+
+    /// A sign-in with no device still has its access token revoked.
+    ///
+    /// Device-scoped revocation could not reach these at all, so the
+    /// condemned family's access token stayed live for its full lifetime --
+    /// exactly the window an attacker holding it would use.
+    #[test]
+    fn a_device_less_family_still_loses_its_access_token() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        registered(&mut store, now);
+
+        let (salt, scheme) = store.password_challenge_scheme("operator");
+        let derived = derive_password_with(PASSWORD, &salt, scheme);
+        let headless = store
+            .login_derived("operator", salt, derived, None, now)
+            .expect("sign-in with no device");
+        assert!(headless.device.is_none());
+
+        let rotated = store.refresh(&headless.refresh_token, now).expect("rotate");
+        assert!(
+            store.authorize_access(&rotated.access_token, now).is_some(),
+            "the access token works before the replay"
+        );
+
+        store
+            .refresh(&headless.refresh_token, now)
+            .expect_err("replay is refused");
+        assert!(
+            store.authorize_access(&rotated.access_token, now).is_none(),
+            "a device-less family's access token must be revoked too"
         );
         cleanup(&directory);
     }

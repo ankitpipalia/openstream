@@ -7,7 +7,7 @@
 //! input never cross Tauri IPC.
 
 use openstream_client_core::load_pairing_from_file;
-use openstream_platform::process_containment::Containment;
+use openstream_platform::process_containment::{self, Containment};
 use openstream_settings::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -318,17 +318,16 @@ impl SessionSupervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // Keep FFmpeg and any helper it creates in a session-owned
-            // process group. The supervisor can therefore release capture,
-            // decoder and audio resources together on disconnect.
-            command.as_std_mut().process_group(0);
-        }
-        // Windows needs the container to exist before the child does, because
-        // a process cannot join a job object by itself. Unix returns nothing
-        // here: the child made its own group above.
+        // Whatever this platform needs before the child exists: a new process
+        // group on Unix, a suspended start on Windows so the runner cannot
+        // spawn FFmpeg before it has been put in its job.
+        //
+        // No `cfg` here on purpose. This shell is built for Windows nowhere --
+        // not on a developer machine, not in CI -- so a platform branch
+        // written here would be verified by nothing. It lives in
+        // `openstream-platform`, which the target matrix compiles for both
+        // Windows targets.
+        process_containment::prepare_command(command.as_std_mut());
         let prepared = Containment::prepare().map_err(|_| SessionError::SpawnFailed)?;
         // Remove a status left by a previous runner before spawning the new
         // one. Removing it after spawn creates a race in which a fast runner
@@ -345,18 +344,35 @@ impl SessionSupervisor {
         // whichever of "assign into the job" or "name the group" applies.
         // Putting that difference in the caller is how one platform ends up
         // uncontained without anybody noticing.
-        self.cleanup = child
+        // Contain, then start. On Windows the child is suspended until this
+        // succeeds, so it cannot spawn anything outside its job; on Unix it
+        // is already in its own group and `resume` is a no-op.
+        //
+        // An uncontained session is the leak this exists to stop and would
+        // only be discovered when the next connect failed, so a failure here
+        // kills the child rather than running it loose. While it is still
+        // suspended, killing the runner and killing the tree are the same
+        // thing.
+        let contained = child
             .id()
-            .and_then(|pid| Containment::bind(prepared, pid).ok())
-            .map(|containment| CleanupTarget::Contained(std::sync::Arc::new(containment)));
-        if self.cleanup.is_none() {
-            // An uncontained session is the leak this exists to stop, and it
-            // would only be discovered when the next connect failed. Refuse
-            // to start one.
-            let mut child = child;
-            let _ = child.kill().await;
-            return Err(SessionError::SpawnFailed);
-        }
+            .ok_or(SessionError::SpawnFailed)
+            .and_then(|pid| Containment::bind(prepared, pid).map_err(|_| SessionError::SpawnFailed))
+            .and_then(|containment| {
+                containment
+                    .resume()
+                    .map(|()| containment)
+                    .map_err(|_| SessionError::SpawnFailed)
+            });
+        let containment = match contained {
+            Ok(containment) => containment,
+            Err(error) => {
+                let mut child = child;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(error);
+            }
+        };
+        self.cleanup = Some(CleanupTarget::Contained(std::sync::Arc::new(containment)));
         self.child = Some(child);
         self.device_id = Some(device_id.into());
         self.session_id = Some(pairing.session_id);

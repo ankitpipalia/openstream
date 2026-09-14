@@ -13,28 +13,46 @@
 //! The flow this implements instead:
 //!
 //! ```text
-//! host device signs in ──► announces presence ──► polls for requests
+//! host device signs in --> announces presence --> polls for requests
 //!
-//! client signs in ──► lists devices ──► POST /v1/connect { target_device_id }
-//!                                              │
-//!                                     pending request
-//!                                              │
+//! client signs in --> lists devices --> POST /v1/connect {target_device_id}
+//!                                              |
+//!                                       pending request
+//!                                              |
 //!                                     host approves or denies
-//!                                              │
-//!                          ┌───────────────────┴───────────────────┐
-//!                    host credential                        client credential
-//!                    (target device only)                   (requester only)
+//!                                              |
+//!                         +--------------------+--------------------+
+//!                   host credential                          client credential
+//!                   (target device only)                     (requester only)
 //! ```
 //!
 //! # The property that matters
 //!
-//! Each role capability is delivered to exactly one party, once. The host
-//! credential is readable only by the device that approved the request, the
-//! client credential only by the device that made it, and each is handed over
-//! a single time. A capability that both ends can read is not an
-//! authorisation boundary, it is a shared secret with extra steps -- and a
-//! capability that can be fetched repeatedly turns any log, proxy or crash
-//! dump that captured one response into a replay.
+//! Each role capability is readable by exactly one party. The host credential
+//! only by the device that approved the request, the client credential only
+//! by the device that made it. A capability that both ends can read is not an
+//! authorisation boundary; it is a shared secret with extra steps, which is
+//! what handing one caller both tokens amounted to.
+//!
+//! # Why retrieval is idempotent rather than once-only
+//!
+//! An earlier version deleted the credential as it was handed over, on the
+//! theory that a single delivery limits replay. It does not: the value is a
+//! bearer token, and anyone who captured the response already holds it
+//! whether or not the server kept a copy. Deleting the server's copy prevents
+//! nothing an attacker would do.
+//!
+//! What it does prevent is recovery. HTTP responses are lost -- a dropped
+//! connection, a timed-out proxy, a client that crashed between receiving and
+//! storing -- and under once-only delivery the retry returns a conflict, so a
+//! perfectly good session exists that one of its two ends can never join. The
+//! failure is silent, looks like a broker bug, and is unrecoverable without
+//! starting over.
+//!
+//! So the same authenticated device may collect its own credential as many
+//! times as it needs, and the whole request expires on [`APPROVAL_TTL`]
+//! instead. The bound on exposure is the clock and the device check, which
+//! are the two things that actually hold.
 //!
 //! # What this deliberately does not do
 //!
@@ -138,8 +156,6 @@ pub(crate) enum ConnectError {
     Forbidden,
     /// The request is not in a state where this makes sense.
     InvalidState,
-    /// This credential has already been delivered.
-    AlreadyTaken,
     /// The target device is not online.
     TargetOffline,
     /// The target is not a device this account may connect to.
@@ -160,6 +176,8 @@ pub(crate) struct ConnectRequest {
     pub expires_at: Instant,
     /// Set on approval. The session these credentials belong to.
     pub session_id: Option<String>,
+    /// Retained until the request expires, so a lost response can be
+    /// retried. See the module documentation.
     host_credential: Option<String>,
     client_credential: Option<String>,
 }
@@ -168,17 +186,6 @@ impl ConnectRequest {
     /// Whether this request has outlived its deadline.
     fn is_expired(&self, now: Instant) -> bool {
         now >= self.expires_at
-    }
-
-    /// Whether anything still needs to be delivered from this request.
-    ///
-    /// An approved request whose credentials have both been taken is
-    /// finished, and keeping it only lengthens the window in which a leaked
-    /// request id means something.
-    fn is_drained(&self) -> bool {
-        self.state == ConnectState::Approved
-            && self.host_credential.is_none()
-            && self.client_credential.is_none()
     }
 }
 
@@ -394,12 +401,15 @@ impl ConnectBroker {
         Ok(())
     }
 
-    /// Take the host credential, once, as the device that approved.
-    pub(crate) fn take_host_credential(
+    /// Collect the host credential, as the device that approved.
+    ///
+    /// Idempotent: the same device may ask again if it never received the
+    /// answer. See the module documentation for why that is safer than
+    /// once-only delivery rather than less safe.
+    pub(crate) fn collect_host_credential(
         &mut self,
         request_id: &str,
-        account_id: &str,
-        target_device_id: &str,
+        answered_by: Party<'_>,
         now: Instant,
     ) -> Result<(String, String), ConnectError> {
         self.expire(now);
@@ -407,7 +417,9 @@ impl ConnectBroker {
             .requests
             .get_mut(request_id)
             .ok_or(ConnectError::NotFound)?;
-        if request.account_id != account_id || request.target_device_id != target_device_id {
+        if request.account_id != answered_by.account_id
+            || request.target_device_id != answered_by.device_id
+        {
             return Err(ConnectError::Forbidden);
         }
         if request.state != ConnectState::Approved {
@@ -419,21 +431,18 @@ impl ConnectBroker {
             .ok_or(ConnectError::InvalidState)?;
         let credential = request
             .host_credential
-            .take()
-            .ok_or(ConnectError::AlreadyTaken)?;
-        let drained = request.is_drained();
-        if drained {
-            self.requests.remove(request_id);
-        }
+            .clone()
+            .ok_or(ConnectError::InvalidState)?;
         Ok((session_id, credential))
     }
 
-    /// Take the client credential, once, as the device that asked.
-    pub(crate) fn take_client_credential(
+    /// Collect the client credential, as the device that asked.
+    ///
+    /// Idempotent, for the same reason.
+    pub(crate) fn collect_client_credential(
         &mut self,
         request_id: &str,
-        account_id: &str,
-        requester_device_id: &str,
+        asked_by: Party<'_>,
         now: Instant,
     ) -> Result<(String, String), ConnectError> {
         self.expire(now);
@@ -441,7 +450,9 @@ impl ConnectBroker {
             .requests
             .get_mut(request_id)
             .ok_or(ConnectError::NotFound)?;
-        if request.account_id != account_id || request.requester_device_id != requester_device_id {
+        if request.account_id != asked_by.account_id
+            || request.requester_device_id != asked_by.device_id
+        {
             return Err(ConnectError::Forbidden);
         }
         if request.state != ConnectState::Approved {
@@ -453,13 +464,17 @@ impl ConnectBroker {
             .ok_or(ConnectError::InvalidState)?;
         let credential = request
             .client_credential
-            .take()
-            .ok_or(ConnectError::AlreadyTaken)?;
-        let drained = request.is_drained();
-        if drained {
-            self.requests.remove(request_id);
-        }
+            .clone()
+            .ok_or(ConnectError::InvalidState)?;
         Ok((session_id, credential))
+    }
+
+    /// Withdraw an approval whose session could not be published.
+    ///
+    /// Leaving it would hand out credentials for a session that does not
+    /// exist, which a client cannot tell apart from a network fault.
+    pub(crate) fn withdraw(&mut self, request_id: &str) {
+        self.requests.remove(request_id);
     }
 
     /// What the requester is allowed to know about its own request.
@@ -495,11 +510,6 @@ impl ConnectBroker {
         self.requests.retain(|_, request| !request.is_expired(now));
         self.presence
             .retain(|_, entry| now.saturating_duration_since(entry.last_seen) < PRESENCE_TTL);
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.requests.len()
     }
 }
 
@@ -556,64 +566,140 @@ mod tests {
 
         // The requester cannot take the host's capability...
         assert_eq!(
-            broker.take_host_credential("request-1", ACCOUNT, CLIENT, now),
+            broker.collect_host_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: CLIENT
+                },
+                now,
+            ),
             Err(ConnectError::Forbidden)
         );
         // ...and the host cannot take the requester's.
         assert_eq!(
-            broker.take_client_credential("request-1", ACCOUNT, HOST, now),
+            broker.collect_client_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: HOST
+                },
+                now,
+            ),
             Err(ConnectError::Forbidden)
         );
 
         let (session, host_credential) = broker
-            .take_host_credential("request-1", ACCOUNT, HOST, now)
+            .collect_host_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: HOST,
+                },
+                now,
+            )
             .expect("the approving device takes the host credential");
         assert_eq!(session, "session-1");
         assert_eq!(host_credential, "HOST-CREDENTIAL");
 
         let (session, client_credential) = broker
-            .take_client_credential("request-1", ACCOUNT, CLIENT, now)
+            .collect_client_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: CLIENT,
+                },
+                now,
+            )
             .expect("the requesting device takes the client credential");
         assert_eq!(session, "session-1");
         assert_eq!(client_credential, "CLIENT-CREDENTIAL");
     }
 
-    /// A credential is delivered once.
+    /// A device that never received its answer can ask again.
     ///
-    /// Repeatable delivery turns any log, proxy or crash dump that captured
-    /// one response into a replay.
+    /// Deleting the credential on delivery prevented nothing -- the value is
+    /// a bearer token, and anyone who captured the response already holds it
+    /// whether or not the server kept a copy. What it did prevent was
+    /// recovery: a dropped connection or a timed-out proxy left a perfectly
+    /// good session that one of its two ends could never join, silently and
+    /// unrecoverably.
     #[test]
-    fn a_credential_cannot_be_taken_twice() {
+    fn a_lost_response_can_be_retried_by_the_same_device() {
         let now = Instant::now();
         let mut broker = pending(now);
         approve(&mut broker, now);
 
-        broker
-            .take_host_credential("request-1", ACCOUNT, HOST, now)
-            .expect("first take");
+        let host = Party {
+            account_id: ACCOUNT,
+            device_id: HOST,
+        };
+        let first = broker
+            .collect_host_credential("request-1", host, now)
+            .expect("first collection");
+        // The response never arrived. The device asks again.
+        let retry = broker
+            .collect_host_credential("request-1", host, now)
+            .expect("a retry must not be refused");
+        assert_eq!(first, retry, "and must get the same session and credential");
+
+        let client = Party {
+            account_id: ACCOUNT,
+            device_id: CLIENT,
+        };
+        let first = broker
+            .collect_client_credential("request-1", client, now)
+            .expect("first collection");
+        let retry = broker
+            .collect_client_credential("request-1", client, now)
+            .expect("a retry must not be refused");
+        assert_eq!(first, retry);
+    }
+
+    /// Retries do not extend the window. The clock is what bounds exposure.
+    #[test]
+    fn retrying_does_not_keep_a_request_alive() {
+        let now = Instant::now();
+        let mut broker = pending(now);
+        approve(&mut broker, now);
+        let host = Party {
+            account_id: ACCOUNT,
+            device_id: HOST,
+        };
+
+        let mut at = now;
+        for _ in 0..5 {
+            at += APPROVAL_TTL / 10;
+            broker
+                .collect_host_credential("request-1", host, at)
+                .expect("still inside the window");
+        }
+        let past = now + APPROVAL_TTL + Duration::from_secs(1);
         assert_eq!(
-            broker.take_host_credential("request-1", ACCOUNT, HOST, now),
-            Err(ConnectError::AlreadyTaken),
-            "a capability that can be fetched twice can be replayed"
+            broker.collect_host_credential("request-1", host, past),
+            Err(ConnectError::NotFound),
+            "collection must not refresh the approval deadline"
         );
     }
 
-    /// A drained request stops existing.
+    /// An approval whose session could not be published is withdrawn.
     #[test]
-    fn a_fully_delivered_request_is_forgotten() {
+    fn a_withdrawn_approval_hands_out_nothing() {
         let now = Instant::now();
         let mut broker = pending(now);
         approve(&mut broker, now);
-        broker
-            .take_host_credential("request-1", ACCOUNT, HOST, now)
-            .expect("host take");
-        broker
-            .take_client_credential("request-1", ACCOUNT, CLIENT, now)
-            .expect("client take");
-        assert_eq!(broker.len(), 0, "nothing is left to leak or replay");
+        broker.withdraw("request-1");
         assert_eq!(
-            broker.observe("request-1", ACCOUNT, CLIENT, now),
-            Err(ConnectError::NotFound)
+            broker.collect_host_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: HOST
+                },
+                now
+            ),
+            Err(ConnectError::NotFound),
+            "a credential for a session that does not exist is worse than none"
         );
     }
 
@@ -692,7 +778,14 @@ mod tests {
         );
         let past = now + APPROVAL_TTL + Duration::from_secs(1);
         assert_eq!(
-            broker.take_host_credential("request-1", ACCOUNT, HOST, past),
+            broker.collect_host_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: HOST
+                },
+                past
+            ),
             Err(ConnectError::NotFound),
             "an uncollected credential must not wait indefinitely"
         );
@@ -710,7 +803,14 @@ mod tests {
             "a refusal the asker never sees reads as the host being broken"
         );
         assert_eq!(
-            broker.take_client_credential("request-1", ACCOUNT, CLIENT, now),
+            broker.collect_client_credential(
+                "request-1",
+                Party {
+                    account_id: ACCOUNT,
+                    device_id: CLIENT
+                },
+                now
+            ),
             Err(ConnectError::InvalidState),
             "a denied request has no credentials to hand out"
         );

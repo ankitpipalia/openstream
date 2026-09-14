@@ -20,6 +20,9 @@ windows-sys = { version = "0.59", features = [
     # `CreateJobObjectW` takes a `SECURITY_ATTRIBUTES` pointer, so its binding
     # is gated on this even though a null is passed for it.
     "Win32_Security",
+    # A suspended child's initial thread has to be found to resume it; Rust's
+    # `Child` does not expose the thread handle.
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
