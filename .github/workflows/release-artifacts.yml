@@ -25,6 +25,10 @@ on:
 
 permissions:
   contents: read
+  # Provenance attestation is signed with a short-lived OIDC identity issued
+  # to this workflow run; nothing long-lived is stored to produce it.
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -183,6 +187,20 @@ jobs:
           OPENSTREAM_MACOS_PACKAGE: inputs/macos/OpenStream-macOS-arm64.dmg
           OPENSTREAM_MACOS_APP_ARCHIVE: inputs/macos/OpenStream-macOS-arm64.zip
         run: scripts/build-release-artifacts.sh --force
+
+      - name: Attest what built these artifacts
+        # Records, against each artifact's digest, which workflow and which
+        # commit produced it. This is the provenance half of supply-chain
+        # evidence and is independent of signing: it says where a file came
+        # from, not who vouches for it, so it is obtainable without any
+        # signing identity. Verify with:
+        #   gh attestation verify <file> --repo <owner>/<repo>
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/openstream-1.0.0/linux-x86_64/OpenStream-Linux-x86_64.tar.gz
+            dist/openstream-1.0.0/macos-aarch64/OpenStream-macOS-arm64.dmg
+            dist/openstream-1.0.0/macos-aarch64/OpenStream-macOS-arm64.zip
 
       - name: Report remaining gates
         run: |
