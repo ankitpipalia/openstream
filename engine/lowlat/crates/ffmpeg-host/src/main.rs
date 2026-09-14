@@ -1618,13 +1618,21 @@ fn capture_arguments(
 
 fn spawn_audio_ffmpeg() -> Result<Child, Box<dyn std::error::Error>> {
     let executable = env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| DEFAULT_FFMPEG.into());
-    let args = env::var("OPENSTREAM_AUDIO_FFMPEG_ARGS").or_else(|_| {
-        if env::var("OPENSTREAM_AUDIO_TEST").as_deref() == Ok("1") {
-            Ok("-f lavfi -i sine=frequency=440:sample_rate=48000".to_string())
-        } else {
-            Err(std::env::VarError::NotPresent)
+    // Audio is negotiated with the client before this runs, so a bare
+    // VarError here ended the whole session with the single word
+    // "NotPresent" -- no mention of audio, and no mention of what was
+    // missing. Name the setting instead; the operator has to know which
+    // one to provide.
+    let args = match env::var("OPENSTREAM_AUDIO_FFMPEG_ARGS") {
+        Ok(args) => args,
+        Err(_) if env::var("OPENSTREAM_AUDIO_TEST").as_deref() == Ok("1") => {
+            "-f lavfi -i sine=frequency=440:sample_rate=48000".to_string()
         }
-    })?;
+        Err(_) => {
+            return Err("audio was requested but no audio source is configured: set OPENSTREAM_AUDIO_FFMPEG_ARGS to an FFmpeg input, or OPENSTREAM_AUDIO_TEST=1 for a test tone"
+                .into());
+        }
+    };
     let mut command = Command::new(executable);
     command.args(["-hide_banner", "-loglevel", "error"]);
     // Audio must share the live wall clock with video. Without `-re`, lavfi
