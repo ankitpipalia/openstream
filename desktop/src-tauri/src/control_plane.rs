@@ -123,6 +123,64 @@ struct RefreshRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct ConnectRequestBody<'a> {
+    target_device_id: &'a str,
+}
+
+/// What the service says about a request this device just made.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ConnectRequested {
+    pub request_id: String,
+    pub state: ConnectState,
+    pub expires_in_seconds: u64,
+}
+
+/// A request this device is being asked to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PendingConnectRequest {
+    pub request_id: String,
+    pub requester_device_id: String,
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectState {
+    Pending,
+    Approved,
+    Denied,
+    Expired,
+}
+
+/// One end of an approved session: a session and exactly one role token.
+///
+/// There is deliberately no shape here carrying both roles. The service will
+/// not return both to one caller, and a type that could hold them would be
+/// the first step towards asking it to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ConnectCredential {
+    pub session_id: String,
+    pub role: String,
+    pub token: String,
+    pub websocket_path: String,
+    #[serde(default)]
+    pub relay_address: Option<String>,
+    pub relay_ticket: String,
+}
+
+/// Either a request that is still waiting, or the capability it produced.
+///
+/// Untagged because the service answers the same URL with one or the other:
+/// a pending request has no credential to report, and an approved one has
+/// nothing else worth saying.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ConnectObservation {
+    Granted(Box<ConnectCredential>),
+    Waiting { state: ConnectState },
+}
+
+#[derive(Debug, Serialize)]
 struct TrustRequest {
     trust: DeviceTrust,
 }
@@ -288,6 +346,138 @@ impl ControlPlaneClient {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Secure Connect
+    // -----------------------------------------------------------------
+
+    /// Tell the service this device is online and able to host.
+    ///
+    /// A heartbeat, not a registration: presence lapses on its own, so a
+    /// machine that is switched off stops being offered rather than lingering
+    /// in its owner's device list as connectable.
+    pub async fn announce_presence(&mut self) -> Result<(), ControlPlaneError> {
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(self.http.post(self.endpoint("/v1/presence")?))?
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        expect_no_content(response)
+    }
+
+    /// Stop being offered as a host.
+    pub async fn withdraw_presence(&mut self) -> Result<(), ControlPlaneError> {
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(self.http.delete(self.endpoint("/v1/presence")?))?
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        expect_no_content(response)
+    }
+
+    /// Ask one of this account's devices for a session.
+    pub async fn request_connect(
+        &mut self,
+        target_device_id: &str,
+    ) -> Result<ConnectRequested, ControlPlaneError> {
+        if target_device_id.is_empty() || target_device_id.len() > 128 {
+            return Err(ControlPlaneError::InvalidInput);
+        }
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(self.http.post(self.endpoint("/v1/connect")?))?
+            .json(&ConnectRequestBody { target_device_id })
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        parse_response(response).await
+    }
+
+    /// Requests this device is being asked to approve.
+    pub async fn pending_connect_requests(
+        &mut self,
+    ) -> Result<Vec<PendingConnectRequest>, ControlPlaneError> {
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(self.http.get(self.endpoint("/v1/connect/pending")?))?
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        parse_response(response).await
+    }
+
+    /// Approve a request and receive the host capability.
+    ///
+    /// Safe to repeat. The service treats a second identical approval as the
+    /// retry it is and returns the same credential, because approving is the
+    /// only way a host receives one and a lost response would otherwise
+    /// strand it outside its own session.
+    pub async fn approve_connect(
+        &mut self,
+        request_id: &str,
+    ) -> Result<ConnectCredential, ControlPlaneError> {
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(
+                self.http
+                    .post(self.connect_endpoint(request_id, "approve")?),
+            )?
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        parse_response(response).await
+    }
+
+    /// Refuse a request.
+    pub async fn deny_connect(&mut self, request_id: &str) -> Result<(), ControlPlaneError> {
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(self.http.post(self.connect_endpoint(request_id, "deny")?))?
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        expect_no_content(response)
+    }
+
+    /// Poll a request this device made, collecting the client capability once
+    /// it has been approved.
+    ///
+    /// Also safe to repeat, for the same reason.
+    pub async fn observe_connect(
+        &mut self,
+        request_id: &str,
+    ) -> Result<ConnectObservation, ControlPlaneError> {
+        self.refresh_if_needed().await?;
+        let response = self
+            .authenticated_request(self.http.get(self.connect_endpoint(request_id, "")?))?
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        parse_response(response).await
+    }
+
+    fn connect_endpoint(
+        &self,
+        request_id: &str,
+        action: &str,
+    ) -> Result<reqwest::Url, ControlPlaneError> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(ControlPlaneError::InvalidInput);
+        }
+        let mut url = self.endpoint("/v1/connect")?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| ControlPlaneError::InvalidOrigin)?;
+            segments.push(request_id);
+            if !action.is_empty() {
+                segments.push(action);
+            }
+        }
+        Ok(url)
+    }
+
     pub fn clear_credentials(&mut self) {
         self.access_token = None;
         self.refresh_token = None;
@@ -351,25 +541,43 @@ impl ControlPlaneClient {
     }
 }
 
+/// Accept a success that carries no body.
+///
+/// Separate from [`parse_response`] because a 204 has nothing to deserialise
+/// and feeding an empty body to a JSON parser reports a transport fault for
+/// a call that in fact succeeded.
+fn expect_no_content(response: reqwest::Response) -> Result<(), ControlPlaneError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(status_error(status))
+}
+
 async fn parse_response<T: DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, ControlPlaneError> {
     let status = response.status();
     if !status.is_success() {
-        return Err(match status.as_u16() {
-            401 => ControlPlaneError::Unauthorized,
-            403 => ControlPlaneError::Forbidden,
-            404 => ControlPlaneError::NotFound,
-            409 => ControlPlaneError::Conflict,
-            429 => ControlPlaneError::RateLimited,
-            500..=599 => ControlPlaneError::ServerUnavailable,
-            _ => ControlPlaneError::InvalidResponse,
-        });
+        return Err(status_error(status));
     }
     response
         .json::<T>()
         .await
         .map_err(|_| ControlPlaneError::InvalidResponse)
+}
+
+/// One mapping from HTTP status to a typed error, shared by every call.
+fn status_error(status: reqwest::StatusCode) -> ControlPlaneError {
+    match status.as_u16() {
+        401 => ControlPlaneError::Unauthorized,
+        403 => ControlPlaneError::Forbidden,
+        404 => ControlPlaneError::NotFound,
+        409 => ControlPlaneError::Conflict,
+        429 => ControlPlaneError::RateLimited,
+        500..=599 => ControlPlaneError::ServerUnavailable,
+        _ => ControlPlaneError::InvalidResponse,
+    }
 }
 
 /// Accept only a loopback plaintext origin or an HTTPS one.

@@ -6,7 +6,7 @@
 //! small secret-free status file written by the runner. Video, audio and
 //! input never cross Tauri IPC.
 
-use openstream_client_core::load_pairing_from_file;
+use openstream_client_core::{load_pairing_from_file, Pairing, Role, RoleCredential};
 use openstream_platform::process_containment::{self, Containment};
 use openstream_settings::AppConfig;
 use serde::{Deserialize, Serialize};
@@ -153,6 +153,18 @@ pub struct SessionSupervisor {
     session_id: Option<String>,
     generation: Option<u64>,
     status_file: PathBuf,
+    /// Where a broker credential is written for the runner to read.
+    ///
+    /// Inside the supervisor's private runtime directory, which is already
+    /// 0700 and owner-checked, so the capability never sits anywhere another
+    /// user could reach it.
+    credential_file: PathBuf,
+    /// Whether this supervisor wrote the pairing file it handed the runner,
+    /// and must therefore remove it when the session ends.
+    ///
+    /// A developer pairing file belongs to whoever launched the shell and
+    /// must survive; a broker credential is this supervisor's to clean up.
+    owns_pairing_file: bool,
     state: SessionProcessState,
     /// What to settle to once cleanup completes, when the runner exited by
     /// itself rather than being asked to stop. Retained across retries so a
@@ -176,6 +188,8 @@ impl SessionSupervisor {
             session_id: None,
             generation: None,
             status_file: runtime_dir.join("session-status.json"),
+            credential_file: runtime_dir.join("session-credential.json"),
+            owns_pairing_file: false,
             state: SessionProcessState::Idle,
             exit_state: SessionProcessState::Idle,
             last_exit_code: None,
@@ -206,6 +220,69 @@ impl SessionSupervisor {
         validate_pairing_path(&pairing_path)?;
         let pairing =
             load_pairing_from_file(&pairing_path).map_err(|_| SessionError::PairingInsecure)?;
+        self.launch(
+            settings,
+            device_id,
+            &pairing_path,
+            pairing.session_id,
+            false,
+        )
+        .await
+    }
+
+    /// Start a session from a capability the Connect broker granted.
+    ///
+    /// This is the product path. The credential names one role and carries
+    /// one token, so the file written here cannot be used to act as the host
+    /// of its own session -- which the environment pairing file, carrying
+    /// both, always could.
+    pub async fn connect_with_credential(
+        &mut self,
+        settings: &AppConfig,
+        device_id: impl Into<String>,
+        credential: RoleCredential,
+    ) -> Result<SessionHealth, SessionError> {
+        self.poll().await?;
+        if self.child.is_some() {
+            return Err(SessionError::AlreadyActive);
+        }
+        if self.cleanup.is_some() {
+            return Err(SessionError::CleanupPending);
+        }
+        let pairing = Pairing::from_role_credential(credential);
+        // This supervisor runs the client end. A host credential here would
+        // be a routing mistake somewhere above, and starting the client
+        // runner with it would fail later and less legibly.
+        if !pairing.can_act_as(Role::Client) {
+            return Err(SessionError::PairingInsecure);
+        }
+        let session_id = pairing.session_id.clone();
+        let path = self.credential_file.clone();
+        write_private_json(&path, &pairing)?;
+        let started = self
+            .launch(settings, device_id, &path, session_id, true)
+            .await;
+        if started.is_err() {
+            // Nothing is going to read it now, and a capability left on disk
+            // after a failed start is a capability nobody is watching.
+            let _ = std::fs::remove_file(&path);
+        }
+        started
+    }
+
+    /// Spawn the runner against a pairing file that is already on disk.
+    ///
+    /// Shared by the developer path, which is handed a file by its launcher,
+    /// and the product path, which writes one from a broker credential. The
+    /// two differ only in who owns the file afterwards.
+    async fn launch(
+        &mut self,
+        settings: &AppConfig,
+        device_id: impl Into<String>,
+        pairing_path: &Path,
+        session_id: String,
+        owns_pairing_file: bool,
+    ) -> Result<SessionHealth, SessionError> {
         let runner = env::var_os("OPENSTREAM_SESSION_RUNNER")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("openstream-desktop-client"));
@@ -222,7 +299,7 @@ impl SessionSupervisor {
         command
             .env_remove("OPENSTREAM_PAIRING_JSON")
             .env_remove("OPENSTREAM_IDENTITY_KEY")
-            .env("OPENSTREAM_PAIRING_FILE", &pairing_path)
+            .env("OPENSTREAM_PAIRING_FILE", pairing_path)
             .env("OPENSTREAM_SIGNAL_ORIGIN", &effective.client.signal_origin)
             .env("OPENSTREAM_UDP_BIND", bind)
             .env("OPENSTREAM_SESSION_STATUS_FILE", &self.status_file)
@@ -374,8 +451,9 @@ impl SessionSupervisor {
         };
         self.cleanup = Some(CleanupTarget::Contained(std::sync::Arc::new(containment)));
         self.child = Some(child);
+        self.owns_pairing_file = owns_pairing_file;
         self.device_id = Some(device_id.into());
-        self.session_id = Some(pairing.session_id);
+        self.session_id = Some(session_id);
         self.generation = None;
         self.state = SessionProcessState::Starting;
         self.exit_state = SessionProcessState::Idle;
@@ -460,6 +538,12 @@ impl SessionSupervisor {
         self.generation = None;
         self.state = settled;
         let _ = std::fs::remove_file(&self.status_file);
+        if self.owns_pairing_file {
+            // The capability outlives its session by exactly as long as this
+            // file does, so it goes when the session does.
+            let _ = std::fs::remove_file(&self.credential_file);
+            self.owns_pairing_file = false;
+        }
         Ok(self.health())
     }
 
@@ -603,6 +687,45 @@ impl SessionSupervisor {
             .ok()
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
     }
+}
+
+/// Write JSON to a private file, atomically, readable only by this user.
+///
+/// A capability on disk. The temporary file is created with 0600 *before*
+/// anything is written to it and renamed into place, so the contents are
+/// never visible under the final name at wider permissions, and a reader
+/// never sees a half-written credential.
+fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), SessionError> {
+    let parent = path.parent().ok_or(SessionError::PairingInsecure)?;
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(SessionError::PairingInsecure)?,
+        std::process::id()
+    ));
+    let encoded = serde_json::to_vec(value).map_err(|_| SessionError::PairingInsecure)?;
+    let write = (|| -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        use std::io::Write;
+        file.write_all(&encoded)?;
+        file.sync_all()
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(SessionError::PairingInsecure);
+    }
+    std::fs::rename(&temporary, path).map_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+        SessionError::PairingInsecure
+    })
 }
 
 fn ensure_private_runtime_dir(path: &Path) -> Result<(), SessionError> {
@@ -756,8 +879,9 @@ async fn drain_containment(containment: &Containment, budget: Duration) -> bool 
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        sweep_containment, CleanupTarget, Containment, SessionError, SessionProcessState,
-        SessionSupervisor, GROUP_DRAIN_TIMEOUT, GROUP_SWEEP_GRACE,
+        sweep_containment, write_private_json, CleanupTarget, Containment, Pairing, Role,
+        RoleCredential, SessionError, SessionProcessState, SessionSupervisor, GROUP_DRAIN_TIMEOUT,
+        GROUP_SWEEP_GRACE,
     };
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1064,6 +1188,112 @@ mod tests {
              make that a clean session"
         );
         assert_eq!(health.last_exit_code, Some(3));
+    }
+
+    fn client_credential(session: &str) -> RoleCredential {
+        RoleCredential {
+            session_id: session.to_string(),
+            role: Role::Client,
+            token: "CLIENT-CAPABILITY".to_string(),
+            websocket_path: format!("/v1/signal/{session}/client"),
+            expires_in_seconds: 60,
+            relay_address: None,
+            relay_ticket: Some("ticket".to_string()),
+            turn: None,
+        }
+    }
+
+    /// A broker credential is written where only this user can read it.
+    ///
+    /// It is a bearer capability sitting on a filesystem, so the permissions
+    /// are the whole protection. 0600 inside a 0700 runtime directory.
+    #[tokio::test]
+    async fn a_broker_credential_is_written_privately_and_names_one_role() {
+        let (supervisor, _directory) = supervisor();
+        let path = supervisor.credential_file.clone();
+        let pairing = Pairing::from_role_credential(client_credential("session-1"));
+        write_private_json(&path, &pairing).expect("write credential");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "a capability must not be readable by anyone else"
+            );
+        }
+
+        let loaded = openstream_client_core::load_pairing_from_file(&path)
+            .expect("the runner can read it back");
+        assert!(loaded.can_act_as(Role::Client));
+        assert!(
+            !loaded.can_act_as(Role::Host),
+            "a client credential on disk must not be usable as the host"
+        );
+    }
+
+    /// A host credential is refused: this supervisor runs the client end.
+    #[tokio::test]
+    async fn a_host_credential_is_refused_by_the_client_supervisor() {
+        let (mut supervisor, _directory) = supervisor();
+        let settings = openstream_settings::default_config();
+        let mut credential = client_credential("session-1");
+        credential.role = Role::Host;
+        assert_eq!(
+            supervisor
+                .connect_with_credential(&settings, "rig", credential)
+                .await
+                .unwrap_err(),
+            SessionError::PairingInsecure,
+            "a host capability here is a routing mistake, not a session"
+        );
+        assert!(
+            !supervisor.credential_file.exists(),
+            "and nothing is left on disk"
+        );
+    }
+
+    /// The credential does not outlive its session.
+    #[tokio::test]
+    async fn a_written_credential_is_removed_when_the_session_settles() {
+        let (mut supervisor, _directory) = supervisor();
+        let path = supervisor.credential_file.clone();
+        let pairing = Pairing::from_role_credential(client_credential("session-1"));
+        write_private_json(&path, &pairing).expect("write credential");
+        supervisor.owns_pairing_file = true;
+        supervisor.session_id = Some("session-1".to_string());
+        assert!(path.exists());
+
+        supervisor.disconnect().await.expect("settle");
+        assert!(
+            !path.exists(),
+            "a capability nobody is watching must not survive its session"
+        );
+    }
+
+    /// A pairing file the supervisor did not write is left alone.
+    ///
+    /// The developer flow is handed a file by whoever launched the shell, and
+    /// deleting someone else's credential on disconnect would break the next
+    /// launch for a reason that looks nothing like this one.
+    #[tokio::test]
+    async fn a_pairing_file_the_supervisor_does_not_own_survives() {
+        let (mut supervisor, _directory) = supervisor();
+        let path = supervisor.credential_file.clone();
+        let pairing = Pairing::from_role_credential(client_credential("session-1"));
+        write_private_json(&path, &pairing).expect("write credential");
+        supervisor.owns_pairing_file = false;
+
+        supervisor.disconnect().await.expect("settle");
+        assert!(
+            path.exists(),
+            "someone else's pairing file is not ours to delete"
+        );
     }
 
     /// An idle supervisor with nothing to clean up still reports idle.
