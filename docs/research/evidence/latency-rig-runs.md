@@ -176,8 +176,14 @@ the clock. The raw-to-BGRA conversion costs 1.8 ms per frame.
 
 **Reorder waiting is finally in the reassembly span.** `LastFragmentReceived
 -> Reassembled` went from a 3 us mean over immediately-releasable frames to a
-282 us mean with a **290 ms** tail once held frames were included. The old
-figure was a selected population, exactly as review predicted.
+282 us mean once held frames were included. The old figure was a selected
+population, exactly as review predicted.
+
+**The 290 ms maximum this run reported for that span is retracted.** The
+release stamp was taken inside the submission loop, which sits after a
+reliable keyframe-request round trip and, for every frame after the first,
+after the previous frame's decoder write and ACK. The span was timing those
+too. Fixed by stamping release as each frame leaves the assembler.
 
 **`in_flight_at_end=3`**, which could only ever print zero before.
 
@@ -193,11 +199,14 @@ client frames decoded    25.8/s
 client frames presented  25.8/s
 ```
 
-Two things are now visible that were not. The helper does not achieve its
-requested heartbeat -- 43.6/s against 62.5 -- because each full-surface
-upload takes 4.5 ms. And the client decodes 25.8/s against the helper's
-43.6/s, so frames are being lost to rate somewhere between the helper's
-upload and the client's decoder.
+The client decodes 25.8/s against the helper's 43.6/s, so frames are being
+lost to rate somewhere between the helper's upload and the client's decoder.
+
+The earlier reading of 43.6/s "against a requested 62.5" is **withdrawn**.
+The helper measured its heartbeat from the end of the previous upload, so a
+16 ms setting plus a 4.5 ms upload had a real period near 20.5 ms -- roughly
+49 Hz before loop overhead. Most of that shortfall was the helper's own
+scheduling, not the capture path. It now measures start-to-start.
 
 Client CPU is a candidate: 1.8 ms of pixel unpack plus 9.3 ms of presenter
 call is 11 ms per frame, and 1/0.011 is about 90/s, so it does not explain

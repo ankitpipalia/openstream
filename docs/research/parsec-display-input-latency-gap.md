@@ -299,25 +299,37 @@ Three measurements that did not exist before:
   decode-to-present is the presenter call.
 - **The pixel conversion costs 1.8 ms**, which the first run's clock started
   after.
-- **Reorder waiting has a 290 ms tail.** The reassembly span went from a 3 us
-  mean over immediately-releasable frames to a 282 us mean once held frames
-  were included in it.
+- **Reorder waiting is now in the reassembly span at all.** It went from a
+  3 us mean over immediately-releasable frames to a 282 us mean once held
+  frames were included. **The 290 ms maximum that run reported has since been
+  retracted**: the release stamp was taken after a reliable keyframe-request
+  round trip, so the span was timing that too. Fixed, and not yet
+  re-measured.
 
 And the rates, which is what the C/D spread needed:
 
 ```text
-helper surface uploads   43.6/s   (requested 62.5; each upload costs 4.5 ms)
+helper surface uploads   43.6/s
 client fragments         499.2/s
 client frames decoded     25.8/s
 client frames presented   25.8/s
 ```
 
-The helper does not achieve its requested heartbeat, and the client decodes
-26/s against the helper's 44/s. Client CPU is a candidate but not a
-sufficient one -- 1.8 ms of unpack plus 9.3 ms of present is 11 ms per frame,
-which would allow about 90/s. **Where the rate is lost between the helper and
-the decoder is not established**, and the host side is still
-`not-observable`, so the next instrumentation belongs there.
+The client decodes 26/s against the helper's 44/s. **Where that rate is lost
+is not established.** It could be anywhere in portal/PipeWire/GStreamer,
+FFmpeg/NVENC, the access-unit boundary, transport, reordering, or the
+decoder; nothing in this run distinguishes them, and the host side is still
+`not-observable`. That is the clearest argument for instrumenting the host
+next.
+
+Client CPU is a candidate and not a sufficient one: 1.8 ms of unpack plus
+9.3 ms of present is 11 ms per frame, which would allow about 90/s.
+
+The earlier reading of "43.6/s against a requested 62.5" as a capture-path
+shortfall has been **withdrawn**. The helper measured its heartbeat from the
+*end* of the previous upload, so a 16 ms setting plus a 4.5 ms upload had a
+real period near 20.5 ms -- about 49 Hz before loop overhead. Most of that
+gap was the helper's own scheduling. It now measures start-to-start.
 
 Zero drops again, in both bounded queues, across 8,720 decoded pictures.
 
