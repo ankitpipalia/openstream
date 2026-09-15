@@ -37,6 +37,19 @@ export interface ConnectionSnapshot {
   computerId?: string;
 }
 
+/**
+ * An incoming Secure Connect request this device is being asked to answer.
+ *
+ * The broker's pending-request payload carries only these fields today; the
+ * requester's account, requested permissions, and target host are not part of
+ * it yet, so the approval UI shows the device and the expiry it does have.
+ */
+export interface ConnectRequest {
+  requestId: string;
+  requesterDeviceId: string;
+  expiresInSeconds: number;
+}
+
 export interface PermissionSet {
   view: boolean;
   keyboard: boolean;
