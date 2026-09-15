@@ -1848,25 +1848,29 @@ async fn network_session(
         VideoCodec::H264 => "h264",
         VideoCodec::H265 => "hevc",
     };
-    let mut decoder =
-        Command::new(env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()))
-            .args(decoder_args(format, width, height))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                TerminalError::new(format!("could not start FFmpeg decoder: {error}"))
-            })?;
-    let mut decoder_stdin = decoder
-        .stdin
-        .take()
-        .ok_or("FFmpeg decoder stdin was not piped")?;
-    let mut decoder_stdout = decoder
-        .stdout
-        .take()
-        .ok_or("FFmpeg decoder stdout was not piped")?;
+    // Native VideoToolbox decode is opt-in on macOS for H.264
+    // (`OPENSTREAM_DECODER=videotoolbox-native`); every other value uses the
+    // ffmpeg subprocess, which stays the default and the universal fallback.
+    let backend = if format == "h264" {
+        decode_dispatch::DecodeBackend::from_env()
+    } else {
+        decode_dispatch::DecodeBackend::Ffmpeg
+    };
+    // A mailbox, not a queue (see the consumer below): the decoder outruns the
+    // network loop whenever it is busy, and replace-oldest keeps only the
+    // freshest picture. `Notify` supplies the wake `select!` needs.
+    let (frame_tx, frame_rx) = latest_frame::<DecodedFrame>();
+    let decoded_ready = Arc::new(tokio::sync::Notify::new());
+    let mut session_decoder = build_session_decoder(
+        backend,
+        format,
+        width,
+        height,
+        frame_bytes,
+        frame_tx.clone(),
+        Arc::clone(&decoded_ready),
+        Arc::clone(telemetry),
+    )?;
 
     let mut audio_player = spawn_audio_player()?;
     let mut audio_stdin = audio_player.as_mut().and_then(|child| child.stdin.take());
@@ -1875,92 +1879,6 @@ async fn network_session(
     let mut audio_jitter = JitterBuffer::new(3);
     let mut audio_pcm = vec![0_f32; lowlat_audio::FRAME * lowlat_audio::CHANNELS];
     let mut last_audio_toc = None;
-
-    // A mailbox, not a queue. The decoder produces faster than the network
-    // loop consumes whenever the loop is busy, and the two stale frames this
-    // used to hold were two pictures of a desktop that had already moved on.
-    // `Notify` supplies the wake that `select!` needs; the mailbox supplies
-    // the replace-oldest semantics a channel cannot.
-    let (frame_tx, frame_rx) = latest_frame::<DecodedFrame>();
-    let decoded_ready = Arc::new(tokio::sync::Notify::new());
-    let decoded_ready_writer = Arc::clone(&decoded_ready);
-    let reader_telemetry = Arc::clone(telemetry);
-    tokio::spawn(async move {
-        loop {
-            let mut raw = vec![0_u8; frame_bytes];
-            if tokio::io::AsyncReadExt::read_exact(&mut decoder_stdout, &mut raw)
-                .await
-                .is_err()
-            {
-                break;
-            }
-            // Stamped before the conversion, not after. The loop below
-            // walks every pixel of the frame and allocates four bytes per
-            // pixel -- about 15 MB at 2560x1440 -- and taking the clock
-            // afterwards left all of it outside every span while the report
-            // still claimed client frame movement had been ruled out.
-            let raw_ready_at = Stamp::<ClientClock>::now();
-            let mut pixels = Vec::with_capacity(width * height);
-            for pixel in raw.chunks_exact(4) {
-                let value = u32::from(pixel[0])
-                    | (u32::from(pixel[1]) << 8)
-                    | (u32::from(pixel[2]) << 16)
-                    | (u32::from(pixel[3]) << 24);
-                pixels.push(value);
-            }
-            let ready_at = Stamp::<ClientClock>::now();
-            // The sequence number is assigned here, by the client, and is
-            // not the host's frame id. The decoder is free to emit a
-            // different number of pictures than the host encoded, so a host
-            // id carried through it would look like a correlation without
-            // being one.
-            let Some(seq) = with_telemetry(&reader_telemetry, |client| {
-                client.frames.pixels_unpacked(raw_ready_at, ready_at);
-                client.frames.frame_decoded()
-            }) else {
-                break;
-            };
-            // Queue ages run from `ready_at`, so pixel conversion cannot
-            // masquerade as queue wait.
-            with_telemetry(&reader_telemetry, |client| {
-                client
-                    .liveness
-                    .advance(Milestone::FrameDecoded, seq_as_frame_id(seq), ready_at);
-            });
-            let frame = DecodedFrame::new(seq, raw_ready_at, ready_at, width, height, pixels);
-            // Reading the marker here, not after the queues, so a probe
-            // whose frame is later dropped is still counted as decoded --
-            // and counted as never presented, which is the pair the probe's
-            // separate stage counters exist to keep apart.
-            with_telemetry(&reader_telemetry, |client| {
-                client.marker_decoded(&frame, Stamp::now());
-            });
-            // Never block here. This task is the only thing draining the
-            // decoder's stdout, and the loop that drains `frame_rx` is the
-            // same loop that writes access units to the decoder's stdin.
-            // Awaiting a full channel therefore deadlocks the session: the
-            // decoder's output pipe fills, the decoder stops reading its
-            // input, the network loop blocks in `write_all`, and so never
-            // reaches `frame_rx.recv()` to make room here. The window then
-            // shows nothing at all while packets pile up unread in the
-            // socket.
-            //
-            // A late frame is worth less than a live one, so a frame the UI
-            // has not kept up with is dropped, exactly as `UiSender` already
-            // drops stale frames and metrics.
-            let offer = offer_decoded_frame(&frame_tx, frame);
-            with_telemetry(&reader_telemetry, |client| {
-                client.frames.decoder_queue_offer(offer);
-            });
-            if offer.should_stop() {
-                break;
-            }
-            // After publishing, so the woken loop always finds the frame.
-            // `notify_one` stores a permit when nobody is waiting, so a wake
-            // raced against the consumer's next poll is not lost.
-            decoded_ready_writer.notify_one();
-        }
-    });
 
     let mut assembler = Assembler::default();
     // Timing stops at decoder submission: FFmpeg does not return the frame
@@ -2082,7 +2000,9 @@ async fn network_session(
                 }
                 UiInput::Stop => {
                     let _ = reliable_control.send(&mut session, b"openstream/end").await;
-                    let _ = decoder.kill().await;
+                    // Returning drops `session_decoder`: the ffmpeg child dies via
+                    // kill_on_drop, and the native worker's channel closes so its
+                    // thread exits.
                     if let Some(mut player) = audio_player {
                         let _ = player.kill().await;
                     }
@@ -2321,7 +2241,9 @@ async fn network_session(
                         keyframe_pacer.keyframe_received();
                     }
                     if !keyframe_pacer.is_waiting() {
-                        decoder_stdin.write_all(&frame.payload).await?;
+                        session_decoder
+                            .feed(&frame.payload, frame.presentation_time_us, frame.keyframe)
+                            .await?;
                         stages.mark(frame.frame_id, ClientStage::DecoderSubmitted, Stamp::now());
                         // The last stage this client can attribute to a
                         // host frame id: FFmpeg does not hand the id back
@@ -2676,6 +2598,237 @@ fn offer_decoded_frame(
     frame: DecodedFrame,
 ) -> FrameOffer {
     sender.publish(frame)
+}
+
+/// The decoder backing a session: the ffmpeg subprocess (default and universal
+/// fallback) or the in-process native decoder fed over a channel.
+enum SessionDecoder {
+    Ffmpeg {
+        stdin: tokio::process::ChildStdin,
+        // Held so the subprocess is killed on drop at session end.
+        _child: Child,
+    },
+    #[cfg(target_os = "macos")]
+    Native {
+        au_tx: std::sync::mpsc::Sender<NativeAccessUnit>,
+    },
+}
+
+impl SessionDecoder {
+    /// Submit one reassembled access unit to the decoder.
+    async fn feed(
+        &mut self,
+        payload: &[u8],
+        presentation_time_us: u64,
+        keyframe: bool,
+    ) -> std::io::Result<()> {
+        match self {
+            SessionDecoder::Ffmpeg { stdin, .. } => stdin.write_all(payload).await,
+            #[cfg(target_os = "macos")]
+            SessionDecoder::Native { au_tx } => au_tx
+                .send(NativeAccessUnit {
+                    payload: payload.to_vec(),
+                    presentation_time_us,
+                    keyframe,
+                })
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "native decoder thread stopped",
+                    )
+                }),
+        }
+    }
+}
+
+/// One access unit handed to the native decoder thread.
+#[cfg(target_os = "macos")]
+struct NativeAccessUnit {
+    payload: Vec<u8>,
+    presentation_time_us: u64,
+    keyframe: bool,
+}
+
+/// Build the session decoder for `backend`: spawn the ffmpeg subprocess plus its
+/// stdout reader, or the native decoder thread. Both feed the same mailbox
+/// through [`publish_decoded_picture`], so everything downstream is identical.
+#[allow(clippy::too_many_arguments)]
+fn build_session_decoder(
+    backend: decode_dispatch::DecodeBackend,
+    format: &str,
+    width: usize,
+    height: usize,
+    frame_bytes: usize,
+    frame_tx: LatestFramePublisher<DecodedFrame>,
+    decoded_ready: Arc<tokio::sync::Notify>,
+    telemetry: SharedTelemetry,
+) -> Result<SessionDecoder, TerminalError> {
+    match backend {
+        #[cfg(target_os = "macos")]
+        decode_dispatch::DecodeBackend::VideoToolboxNative => {
+            let (au_tx, au_rx) = std::sync::mpsc::channel::<NativeAccessUnit>();
+            std::thread::Builder::new()
+                .name("openstream-vt-decode".into())
+                .spawn(move || native_decode_worker(au_rx, frame_tx, decoded_ready, telemetry))
+                .map_err(|error| {
+                    TerminalError::new(format!("could not start native decoder thread: {error}"))
+                })?;
+            Ok(SessionDecoder::Native { au_tx })
+        }
+        decode_dispatch::DecodeBackend::Ffmpeg => {
+            let mut decoder =
+                Command::new(env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()))
+                    .args(decoder_args(format, width, height))
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| {
+                        TerminalError::new(format!("could not start FFmpeg decoder: {error}"))
+                    })?;
+            let stdin = decoder
+                .stdin
+                .take()
+                .ok_or_else(|| TerminalError::new("FFmpeg decoder stdin was not piped"))?;
+            let mut decoder_stdout = decoder
+                .stdout
+                .take()
+                .ok_or_else(|| TerminalError::new("FFmpeg decoder stdout was not piped"))?;
+            tokio::spawn(async move {
+                loop {
+                    let mut raw = vec![0_u8; frame_bytes];
+                    if tokio::io::AsyncReadExt::read_exact(&mut decoder_stdout, &mut raw)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    // Stamped before the pixel conversion (see frame_age): the
+                    // loop below walks every pixel, and clocking after it would
+                    // leave that CPU work outside every span.
+                    let raw_ready_at = Stamp::<ClientClock>::now();
+                    let mut pixels = Vec::with_capacity(width * height);
+                    for pixel in raw.chunks_exact(4) {
+                        let value = u32::from(pixel[0])
+                            | (u32::from(pixel[1]) << 8)
+                            | (u32::from(pixel[2]) << 16)
+                            | (u32::from(pixel[3]) << 24);
+                        pixels.push(value);
+                    }
+                    let ready_at = Stamp::<ClientClock>::now();
+                    if !publish_decoded_picture(
+                        pixels,
+                        width,
+                        height,
+                        raw_ready_at,
+                        ready_at,
+                        &telemetry,
+                        &frame_tx,
+                        &decoded_ready,
+                    ) {
+                        break;
+                    }
+                }
+            });
+            Ok(SessionDecoder::Ffmpeg {
+                stdin,
+                _child: decoder,
+            })
+        }
+    }
+}
+
+/// The native decoder thread: decode each access unit in-process with
+/// VideoToolbox and publish the pictures to the same mailbox the ffmpeg reader
+/// uses. A decode error is recoverable — the network loop keeps requesting
+/// keyframes, and the next one re-seeds the decoder.
+#[cfg(target_os = "macos")]
+fn native_decode_worker(
+    au_rx: std::sync::mpsc::Receiver<NativeAccessUnit>,
+    frame_tx: LatestFramePublisher<DecodedFrame>,
+    decoded_ready: Arc<tokio::sync::Notify>,
+    telemetry: SharedTelemetry,
+) {
+    let mut decoder = vt_decoder::VideoToolboxH264Decoder::new();
+    while let Ok(au) = au_rx.recv() {
+        let raw_ready_at = Stamp::<ClientClock>::now();
+        match decoder.decode(&au.payload, au.presentation_time_us, au.keyframe) {
+            Ok(pictures) => {
+                for picture in pictures {
+                    let ready_at = Stamp::<ClientClock>::now();
+                    if !publish_decoded_picture(
+                        picture.pixels,
+                        picture.width,
+                        picture.height,
+                        raw_ready_at,
+                        ready_at,
+                        &telemetry,
+                        &frame_tx,
+                        &decoded_ready,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            Err(vt_decoder::VtError::NotConfigured) => {
+                // Waiting for the first keyframe; nothing to publish yet.
+            }
+            Err(error) => {
+                eprintln!("native VideoToolbox decode error: {error}");
+            }
+        }
+    }
+}
+
+/// Assign the client sequence number, stamp, wrap, and publish a decoded picture
+/// to the mailbox. Shared by the ffmpeg reader and the native decoder so both
+/// record identical telemetry and freshness. Returns `false` when the session
+/// should stop (telemetry gone, or the mailbox reports stop).
+#[allow(clippy::too_many_arguments)]
+fn publish_decoded_picture(
+    pixels: Vec<u32>,
+    width: usize,
+    height: usize,
+    raw_ready_at: Stamp<ClientClock>,
+    ready_at: Stamp<ClientClock>,
+    telemetry: &SharedTelemetry,
+    frame_tx: &LatestFramePublisher<DecodedFrame>,
+    decoded_ready: &tokio::sync::Notify,
+) -> bool {
+    // The sequence number is assigned here, by the client, not the host's frame
+    // id: the decoder may emit a different number of pictures than the host
+    // encoded, so a host id carried through would be a false correlation.
+    let Some(seq) = with_telemetry(telemetry, |client| {
+        client.frames.pixels_unpacked(raw_ready_at, ready_at);
+        client.frames.frame_decoded()
+    }) else {
+        return false;
+    };
+    with_telemetry(telemetry, |client| {
+        client
+            .liveness
+            .advance(Milestone::FrameDecoded, seq_as_frame_id(seq), ready_at);
+    });
+    let frame = DecodedFrame::new(seq, raw_ready_at, ready_at, width, height, pixels);
+    with_telemetry(telemetry, |client| {
+        client.marker_decoded(&frame, Stamp::now());
+    });
+    // Never block: a late frame is worth less than a live one, so a frame the UI
+    // has not kept up with is dropped, exactly as the UI queue already drops
+    // stale frames.
+    let offer = offer_decoded_frame(frame_tx, frame);
+    with_telemetry(telemetry, |client| {
+        client.frames.decoder_queue_offer(offer);
+    });
+    if offer.should_stop() {
+        return false;
+    }
+    // After publishing, so the woken loop always finds the frame. `notify_one`
+    // stores a permit when nobody is waiting, so a wake raced against the
+    // consumer's next poll is not lost.
+    decoded_ready.notify_one();
+    true
 }
 
 /// The opt-in interaction probe's client-side state.
@@ -4081,5 +4234,65 @@ mod tests {
                 .any(|window| { window[0] == "-fps_mode" && window[1] == "passthrough" })
         );
         assert!(!args.iter().any(|arg| arg == "-vsync"));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_wiring_tests {
+    use super::*;
+    use crate::test_fixtures::{access_units_by_aud, generate_h264};
+
+    /// The wired native path end to end: build the native `SessionDecoder`, feed
+    /// it real access units through `feed`, and confirm decoded frames reach the
+    /// mailbox exactly as the ffmpeg reader would deliver them. Exercises
+    /// `build_session_decoder`, the `SessionDecoder::Native` channel, the decoder
+    /// thread, and `publish_decoded_picture` together.
+    #[tokio::test]
+    async fn native_session_decoder_publishes_to_the_mailbox() {
+        let Some(stream) = generate_h264("testsrc2=size=160x120:rate=10", 6, 6) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+
+        let telemetry: SharedTelemetry = Arc::new(Mutex::new(ClientTelemetry::new(None)));
+        let (frame_tx, frame_rx) = latest_frame::<DecodedFrame>();
+        let decoded_ready = Arc::new(tokio::sync::Notify::new());
+
+        let mut decoder = build_session_decoder(
+            decode_dispatch::DecodeBackend::VideoToolboxNative,
+            "h264",
+            160,
+            120,
+            160 * 120 * 4,
+            frame_tx,
+            Arc::clone(&decoded_ready),
+            Arc::clone(&telemetry),
+        )
+        .expect("build native session decoder");
+
+        for (index, au) in access_units.iter().enumerate() {
+            decoder
+                .feed(au, index as u64 * 100_000, index == 0)
+                .await
+                .expect("feed access unit");
+        }
+
+        // The decoder runs on its own thread; wait briefly for frames to land.
+        let mut frames = 0;
+        for _ in 0..100 {
+            while let Some(frame) = frame_rx.take() {
+                assert_eq!(frame.width(), 160);
+                assert_eq!(frame.height(), 120);
+                frames += 1;
+            }
+            if frames >= 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            frames >= 1,
+            "native SessionDecoder published no frames to the mailbox"
+        );
     }
 }
