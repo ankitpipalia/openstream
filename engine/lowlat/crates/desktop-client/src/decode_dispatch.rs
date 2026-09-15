@@ -19,6 +19,11 @@ pub(crate) enum DecodeBackend {
     /// In-process VideoToolbox (macOS). Opt-in until a live stream validates it.
     #[cfg(target_os = "macos")]
     VideoToolboxNative,
+    /// In-process Media Foundation H.264 decoder MFT (Windows). Vendor-neutral
+    /// (runs on NVIDIA/AMD/Intel via the OS decoder), so it is preferred over a
+    /// vendor SDK. Opt-in until a live stream validates it.
+    #[cfg(target_os = "windows")]
+    MediaFoundationNative,
 }
 
 /// A video codec the client may be asked to decode.
@@ -64,6 +69,17 @@ pub(crate) fn available_decoders() -> Vec<DecoderCapability> {
         0,
         DecoderCapability {
             backend: DecodeBackend::VideoToolboxNative,
+            codecs: &[DecodeCodec::H264],
+            in_process: true,
+        },
+    );
+    // Windows: the Media Foundation H.264 decoder MFT, in-process and
+    // vendor-neutral. H.265 is a follow-up (a separate HEVC MFT).
+    #[cfg(target_os = "windows")]
+    decoders.insert(
+        0,
+        DecoderCapability {
+            backend: DecodeBackend::MediaFoundationNative,
             codecs: &[DecodeCodec::H264],
             in_process: true,
         },
@@ -146,6 +162,23 @@ mod selection_tests {
         );
         // VideoToolbox native is H.264-only, so H.265 falls back to ffmpeg even
         // when the native path is preferred.
+        assert_eq!(
+            select_decoder(DecodeCodec::H265, true, &decoders),
+            DecodeBackend::Ffmpeg
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn preferring_native_picks_media_foundation_for_h264_and_falls_back_for_h265() {
+        let decoders = available_decoders();
+        // H.264 has an in-process decoder (Media Foundation), so it is chosen.
+        assert_eq!(
+            select_decoder(DecodeCodec::H264, true, &decoders),
+            DecodeBackend::MediaFoundationNative
+        );
+        // The Media Foundation H.264 MFT does not decode H.265, so H.265 falls
+        // back to ffmpeg even when the native path is preferred.
         assert_eq!(
             select_decoder(DecodeCodec::H265, true, &decoders),
             DecodeBackend::Ffmpeg
