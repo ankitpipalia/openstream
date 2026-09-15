@@ -4545,22 +4545,23 @@ fn keystore_marker_path(path: &Path) -> std::path::PathBuf {
 /// Written to a temporary file and renamed, so a crash mid-write leaves
 /// either the old marker or none -- never a truncated one that would be
 /// mistaken for recorded custody.
-fn publish_keystore_marker(path: &Path, account: &str) {
+///
+/// **Returns an error rather than reporting one.** A keystore-only identity
+/// is only protected from silent replacement by a durable marker, so a caller
+/// holding one must refuse to hand it out when this fails. Treating the
+/// failure as advisory is what reintroduces the defect the marker exists to
+/// prevent: the next keystore outage finds no marker and mints a new device.
+fn publish_keystore_marker(path: &Path, account: &str) -> Result<(), String> {
     let marker = keystore_marker_path(path);
     let Some(parent) = marker.parent() else {
-        return;
+        return Err("the identity store has no parent directory".into());
     };
     // Nothing else creates this directory on the keystore-only path: the file
     // loader that normally makes it is never reached when the key goes
     // straight to the keystore. Without this the marker cannot be written, no
     // custody is recorded, and a lost keystore silently mints a new identity.
-    if std::fs::create_dir_all(parent).is_err() {
-        eprintln!(
-            "OpenStream identity: could not create {} to record keystore custody",
-            parent.display()
-        );
-        return;
-    }
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4574,22 +4575,26 @@ fn publish_keystore_marker(path: &Path, account: &str) {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    // Best effort throughout. A missing marker costs a refusal that should
-    // have been a mint on some later run; it must not fail a session whose
-    // key is already safely in the keystore.
     let written = options.open(&staging).and_then(|mut file| {
         use std::io::Write;
         file.write_all(account.as_bytes())
             .and_then(|()| file.write_all(b"\n"))
             .and_then(|()| file.sync_all())
     });
-    if written.is_err() || std::fs::rename(&staging, &marker).is_err() {
+    if let Err(error) = written {
         let _ = std::fs::remove_file(&staging);
-        eprintln!(
-            "OpenStream identity: could not record keystore custody at {}",
-            marker.display()
-        );
+        return Err(format!("could not write {}: {error}", staging.display()));
     }
+    if let Err(error) = std::fs::rename(&staging, &marker) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("could not publish {}: {error}", marker.display()));
+    }
+    // The rename is only durable once the directory entry is, which matters
+    // here: a marker lost to a crash is a marker that cannot refuse later.
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 /// Store the key and read it back before believing the keystore took it.
@@ -4625,7 +4630,16 @@ start the keystore and retry; if the identity is genuinely gone, remove {} to ac
                 // Repair a marker that is missing because an earlier run was
                 // interrupted between storing the key and recording it.
                 if !recorded {
-                    publish_keystore_marker(path, &account);
+                    // This identity lives only in the keystore, so without a
+                    // marker nothing stops a later outage minting over it.
+                    publish_keystore_marker(path, &account).map_err(|error| {
+                        Error::KeyStoreUnavailable(format!(
+                            "the identity was read from the platform keystore, but custody could \
+not be recorded beside {} ({error}). Refusing to continue, because an unrecorded keystore \
+identity is one a later outage would silently replace",
+                            path.display()
+                        ))
+                    })?;
                 }
                 eprintln!("OpenStream identity source=keystore");
                 return Ok(identity);
@@ -4657,12 +4671,22 @@ recorded here"
         let identity = load_identity_file(path)?;
         match store_and_verify(&account, identity.pkcs8()) {
             Ok(()) => {
-                publish_keystore_marker(path, &account);
-                eprintln!(
-                    "OpenStream identity source=migrated-to-keystore; the file at {} is kept as \
-a fallback, and removing it is what completes the migration",
-                    path.display()
-                );
+                // The file is still here and is the continuity guarantee, so
+                // a marker that cannot be written costs the refusal but not
+                // the identity. Say so rather than failing the session.
+                match publish_keystore_marker(path, &account) {
+                    Ok(()) => eprintln!(
+                        "OpenStream identity source=migrated-to-keystore; the file at {} is kept \
+as a fallback, and removing it is what completes the migration",
+                        path.display()
+                    ),
+                    Err(error) => eprintln!(
+                        "OpenStream identity source=migrated-to-keystore; custody could not be \
+recorded ({error}), so do not remove the file at {}: it is now the only thing keeping this \
+device's identity recoverable",
+                        path.display()
+                    ),
+                }
             }
             Err(error) => eprintln!(
                 "OpenStream identity source=file-fallback; keystore custody was requested but \
@@ -4680,7 +4704,17 @@ running as this user",
     let identity = IdentityKey::generate().map_err(Error::Identity)?;
     match store_and_verify(&account, identity.pkcs8()) {
         Ok(()) => {
-            publish_keystore_marker(path, &account);
+            // Nothing else holds this key. Handing it back before custody is
+            // durably recorded would leave exactly the gap the marker exists
+            // to close, so the failure is the caller's problem, not a log line.
+            publish_keystore_marker(path, &account).map_err(|error| {
+                Error::KeyStoreUnavailable(format!(
+                    "the new identity was stored in the platform keystore, but custody could not \
+be recorded beside {} ({error}). Refusing to continue, because an unrecorded keystore identity \
+is one a later outage would silently replace",
+                    path.display()
+                ))
+            })?;
             eprintln!("OpenStream identity source=keystore");
             Ok(identity)
         }
@@ -4711,7 +4745,8 @@ mod keystore_account_tests {
     fn publishing_the_marker_leaves_no_staging_file_and_records_the_account() {
         let dir = scratch("publish");
         let store = dir.join("device-identity.pk8");
-        super::publish_keystore_marker(&store, "device-identity-abcdef0123456789");
+        super::publish_keystore_marker(&store, "device-identity-abcdef0123456789")
+            .expect("marker published");
 
         let marker = super::keystore_marker_path(&store);
         let body = std::fs::read_to_string(&marker).expect("marker written");
@@ -4734,7 +4769,8 @@ mod keystore_account_tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = scratch("mode");
         let store = dir.join("device-identity.pk8");
-        super::publish_keystore_marker(&store, "device-identity-0011223344556677");
+        super::publish_keystore_marker(&store, "device-identity-0011223344556677")
+            .expect("marker published");
         let marker = super::keystore_marker_path(&store);
         let mode = std::fs::metadata(&marker)
             .expect("marker")
@@ -4750,14 +4786,37 @@ mod keystore_account_tests {
         // the rename makes the last writer win with a whole marker.
         let dir = scratch("race");
         let store = dir.join("device-identity.pk8");
-        super::publish_keystore_marker(&store, "device-identity-1111111111111111");
-        super::publish_keystore_marker(&store, "device-identity-2222222222222222");
+        super::publish_keystore_marker(&store, "device-identity-1111111111111111")
+            .expect("first publish");
+        super::publish_keystore_marker(&store, "device-identity-2222222222222222")
+            .expect("second publish");
         let body = std::fs::read_to_string(super::keystore_marker_path(&store)).expect("marker");
         assert!(
             body.trim() == "device-identity-1111111111111111"
                 || body.trim() == "device-identity-2222222222222222",
             "torn marker: {body:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_is_reported_rather_than_shrugged_off() {
+        let dir = scratch("blocked");
+        // A regular file where the store's directory would be, so the marker's
+        // parent cannot be created at all. Permissions are not used to force
+        // this: publication deliberately makes the directory private, which
+        // would undo a read-only mode set by the test.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let store = blocker.join("device-identity.pk8");
+
+        let published = super::publish_keystore_marker(&store, "device-identity-3333333333333333");
+        assert!(
+            published.is_err(),
+            "an unwritable marker must be an error, not a warning: a keystore-only identity \
+whose custody went unrecorded is one a later outage would silently replace"
+        );
+        assert!(!super::keystore_marker_path(&store).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

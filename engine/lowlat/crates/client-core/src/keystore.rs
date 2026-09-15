@@ -23,6 +23,19 @@ pub(crate) fn available() -> bool {
 }
 
 /// What a keystore read found.
+///
+/// On a target with no keystore backend only `Unavailable` is ever built, and
+/// this workspace denies dead code. The variants are still the right shape
+/// there -- the caller matches all three regardless of target -- so the
+/// expectation is scoped to exactly those targets rather than the enum being
+/// split per platform.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "the unsupported backend only ever reports Unavailable"
+    )
+)]
 #[derive(Debug)]
 pub(crate) enum Lookup {
     /// The entry was there and came back.
@@ -373,21 +386,26 @@ mod platform {
 
     // Declared variadic, because that is what these are. Calling a variadic
     // function through a non-variadic pointer is not the same ABI.
+    //
+    // Every one of these takes `GCancellable *` then `GError **`. The error
+    // parameter is a pointer to a pointer: libsecret writes a newly allocated
+    // GError through it. Declaring it as a single pointer happens to compile
+    // wherever a null literal is passed, which is exactly why all three are
+    // spelled out here rather than only the one that passes an address.
     type StoreSync = unsafe extern "C" fn(
         *const Schema,
         *const c_char,
         *const c_char,
         *const c_char,
         *mut c_void,
-        *mut c_void,
+        *mut *mut c_void,
         ...
     ) -> c_int;
-    // The third parameter is `GError **`: libsecret writes a pointer to a new
-    // GError there on failure, so it is a pointer to a pointer, not a pointer.
     type LookupSync =
         unsafe extern "C" fn(*const Schema, *mut c_void, *mut *mut c_void, ...) -> *mut c_char;
     #[cfg(test)]
-    type ClearSync = unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> c_int;
+    type ClearSync =
+        unsafe extern "C" fn(*const Schema, *mut c_void, *mut *mut c_void, ...) -> c_int;
     type FreePassword = unsafe extern "C" fn(*mut c_char);
     /// From glib, reached through libsecret's own dependency graph: dlsym on a
     /// handle searches the library and everything it links.
