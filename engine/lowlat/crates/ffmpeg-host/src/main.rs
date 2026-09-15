@@ -65,6 +65,14 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const FRAME_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const INPUT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+/// After this long with no authenticated packet from the peer, the host ends
+/// the session and exits so its supervisor restarts it and it re-registers for
+/// a fresh establishment epoch. A client that drops uncleanly (no
+/// `openstream/end`) would otherwise leave the host streaming into a dead
+/// session for the whole run, and a reconnecting client could never re-pair.
+/// This sits well above the 5s keepalive cadence so a healthy but idle peer,
+/// which sends authenticated keepalives, is never torn down.
+const PEER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wire pacing must sit above the encoder target, not below it. The scheduler
 /// paces the sealed datagram stream, which carries per-packet headers, AEAD
@@ -603,6 +611,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reliable_control.retry(&mut session).await?;
                 session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
+                let peer_silence = session.last_peer_activity_age();
+                if peer_silence >= PEER_LIVENESS_TIMEOUT {
+                    eprintln!(
+                        "OpenStream ending session: no authenticated peer traffic for {peer_silence:?}; re-registering"
+                    );
+                    break 'stream;
+                }
                 let now = Instant::now();
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
                 telemetry.observe_path(&session.transport_snapshot(now), now_ms);

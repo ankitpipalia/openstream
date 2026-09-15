@@ -54,6 +54,12 @@ pub mod control {
         InvalidAcknowledgement,
         EmptyMessage,
         TooLarge,
+        /// The bounded outstanding window is full. This is transient
+        /// backpressure -- the peer has not acknowledged enough in-flight
+        /// messages yet -- and is deliberately distinct from `TooLarge`, which
+        /// is a permanent property of an oversized payload. Callers treat this
+        /// as "retry later / drop this one", never as a malformed message.
+        WindowFull,
     }
 
     impl core::fmt::Display for Error {
@@ -70,6 +76,7 @@ pub mod control {
                 }
                 Self::EmptyMessage => f.write_str("ordered control message cannot be empty"),
                 Self::TooLarge => f.write_str("ordered control payload is too large"),
+                Self::WindowFull => f.write_str("ordered control window is full"),
             }
         }
     }
@@ -185,8 +192,15 @@ pub mod control {
             if payload.is_empty() {
                 return Err(Error::EmptyMessage);
             }
-            if payload.len() > MAX_PAYLOAD || self.outstanding.len() >= self.max_pending {
+            // An oversized payload is permanently malformed; a full window is
+            // transient backpressure. They are reported separately so a caller
+            // can drop or defer on `WindowFull` without ever mistaking a small
+            // message for an oversized one.
+            if payload.len() > MAX_PAYLOAD {
                 return Err(Error::TooLarge);
+            }
+            if self.outstanding.len() >= self.max_pending {
+                return Err(Error::WindowFull);
             }
             let sequence = self.next_sequence;
             self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -356,6 +370,26 @@ pub mod control {
             assert!(!channel.has_capacity());
             channel.acknowledge(0);
             assert!(channel.has_capacity());
+        }
+
+        #[test]
+        fn full_window_reports_window_full_not_too_large_even_for_a_tiny_payload() {
+            let mut channel = Channel::new(1);
+            channel.queue(b"x").unwrap();
+            // A one-byte payload can never be too large. When the window is
+            // full it must report WindowFull, the transient/backpressure fault,
+            // never TooLarge, which is reserved for a genuinely oversized one.
+            assert_eq!(channel.queue(b"x"), Err(Error::WindowFull));
+        }
+
+        #[test]
+        fn oversized_payload_reports_too_large_even_with_a_free_window() {
+            let mut channel = Channel::new(64);
+            let oversized = vec![0_u8; MAX_PAYLOAD + 1];
+            assert_eq!(channel.queue(&oversized), Err(Error::TooLarge));
+            // The exact limit is still accepted.
+            let at_limit = vec![0_u8; MAX_PAYLOAD];
+            assert!(channel.queue(&at_limit).is_ok());
         }
     }
 }
