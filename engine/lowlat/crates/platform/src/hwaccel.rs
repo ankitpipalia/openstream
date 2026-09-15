@@ -401,35 +401,66 @@ fn ffmpeg_encoder_usable(encoder: &str) -> bool {
     )
 }
 
-/// Return a real render node instead of assuming the first GPU is always
-/// `renderD128`. Multi-GPU hosts commonly expose renderD129+ and selecting the
-/// wrong node makes FFmpeg fail after negotiation.
-fn vaapi_render_node() -> Option<String> {
+/// Order `/dev/dri` entry names into the render nodes, low index first.
+///
+/// Pulled out of [`vaapi_render_nodes`] so the multi-GPU ordering is a pure
+/// function testable without a `/dev/dri` to read: it keeps only `renderD<n>`
+/// names and sorts them by their numeric index, so `renderD128` precedes
+/// `renderD129` and a stray `card0`/`by-path` entry is dropped.
+fn ordered_render_node_names(names: Vec<String>) -> Vec<String> {
+    let mut nodes = names
+        .into_iter()
+        .filter_map(|name| {
+            let index = name.strip_prefix("renderD")?.parse::<u32>().ok()?;
+            Some((index, name))
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(|(index, _)| *index);
+    nodes.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Every VAAPI render node on this host, low index first.
+///
+/// A multi-GPU host exposes `renderD128`, `renderD129`, ... — one per DRM
+/// render device — and which one can encode is a per-device question. The
+/// pre-1.1 code resolved only the first node and probed VAAPI against it alone,
+/// so a second GPU that was the only one able to encode went unseen. This
+/// enumerates them all; callers probe per node.
+///
+/// `OPENSTREAM_VAAPI_RENDER_NODE` still pins exactly one node when set, for a
+/// host that has to override discovery.
+pub fn vaapi_render_nodes() -> Vec<String> {
     if let Ok(path) = std::env::var("OPENSTREAM_VAAPI_RENDER_NODE") {
         let path = path.trim();
         if path.is_empty() {
-            return None;
+            return Vec::new();
         }
-        return (path.starts_with("/dev/dri/renderD") && path_exists(path))
-            .then(|| path.to_string());
+        return if path.starts_with("/dev/dri/renderD") && path_exists(path) {
+            vec![path.to_string()]
+        } else {
+            Vec::new()
+        };
     }
-    let mut nodes = std::fs::read_dir("/dev/dri")
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            name.strip_prefix("renderD")?.parse::<u32>().ok()?;
-            Some((name, entry.path()))
+    let names = std::fs::read_dir("/dev/dri")
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
-    nodes.sort_by_key(|(name, _)| {
-        name.strip_prefix("renderD")
-            .and_then(|number| number.parse::<u32>().ok())
-    });
-    nodes
+        .unwrap_or_default();
+    ordered_render_node_names(names)
         .into_iter()
-        .next()
-        .map(|(_, path)| path.to_string_lossy().into_owned())
+        .map(|name| format!("/dev/dri/{name}"))
+        .collect()
+}
+
+/// Return the first render node, or `None`. Multi-GPU hosts commonly expose
+/// `renderD129`+; enumerate every node with [`vaapi_render_nodes`] when more
+/// than the first matters.
+pub(crate) fn vaapi_render_node() -> Option<String> {
+    vaapi_render_nodes().into_iter().next()
 }
 
 fn command_exists(program: &str) -> bool {
@@ -990,6 +1021,35 @@ mod tests {
             .map(|window| window[1].clone())
             .expect("the profile sets a VBV size");
         assert_eq!(bufsize, "0.20M", "one frame of VBV at 12 Mbps / 60 fps");
+    }
+
+    /// Multi-GPU render nodes enumerate in device order, and non-render `/dev/dri`
+    /// entries are ignored.
+    ///
+    /// The pre-1.1 code took the first node and probed VAAPI against it alone.
+    /// On a laptop with an Intel iGPU on `renderD128` and a discrete GPU on
+    /// `renderD129`, that hid whichever device was not first — including the
+    /// case where only the second one can encode. Ordering is by numeric index,
+    /// not directory-listing order, so it does not depend on how the kernel
+    /// happens to return entries.
+    #[test]
+    fn render_nodes_enumerate_in_device_order() {
+        let names = vec![
+            "renderD129".to_string(),
+            "card0".to_string(),
+            "renderD128".to_string(),
+            "by-path".to_string(),
+            "renderD130".to_string(),
+        ];
+        assert_eq!(
+            ordered_render_node_names(names),
+            vec!["renderD128", "renderD129", "renderD130"]
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_render_nodes_enumerates_empty() {
+        assert!(ordered_render_node_names(vec!["card0".into(), "controlD64".into()]).is_empty());
     }
 
     #[test]
