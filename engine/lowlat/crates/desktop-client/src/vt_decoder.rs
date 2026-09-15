@@ -756,7 +756,7 @@ fn split_nal_units(data: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use crate::test_fixtures::{access_units_by_aud, generate_h264};
 
     #[test]
     fn nal_splitter_handles_three_and_four_byte_start_codes() {
@@ -780,98 +780,6 @@ mod tests {
         assert_eq!(nals.len(), 2);
         assert_eq!(nals[0], &[0x41, 0x9a]);
         assert_eq!(nals[1], &[0x41]);
-    }
-
-    fn ffmpeg() -> String {
-        std::env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
-    }
-
-    /// When set, a missing/failed ffmpeg fixture is a hard failure rather than a
-    /// skip — so the hardware-acceptance run cannot pass by silently not running.
-    fn require_vt_test() -> bool {
-        std::env::var_os("OPENSTREAM_REQUIRE_VT_TEST").is_some()
-    }
-
-    /// Generate an Annex-B H.264 clip (one keyframe every `gop`, no B-frames,
-    /// AUDs so access units split cleanly). Returns `None` to skip when ffmpeg is
-    /// unavailable, unless `OPENSTREAM_REQUIRE_VT_TEST` forces a failure.
-    fn generate_h264(source: &str, frames: u32, gop: u32) -> Option<Vec<u8>> {
-        let frames_s = frames.to_string();
-        let gop_s = gop.to_string();
-        let result = Command::new(ffmpeg())
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                source,
-                "-frames:v",
-                &frames_s,
-                "-c:v",
-                "libx264",
-                "-bf",
-                "0",
-                "-g",
-                &gop_s,
-                "-keyint_min",
-                &gop_s,
-                "-pix_fmt",
-                "yuv420p",
-                "-x264-params",
-                "aud=1",
-                "-f",
-                "h264",
-                "-",
-            ])
-            .output();
-        match result {
-            Ok(out) if out.status.success() && !out.stdout.is_empty() => Some(out.stdout),
-            other => {
-                let detail = match &other {
-                    Ok(out) => String::from_utf8_lossy(&out.stderr).into_owned(),
-                    Err(error) => error.to_string(),
-                };
-                assert!(
-                    !require_vt_test(),
-                    "OPENSTREAM_REQUIRE_VT_TEST is set but ffmpeg could not produce a fixture: {detail}"
-                );
-                eprintln!("ffmpeg unavailable ({detail}); skipping VideoToolbox test");
-                None
-            }
-        }
-    }
-
-    /// Split an Annex-B elementary stream into access units on AUD (type 9)
-    /// boundaries. Used by the fixture tests, which generate the stream with
-    /// `aud=1`.
-    fn access_units_by_aud(stream: &[u8]) -> Vec<Vec<u8>> {
-        // Byte offsets where an AUD start code begins.
-        let mut aud_offsets: Vec<usize> = Vec::new();
-        let mut p = 0usize;
-        while p + 4 <= stream.len() {
-            if stream[p] == 0 && stream[p + 1] == 0 && stream[p + 2] == 1 {
-                if stream[p + 3] & 0x1f == 9 {
-                    // Include a preceding zero (4-byte start code) if present.
-                    let start = if p > 0 && stream[p - 1] == 0 {
-                        p - 1
-                    } else {
-                        p
-                    };
-                    aud_offsets.push(start);
-                }
-                p += 3;
-            } else {
-                p += 1;
-            }
-        }
-        let mut units = Vec::new();
-        for (k, &start) in aud_offsets.iter().enumerate() {
-            let end = aud_offsets.get(k + 1).copied().unwrap_or(stream.len());
-            units.push(stream[start..end].to_vec());
-        }
-        units
     }
 
     /// Decode every access unit of a clip, tolerating the pre-keyframe

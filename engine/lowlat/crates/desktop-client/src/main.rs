@@ -60,6 +60,12 @@ mod render;
 // the DecodeAccel dispatch wires it into the hot path in a follow-up commit.
 #[cfg(target_os = "macos")]
 mod vt_decoder;
+// Decoder-backend selection and the native decode -> DecodedFrame path, shared
+// by the (future) runtime dispatch and the loopback harness. Not yet wired into
+// the live network loop.
+mod decode_dispatch;
+#[cfg(test)]
+mod test_fixtures;
 // Pure lifecycle/input-safety seam; a future winit presenter can consume it
 // without making this minifb path or the dependency graph change in this slice.
 #[allow(dead_code)]
