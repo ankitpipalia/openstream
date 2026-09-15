@@ -88,4 +88,45 @@ describe("OpenStream desktop shell", () => {
     expect((await screen.findAllByText("The runtime bridge did not respond.")).length).toBeGreaterThan(0);
     expect(screen.getByRole("heading", { name: "Computers" })).toBeInTheDocument();
   });
+
+  it("keeps the view and shows an inline error when a connect fails, instead of wiping the snapshot", async () => {
+    const seeded = createEmptySnapshot();
+    seeded.computers = [
+      {
+        id: "host-1",
+        name: "Studio",
+        platform: "linux",
+        status: "online",
+        detail: "Ready",
+        capabilities: [],
+      },
+    ];
+    const adapter: ProductAdapter = {
+      getSnapshot: () => seeded,
+      subscribe: () => () => {},
+      refresh: async () => seeded,
+      // A recoverable session-start failure, not a dead runtime bridge.
+      dispatch: async () => {
+        throw new Error("session start failed");
+      },
+      updateSettings: async () => seeded,
+      updateSetting: async () => seeded,
+      setDeviceTrust: async () => seeded,
+      signIn: async () => seeded,
+      registerAccount: async () => seeded,
+      signOut: async () => seeded,
+    };
+
+    render(<App adapter={adapter} />);
+    await screen.findByRole("heading", { name: "Computers" });
+    expect(screen.getByRole("heading", { name: "Studio" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+
+    // The failure is surfaced inline, and the snapshot is not wiped: the
+    // computer is still listed and the runtime-unavailable message never shows.
+    expect(await screen.findByText(/The session could not be started/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Studio" })).toBeInTheDocument();
+    expect(screen.queryByText("The runtime bridge did not respond.")).toBeNull();
+  });
 });
