@@ -67,6 +67,28 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 
+      - name: Keystore round trip against a real Secret Service
+        # The keystore tests are ignored by default because they write to the
+        # developer's own keyring. They are the only thing that exercises a
+        # second libsecret call in one process, which is where a dlclosed
+        # GObject library aborts re-registration -- a fault that made Linux
+        # custody fall back to the file silently, and that no macOS run and no
+        # keyring-less runner can reach. So CI provides a keyring and runs
+        # them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring libsecret-1-0 dbus-x11
+          # The daemon prints the environment the client library needs
+          # (GNOME_KEYRING_CONTROL and friends) on stdout. Backgrounding it
+          # instead of eval-ing that output leaves libsecret talking to a
+          # locked keyring, which makes it ask a GUI prompter for a password
+          # and fail with "cannot open display" on a runner with no session.
+          dbus-run-session -- bash -c '
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            export GNOME_KEYRING_CONTROL
+            cargo test --locked -p openstream-client-core --lib keystore -- --ignored --test-threads=1
+          '
+
       - name: C ABI header syntax
         run: |
           cc -std=c11 -Wall -Wextra -Werror -I include \
