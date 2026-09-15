@@ -2026,7 +2026,12 @@ async fn network_session(
     };
     let mut mic_encoder = mic::MicEncoder::new().ok();
     let mut mic_buffer = vec![0_u8; mic::MIC_CHUNK_BYTES];
-    let mut waiting_for_keyframe = false;
+    // Coalesce keyframe requests: a burst of detected gaps on a fresh or lossy
+    // path (before the first keyframe lands) collapses into a single pending
+    // request, re-sent at most once per interval, so it can never flood the
+    // bounded reliable-control window and tear the session down.
+    let mut keyframe_pacer =
+        openstream_client_core::KeyframeRequestPacer::new(KEYFRAME_REQUEST_INTERVAL);
     let mut control_tick = tokio::time::interval(Duration::from_millis(100));
     let mut clipboard_tick = tokio::time::interval(Duration::from_millis(500));
     loop {
@@ -2284,15 +2289,28 @@ async fn network_session(
                     ready_frames.push((frame, Stamp::<ClientClock>::now()));
                 }
                 if assembler.take_keyframe_request() {
-                    waiting_for_keyframe = true;
-                    reliable_control.send(&mut session, KEYFRAME_REQUEST).await?;
+                    keyframe_pacer.note_gap();
+                }
+                // Draining the assembler's flag above coalesces any number of
+                // detected gaps into a single pending request; the pacer emits
+                // it at most once per interval, and `send_if_available` can never
+                // grow the reliable-control window past its bound, so a keyframe
+                // request can never kill the session. The request is retried
+                // until an actual keyframe clears the pacer below.
+                if keyframe_pacer.due(Instant::now())
+                    && reliable_control
+                        .send_if_available(&mut session, KEYFRAME_REQUEST)
+                        .await?
+                        .is_some()
+                {
+                    keyframe_pacer.note_sent(Instant::now());
                 }
                 for (frame, released_at) in ready_frames {
                     stages.mark(frame.frame_id, ClientStage::Reassembled, released_at);
                     if frame.keyframe {
-                        waiting_for_keyframe = false;
+                        keyframe_pacer.keyframe_received();
                     }
-                    if !waiting_for_keyframe {
+                    if !keyframe_pacer.is_waiting() {
                         decoder_stdin.write_all(&frame.payload).await?;
                         stages.mark(frame.frame_id, ClientStage::DecoderSubmitted, Stamp::now());
                         // The last stage this client can attribute to a
@@ -2962,6 +2980,10 @@ enum ProbeAction {
 /// become the load -- each probe costs one key event and one redraw on the
 /// host -- and fast enough to gather a few hundred samples in a few minutes.
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+/// Minimum spacing between keyframe requests while one is outstanding. A few
+/// round trips: long enough that a burst of gaps coalesces into one request,
+/// short enough that a genuinely lost keyframe is re-requested promptly.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The key the probe presses. A modifier, so an ordinary application that
 /// happens to be focused instead of the helper receives something inert
