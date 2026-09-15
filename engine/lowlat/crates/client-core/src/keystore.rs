@@ -293,7 +293,204 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod platform {
+    //! Secret Service through libsecret, resolved at runtime.
+    //!
+    //! libsecret is never linked. A machine without it -- a headless host, a
+    //! container -- gets a keystore that reports itself unavailable and a
+    //! caller that keeps the file, rather than a binary that will not start.
+    //! That is the same rule the vendor codec runtimes follow.
+
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+
+    use lowlat_common::dynlib::Library;
+
+    pub(super) const AVAILABLE: bool = true;
+
+    const SCHEMA_NAME: &CStr = c"com.openstream.DeviceIdentity";
+    const ATTRIBUTE_ACCOUNT: &CStr = c"account";
+    const LABEL: &CStr = c"OpenStream device identity";
+    /// libsecret's `SECRET_COLLECTION_DEFAULT`.
+    const COLLECTION_DEFAULT: &CStr = c"default";
+
+    const SECRET_SCHEMA_NONE: c_int = 0;
+    const SECRET_SCHEMA_ATTRIBUTE_STRING: c_int = 0;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SchemaAttribute {
+        name: *const c_char,
+        kind: c_int,
+    }
+
+    /// Mirrors `SecretSchema`. The trailing reserved fields are part of the
+    /// published layout and have to be present even though nothing reads
+    /// them: libsecret copies the struct by value.
+    #[repr(C)]
+    struct Schema {
+        name: *const c_char,
+        flags: c_int,
+        attributes: [SchemaAttribute; 32],
+        reserved: c_int,
+        reserved1: *mut c_void,
+        reserved2: *mut c_void,
+        reserved3: *mut c_void,
+        reserved4: *mut c_void,
+        reserved5: *mut c_void,
+        reserved6: *mut c_void,
+        reserved7: *mut c_void,
+    }
+
+    // Declared variadic, because that is what these are. Calling a variadic
+    // function through a non-variadic pointer is not the same ABI.
+    type StoreSync = unsafe extern "C" fn(
+        *const Schema,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *mut c_void,
+        *mut c_void,
+        ...
+    ) -> c_int;
+    type LookupSync =
+        unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> *mut c_char;
+    type ClearSync = unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> c_int;
+    type FreePassword = unsafe extern "C" fn(*mut c_char);
+
+    struct Secret {
+        _library: Library,
+        store: StoreSync,
+        lookup: LookupSync,
+        clear: ClearSync,
+        free: FreePassword,
+    }
+
+    fn schema() -> Schema {
+        let mut attributes = [SchemaAttribute {
+            name: std::ptr::null(),
+            kind: 0,
+        }; 32];
+        attributes[0] = SchemaAttribute {
+            name: ATTRIBUTE_ACCOUNT.as_ptr(),
+            kind: SECRET_SCHEMA_ATTRIBUTE_STRING,
+        };
+        Schema {
+            name: SCHEMA_NAME.as_ptr(),
+            flags: SECRET_SCHEMA_NONE,
+            attributes,
+            reserved: 0,
+            reserved1: std::ptr::null_mut(),
+            reserved2: std::ptr::null_mut(),
+            reserved3: std::ptr::null_mut(),
+            reserved4: std::ptr::null_mut(),
+            reserved5: std::ptr::null_mut(),
+            reserved6: std::ptr::null_mut(),
+            reserved7: std::ptr::null_mut(),
+        }
+    }
+
+    fn open() -> Option<Secret> {
+        // Versioned name first: the unversioned alias ships with the
+        // development package, which a plain desktop does not have.
+        let library = Library::open_first(&[c"libsecret-1.so.0", c"libsecret-1.so"])?;
+        // SAFETY: each type matches the signature libsecret publishes for the
+        // symbol of that name, and the pointers borrow `library`, which is
+        // moved into the returned value and outlives every call.
+        unsafe {
+            Some(Secret {
+                store: library.symbol(c"secret_password_store_sync")?,
+                lookup: library.symbol(c"secret_password_lookup_sync")?,
+                clear: library.symbol(c"secret_password_clear_sync")?,
+                free: library.symbol(c"secret_password_free")?,
+                _library: library,
+            })
+        }
+    }
+
+    pub(super) fn load(account: &str) -> Option<Vec<u8>> {
+        let secret = open()?;
+        let account = CString::new(account).ok()?;
+        let schema = schema();
+        // SAFETY: the schema outlives the call; the variadic tail is one
+        // attribute name/value pair terminated by NULL, as libsecret requires.
+        // A null GError** means "report no detail", which is legal in GLib.
+        let found = unsafe {
+            (secret.lookup)(
+                &raw const schema,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                ATTRIBUTE_ACCOUNT.as_ptr(),
+                account.as_ptr(),
+                std::ptr::null::<c_char>(),
+            )
+        };
+        if found.is_null() {
+            return None;
+        }
+        // SAFETY: a non-null return is a NUL-terminated string owned by
+        // libsecret, valid until freed below.
+        let text = unsafe { CStr::from_ptr(found) }
+            .to_str()
+            .ok()
+            .map(str::to_owned);
+        // SAFETY: freeing exactly what libsecret returned, once.
+        unsafe { (secret.free)(found) };
+        hex::decode(text?.trim()).ok()
+    }
+
+    pub(super) fn store(account: &str, value: &[u8]) -> Result<(), String> {
+        let secret = open().ok_or("libsecret is not available on this machine")?;
+        let account = CString::new(account).map_err(|_| "the account name is not usable")?;
+        // The Secret Service carries a NUL-terminated string, so the key is
+        // hex encoded rather than passed as raw bytes.
+        let encoded = CString::new(hex::encode(value)).map_err(|_| "the key is not encodable")?;
+        let schema = schema();
+        // SAFETY: as in `load`; the variadic tail is one attribute pair
+        // terminated by NULL.
+        let stored = unsafe {
+            (secret.store)(
+                &raw const schema,
+                COLLECTION_DEFAULT.as_ptr(),
+                LABEL.as_ptr(),
+                encoded.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                ATTRIBUTE_ACCOUNT.as_ptr(),
+                account.as_ptr(),
+                std::ptr::null::<c_char>(),
+            )
+        };
+        if stored == 0 {
+            return Err("the Secret Service refused the key".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn remove(account: &str) -> Result<(), String> {
+        let secret = open().ok_or("libsecret is not available on this machine")?;
+        let account = CString::new(account).map_err(|_| "the account name is not usable")?;
+        let schema = schema();
+        // SAFETY: as in `load`.
+        let cleared = unsafe {
+            (secret.clear)(
+                &raw const schema,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                ATTRIBUTE_ACCOUNT.as_ptr(),
+                account.as_ptr(),
+                std::ptr::null::<c_char>(),
+            )
+        };
+        if cleared == 0 {
+            return Err("the Secret Service refused the delete".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
     pub(super) const AVAILABLE: bool = false;
 
@@ -308,10 +505,10 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    /// A real keychain round trip. Ignored by default because it writes to
-    /// the developer's own login keychain and can raise an authorization
-    /// prompt; run it deliberately with `--ignored`.
-    #[cfg(target_os = "macos")]
+    /// A real keystore round trip. Ignored by default because it writes to
+    /// the developer's own keychain or keyring and can raise an
+    /// authorization prompt; run it deliberately with `--ignored`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     #[ignore = "writes to the login keychain"]
     fn a_stored_key_comes_back_byte_for_byte() {
@@ -338,7 +535,7 @@ mod tests {
         assert!(super::load(&account).is_none());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn targets_without_an_implementation_say_so_rather_than_pretending() {
         assert!(!super::available());

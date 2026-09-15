@@ -4,6 +4,12 @@
 //! environment variables; sharing a process with other tests would make the
 //! result depend on scheduling.
 //!
+//! macOS only, and deliberately. The account name is derived inside the crate
+//! from the store path, so an integration test cannot compute it to clean up
+//! afterwards; here the whole service can be cleared by name instead. The
+//! Linux platform layer is covered by the round-trip test inside
+//! `keystore.rs`, which knows its own account and removes it.
+//!
 //! Ignored by default: it writes to the developer's login keychain. Run it
 //! deliberately with `--ignored`.
 
