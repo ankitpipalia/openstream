@@ -184,3 +184,16 @@ button { color: inherit; }
   .page-content { padding-right: 34px; padding-left: 34px; }
   .topbar { padding-right: 34px; padding-left: 34px; }
 }
+
+/* Secure Connect approval modal: an app-wide overlay above every page. */
+.modal-backdrop { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; padding: 24px; background: rgba(4, 8, 13, .62); backdrop-filter: blur(2px); }
+.modal-card { width: min(420px, 100%); border: 1px solid var(--border-strong); border-radius: 12px; background: linear-gradient(145deg, rgba(22, 34, 49, .96), rgba(15, 24, 34, .98)); box-shadow: 0 24px 64px rgba(0, 0, 0, .4); padding: 22px 23px; }
+.modal-card h2 { margin: 0; color: var(--text); font-size: 15px; font-weight: 650; }
+.modal-lead { margin: 6px 0 16px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.modal-facts { margin: 0 0 16px; display: grid; gap: 12px; }
+.modal-facts div { display: grid; gap: 3px; }
+.modal-facts dt { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.modal-facts dd { margin: 0; color: var(--text); font-size: 12px; }
+.modal-monospace { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+.modal-note { margin: 0 0 16px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; }

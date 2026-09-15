@@ -71,6 +71,13 @@ interface ConnectionRequest {
   expires_at_ms: number;
 }
 
+/** The Rust `PendingConnectRequest` shape returned by `host_connect_requests`. */
+interface PendingConnectRequestRaw {
+  request_id: string;
+  requester_device_id: string;
+  expires_in_seconds: number;
+}
+
 /// Runtime truth for one probe, decided in Rust. The state is a closed set
 /// and the detail is prose for the operator; nothing here is parsed.
 export type DiagnosticState =
@@ -878,6 +885,22 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
     signOut: async () => {
       const raw = (await invokeFn("control_plane_sign_out")) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
+    },
+    hostConnectRequests: async () => {
+      const raw = (await invokeFn("host_connect_requests")) as PendingConnectRequestRaw[];
+      return raw.map((request) => ({
+        requestId: request.request_id,
+        requesterDeviceId: request.requester_device_id,
+        expiresInSeconds: request.expires_in_seconds,
+      }));
+    },
+    // The Rust `request_id` parameter is addressed as camelCase `requestId`,
+    // which is how Tauri v2 deserializes command arguments.
+    approveConnectRequest: async (requestId) => {
+      await invokeFn("approve_connect_request", { requestId });
+    },
+    denyConnectRequest: async (requestId) => {
+      await invokeFn("deny_connect_request", { requestId });
     },
   };
 }
