@@ -2820,6 +2820,7 @@ dependencies = [
  "hex",
  "if-addrs",
  "libc",
+ "lowlat-common",
  "openstream-protocol",
  "openstream-transport",
  "openstream-transport-policy",

@@ -37,10 +37,10 @@ pub(crate) fn store(account: &str, secret: &[u8]) -> Result<(), String> {
 /// Remove an entry. This exists so the round-trip test leaves no residue in
 /// the developer's keychain; the product never deletes an identity.
 ///
-/// Gated on macOS as well as test, because the only caller is the macOS
-/// round-trip test: on other targets it would be dead code, which this
-/// workspace treats as an error.
-#[cfg(all(test, target_os = "macos"))]
+/// Gated on the platforms that implement a keystore as well as on test,
+/// because the only caller is the round-trip test: elsewhere it would be dead
+/// code, which this workspace treats as an error.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn remove(account: &str) -> Result<(), String> {
     platform::remove(account)
 }
@@ -355,6 +355,7 @@ mod platform {
     ) -> c_int;
     type LookupSync =
         unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> *mut c_char;
+    #[cfg(test)]
     type ClearSync = unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> c_int;
     type FreePassword = unsafe extern "C" fn(*mut c_char);
 
@@ -362,6 +363,10 @@ mod platform {
         _library: Library,
         store: StoreSync,
         lookup: LookupSync,
+        /// Only the round-trip test clears an entry; the product never
+        /// deletes an identity, so outside test builds this is not resolved
+        /// and the field is not carried.
+        #[cfg(test)]
         clear: ClearSync,
         free: FreePassword,
     }
@@ -401,6 +406,7 @@ mod platform {
             Some(Secret {
                 store: library.symbol(c"secret_password_store_sync")?,
                 lookup: library.symbol(c"secret_password_lookup_sync")?,
+                #[cfg(test)]
                 clear: library.symbol(c"secret_password_clear_sync")?,
                 free: library.symbol(c"secret_password_free")?,
                 _library: library,
