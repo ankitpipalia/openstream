@@ -382,8 +382,10 @@ mod platform {
         *mut c_void,
         ...
     ) -> c_int;
+    // The third parameter is `GError **`: libsecret writes a pointer to a new
+    // GError there on failure, so it is a pointer to a pointer, not a pointer.
     type LookupSync =
-        unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> *mut c_char;
+        unsafe extern "C" fn(*const Schema, *mut c_void, *mut *mut c_void, ...) -> *mut c_char;
     #[cfg(test)]
     type ClearSync = unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> c_int;
     type FreePassword = unsafe extern "C" fn(*mut c_char);
