@@ -4742,19 +4742,43 @@ identity is one a later outage would silently replace",
                 eprintln!("OpenStream identity source=keystore");
                 return Ok(identity);
             }
-            Err(_) if recorded => return refuse("the entry it holds is unreadable"),
+            Err(_) if recorded && !path.exists() => {
+                return refuse("the entry it holds is unreadable");
+            }
+            Err(_) if recorded => eprintln!(
+                "OpenStream identity: the keystore entry is unreadable; recovering this device's \
+identity from the retained file fallback at {}",
+                path.display()
+            ),
             Err(_) => eprintln!(
                 "OpenStream identity: the keystore entry is unreadable and no custody was \
 recorded here; trying the file"
             ),
         },
-        // Custody was recorded, so an answer of "no entry" means one was lost
-        // rather than never created. Minting here is the exact failure this
-        // marker exists to prevent.
-        keystore::Lookup::Absent if recorded => return refuse("the entry it held is gone"),
-        keystore::Lookup::Unavailable(reason) if recorded => {
+        // Custody was recorded, so an answer of "no entry" or "cannot read"
+        // means the keystore copy was lost, not that it was never created.
+        // Minting a new identity here is the exact failure this marker exists to
+        // prevent -- but a file->keystore migration deliberately keeps the
+        // identity file as a fallback holding the same key, so recover from it
+        // when it is present. Refuse only when there is nothing to recover,
+        // which is the case that would otherwise enrol the machine as a
+        // different device.
+        keystore::Lookup::Absent if recorded && !path.exists() => {
+            return refuse("the entry it held is gone");
+        }
+        keystore::Lookup::Absent if recorded => eprintln!(
+            "OpenStream identity: the keystore entry is gone; recovering this device's identity \
+from the retained file fallback at {}",
+            path.display()
+        ),
+        keystore::Lookup::Unavailable(reason) if recorded && !path.exists() => {
             return refuse(&format!("it cannot be read ({reason})"));
         }
+        keystore::Lookup::Unavailable(reason) if recorded => eprintln!(
+            "OpenStream identity: the keystore is unavailable ({reason}); recovering this \
+device's identity from the retained file fallback at {}",
+            path.display()
+        ),
         keystore::Lookup::Absent => {}
         keystore::Lookup::Unavailable(reason) => eprintln!(
             "OpenStream identity: the keystore is unavailable ({reason}) and no custody was \
