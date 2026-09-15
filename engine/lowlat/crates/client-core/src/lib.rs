@@ -186,6 +186,62 @@ const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// so clipboard transfers can use at most 64 chunks without changing the
 /// media datagram limit or allowing an unbounded control backlog.
 pub const MAX_CONTROL_PENDING: usize = 64;
+
+/// Paces client keyframe requests so a burst of detected gaps cannot flood the
+/// reliable-control channel. A gap marks a single request pending; the request
+/// is emitted at most once per `interval` until an actual keyframe (or a decoder
+/// restart) clears it. Without this, hundreds of gaps on a fresh or lossy path
+/// -- before the first keyframe lands -- queued hundreds of keyframe requests
+/// and saturated the bounded control window, which tore the session down.
+#[derive(Debug)]
+pub struct KeyframeRequestPacer {
+    waiting: bool,
+    last_request: Option<Instant>,
+    interval: Duration,
+}
+
+impl KeyframeRequestPacer {
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            waiting: false,
+            last_request: None,
+            interval,
+        }
+    }
+
+    /// Record that the decoder detected a gap needing a keyframe. Any number of
+    /// gaps collapse into a single pending request.
+    pub fn note_gap(&mut self) {
+        self.waiting = true;
+    }
+
+    /// Whether a keyframe request should be sent at `now`: only while one is
+    /// pending, and at most once per `interval`.
+    pub fn due(&self, now: Instant) -> bool {
+        self.waiting
+            && self
+                .last_request
+                .is_none_or(|sent| now.duration_since(sent) >= self.interval)
+    }
+
+    /// Record that a request was actually transmitted at `now`.
+    pub fn note_sent(&mut self, now: Instant) {
+        self.last_request = Some(now);
+    }
+
+    /// Clear the pending state. Called when an actual keyframe arrives or the
+    /// decoder/session is restarted -- never merely because a request was sent.
+    pub fn keyframe_received(&mut self) {
+        self.waiting = false;
+        self.last_request = None;
+    }
+
+    /// Whether the client is still waiting for a keyframe. Gates decoder submit:
+    /// non-keyframe pictures are not fed to the decoder while recovering.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting
+    }
+}
 /// Maximum size accepted for a signaling JSON envelope. This is lower than
 /// the server's WebSocket ceiling and prevents a client from retaining a
 /// large attacker-controlled value while it waits for a later phase.
@@ -195,10 +251,13 @@ pub const MAX_SIGNAL_MESSAGE_BYTES: usize = 64 * 1024;
 const CAPABILITY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// Direct UDP has no ICE consent agent. Send an authenticated application
 /// keepalive when an otherwise quiet stream reaches this interval.
-const DIRECT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// Cadence for the authenticated application-layer keepalive. It is sent on any
+/// selected path -- direct or full ICE -- so that both peers observe authenticated
+/// traffic during a media pause. ICE consent freshness keeps the transport open
+/// but is invisible to the application layer, so it cannot substitute for this.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// A direct path that produces no authenticated packet for this long is
-/// considered dead. Full ICE retains its own consent freshness and is not
-/// subject to this application-data timeout.
+/// considered dead.
 const DIRECT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Video codecs understood by the initial OpenStream clients.
@@ -1868,13 +1927,33 @@ impl ReliableControl {
     }
 
     /// Queue and immediately transmit the oldest reliable control message.
-    pub async fn send(&mut self, session: &mut PeerSession, payload: &[u8]) -> Result<u32, Error> {
-        let sequence = self
-            .outbound
-            .queue(payload)
-            .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        self.flush(session).await?;
-        Ok(sequence)
+    ///
+    /// Returns `Some(sequence)` when the message was accepted into the
+    /// outstanding window, and `None` when the window was full. A full window
+    /// is transient backpressure -- the peer has not acknowledged enough
+    /// in-flight control yet -- so this newest message is dropped rather than
+    /// the session being torn down: the oldest frame is still flushed to
+    /// elicit acknowledgements, and a genuinely dead peer is caught by the
+    /// liveness timeout, not by a fatal error here. A genuinely oversized or
+    /// empty payload is a permanent fault and is still returned as an error.
+    pub async fn send(
+        &mut self,
+        session: &mut PeerSession,
+        payload: &[u8],
+    ) -> Result<Option<u32>, Error> {
+        match self.outbound.queue(payload) {
+            Ok(sequence) => {
+                self.flush(session).await?;
+                Ok(Some(sequence))
+            }
+            Err(openstream_protocol::control::Error::WindowFull) => {
+                // Backpressure, not malformed input: drive the oldest frame so
+                // its acknowledgement can open the window, and drop this one.
+                self.flush(session).await?;
+                Ok(None)
+            }
+            Err(error) => Err(Error::InvalidMessage(error.to_string())),
+        }
     }
 
     /// Send a redundant control message only when the bounded window has
@@ -1889,7 +1968,7 @@ impl ReliableControl {
         if !self.outbound.has_capacity() {
             return Ok(None);
         }
-        self.send(session, payload).await.map(Some)
+        self.send(session, payload).await
     }
 
     /// Retransmit the oldest outstanding message, if one exists.
@@ -3086,9 +3165,16 @@ impl PeerSession {
         ) {
             return Ok(());
         }
-        if !matches!(self.path.active().backend(), PeerPathBackend::Direct { .. })
-            || self.last_keepalive.elapsed() < DIRECT_KEEPALIVE_INTERVAL
-        {
+        // Keepalives are sent on any established path -- direct or full ICE.
+        // ICE's own consent freshness keeps the socket open but never surfaces
+        // to the application layer, so without this a peer that stops sending
+        // media (a paused or idle session) would look dead to the other side's
+        // authenticated-liveness timeout even though the path is healthy.
+        let path_supports_keepalive = matches!(
+            self.path.active().backend(),
+            PeerPathBackend::Direct { .. } | PeerPathBackend::Ice(_)
+        );
+        if !path_supports_keepalive || self.last_keepalive.elapsed() < KEEPALIVE_INTERVAL {
             return Ok(());
         }
         self.send_path_control(PathSlot(self.path_generation()), 0, PATH_KEEPALIVE)
@@ -5944,6 +6030,103 @@ mod tests {
             draining: None,
             migration_inbox: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn full_reliable_control_window_is_backpressure_not_fatal() {
+        let mut sender = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let sink = UdpTransport::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        sender.connect(sink.local_addr().unwrap()).await.unwrap();
+        // `sink` is never read, so no control frame is ever acknowledged and
+        // the outbound window cannot drain.
+        let mut session = direct_test_session(sender);
+        let mut control = ReliableControl::new(4);
+        for index in 0..4 {
+            let accepted = control
+                .send(&mut session, format!("m{index}").as_bytes())
+                .await
+                .expect("send must not error while the window has room");
+            assert!(
+                accepted.is_some(),
+                "message {index} should enter the window"
+            );
+        }
+        // The window is full and nothing can acknowledge it. Every further send
+        // must be backpressure -- Ok(None) -- never a fatal or malformed-input
+        // error that would tear the session down.
+        for _ in 0..200 {
+            match control.send(&mut session, b"overflow").await {
+                Ok(None) => {}
+                other => panic!("a full window must backpressure, got {other:?}"),
+            }
+        }
+        assert_eq!(control.outstanding(), 4);
+    }
+
+    #[test]
+    fn stale_epoch_ice_messages_are_ignored_not_applied() {
+        // Leftover ICE traffic from a previous establishment epoch must be
+        // ignored (Ok(false)) so it can neither advance nor revive the current
+        // one; the current generation is accepted; a future one is rejected.
+        let message = |generation: u64| {
+            serde_json::json!({
+                "type": "ice_credentials_v2",
+                "establishment_generation": generation,
+                "ufrag": "u",
+                "pwd": "p",
+            })
+        };
+        assert!(
+            !handle_ice_generation(&message(1), "ice_credentials_v2", 2).unwrap(),
+            "a stale epoch must be ignored, never applied"
+        );
+        assert!(
+            handle_ice_generation(&message(2), "ice_credentials_v2", 2).unwrap(),
+            "the current epoch must be accepted"
+        );
+        assert!(
+            handle_ice_generation(&message(3), "ice_credentials_v2", 2).is_err(),
+            "a future epoch is a protocol error"
+        );
+    }
+
+    #[test]
+    fn keyframe_pacer_coalesces_many_gaps_into_bounded_requests() {
+        let interval = Duration::from_millis(250);
+        let mut pacer = KeyframeRequestPacer::new(interval);
+        let start = Instant::now();
+        // With no gap detected, nothing is ever due.
+        assert!(!pacer.due(start));
+
+        // Hundreds of gaps arriving rapidly within a single interval.
+        let mut sent = 0_u32;
+        for step in 0..500_u64 {
+            pacer.note_gap();
+            let now = start + Duration::from_micros(step * 100);
+            if pacer.due(now) {
+                pacer.note_sent(now);
+                sent += 1;
+            }
+        }
+        assert_eq!(
+            sent, 1,
+            "hundreds of gaps within one interval must coalesce to a single request"
+        );
+
+        // Still waiting after the interval elapses: exactly one more request.
+        let later = start + interval + Duration::from_millis(1);
+        assert!(pacer.due(later));
+        pacer.note_sent(later);
+        assert!(!pacer.due(later + Duration::from_millis(1)));
+
+        // An actual keyframe clears the pending state; nothing is due afterwards.
+        pacer.keyframe_received();
+        assert!(!pacer.is_waiting());
+        assert!(!pacer.due(later + interval * 10));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

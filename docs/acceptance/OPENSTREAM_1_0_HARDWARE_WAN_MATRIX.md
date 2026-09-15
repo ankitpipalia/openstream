@@ -92,3 +92,64 @@ but those are not substitutes for the rows above. If hardware, WAN, signing,
 or notarization evidence is unavailable, publish a development build or a
 release candidate with the exact missing gates listed; do not label it
 OpenStream 1.0 production-ready.
+
+## Cross-NAT WAN run of 2026-09-15 (PARTIAL — not a gate pass)
+
+Client on a mobile carrier hotspot (public map `47.11.113.62`, LAN
+unreachable); host on the home network reached only through the Cloudflare
+Tunnel for signalling. Both used full ICE (`OPENSTREAM_ICE_URLS=stun:stun.l.google.com:19302`)
+with mutual peer-identity pinning. Synthetic FFmpeg source (`lavfi testsrc2`)
+to remove the capture rig as a variable, which had broken three prior runs.
+
+What was proven:
+
+| observation | result |
+| --- | --- |
+| signalling over tunnel | client and host both registered; server minted an establishment epoch and both received `ice_peer_ready` |
+| direct cross-NAT ICE | a direct path was established between the carrier NAT and the home NAT via peer-reflexive discovery — no relay in the path |
+| media delivery | 925 media datagrams and 82 decoded H264 frames received at the client (`stage client frames=82 rate=89.5/s`), first fragment to reassembled p95 ≤ 33 ms |
+| path RTT | ICMP to the host's public map averaged ~11 ms; latency was never the constraint |
+
+What terminated it, and what remains unverified:
+
+- The direct session ended after ≈0.9 s — **terminated by the application, not
+  by the transport.** The client's reliable-control window filled with
+  unthrottled keyframe requests during initial packet loss; the 65th `send()`
+  returned the control layer's `TooLarge`, which was (a) the same variant used
+  for a genuinely oversized payload and (b) fatal. The client reported
+  `invalid signaling message: ordered control payload is too large` and dropped.
+- Reconnect then failed on every retry with `establishment phase timed out:
+  ice credentials/candidates`. Root cause is host-side: after the client's
+  unclean drop (no `openstream/end`), the host had no peer-liveness teardown on
+  the ICE path and stayed in its media loop for the whole `OPENSTREAM_HOST_SECONDS`
+  window, so it never re-registered for the new epoch the client was waiting on.
+- Endpoint-dependent (symmetric) NAT was observed on the carrier: three STUN
+  queries from one socket returned three different public ports
+  (`59216`, `64701`, `62870`). Peer-reflexive discovery still established a
+  direct path here, but a TURN relay remains **mandatory** as a production
+  fallback for networks where it cannot.
+
+Still unverified after this run, and required before `wan-turn` or any WAN row
+may change from `UNVERIFIED`: sustained direct operation (minutes, not
+seconds), clean reconnect to a fresh epoch, TURN relay fallback, and behaviour
+when signalling is stopped during an active session. `wan-turn` is **not**
+passed by this result.
+
+### Post-fix validation of the control-window and host-liveness changes (2026-09-15)
+
+After the fix in this change set, the failure mode was re-exercised on the LAN
+(the cross-NAT confirmation on a mobile hotspot is still pending):
+
+| check | result |
+| --- | --- |
+| sustained session (direct path) | A synthetic-source session ran ~2 minutes: the host encoded 7455 frames at 60.2 fps with 0 stalls, and the client session stayed up the whole time with no `session ended`, no `ordered control payload is too large`, and no spurious teardown. The pre-fix failure killed the session at ~0.9 s |
+| clean teardown (direct path) | killing the client produced an immediate transport error and the host ended cleanly: `ended after peer disconnect` |
+| authenticated ICE liveness backstop | an ICE session was established, then the client was killed **silently** (no `openstream/end`, no socket error the host could observe on the ICE path). Exactly 15 s later the host logged `ending session: no authenticated peer traffic for 15.04s; re-registering` and exited for its supervisor to restart. Before the fix the ICE host stayed in its media loop indefinitely and a reconnecting client timed out forever on `ice credentials/candidates` |
+| unit regressions | a tiny payload never returns `TooLarge`; a full window is backpressure, never fatal; hundreds of gaps coalesce to one request per interval; stale-epoch ICE messages are ignored |
+
+Not shown here: reconnect to the **same** `session_id` after teardown. Sessions
+are reaped by server TTL once no peer holds them, so the static test pairing's
+id returned 404 (absent), not 410 (expired). Production issues a fresh pairing
+per connect, so this is a test-fixture limitation, not a regression. The
+cross-NAT direct-media re-run and the signalling-outage-during-session test
+remain to be repeated on a genuinely different network.
