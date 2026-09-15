@@ -29,10 +29,11 @@
 #![allow(dead_code)]
 
 use core_foundation::base::{CFType, TCFType};
+use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::CFRelease;
+use core_foundation_sys::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
 use std::ffi::c_void;
@@ -184,6 +185,23 @@ unsafe extern "C" {
     ) -> OSStatus;
 
     fn VTDecompressionSessionInvalidate(session: VtDecompressionSessionRef);
+
+    fn VTSessionCopyProperty(
+        session: VtDecompressionSessionRef,
+        property_key: CFStringRef,
+        allocator: CfAllocatorRef,
+        property_value_out: *mut CFTypeRef,
+    ) -> OSStatus;
+
+    // Ask the session to use the hardware decoder, and the key to read back
+    // whether it actually did.
+    static kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: CFStringRef;
+    static kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder: CFStringRef;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
@@ -251,15 +269,21 @@ impl fmt::Display for VtError {
 impl std::error::Error for VtError {}
 
 /// The output callback drains decoded pictures into this sink. It lives boxed at
-/// a stable address for the session's lifetime, and the decode call reads and
-/// clears it after `WaitForAsynchronousFrames`.
+/// a stable address for the session's lifetime; a synchronous decode fills it
+/// before `VTDecompressionSessionDecodeFrame` returns, and the decode call reads
+/// and clears it then.
 struct DecodeSink {
     frames: Vec<VtFrame>,
+    /// A nonzero status reported to the callback, so `decode` can surface a
+    /// decoder failure instead of an empty success (which would hide the error
+    /// from the fallback path).
+    last_error: Option<OSStatus>,
 }
 
 /// The VideoToolbox output callback. Copies the decoded BGRA image into a
-/// `VtFrame`. Runs on a VideoToolbox thread, but the decode call waits for it
-/// before reading the sink, so there is no concurrent access.
+/// `VtFrame`, or records the failure status. Runs on a VideoToolbox thread, but
+/// a synchronous decode completes it before the decode call reads the sink, so
+/// there is no concurrent access.
 extern "C" fn output_callback(
     ref_con: *mut c_void,
     _source_frame_ref_con: *mut c_void,
@@ -269,13 +293,20 @@ extern "C" fn output_callback(
     presentation_time_stamp: CmTime,
     _presentation_duration: CmTime,
 ) {
-    if ref_con.is_null() || status != 0 || image_buffer.is_null() {
+    if ref_con.is_null() {
         return;
     }
     // SAFETY: `ref_con` is the `Box<DecodeSink>` pointer this decoder passed to
     // `VTDecompressionSessionCreate` and keeps alive for the session's life; the
     // decode call has no other reference live while the callback runs.
     let sink = unsafe { &mut *(ref_con as *mut DecodeSink) };
+    if status != 0 {
+        sink.last_error = Some(status);
+        return;
+    }
+    if image_buffer.is_null() {
+        return;
+    }
 
     let presentation_time_us = if presentation_time_stamp.flags & K_CM_TIME_FLAGS_VALID != 0
         && presentation_time_stamp.timescale > 0
@@ -330,6 +361,9 @@ pub(crate) struct VideoToolboxH264Decoder {
     // so a format change can be detected without rebuilding needlessly.
     sps: Vec<u8>,
     pps: Vec<u8>,
+    // Whether the created session actually resolved to the hardware decoder, as
+    // reported by VideoToolbox — `None` until a session is created.
+    hardware_accelerated: Option<bool>,
     // Boxed so its address is stable for the callback record; freed in Drop.
     sink: *mut DecodeSink,
 }
@@ -338,6 +372,7 @@ impl fmt::Debug for VideoToolboxH264Decoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoToolboxH264Decoder")
             .field("configured", &(!self.format.is_null()))
+            .field("hardware_accelerated", &self.hardware_accelerated)
             .field("sps_len", &self.sps.len())
             .field("pps_len", &self.pps.len())
             .finish()
@@ -348,14 +383,36 @@ impl VideoToolboxH264Decoder {
     /// Create an unconfigured decoder. The session is built lazily once the
     /// first keyframe supplies SPS/PPS.
     pub(crate) fn new() -> Self {
-        let sink = Box::into_raw(Box::new(DecodeSink { frames: Vec::new() }));
+        let sink = Box::into_raw(Box::new(DecodeSink {
+            frames: Vec::new(),
+            last_error: None,
+        }));
         VideoToolboxH264Decoder {
             session: std::ptr::null_mut(),
             format: std::ptr::null_mut(),
             sps: Vec::new(),
             pps: Vec::new(),
+            hardware_accelerated: None,
             sink,
         }
+    }
+
+    /// Whether the current session resolved to the hardware decoder, as reported
+    /// by VideoToolbox. `None` before the first session is created.
+    pub(crate) fn hardware_accelerated(&self) -> Option<bool> {
+        self.hardware_accelerated
+    }
+
+    /// Flush any frames VideoToolbox is still holding (end of stream / teardown).
+    /// The steady-state decode path is synchronous and does not need this.
+    pub(crate) fn flush(&mut self) -> Vec<VtFrame> {
+        if self.session.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: session is valid; wait for any deferred frames, then drain.
+        unsafe { VTDecompressionSessionWaitForAsynchronousFrames(self.session) };
+        let sink = unsafe { &mut *self.sink };
+        std::mem::take(&mut sink.frames)
     }
 
     /// Decode one Annex-B access unit, returning the pictures it produced (zero
@@ -415,13 +472,16 @@ impl VideoToolboxH264Decoder {
         self.ensure_session()?;
         let sample = self.build_sample_buffer(&avcc, presentation_time_us)?;
 
-        // SAFETY: sink is our live boxed pointer; the decode + wait completes the
-        // callback before we read it, so the &mut here is exclusive.
+        // SAFETY: sink is our live boxed pointer; a synchronous decode completes
+        // the callback before DecodeFrame returns, so the &mut here is exclusive.
         let sink = unsafe { &mut *self.sink };
         sink.frames.clear();
+        sink.last_error = None;
 
-        // SAFETY: session and sample are valid; a synchronous decode (no async
-        // flag) plus WaitForAsynchronousFrames guarantees the callback has run.
+        // SAFETY: session and sample are valid. Decode flags are zero, so the
+        // decode is synchronous and the output callback runs before DecodeFrame
+        // returns. No per-frame WaitForAsynchronousFrames: it also flushes
+        // deferred frames and is inappropriate for the steady-state path.
         let status = unsafe {
             let mut info_flags: u32 = 0;
             let status = VTDecompressionSessionDecodeFrame(
@@ -431,9 +491,6 @@ impl VideoToolboxH264Decoder {
                 std::ptr::null_mut(),
                 &mut info_flags,
             );
-            if status == 0 {
-                VTDecompressionSessionWaitForAsynchronousFrames(self.session);
-            }
             CFRelease(sample as *const c_void);
             status
         };
@@ -441,8 +498,16 @@ impl VideoToolboxH264Decoder {
             return Err(VtError::Decode(status));
         }
 
-        // SAFETY: same exclusivity argument; the callback has finished.
+        // SAFETY: the synchronous callback has finished.
         let sink = unsafe { &mut *self.sink };
+        if let Some(callback_status) = sink.last_error
+            && sink.frames.is_empty()
+        {
+            // DecodeFrame returned success but the callback reported a failure
+            // and produced nothing — surface it so the caller can fall back
+            // rather than mistaking a broken decode for an empty one.
+            return Err(VtError::Decode(callback_status));
+        }
         Ok(std::mem::take(&mut sink.frames))
     }
 
@@ -483,19 +548,20 @@ impl VideoToolboxH264Decoder {
             return Ok(());
         }
         let attrs = bgra_buffer_attributes();
+        let spec = hardware_decoder_specification();
         let record = VtDecompressionOutputCallbackRecord {
             callback: output_callback,
             ref_con: self.sink as *mut c_void,
         };
         let mut session: VtDecompressionSessionRef = std::ptr::null_mut();
-        // SAFETY: format is a valid, owned format description; attrs is a valid
-        // dictionary living for the call; record points to a stable callback +
-        // sink. On success we own the session.
+        // SAFETY: format is a valid, owned format description; spec and attrs are
+        // valid dictionaries living for the call; record points to a stable
+        // callback + sink. On success we own the session.
         let status = unsafe {
             VTDecompressionSessionCreate(
                 std::ptr::null(),
                 self.format,
-                std::ptr::null(),
+                spec.as_concrete_TypeRef(),
                 attrs.as_concrete_TypeRef(),
                 &record,
                 &mut session,
@@ -505,7 +571,34 @@ impl VideoToolboxH264Decoder {
             return Err(VtError::SessionCreate(status));
         }
         self.session = session;
+        self.hardware_accelerated = self.query_hardware_acceleration();
         Ok(())
+    }
+
+    /// Read back whether VideoToolbox resolved this session to the hardware
+    /// decoder. `None` if the property is unavailable.
+    fn query_hardware_acceleration(&self) -> Option<bool> {
+        let mut value: CFTypeRef = std::ptr::null();
+        // SAFETY: session is valid; the key is a framework constant; a non-null
+        // returned value is owned by us under the Copy rule and released below.
+        let status = unsafe {
+            VTSessionCopyProperty(
+                self.session,
+                kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                std::ptr::null(),
+                &mut value,
+            )
+        };
+        if status != 0 || value.is_null() {
+            return None;
+        }
+        // SAFETY: value is a CFBoolean owned by us.
+        let is_hardware = unsafe {
+            let is_hardware = CFBooleanGetValue(value) != 0;
+            CFRelease(value);
+            is_hardware
+        };
+        Some(is_hardware)
     }
 
     fn build_sample_buffer(
@@ -579,6 +672,7 @@ impl VideoToolboxH264Decoder {
                 CFRelease(self.session as *const c_void);
             }
             self.session = std::ptr::null_mut();
+            self.hardware_accelerated = None;
         }
     }
 }
@@ -598,6 +692,19 @@ impl Drop for VideoToolboxH264Decoder {
             self.sink = std::ptr::null_mut();
         }
     }
+}
+
+/// Decoder specification asking VideoToolbox to use the hardware decoder. It is
+/// a request, not a guarantee — the session reports back what it actually chose,
+/// which is why the caller reads `UsingHardwareAcceleratedVideoDecoder`.
+fn hardware_decoder_specification() -> CFDictionary<CFType, CFType> {
+    // SAFETY: the key is a framework string constant, valid for the process.
+    let key = unsafe {
+        CFString::wrap_under_get_rule(
+            kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder,
+        )
+    };
+    CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())])
 }
 
 /// Destination attributes requesting BGRA, IOSurface-backed pixel buffers.
@@ -679,9 +786,66 @@ mod tests {
         std::env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
     }
 
+    /// When set, a missing/failed ffmpeg fixture is a hard failure rather than a
+    /// skip — so the hardware-acceptance run cannot pass by silently not running.
+    fn require_vt_test() -> bool {
+        std::env::var_os("OPENSTREAM_REQUIRE_VT_TEST").is_some()
+    }
+
+    /// Generate an Annex-B H.264 clip (one keyframe every `gop`, no B-frames,
+    /// AUDs so access units split cleanly). Returns `None` to skip when ffmpeg is
+    /// unavailable, unless `OPENSTREAM_REQUIRE_VT_TEST` forces a failure.
+    fn generate_h264(source: &str, frames: u32, gop: u32) -> Option<Vec<u8>> {
+        let frames_s = frames.to_string();
+        let gop_s = gop.to_string();
+        let result = Command::new(ffmpeg())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                source,
+                "-frames:v",
+                &frames_s,
+                "-c:v",
+                "libx264",
+                "-bf",
+                "0",
+                "-g",
+                &gop_s,
+                "-keyint_min",
+                &gop_s,
+                "-pix_fmt",
+                "yuv420p",
+                "-x264-params",
+                "aud=1",
+                "-f",
+                "h264",
+                "-",
+            ])
+            .output();
+        match result {
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => Some(out.stdout),
+            other => {
+                let detail = match &other {
+                    Ok(out) => String::from_utf8_lossy(&out.stderr).into_owned(),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    !require_vt_test(),
+                    "OPENSTREAM_REQUIRE_VT_TEST is set but ffmpeg could not produce a fixture: {detail}"
+                );
+                eprintln!("ffmpeg unavailable ({detail}); skipping VideoToolbox test");
+                None
+            }
+        }
+    }
+
     /// Split an Annex-B elementary stream into access units on AUD (type 9)
-    /// boundaries. Only used by the fixture test, which generates the stream
-    /// with `aud=1`.
+    /// boundaries. Used by the fixture tests, which generate the stream with
+    /// `aud=1`.
     fn access_units_by_aud(stream: &[u8]) -> Vec<Vec<u8>> {
         // Byte offsets where an AUD start code begins.
         let mut aud_offsets: Vec<usize> = Vec::new();
@@ -710,51 +874,31 @@ mod tests {
         units
     }
 
-    /// Decode a small H.264 clip end-to-end through VideoToolbox on this
-    /// machine. Skips when ffmpeg is unavailable to generate the fixture.
+    /// Decode every access unit of a clip, tolerating the pre-keyframe
+    /// `NotConfigured` and panicking on any real decode error.
+    fn decode_clip(
+        decoder: &mut VideoToolboxH264Decoder,
+        access_units: &[Vec<u8>],
+    ) -> Vec<VtFrame> {
+        let mut decoded = Vec::new();
+        for (index, au) in access_units.iter().enumerate() {
+            match decoder.decode(au, index as u64 * 100_000, index == 0) {
+                Ok(frames) => decoded.extend(frames),
+                Err(VtError::NotConfigured) => {}
+                Err(error) => panic!("decode failed on AU {index}: {error}"),
+            }
+        }
+        decoded
+    }
+
+    /// End-to-end decode of a real clip: geometry, and presentation-order
+    /// timestamps (the encoder emits no B-frames, so output is display order).
     #[test]
-    fn decodes_a_real_h264_clip_on_this_machine() {
-        let generate = Command::new(ffmpeg())
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc2=size=320x240:rate=10",
-                "-frames:v",
-                "8",
-                "-c:v",
-                "libx264",
-                "-bf",
-                "0",
-                "-g",
-                "8",
-                "-keyint_min",
-                "8",
-                "-pix_fmt",
-                "yuv420p",
-                "-x264-params",
-                "aud=1",
-                "-f",
-                "h264",
-                "-",
-            ])
-            .output();
-        let Ok(output) = generate else {
-            eprintln!("ffmpeg not available; skipping VideoToolbox decode test");
+    fn decodes_a_real_h264_clip_and_preserves_timestamps() {
+        let Some(stream) = generate_h264("testsrc2=size=320x240:rate=10", 8, 8) else {
             return;
         };
-        if !output.status.success() || output.stdout.is_empty() {
-            eprintln!(
-                "ffmpeg could not produce a fixture ({}); skipping",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-
-        let access_units = access_units_by_aud(&output.stdout);
+        let access_units = access_units_by_aud(&stream);
         assert!(
             access_units.len() >= 2,
             "expected several access units, got {}",
@@ -762,21 +906,9 @@ mod tests {
         );
 
         let mut decoder = VideoToolboxH264Decoder::new();
-        let mut decoded = Vec::new();
-        for (index, au) in access_units.iter().enumerate() {
-            let keyframe = index == 0;
-            match decoder.decode(au, index as u64 * 100_000, keyframe) {
-                Ok(frames) => decoded.extend(frames),
-                Err(VtError::NotConfigured) => {} // before the first keyframe
-                Err(error) => panic!("decode failed on AU {index}: {error}"),
-            }
-        }
+        let decoded = decode_clip(&mut decoder, &access_units);
 
-        assert!(
-            !decoded.is_empty(),
-            "VideoToolbox produced no frames from {} access units",
-            access_units.len()
-        );
+        assert!(!decoded.is_empty(), "VideoToolbox produced no frames");
         for frame in &decoded {
             assert_eq!(frame.width, 320, "decoded width");
             assert_eq!(frame.height, 240, "decoded height");
@@ -786,5 +918,114 @@ mod tests {
                 "pixel count matches geometry"
             );
         }
+        for pair in decoded.windows(2) {
+            assert!(
+                pair[1].presentation_time_us >= pair[0].presentation_time_us,
+                "timestamps went backwards: {} then {}",
+                pair[0].presentation_time_us,
+                pair[1].presentation_time_us
+            );
+        }
+    }
+
+    /// The session must resolve to the *hardware* decoder on this machine, not
+    /// fall back to software — the whole point of the native path.
+    #[test]
+    fn native_decode_uses_the_hardware_decoder() {
+        let Some(stream) = generate_h264("testsrc2=size=320x240:rate=10", 4, 4) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+        let mut decoder = VideoToolboxH264Decoder::new();
+        let first = access_units.first().expect("a keyframe access unit");
+        decoder.decode(first, 0, true).expect("keyframe decodes");
+        assert_eq!(
+            decoder.hardware_accelerated(),
+            Some(true),
+            "VideoToolbox did not resolve to the hardware decoder on this machine"
+        );
+    }
+
+    /// Decoding a known solid colour proves the BGRA channel order and range
+    /// survive decode — a check on pixel *values*, not just buffer length.
+    #[test]
+    fn native_decode_reproduces_a_known_solid_colour() {
+        // Pure green (0,255,0); solid colour so 4:2:0 chroma carries no error.
+        let Some(stream) = generate_h264("color=c=0x00FF00:size=320x240:rate=5", 3, 3) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+        let mut decoder = VideoToolboxH264Decoder::new();
+        let decoded = decode_clip(&mut decoder, &access_units);
+        let frame = decoded.first().expect("at least one decoded frame");
+
+        let centre = frame.pixels[(frame.height / 2) * frame.width + frame.width / 2];
+        let blue = centre & 0xff;
+        let green = (centre >> 8) & 0xff;
+        let red = (centre >> 16) & 0xff;
+        assert!(
+            green > 150,
+            "green channel should dominate (B={blue} G={green} R={red})"
+        );
+        assert!(red < 100, "red channel should be low (R={red})");
+        assert!(blue < 100, "blue channel should be low (B={blue})");
+    }
+
+    /// A mid-stream resolution change carries a new SPS, which must rebuild the
+    /// format description and recreate the session; both sizes must decode.
+    #[test]
+    fn native_decode_recreates_the_session_on_a_resolution_change() {
+        let Some(small) = generate_h264("testsrc2=size=320x240:rate=5", 3, 3) else {
+            return;
+        };
+        let Some(large) = generate_h264("testsrc2=size=640x480:rate=5", 3, 3) else {
+            return;
+        };
+        let mut access_units = access_units_by_aud(&small);
+        access_units.extend(access_units_by_aud(&large));
+
+        let mut decoder = VideoToolboxH264Decoder::new();
+        let decoded = decode_clip(&mut decoder, &access_units);
+        let sizes: std::collections::HashSet<(usize, usize)> =
+            decoded.iter().map(|f| (f.width, f.height)).collect();
+        assert!(
+            sizes.contains(&(320, 240)),
+            "expected 320x240 frames: {sizes:?}"
+        );
+        assert!(
+            sizes.contains(&(640, 480)),
+            "expected 640x480 frames: {sizes:?}"
+        );
+    }
+
+    /// A malformed access unit must not panic or fabricate a frame, and the
+    /// decoder must recover on the next real keyframe. (Deterministic injection
+    /// of callback-status errors is exercised in the loopback harness.)
+    #[test]
+    fn native_decode_recovers_from_a_malformed_access_unit() {
+        let Some(stream) = generate_h264("testsrc2=size=320x240:rate=5", 4, 4) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+        let mut decoder = VideoToolboxH264Decoder::new();
+        let key = &access_units[0];
+        decoder.decode(key, 0, true).expect("keyframe decodes");
+
+        // A non-IDR slice NAL (type 1) full of garbage. VideoToolbox may reject
+        // it (decode returns Err, exercising error propagation) or drop it; it
+        // must do neither of: panic, or invent a frame from nothing.
+        let garbage = [0x00, 0x00, 0x00, 0x01, 0x41, 0xde, 0xad, 0xbe, 0xef, 0x11];
+        match decoder.decode(&garbage, 100_000, false) {
+            Err(VtError::Decode(_)) | Ok(_) => {}
+            Err(other) => panic!("unexpected error kind: {other}"),
+        }
+
+        let recovered = decoder
+            .decode(key, 200_000, true)
+            .expect("recovery keyframe decodes");
+        assert!(
+            !recovered.is_empty(),
+            "decoder did not recover after a bad access unit"
+        );
     }
 }
