@@ -134,3 +134,22 @@ may change from `UNVERIFIED`: sustained direct operation (minutes, not
 seconds), clean reconnect to a fresh epoch, TURN relay fallback, and behaviour
 when signalling is stopped during an active session. `wan-turn` is **not**
 passed by this result.
+
+### Post-fix validation of the control-window and host-liveness changes (2026-09-15)
+
+After the fix in this change set, the failure mode was re-exercised on the LAN
+(the cross-NAT confirmation on a mobile hotspot is still pending):
+
+| check | result |
+| --- | --- |
+| sustained session (direct path) | A synthetic-source session ran ~2 minutes: the host encoded 7455 frames at 60.2 fps with 0 stalls, and the client session stayed up the whole time with no `session ended`, no `ordered control payload is too large`, and no spurious teardown. The pre-fix failure killed the session at ~0.9 s |
+| clean teardown (direct path) | killing the client produced an immediate transport error and the host ended cleanly: `ended after peer disconnect` |
+| authenticated ICE liveness backstop | an ICE session was established, then the client was killed **silently** (no `openstream/end`, no socket error the host could observe on the ICE path). Exactly 15 s later the host logged `ending session: no authenticated peer traffic for 15.04s; re-registering` and exited for its supervisor to restart. Before the fix the ICE host stayed in its media loop indefinitely and a reconnecting client timed out forever on `ice credentials/candidates` |
+| unit regressions | a tiny payload never returns `TooLarge`; a full window is backpressure, never fatal; hundreds of gaps coalesce to one request per interval; stale-epoch ICE messages are ignored |
+
+Not shown here: reconnect to the **same** `session_id` after teardown. Sessions
+are reaped by server TTL once no peer holds them, so the static test pairing's
+id returned 404 (absent), not 410 (expired). Production issues a fresh pairing
+per connect, so this is a test-fixture limitation, not a regression. The
+cross-NAT direct-media re-run and the signalling-outage-during-session test
+remain to be repeated on a genuinely different network.
