@@ -78,9 +78,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gnome-keyring libsecret-1-0 dbus-x11
+          # The daemon prints the environment the client library needs
+          # (GNOME_KEYRING_CONTROL and friends) on stdout. Backgrounding it
+          # instead of eval-ing that output leaves libsecret talking to a
+          # locked keyring, which makes it ask a GUI prompter for a password
+          # and fail with "cannot open display" on a runner with no session.
           dbus-run-session -- bash -c '
-            echo -n "" | gnome-keyring-daemon --unlock --components=secrets &
-            sleep 2
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            export GNOME_KEYRING_CONTROL
             cargo test --locked -p openstream-client-core --lib keystore -- --ignored --test-threads=1
           '
 
