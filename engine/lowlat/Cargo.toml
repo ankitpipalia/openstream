@@ -20,6 +20,7 @@ members = [
     "crates/reference-peer",
     "crates/ffmpeg-host",
     "crates/platform",
+    "crates/capability",
     "crates/media",
     "crates/linux-host",
     "crates/client",
@@ -56,6 +57,7 @@ lowlat-inject = { path = "crates/inject" }
 lowlat-host = { path = "crates/host" }
 lowlat-kessel = { path = "crates/kessel" }
 openstream-transport-policy = { path = "crates/transport-policy" }
+openstream-capability = { path = "crates/capability" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 base64 = "0.22"

@@ -1797,6 +1797,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-capability"
+version = "0.1.0"
+
+[[package]]
 name = "openstream-client"
 version = "0.1.0"
 dependencies = [
@@ -1956,6 +1960,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "lowlat-inject",
+ "openstream-capability",
  "windows-sys 0.59.0",
 ]
 
