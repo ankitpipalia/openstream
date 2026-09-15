@@ -20,6 +20,7 @@ members = [
     "crates/reference-peer",
     "crates/ffmpeg-host",
     "crates/platform",
+    "crates/capability",
     "crates/media",
     "crates/linux-host",
     "crates/client",

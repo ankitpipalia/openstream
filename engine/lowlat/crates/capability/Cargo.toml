@@ -1,0 +1,20 @@
+[package]
+name = "openstream-capability"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+# Pure, platform-agnostic capability model and pipeline planner. It deliberately
+# has no dependencies and no platform code: real backends (NVENC, VAAPI,
+# VideoToolbox, Windows Graphics Capture, ...) discover their own capabilities
+# and register structured records here, and the planner picks a compatible
+# capture -> conversion -> encoder path from those records. That keeps vendor
+# specifics out of the planner and makes the selection logic testable everywhere.
+
+[dependencies]
+
+[lints]
+workspace = true
