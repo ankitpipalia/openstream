@@ -31,5 +31,14 @@ wgpu.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
+# In-process VideoToolbox decode (macOS). Raw FFI to the VideoToolbox/CoreMedia/
+# CoreVideo frameworks is declared in src/vt_decoder.rs; these give the CoreFoundation
+# plumbing (CFDictionary/CFNumber/CFRetain) so the FFI surface stays small.
+# 0.9 to unify with the version wgpu's Metal backend already pulls in, so the
+# graph carries a single core-foundation.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+core-foundation-sys = "0.8"
+
 [lints]
 workspace = true

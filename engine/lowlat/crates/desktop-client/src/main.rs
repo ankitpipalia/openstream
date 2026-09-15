@@ -56,6 +56,10 @@ mod fullscreen;
 mod mic;
 mod raw_pointer;
 mod render;
+// In-process VideoToolbox H.264 decode (macOS). Landed and tested in isolation;
+// the DecodeAccel dispatch wires it into the hot path in a follow-up commit.
+#[cfg(target_os = "macos")]
+mod vt_decoder;
 // Pure lifecycle/input-safety seam; a future winit presenter can consume it
 // without making this minifb path or the dependency graph change in this slice.
 #[allow(dead_code)]
