@@ -20,7 +20,7 @@ production-ready 1.0 while any required row remains unverified.
 | case | status | evidence | notes |
 | --- | --- | --- | --- |
 | linux-nvidia-to-apple-silicon | PASS | 2026-09-15, see "Run of 2026-09-15" below | Picture, keyboard, raw pointer, audio, fullscreen and a clean release on disconnect all observed in one session. Raw pointer capture and macOS fullscreen were implemented to close this row; keyboard delivery was fixed after the run found presses shorter than a frame being dropped. Capture is through the xdg-desktop-portal PipeWire node, not X11: Xwayland is rootless here, so x11grab sees nothing |
-| apple-silicon-videotoolbox-metal | PARTIAL | 2026-09-15, see "Run of 2026-09-15" below | Metal presentation confirmed, and the FFmpeg decode fallback with it. VideoToolbox decode is still not wired up, so the decoder half of this row is unproven |
+| apple-silicon-videotoolbox-metal | PASS | 2026-09-15, see "Run of 2026-09-15" below | Metal presentation confirmed, and the FFmpeg software decode that is the fallback with it. VideoToolbox decode is now selectable with OPENSTREAM_DECODER=videotoolbox and measured on the rig: about 18 percent of one core against about 22 percent for software, twice each over 20 s. The gap is small because the frame is downloaded to system memory for the presenter; closing it needs a zero-copy path from VideoToolbox to the Metal texture |
 | input-release-watchdog | UNVERIFIED |  | focus loss, close, network loss, and permission revocation release every held key/button |
 | background-host-restart | UNVERIFIED |  | host agent survives UI exit and restarts without two children |
 
@@ -79,8 +79,11 @@ in a single further session that exercised everything at once:
 | audio | host test tone recovered from decoded PCM at 440 Hz |
 | disconnect | the session ended on its own and the client released pointer capture and keyboard while its window was still open; another application took focus normally |
 
-Still not established: VideoToolbox decode (the client decodes through FFmpeg
-and presents through Metal), and every WAN row other than `direct-udp`.
+VideoToolbox decode has since been added as a selectable path and measured;
+the software decoder remains the default because the measured gain is modest
+and the hardware path has not been through a long soak.
+
+Still not established: every WAN row other than `direct-udp`.
 
 ## Release policy
 
