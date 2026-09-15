@@ -48,6 +48,7 @@ use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc_ice::url::Url as IceUrl;
 use webrtc_util::conn::Conn as IceConn;
 
+mod keystore;
 mod path;
 pub mod scheduler;
 pub mod transport_ack;
@@ -4490,7 +4491,135 @@ fn identity_store_path() -> Result<std::path::PathBuf, Error> {
     Ok(base.join("device-identity.pk8"))
 }
 
+/// Account name for this identity in the platform keystore.
+///
+/// Derived from the store path so two stores on one machine -- a test fixture
+/// beside a real install -- cannot collide on one keystore entry.
+fn keystore_account(path: &Path) -> String {
+    let digest = sha2::Sha256::digest(path.as_os_str().as_encoded_bytes());
+    format!("device-identity-{}", hex::encode(&digest[..8]))
+}
+
+/// Whether the operator asked for the identity to live in the platform
+/// keystore. Off by default: losing a device identity is a worse failure than
+/// not having hardware-backed custody, so this earns its place before it
+/// becomes the default.
+fn keystore_custody_requested() -> bool {
+    matches!(
+        std::env::var("OPENSTREAM_IDENTITY_CUSTODY")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "keystore" | "keychain"
+    )
+}
+
+/// Resolve the identity through the platform keystore, falling back to the
+/// file on anything that does not work.
+///
+/// The file is never deleted here. A keystore entry that turns out to be
+/// unreadable on the next boot must not mean the identity is gone, so
+/// migrating copies the key in and leaves the original where it was. The line
+/// printed on migration says that removing the file is what completes it --
+/// that is the operator's call, because it is the irreversible half.
+fn load_or_create_identity_in_keystore(path: &Path) -> Result<IdentityKey, Error> {
+    let account = keystore_account(path);
+
+    if let Some(stored) = keystore::load(&account) {
+        match identity_from_bytes(stored) {
+            Ok(identity) => {
+                println!("OpenStream identity source=keystore");
+                return Ok(identity);
+            }
+            // A corrupt entry is not a reason to refuse to start: the file may
+            // still hold a usable key, and the entry is replaced below.
+            Err(_) => eprintln!(
+                "OpenStream identity: the keystore entry is unreadable; falling back to the file"
+            ),
+        }
+    }
+
+    // Whether a file is already there has to be read before anything creates
+    // one, or a fresh install looks like a migration and, worse, gets its key
+    // written to disk on the way past.
+    if path.exists() {
+        let identity = load_identity_file(path)?;
+        match keystore::store(&account, identity.pkcs8()) {
+            Ok(()) => println!(
+                "OpenStream identity source=migrated-to-keystore; the file at {} is kept as a \
+fallback, and removing it is what completes the migration",
+                path.display()
+            ),
+            Err(error) => eprintln!(
+                "OpenStream identity: the keystore refused the key ({error}); continuing with \
+the file"
+            ),
+        }
+        return Ok(identity);
+    }
+
+    // No file yet, so there is nothing to preserve and no reason to write one:
+    // a key that only ever exists in the keystore is the point of asking for
+    // keystore custody.
+    let identity = IdentityKey::generate().map_err(Error::Identity)?;
+    match keystore::store(&account, identity.pkcs8()) {
+        Ok(()) => {
+            println!("OpenStream identity source=keystore");
+            Ok(identity)
+        }
+        Err(error) => {
+            eprintln!(
+                "OpenStream identity: the keystore would not take a new key ({error}); creating \
+the file instead"
+            );
+            load_or_create_identity_file(path)
+        }
+    }
+}
+
+#[cfg(test)]
+mod keystore_account_tests {
+    use std::path::Path;
+
+    #[test]
+    fn the_account_is_stable_for_one_store_and_distinct_between_stores() {
+        let one = Path::new("/var/lib/openstream/device-identity.pk8");
+        let other = Path::new("/home/someone/.local/state/openstream/device-identity.pk8");
+        assert_eq!(super::keystore_account(one), super::keystore_account(one));
+        assert_ne!(
+            super::keystore_account(one),
+            super::keystore_account(other),
+            "two stores on one machine must not share a keystore entry"
+        );
+    }
+
+    #[test]
+    fn the_account_carries_no_path_text() {
+        // The account name is visible in keychain listings, so it must not
+        // publish where the user keeps their files.
+        let path =
+            Path::new("/home/someone-identifiable/.local/state/openstream/device-identity.pk8");
+        let account = super::keystore_account(path);
+        assert!(!account.contains("someone-identifiable"), "{account}");
+        assert!(account.starts_with("device-identity-"), "{account}");
+    }
+}
+
 fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
+    if keystore_custody_requested() {
+        if keystore::available() {
+            return load_or_create_identity_in_keystore(path);
+        }
+        eprintln!(
+            "OpenStream identity: OPENSTREAM_IDENTITY_CUSTODY asked for the platform keystore, \
+which this build has no implementation for; continuing with the file"
+        );
+    }
+    load_or_create_identity_file(path)
+}
+
+fn load_or_create_identity_file(path: &Path) -> Result<IdentityKey, Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidMessage(
             "identity store path must be absolute".into(),

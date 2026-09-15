@@ -6,7 +6,26 @@ rediscovering it.
 
 ## OS-backed custody for the device identity key
 
-Status: not implemented.
+Status: implemented for macOS, opt-in with `OPENSTREAM_IDENTITY_CUSTODY=keystore`.
+Other platforms report the keystore unavailable and keep the file, rather than
+pretending to a protection that is not there. The rest of this section is kept
+because it is what the implementation had to satisfy, and what a Linux or
+Windows implementation still has to.
+
+Behaviour as built:
+
+- A fresh identity under keystore custody is generated and stored in the
+  keychain only. It is never written to disk, which is the point of asking.
+- An existing key file is copied into the keychain and **left in place**. The
+  line printed says that removing it is what completes the migration, because
+  that is the irreversible half and belongs to the operator.
+- Any keystore failure falls back to the file with a line saying so, so the
+  worst case is today's behaviour rather than a session that will not start.
+- The keychain item is `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: it
+  does not sync, is not carried into a backup, and is reachable by a host that
+  starts at login without a human present.
+- The account name is a digest of the store path, so two stores on one machine
+  cannot collide, and the path is not published in keychain listings.
 
 ### What exists now
 
