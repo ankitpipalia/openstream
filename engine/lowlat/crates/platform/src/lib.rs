@@ -7,7 +7,7 @@
 //! and iOS before each native adapter is linked.
 //!
 //! "Policy" means *which platforms have an implementation*, decided at compile
-//! time — not whether a given machine's hardware is present and working. The
+//! time -- not whether a given machine's hardware is present and working. The
 //! runtime, per-device truth (does this box actually have a usable capture and
 //! encoder right now?) lives in the `openstream-capability` crate, whose
 //! [`host_capable`](../openstream_capability/fn.host_capable.html) inspects
@@ -94,7 +94,7 @@ const fn architecture() -> &'static str {
 }
 
 const fn host_capable() -> bool {
-    // Whether a *host implementation exists* for this platform — compile-time
+    // Whether a *host implementation exists* for this platform -- compile-time
     // policy, not a promise that a given machine's capture/encode hardware is
     // present and working. That runtime question is answered by
     // `openstream_capability::host_capable` against probed per-device records.
@@ -102,7 +102,7 @@ const fn host_capable() -> bool {
     // A host session is driven by the host agent, which refuses to start off
     // Unix (`#[cfg(not(unix))] fn main` exits in host-agent and ffmpeg-host).
     // Windows therefore has no host path yet and must not claim host
-    // capability even though it is a desktop OS — reporting Windows as
+    // capability even though it is a desktop OS -- reporting Windows as
     // host-capable was the pre-1.1 lie this corrects. Linux and macOS both run
     // the Unix host agent and have a real ffmpeg-host capture backend, so they
     // keep host policy; Android and iOS are excluded as before.

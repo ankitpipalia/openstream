@@ -421,8 +421,8 @@ fn ordered_render_node_names(names: Vec<String>) -> Vec<String> {
 
 /// Every VAAPI render node on this host, low index first.
 ///
-/// A multi-GPU host exposes `renderD128`, `renderD129`, ... — one per DRM
-/// render device — and which one can encode is a per-device question. The
+/// A multi-GPU host exposes `renderD128`, `renderD129`, ... -- one per DRM
+/// render device -- and which one can encode is a per-device question. The
 /// pre-1.1 code resolved only the first node and probed VAAPI against it alone,
 /// so a second GPU that was the only one able to encode went unseen. This
 /// enumerates them all; callers probe per node.
@@ -1028,7 +1028,7 @@ mod tests {
     ///
     /// The pre-1.1 code took the first node and probed VAAPI against it alone.
     /// On a laptop with an Intel iGPU on `renderD128` and a discrete GPU on
-    /// `renderD129`, that hid whichever device was not first — including the
+    /// `renderD129`, that hid whichever device was not first -- including the
     /// case where only the second one can encode. Ordering is by numeric index,
     /// not directory-listing order, so it does not depend on how the kernel
     /// happens to return entries.

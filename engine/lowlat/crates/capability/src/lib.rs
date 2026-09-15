@@ -6,7 +6,7 @@
 //! *compile-time* facts: `cfg!(target_os = ...)` flags and flat booleans like a
 //! single `nvenc_h264`. That produces two lies. First, a binary built for a
 //! platform claims the platform's hardware whether or not the running machine
-//! has it — a Windows build reports itself host-capable before a single capture
+//! has it -- a Windows build reports itself host-capable before a single capture
 //! backend exists. Second, a flat boolean cannot describe a machine with more
 //! than one GPU, or tell "this encoder exists in the abstract" from "this
 //! encoder started successfully here five seconds ago".
@@ -22,12 +22,12 @@
 //!   [probed](record::ProbeStatus), and how much it is [trusted](record::StabilityTier).
 //! - Those records go into a [`Registry`].
 //! - The [`planner`] takes the registry and a [`StreamRequest`] and returns a
-//!   [`Plan`]: every viable capture→encoder pipeline, each with its frame-handoff
+//!   [`Plan`]: every viable capture->encoder pipeline, each with its frame-handoff
 //!   [`Conversion`] classified (zero-copy / on-device convert / host upload /
 //!   cross-GPU copy) and costed, ranked best-first, with ordered fallbacks.
 //!
-//! The planner is a pure function of its inputs — no platform calls, no probing,
-//! no globals — so the selection logic is testable on any host, which is exactly
+//! The planner is a pure function of its inputs -- no platform calls, no probing,
+//! no globals -- so the selection logic is testable on any host, which is exactly
 //! how this crate is developed and exercised on macOS while the Linux/Windows
 //! backends that feed it are built out.
 //!
@@ -89,7 +89,7 @@ pub use record::{
 /// Whether a registry can actually host a session on this machine: it holds at
 /// least one usable capture and one usable encoder that share an OS and can be
 /// paired for some request. This is the runtime, evidence-based answer to
-/// "is this a host?" — the truthful replacement for a compile-time `host_capable`
+/// "is this a host?" -- the truthful replacement for a compile-time `host_capable`
 /// flag. A machine reports host-capable because it *demonstrated* the capability,
 /// not because it was compiled for a platform that usually has it.
 pub fn host_capable(registry: &Registry) -> bool {
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn a_client_only_machine_with_no_capture_is_not_host_capable() {
         // A Windows box that can decode/present but registered no capture or
-        // encoder backend must not claim to be a host — the exact 1.0 lie.
+        // encoder backend must not claim to be a host -- the exact 1.0 lie.
         let mut reg = Registry::new();
         reg.register_encoder(usable_encoder(Os::Windows));
         assert!(!host_capable(&reg), "encoder alone is not a host");

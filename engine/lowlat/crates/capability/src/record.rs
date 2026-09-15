@@ -19,7 +19,7 @@ use core::cmp::Ordering;
 use core::fmt;
 
 /// Operating system a backend runs on. Capture and encoder must share one to be
-/// paired — a pipeline lives inside a single host process on a single machine.
+/// paired -- a pipeline lives inside a single host process on a single machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Os {
     /// Linux.
@@ -51,7 +51,7 @@ pub enum Vendor {
 
 /// A physical device on the host, identified stably per machine.
 ///
-/// `id` is whatever the platform exposes as a durable per-boot identifier — a
+/// `id` is whatever the platform exposes as a durable per-boot identifier -- a
 /// PCI address on Linux, an adapter LUID on Windows, a registry id on macOS.
 /// Two records with equal [`DeviceId`] are the *same* device, which is exactly
 /// what the planner needs to tell a same-GPU zero-copy handoff from a cross-GPU
@@ -127,7 +127,7 @@ impl PixelFormat {
 }
 
 /// The kind of memory handle a frame is carried in. This is what determines
-/// whether a capture→encoder handoff can avoid a copy: two backends interoperate
+/// whether a capture->encoder handoff can avoid a copy: two backends interoperate
 /// without a transfer only when they speak the same handle *and* sit on the same
 /// device (see [`SurfaceKind::is_device_local`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -295,7 +295,7 @@ impl Limits {
         }
     }
 
-    /// Whether a `width`×`height` frame at `fps` fits under this ceiling.
+    /// Whether a `width`x`height` frame at `fps` fits under this ceiling.
     pub fn admits(&self, width: u32, height: u32, fps: u32) -> bool {
         width <= self.max_width && height <= self.max_height && fps <= self.max_fps
     }
@@ -318,7 +318,7 @@ pub struct CodecSupport {
 
 impl CodecSupport {
     /// Whether this codec entry can emit the given `codec` at `bit_depth`,
-    /// `chroma`, `width`×`height`, and `fps`.
+    /// `chroma`, `width`x`height`, and `fps`.
     pub fn supports(
         &self,
         codec: Codec,

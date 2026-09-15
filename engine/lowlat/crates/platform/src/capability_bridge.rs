@@ -15,7 +15,7 @@
 //! [`Verified`](ProbeStatus::Verified); the screen-capture path it never probed
 //! is [`Advertised`](ProbeStatus::Advertised). The goal is to wire the existing
 //! host into the planner and then replace this backend-by-backend with native
-//! discovery that fills the fields in for real — not to pretend the flat report
+//! discovery that fills the fields in for real -- not to pretend the flat report
 //! had structure it did not.
 
 use crate::hwaccel::{HwReport, vaapi_render_node};
@@ -27,7 +27,7 @@ use openstream_capability::{
 
 /// A nominal resolution/frame-rate ceiling for a hardware encoder family.
 ///
-/// The flat report did not probe a ceiling — the encode probe ran at 64×64 — so
+/// The flat report did not probe a ceiling -- the encode probe ran at 64x64 -- so
 /// this is the family's published capability, not a per-machine measurement. It
 /// is only ever used as an upper-bound gate, and the pre-1.1 host applied these
 /// encoders to any negotiated resolution with *no* ceiling check at all, so a
@@ -77,8 +77,8 @@ fn h264_and_or_h265(h264: bool, h265: bool) -> Vec<CodecSupport> {
 
 /// Encoder capability records adapted from a probed hardware report.
 ///
-/// Emits at most one NVENC record and one VAAPI record — whichever the report
-/// proved can encode at least one codec — plus a software libx264/libx265 record
+/// Emits at most one NVENC record and one VAAPI record -- whichever the report
+/// proved can encode at least one codec -- plus a software libx264/libx265 record
 /// as the always-present deterministic fallback. The hardware records are
 /// [`Verified`](ProbeStatus::Verified) (the report opened those encoders) and
 /// [`Certified`](StabilityTier::Certified) (they are the shipping ffmpeg paths);
@@ -89,9 +89,9 @@ fn h264_and_or_h265(h264: bool, h265: bool) -> Vec<CodecSupport> {
 /// because the ffmpeg host feeds NVENC software frames directly (no `hwupload`
 /// filter), while VAAPI's input is a
 /// [`VaapiSurface`](SurfaceKind::VaapiSurface) reached through the host's
-/// `format=nv12,hwupload` filter — so the planner correctly classifies the
-/// screen-capture→NVENC handoff as a same-domain pass and the
-/// screen-capture→VAAPI handoff as an upload, matching what ffmpeg actually does.
+/// `format=nv12,hwupload` filter -- so the planner correctly classifies the
+/// screen-capture->NVENC handoff as a same-domain pass and the
+/// screen-capture->VAAPI handoff as an upload, matching what ffmpeg actually does.
 pub fn encoder_records(report: &HwReport, os: Os) -> Vec<EncoderCapability> {
     let mut records = Vec::new();
 
@@ -138,7 +138,7 @@ pub fn encoder_records(report: &HwReport, os: Os) -> Vec<EncoderCapability> {
 
     // Software encoding through libx264/libx265 is the deterministic fallback:
     // it needs no accelerator, so a plan is available even when every hardware
-    // probe failed. Advertised, not Verified — HwReport does not probe it — so
+    // probe failed. Advertised, not Verified -- HwReport does not probe it -- so
     // the planner keeps it below any verified hardware path.
     records.push(EncoderCapability {
         backend_id: "libx264".to_string(),
@@ -175,7 +175,7 @@ pub fn encoder_records(report: &HwReport, os: Os) -> Vec<EncoderCapability> {
 ///
 /// Today's host captures the screen with ffmpeg (x11grab/kmsgrab/PipeWire on
 /// Linux, AVFoundation on macOS) into system-memory frames, so the record's
-/// output is [`SystemMemory`](SurfaceKind::SystemMemory) with no GPU affinity —
+/// output is [`SystemMemory`](SurfaceKind::SystemMemory) with no GPU affinity --
 /// which is why the planner pairs it with NVENC as a same-domain pass and with
 /// VAAPI as an upload. It is [`Advertised`](ProbeStatus::Advertised): the report
 /// never exercised capture, so this states the path exists without claiming it
@@ -217,7 +217,7 @@ pub fn registry_from_report(report: &HwReport, os: Os) -> Registry {
 }
 
 /// Probe this host and build its capability registry, or `None` on a platform
-/// with no host path (Windows, mobile). This is the one non-pure entry point —
+/// with no host path (Windows, mobile). This is the one non-pure entry point --
 /// [`HwReport::probe`](crate::hwaccel::HwReport::probe) spawns encoder probes;
 /// the record-building above it is pure and unit-tested.
 pub fn discover() -> Option<Registry> {
@@ -266,7 +266,7 @@ mod tests {
         let primary = plan.primary().expect("a pipeline");
         assert_eq!(primary.encoder_backend_id, "nvenc");
         // Screen-capture (system memory) into NVENC (system-memory input) is a
-        // same-domain pass, not an upload — ffmpeg feeds NVENC software frames.
+        // same-domain pass, not an upload -- ffmpeg feeds NVENC software frames.
         assert_eq!(primary.conversion, Conversion::ZeroCopy);
         // The software fallback is still offered below it.
         assert!(

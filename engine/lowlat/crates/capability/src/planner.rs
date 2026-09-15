@@ -1,7 +1,7 @@
 //! The pipeline planner.
 //!
 //! Given a [`Registry`] of per-device capture and encoder records and a
-//! [`StreamRequest`], the planner enumerates every capture→encoder pairing that
+//! [`StreamRequest`], the planner enumerates every capture->encoder pairing that
 //! can actually service the request, classifies the frame handoff between them
 //! ([`Conversion`]), assigns each a deterministic [`Cost`], and returns them
 //! ranked best-first as a [`Plan`]. The first entry is the pipeline to run; the
@@ -9,17 +9,17 @@
 //!
 //! The ranking has two levers, in strict priority order:
 //!
-//! 1. **Reliability** — stability tier (a pipeline is only as stable as its
+//! 1. **Reliability** -- stability tier (a pipeline is only as stable as its
 //!    weaker half) plus a penalty for any half that is advertised-but-unproven.
 //!    This dominates: a `Certified` upload path always beats an `Experimental`
 //!    zero-copy path.
-//! 2. **Latency** — the copies and host↔device transfers the handoff costs.
+//! 2. **Latency** -- the copies and host<->device transfers the handoff costs.
 //!    Among equally reliable pipelines, the one that moves the fewest bytes the
 //!    fewest times wins, so a same-GPU zero-copy path beats an upload, which
 //!    beats a cross-GPU copy.
 //!
 //! Ties beyond that are broken by backend and device id purely so the output is
-//! stable regardless of registration order — the planner is a pure function of
+//! stable regardless of registration order -- the planner is a pure function of
 //! its inputs.
 
 use crate::record::{
@@ -29,7 +29,7 @@ use crate::record::{
 
 /// How a frame gets from the capture backend to the encoder backend. This is the
 /// single most important thing the planner decides, because it dictates the
-/// per-frame copy cost — the difference between a same-GPU handoff and a
+/// per-frame copy cost -- the difference between a same-GPU handoff and a
 /// cross-GPU shuffle is the difference between a playable stream and a stuttering
 /// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,13 +38,13 @@ pub enum Conversion {
     /// kind, same pixel format. No per-frame copy.
     ZeroCopy,
     /// Same memory domain (both on one GPU, or both in system memory) but the
-    /// pixel layout must be converted. One copy, no host↔device transfer.
+    /// pixel layout must be converted. One copy, no host<->device transfer.
     Convert,
-    /// The frame is in system memory and must cross the host↔device boundary
+    /// The frame is in system memory and must cross the host<->device boundary
     /// (upload to a GPU encoder, or download to a software encoder).
     Upload,
     /// The frame lives on one GPU and the encoder is on another: it must be
-    /// copied device→device (in practice via host or peer DMA). Two transfers.
+    /// copied device->device (in practice via host or peer DMA). Two transfers.
     CrossGpuCopy,
 }
 
@@ -58,12 +58,12 @@ impl Conversion {
         }
     }
 
-    /// Whether the handoff crosses the host↔device boundary at least once.
+    /// Whether the handoff crosses the host<->device boundary at least once.
     pub fn host_roundtrip(self) -> bool {
         matches!(self, Conversion::Upload | Conversion::CrossGpuCopy)
     }
 
-    /// A latency score; lower is better. A host↔device transfer dominates the
+    /// A latency score; lower is better. A host<->device transfer dominates the
     /// per-copy cost because it pays PCIe/bandwidth latency on every frame.
     fn latency_score(self) -> u32 {
         let mut score = u32::from(self.copies()) * 10;
@@ -140,7 +140,7 @@ pub struct Pipeline {
     pub conversion: Conversion,
     /// The surface the encoder ingests after any conversion.
     pub encoder_input: Surface,
-    /// The pipeline's stability — the weaker of the two halves.
+    /// The pipeline's stability -- the weaker of the two halves.
     pub stability: StabilityTier,
     /// The pipeline's cost, used for ranking.
     pub cost: Cost,
@@ -192,7 +192,7 @@ fn resolve_pair(
         // encoder's own colour convert folds into the same upload, so pixel
         // mismatch does not add a separate step here.)
         (true, false) => Some(Conversion::Upload),
-        // Capture on a GPU, encoder wants system memory: a device→host download.
+        // Capture on a GPU, encoder wants system memory: a device->host download.
         // Same host boundary crossing as an upload, cost-wise.
         (false, true) => Some(Conversion::Upload),
         // Both device-local.
@@ -232,7 +232,7 @@ fn best_handoff(
             else {
                 continue;
             };
-            // For a system-memory→GPU upload the frame lands in the encoder's
+            // For a system-memory->GPU upload the frame lands in the encoder's
             // surface; for a same-memory pass it lands in the capture's layout.
             // Either way the encoder-input surface is what the encoder ingests.
             let landing = enc_surface;
@@ -249,7 +249,7 @@ fn best_handoff(
     best
 }
 
-/// Evaluate one capture×encoder pairing against a request, producing a costed
+/// Evaluate one capturexencoder pairing against a request, producing a costed
 /// [`Pipeline`] or `None` if the pair cannot service the request at all.
 fn evaluate(
     capture: &CaptureCapability,
@@ -330,7 +330,7 @@ fn evaluate(
 
 /// The registry of capability records discovered on this machine. Backends push
 /// their records here at startup; the planner reads from it. It is a plain
-/// container — no platform code, no probing — so it is trivially testable.
+/// container -- no platform code, no probing -- so it is trivially testable.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     captures: Vec<CaptureCapability>,
@@ -413,7 +413,7 @@ impl Plan {
     }
 }
 
-/// Plan `request` against `registry`: enumerate all viable capture×encoder
+/// Plan `request` against `registry`: enumerate all viable capturexencoder
 /// pairings, cost each, and return them ranked best-first.
 pub fn plan(registry: &Registry, request: &StreamRequest) -> Plan {
     let mut pipelines: Vec<Pipeline> = Vec::new();
@@ -700,7 +700,7 @@ mod tests {
         ));
         let plan = reg.plan(&StreamRequest::h264_1080p60());
         let primary = plan.primary().expect("a pipeline");
-        // The certified pairing (sysmem→sysmem upload) wins despite being slower
+        // The certified pairing (sysmem->sysmem upload) wins despite being slower
         // than the experimental zero-copy dmabuf pairing.
         assert_eq!(primary.stability, StabilityTier::Certified);
         assert_eq!(primary.capture_backend_id, "pipewire-shm");
