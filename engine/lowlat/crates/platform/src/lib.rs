@@ -15,6 +15,7 @@
 //! that this build *could* host; the capability registry decides whether it
 //! *does*.
 
+pub mod capability_bridge;
 pub mod clipboard;
 pub mod clipboard_policy;
 pub mod host_heartbeat;
