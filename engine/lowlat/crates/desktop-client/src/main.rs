@@ -2744,7 +2744,7 @@ fn build_session_decoder(
 
 /// The native decoder thread: decode each access unit in-process with
 /// VideoToolbox and publish the pictures to the same mailbox the ffmpeg reader
-/// uses. A decode error is recoverable — the network loop keeps requesting
+/// uses. A decode error is recoverable -- the network loop keeps requesting
 /// keyframes, and the next one re-seeds the decoder.
 #[cfg(target_os = "macos")]
 fn native_decode_worker(

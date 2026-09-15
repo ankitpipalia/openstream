@@ -11,7 +11,7 @@ pub(crate) fn ffmpeg() -> String {
 }
 
 /// When set, a missing/failed ffmpeg fixture is a hard failure rather than a
-/// skip — so a hardware-acceptance run cannot pass by silently not running.
+/// skip -- so a hardware-acceptance run cannot pass by silently not running.
 pub(crate) fn require_vt_test() -> bool {
     std::env::var_os("OPENSTREAM_REQUIRE_VT_TEST").is_some()
 }

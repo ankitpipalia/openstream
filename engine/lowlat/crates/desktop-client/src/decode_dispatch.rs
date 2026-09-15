@@ -14,7 +14,7 @@
 /// Which decoder the client uses for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodeBackend {
-    /// External ffmpeg subprocess — the default, and the universal fallback.
+    /// External ffmpeg subprocess -- the default, and the universal fallback.
     Ffmpeg,
     /// In-process VideoToolbox (macOS). Opt-in until a live stream validates it.
     #[cfg(target_os = "macos")]
@@ -23,8 +23,8 @@ pub(crate) enum DecodeBackend {
 
 impl DecodeBackend {
     /// Select from `OPENSTREAM_DECODER`. `videotoolbox-native` (or `native`)
-    /// opts into the in-process macOS path; every other value — including the
-    /// legacy `videotoolbox`, which means `ffmpeg -hwaccel videotoolbox` — stays
+    /// opts into the in-process macOS path; every other value -- including the
+    /// legacy `videotoolbox`, which means `ffmpeg -hwaccel videotoolbox` -- stays
     /// on ffmpeg. Default: ffmpeg.
     pub(crate) fn from_env() -> Self {
         let requested = std::env::var("OPENSTREAM_DECODER").unwrap_or_default();
@@ -112,8 +112,8 @@ mod native {
 
 // ---------------------------------------------------------------------------
 // Loopback harness: drive generated access units through the REAL client
-// components — fragmentation → Assembler → native decode → latest-frame mailbox
-// → consumer — with no network and no macOS hosting. This validates the decode
+// components -- fragmentation -> Assembler -> native decode -> latest-frame mailbox
+// -> consumer -- with no network and no macOS hosting. This validates the decode
 // path the way it will run, short of the windowed presenter and the multi-minute
 // soak (those need a GPU surface and are a separate on-hardware run).
 // ---------------------------------------------------------------------------
@@ -263,11 +263,11 @@ mod loopback {
         (pixel & 0xff, (pixel >> 8) & 0xff, (pixel >> 16) & 0xff)
     }
 
-    /// A solid colour flows through fragmentation → reassembly → native decode →
-    /// mailbox → consumer with the right pixels, on the hardware decoder.
+    /// A solid colour flows through fragmentation -> reassembly -> native decode ->
+    /// mailbox -> consumer with the right pixels, on the hardware decoder.
     #[test]
     fn loopback_decodes_a_solid_colour_end_to_end() {
-        // Pure blue (0x0000FF) — exercises a different channel than the
+        // Pure blue (0x0000FF) -- exercises a different channel than the
         // decoder-level green test.
         let Some(stream) = generate_h264("color=c=0x0000FF:size=160x120:rate=5", 4, 4) else {
             return;
@@ -291,7 +291,7 @@ mod loopback {
     }
 
     /// An undrained single-slot mailbox keeps only the newest frame and reports
-    /// the stale ones it replaced — the freshness property the gap analysis
+    /// the stale ones it replaced -- the freshness property the gap analysis
     /// named as the reason latency survives in queues.
     #[test]
     fn loopback_mailbox_keeps_only_the_newest_frame() {
@@ -368,16 +368,16 @@ mod loopback {
         );
     }
 
-    /// Sustained run through the real decode → mailbox pipeline: loop a clip
+    /// Sustained run through the real decode -> mailbox pipeline: loop a clip
     /// until `target` frames decode, asserting the decoder and mailbox stay
-    /// healthy — every access unit decodes without error, the hardware decoder
+    /// healthy -- every access unit decodes without error, the hardware decoder
     /// stays selected, and a consumer that keeps pace loses nothing. Ignored by
     /// default; run for several minutes with, e.g.:
     ///
     ///   OPENSTREAM_REQUIRE_VT_TEST=1 OPENSTREAM_SOAK_FRAMES=5400 \
     ///     cargo test -p openstream-desktop-client -- --ignored loopback_soak
     ///
-    /// (5400 frames ≈ 3 minutes at 30 fps.)
+    /// (5400 frames ~ 3 minutes at 30 fps.)
     #[test]
     #[ignore = "soak; run explicitly with --ignored"]
     fn loopback_soak_stays_healthy_over_many_frames() {

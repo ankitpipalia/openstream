@@ -5,13 +5,13 @@
 //! `CVMetalTextureCache` turns that surface into an `MTLTexture` with no CPU
 //! pixel copy; and `wgpu` re-exports its Metal HAL, so that `MTLTexture` wraps
 //! into a `wgpu::Texture` the presenter can sample directly. The import path
-//! never reads the pixels back to the CPU — the honest target from the Parsec
+//! never reads the pixels back to the CPU -- the honest target from the Parsec
 //! analysis, "a GPU-resident path with no CPU pixel readback".
 //!
 //! This module lands the import mechanism in isolation with an on-hardware
 //! readback test (the readback is verification only, not part of the import).
-//! Threading a GPU-backed frame through the mailbox to the presenter — which
-//! means sharing the presenter's `wgpu::Device` with the decode worker — is the
+//! Threading a GPU-backed frame through the mailbox to the presenter -- which
+//! means sharing the presenter's `wgpu::Device` with the decode worker -- is the
 //! integration step that follows.
 
 #![allow(dead_code)]
@@ -332,7 +332,7 @@ mod tests {
     }
 
     /// Copy an imported texture back to the CPU and return its BGRA bytes. This
-    /// is verification only — the import itself never touches pixels on the CPU.
+    /// is verification only -- the import itself never touches pixels on the CPU.
     fn read_back_bgra(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -425,7 +425,7 @@ mod tests {
 
     /// End to end: decode real H.264 into an IOSurface pixel buffer (no CPU
     /// copy), import it into a wgpu texture, and read the colour back. This is
-    /// the real decode→GPU path, not a synthetic buffer.
+    /// the real decode->GPU path, not a synthetic buffer.
     #[test]
     fn decodes_h264_into_a_wgpu_texture() {
         use crate::test_fixtures::{access_units_by_aud, generate_h264};
@@ -475,7 +475,7 @@ mod tests {
         let (b, g, r) = (bytes[offset], bytes[offset + 1], bytes[offset + 2]);
         assert!(
             b > 140 && g < 100 && r < 100,
-            "decoded→GPU centre should be blue (B={b} G={g} R={r})"
+            "decoded->GPU centre should be blue (B={b} G={g} R={r})"
         );
         // The retained pixel buffer keeps the texture valid; drop after use.
         drop(gpu_frames);

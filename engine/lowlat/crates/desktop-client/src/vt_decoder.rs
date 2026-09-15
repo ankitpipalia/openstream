@@ -1,11 +1,11 @@
 //! In-process H.264 decode via Apple VideoToolbox (macOS).
 //!
 //! This replaces the external `ffmpeg` child the client spawns to decode. It is
-//! milestone 1 of the native-decode work: it decodes in-process — no subprocess,
-//! no BGRA pipe — but still hands back a CPU `Vec<u32>` BGRA frame in the exact
+//! milestone 1 of the native-decode work: it decodes in-process -- no subprocess,
+//! no BGRA pipe -- but still hands back a CPU `Vec<u32>` BGRA frame in the exact
 //! packing the existing presenter consumes, so it is a drop-in for the ffmpeg
 //! reader with no downstream changes. Milestone 2 keeps the decoded surface on
-//! the GPU (NV12 `CVPixelBuffer` → `CVMetalTextureCache` → wgpu) to remove the
+//! the GPU (NV12 `CVPixelBuffer` -> `CVMetalTextureCache` -> wgpu) to remove the
 //! CPU pixel readback; the honest target is "a GPU-resident path with no CPU
 //! pixel readback", and this milestone deliberately does not claim it yet.
 //!
@@ -53,7 +53,7 @@ type VtDecompressionSessionRef = *mut c_void;
 type CvImageBufferRef = *mut c_void;
 type CfAllocatorRef = *const c_void;
 
-/// `CMTime`. Microsecond timescale throughout, so `value` is a µs count.
+/// `CMTime`. Microsecond timescale throughout, so `value` is a us count.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CmTime {
@@ -109,10 +109,10 @@ struct VtDecompressionOutputCallbackRecord {
     ref_con: *mut c_void,
 }
 
-// `kCMBlockBufferAssureMemoryNowFlag` — allocate the backing store immediately
+// `kCMBlockBufferAssureMemoryNowFlag` -- allocate the backing store immediately
 // so the subsequent copy has somewhere to land.
 const K_CM_BLOCK_BUFFER_ASSURE_MEMORY_NOW_FLAG: u32 = 1;
-// `kCVPixelBufferLock_ReadOnly` — the callback only reads the decoded pixels.
+// `kCVPixelBufferLock_ReadOnly` -- the callback only reads the decoded pixels.
 const K_CV_PIXEL_BUFFER_LOCK_READ_ONLY: u64 = 1;
 // `kCVPixelFormatType_32BGRA` == 'BGRA'. Same byte order (B,G,R,A) the ffmpeg
 // `-pix_fmt bgra` path produced, so the `u32` packing below is identical.
@@ -219,7 +219,7 @@ unsafe extern "C" {
 }
 
 /// One decoded picture: BGRA packed the way the presenter expects, plus its
-/// presentation timestamp. Plain data — `Send` — so it rides the existing
+/// presentation timestamp. Plain data -- `Send` -- so it rides the existing
 /// latest-frame mailbox unchanged.
 #[derive(Debug, Clone)]
 pub(crate) struct VtFrame {
@@ -361,7 +361,7 @@ extern "C" fn output_callback(
     let presentation_time_us = if presentation_time_stamp.flags & K_CM_TIME_FLAGS_VALID != 0
         && presentation_time_stamp.timescale > 0
     {
-        // Timescale is microseconds (we set it), so value is already µs.
+        // Timescale is microseconds (we set it), so value is already us.
         u64::try_from(presentation_time_stamp.value).unwrap_or(0)
     } else {
         0
@@ -430,7 +430,7 @@ pub(crate) struct VideoToolboxH264Decoder {
     sps: Vec<u8>,
     pps: Vec<u8>,
     // Whether the created session actually resolved to the hardware decoder, as
-    // reported by VideoToolbox — `None` until a session is created.
+    // reported by VideoToolbox -- `None` until a session is created.
     hardware_accelerated: Option<bool>,
     // Boxed so its address is stable for the callback record; freed in Drop.
     sink: *mut DecodeSink,
@@ -566,7 +566,7 @@ impl VideoToolboxH264Decoder {
         }
 
         if self.format.is_null() {
-            // No parameter sets yet — cannot decode until a keyframe arrives.
+            // No parameter sets yet -- cannot decode until a keyframe arrives.
             let _ = keyframe;
             return Err(VtError::NotConfigured);
         }
@@ -622,7 +622,7 @@ impl VideoToolboxH264Decoder {
             && sink.gpu_frames.is_empty()
         {
             // DecodeFrame returned success but the callback reported a failure
-            // and produced nothing — surface it so the caller can fall back
+            // and produced nothing -- surface it so the caller can fall back
             // rather than mistaking a broken decode for an empty one.
             return Err(VtError::Decode(callback_status));
         }
@@ -813,7 +813,7 @@ impl Drop for VideoToolboxH264Decoder {
 }
 
 /// Decoder specification asking VideoToolbox to use the hardware decoder. It is
-/// a request, not a guarantee — the session reports back what it actually chose,
+/// a request, not a guarantee -- the session reports back what it actually chose,
 /// which is why the caller reads `UsingHardwareAcceleratedVideoDecoder`.
 fn hardware_decoder_specification() -> CFDictionary<CFType, CFType> {
     // SAFETY: the key is a framework string constant, valid for the process.
@@ -959,7 +959,7 @@ mod tests {
     }
 
     /// The session must resolve to the *hardware* decoder on this machine, not
-    /// fall back to software — the whole point of the native path.
+    /// fall back to software -- the whole point of the native path.
     #[test]
     fn native_decode_uses_the_hardware_decoder() {
         let Some(stream) = generate_h264("testsrc2=size=320x240:rate=10", 4, 4) else {
@@ -977,7 +977,7 @@ mod tests {
     }
 
     /// Decoding a known solid colour proves the BGRA channel order and range
-    /// survive decode — a check on pixel *values*, not just buffer length.
+    /// survive decode -- a check on pixel *values*, not just buffer length.
     #[test]
     fn native_decode_reproduces_a_known_solid_colour() {
         // Pure green (0,255,0); solid colour so 4:2:0 chroma carries no error.
