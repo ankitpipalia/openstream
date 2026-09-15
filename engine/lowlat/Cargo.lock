@@ -1841,10 +1841,13 @@ name = "openstream-desktop-client"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "core-foundation",
+ "core-foundation-sys",
  "gilrs",
  "libc",
  "lowlat-audio",
  "lowlat-core",
+ "metal",
  "minifb",
  "openstream-client-core",
  "openstream-media",
