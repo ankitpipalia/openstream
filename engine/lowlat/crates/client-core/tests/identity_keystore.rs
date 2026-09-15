@@ -113,3 +113,64 @@ fn a_lost_keystore_refuses_rather_than_enrolling_a_different_device() {
 
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+#[test]
+#[ignore = "writes to the login keychain"]
+fn a_migrated_device_recovers_from_the_retained_file_when_the_keystore_is_lost() {
+    let directory = scratch("migrated");
+    let store = directory.join("device-identity.pk8");
+    let _ = std::fs::remove_dir_all(&directory);
+
+    // Start with a file-based identity so a real file exists to migrate. Default
+    // custody is file, so the key is written to disk here.
+    // SAFETY: this test binary runs alone, which is why it is its own file.
+    unsafe {
+        std::env::remove_var("OPENSTREAM_IDENTITY_CUSTODY");
+        std::env::set_var("OPENSTREAM_IDENTITY_STORE", &store);
+    }
+    let original = openstream_client_core::local_identity_public_key().expect("file identity");
+    assert!(store.exists(), "file custody writes the key to disk");
+
+    // Migrate it into the keystore. The migration deliberately keeps the file as
+    // a fallback and records a custody marker.
+    unsafe {
+        std::env::set_var("OPENSTREAM_IDENTITY_CUSTODY", "keystore");
+    }
+    let migrated = openstream_client_core::local_identity_public_key().expect("migrated identity");
+    assert_eq!(original, migrated, "migration keeps the same identity");
+    assert!(store.exists(), "migration keeps the file as a fallback");
+
+    // Lose the keystore entry, leaving the marker and the retained file behind.
+    let cleared = std::process::Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            "com.openstream.device-identity",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    assert!(
+        cleared.map(|s| s.success()).unwrap_or(false),
+        "entry removed"
+    );
+
+    // The retained file holds the same identity, so a migrated device must
+    // recover from it rather than refusing. Recovery must never mint a
+    // different device.
+    let recovered = openstream_client_core::local_identity_public_key()
+        .expect("a retained file fallback must let a migrated device recover, not refuse");
+    assert_eq!(
+        original, recovered,
+        "recovery uses the retained identity, not a newly minted one"
+    );
+
+    let _ = std::process::Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            "com.openstream.device-identity",
+        ])
+        .status();
+    let _ = std::fs::remove_dir_all(&directory);
+}
