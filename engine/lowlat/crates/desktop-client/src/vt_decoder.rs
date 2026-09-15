@@ -33,7 +33,7 @@ use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::{CFRelease, CFTypeRef};
+use core_foundation_sys::base::{CFRelease, CFRetain, CFTypeRef};
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
 use std::ffi::c_void;
@@ -215,6 +215,7 @@ unsafe extern "C" {
 
     static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
     static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
+    static kCVPixelBufferMetalCompatibilityKey: CFStringRef;
 }
 
 /// One decoded picture: BGRA packed the way the presenter expects, plus its
@@ -227,6 +228,49 @@ pub(crate) struct VtFrame {
     pub(crate) presentation_time_us: u64,
     /// BGRA, one pixel per `u32` as `B | G<<8 | R<<16 | A<<24`.
     pub(crate) pixels: Vec<u32>,
+}
+
+/// A retained IOSurface-backed `CVPixelBuffer`, handed out for GPU import
+/// instead of a CPU copy. Releases on drop; `Send` because CoreVideo
+/// retain/release is thread-safe, so the decode thread can pass it to the
+/// presenter thread.
+pub(crate) struct SendPixelBuffer(CvImageBufferRef);
+
+// SAFETY: CVPixelBuffer is a CoreFoundation object with atomic, thread-safe
+// retain/release; moving our owned reference between threads is sound.
+unsafe impl Send for SendPixelBuffer {}
+
+impl SendPixelBuffer {
+    /// The raw `CVPixelBufferRef` (borrowed; the `SendPixelBuffer` keeps the
+    /// reference alive).
+    pub(crate) fn as_ptr(&self) -> CvImageBufferRef {
+        self.0
+    }
+}
+
+impl Drop for SendPixelBuffer {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: we hold one retain on this pixel buffer.
+            unsafe { CFRelease(self.0 as CFTypeRef) };
+        }
+    }
+}
+
+impl fmt::Debug for SendPixelBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SendPixelBuffer({:p})", self.0)
+    }
+}
+
+/// A decoded picture kept on the GPU: a retained IOSurface-backed
+/// `CVPixelBuffer` the caller can import into a `wgpu` texture with no CPU copy.
+#[derive(Debug)]
+pub(crate) struct GpuFrame {
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) presentation_time_us: u64,
+    pub(crate) pixel_buffer: SendPixelBuffer,
 }
 
 /// Why a decode could not proceed. Failures are recoverable at the call site by
@@ -274,6 +318,12 @@ impl std::error::Error for VtError {}
 /// and clears it then.
 struct DecodeSink {
     frames: Vec<VtFrame>,
+    /// GPU-resident frames, populated instead of `frames` when `gpu_mode` is set:
+    /// the callback retains the pixel buffer rather than copying its pixels.
+    gpu_frames: Vec<GpuFrame>,
+    /// When set, the callback keeps the IOSurface-backed pixel buffer for GPU
+    /// import instead of copying to a CPU `VtFrame`.
+    gpu_mode: bool,
     /// A nonzero status reported to the callback, so `decode` can surface a
     /// decoder failure instead of an empty success (which would hide the error
     /// from the fallback path).
@@ -316,6 +366,24 @@ extern "C" fn output_callback(
     } else {
         0
     };
+
+    if sink.gpu_mode {
+        // Keep the IOSurface-backed pixel buffer for zero-copy GPU import; no
+        // CPU pixel touch. SAFETY: image_buffer is valid; retain gives us an
+        // owned reference the SendPixelBuffer releases on drop.
+        unsafe {
+            CFRetain(image_buffer as CFTypeRef);
+            let width = CVPixelBufferGetWidth(image_buffer);
+            let height = CVPixelBufferGetHeight(image_buffer);
+            sink.gpu_frames.push(GpuFrame {
+                width,
+                height,
+                presentation_time_us,
+                pixel_buffer: SendPixelBuffer(image_buffer),
+            });
+        }
+        return;
+    }
 
     // SAFETY: image_buffer is a valid CVPixelBuffer for the duration of the
     // callback; we lock read-only, read within the reported geometry, unlock.
@@ -380,11 +448,24 @@ impl fmt::Debug for VideoToolboxH264Decoder {
 }
 
 impl VideoToolboxH264Decoder {
-    /// Create an unconfigured decoder. The session is built lazily once the
-    /// first keyframe supplies SPS/PPS.
+    /// Create an unconfigured decoder that yields CPU `VtFrame`s. The session is
+    /// built lazily once the first keyframe supplies SPS/PPS.
     pub(crate) fn new() -> Self {
+        Self::with_gpu_mode(false)
+    }
+
+    /// Create a decoder that yields GPU-resident [`GpuFrame`]s (retained
+    /// IOSurface pixel buffers) via [`decode_gpu`](Self::decode_gpu), for
+    /// zero-copy import instead of a CPU copy.
+    pub(crate) fn new_gpu() -> Self {
+        Self::with_gpu_mode(true)
+    }
+
+    fn with_gpu_mode(gpu_mode: bool) -> Self {
         let sink = Box::into_raw(Box::new(DecodeSink {
             frames: Vec::new(),
+            gpu_frames: Vec::new(),
+            gpu_mode,
             last_error: None,
         }));
         VideoToolboxH264Decoder {
@@ -415,14 +496,56 @@ impl VideoToolboxH264Decoder {
         std::mem::take(&mut sink.frames)
     }
 
-    /// Decode one Annex-B access unit, returning the pictures it produced (zero
-    /// or more). `NotConfigured` means no keyframe has been seen yet.
+    /// Decode one Annex-B access unit, returning the CPU pictures it produced
+    /// (zero or more). `NotConfigured` means no keyframe has been seen yet. Use
+    /// [`decode_gpu`](Self::decode_gpu) on a decoder built with
+    /// [`new_gpu`](Self::new_gpu) for GPU-resident frames.
     pub(crate) fn decode(
         &mut self,
         access_unit: &[u8],
         presentation_time_us: u64,
         keyframe: bool,
     ) -> Result<Vec<VtFrame>, VtError> {
+        self.run_decode(access_unit, presentation_time_us, keyframe)?;
+        // SAFETY: the synchronous callback has finished; exclusive access.
+        let sink = unsafe { &mut *self.sink };
+        Ok(std::mem::take(&mut sink.frames))
+    }
+
+    /// Decode one access unit into GPU-resident [`GpuFrame`]s (retained
+    /// IOSurface pixel buffers). Only meaningful on a decoder from
+    /// [`new_gpu`](Self::new_gpu); otherwise it returns no frames.
+    pub(crate) fn decode_gpu(
+        &mut self,
+        access_unit: &[u8],
+        presentation_time_us: u64,
+        keyframe: bool,
+    ) -> Result<Vec<GpuFrame>, VtError> {
+        self.run_decode(access_unit, presentation_time_us, keyframe)?;
+        // SAFETY: the synchronous callback has finished; exclusive access.
+        let sink = unsafe { &mut *self.sink };
+        Ok(std::mem::take(&mut sink.gpu_frames))
+    }
+
+    /// Shared decode: parse, (re)configure, build the sample, and run a
+    /// synchronous decode. Results land in the sink (`frames` or `gpu_frames`
+    /// per the mode); callers drain the vector they want.
+    fn run_decode(
+        &mut self,
+        access_unit: &[u8],
+        presentation_time_us: u64,
+        keyframe: bool,
+    ) -> Result<(), VtError> {
+        // Clear prior results up front so an early return (not-configured, or a
+        // parameter-set-only unit) leaves nothing stale for the caller to drain.
+        // SAFETY: no callback runs until DecodeFrame below, so this is exclusive.
+        {
+            let sink = unsafe { &mut *self.sink };
+            sink.frames.clear();
+            sink.gpu_frames.clear();
+            sink.last_error = None;
+        }
+
         let nals = split_nal_units(access_unit);
 
         // Refresh the format description if this access unit carries parameter
@@ -466,17 +589,11 @@ impl VideoToolboxH264Decoder {
         if avcc.is_empty() {
             // Parameter-set-only access unit (e.g. a config refresh): nothing to
             // decode, no error.
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         self.ensure_session()?;
         let sample = self.build_sample_buffer(&avcc, presentation_time_us)?;
-
-        // SAFETY: sink is our live boxed pointer; a synchronous decode completes
-        // the callback before DecodeFrame returns, so the &mut here is exclusive.
-        let sink = unsafe { &mut *self.sink };
-        sink.frames.clear();
-        sink.last_error = None;
 
         // SAFETY: session and sample are valid. Decode flags are zero, so the
         // decode is synchronous and the output callback runs before DecodeFrame
@@ -502,13 +619,14 @@ impl VideoToolboxH264Decoder {
         let sink = unsafe { &mut *self.sink };
         if let Some(callback_status) = sink.last_error
             && sink.frames.is_empty()
+            && sink.gpu_frames.is_empty()
         {
             // DecodeFrame returned success but the callback reported a failure
             // and produced nothing — surface it so the caller can fall back
             // rather than mistaking a broken decode for an empty one.
             return Err(VtError::Decode(callback_status));
         }
-        Ok(std::mem::take(&mut sink.frames))
+        Ok(())
     }
 
     fn configure(&mut self, sps: &[u8], pps: &[u8]) -> Result<(), VtError> {
@@ -707,16 +825,20 @@ fn hardware_decoder_specification() -> CFDictionary<CFType, CFType> {
     CFDictionary::from_CFType_pairs(&[(key.as_CFType(), CFBoolean::true_value().as_CFType())])
 }
 
-/// Destination attributes requesting BGRA, IOSurface-backed pixel buffers.
+/// Destination attributes requesting BGRA, IOSurface-backed, Metal-compatible
+/// pixel buffers. Metal compatibility lets the GPU path import them through
+/// `CVMetalTextureCache`; it is harmless for the CPU path.
 fn bgra_buffer_attributes() -> CFDictionary<CFType, CFType> {
     let format = CFNumber::from(K_CV_PIXEL_FORMAT_TYPE_32BGRA);
     // SAFETY: the keys are framework string constants, valid for the process.
     let format_key = unsafe { CFString::wrap_under_get_rule(kCVPixelBufferPixelFormatTypeKey) };
     let io_key = unsafe { CFString::wrap_under_get_rule(kCVPixelBufferIOSurfacePropertiesKey) };
+    let metal_key = unsafe { CFString::wrap_under_get_rule(kCVPixelBufferMetalCompatibilityKey) };
     let empty: CFDictionary<CFType, CFType> = CFDictionary::from_CFType_pairs(&[]);
     CFDictionary::from_CFType_pairs(&[
         (format_key.as_CFType(), format.as_CFType()),
         (io_key.as_CFType(), empty.as_CFType()),
+        (metal_key.as_CFType(), CFBoolean::true_value().as_CFType()),
     ])
 }
 

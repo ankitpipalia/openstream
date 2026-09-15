@@ -422,4 +422,62 @@ mod tests {
         // SAFETY: we own the pixel buffer from CVPixelBufferCreate.
         unsafe { CFRelease(pixel_buffer as CFTypeRef) };
     }
+
+    /// End to end: decode real H.264 into an IOSurface pixel buffer (no CPU
+    /// copy), import it into a wgpu texture, and read the colour back. This is
+    /// the real decode→GPU path, not a synthetic buffer.
+    #[test]
+    fn decodes_h264_into_a_wgpu_texture() {
+        use crate::test_fixtures::{access_units_by_aud, generate_h264};
+        use crate::vt_decoder::VideoToolboxH264Decoder;
+
+        let Some(stream) = generate_h264("color=c=0x0000FF:size=64x48:rate=5", 3, 3) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+
+        // Decode into retained IOSurface pixel buffers.
+        let mut decoder = VideoToolboxH264Decoder::new_gpu();
+        let mut gpu_frames = Vec::new();
+        for (index, au) in access_units.iter().enumerate() {
+            if let Ok(frames) = decoder.decode_gpu(au, index as u64 * 100_000, index == 0) {
+                gpu_frames.extend(frames);
+            }
+        }
+        let Some(frame) = gpu_frames.first() else {
+            panic!("GPU decode produced no frames");
+        };
+        assert_eq!(frame.width, 64);
+        assert_eq!(frame.height, 48);
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            ..Default::default()
+        });
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no Metal adapter; skipping");
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .expect("request device");
+
+        let importer = MetalTextureImporter::new(&device).expect("create importer");
+        let texture = importer
+            .import(&device, frame.pixel_buffer.as_ptr())
+            .expect("import decoded frame");
+
+        let bytes = read_back_bgra(&device, &queue, &texture, 64, 48);
+        // Centre pixel, BGRA.
+        let offset = ((48 / 2) * 64 + 32) * 4;
+        let (b, g, r) = (bytes[offset], bytes[offset + 1], bytes[offset + 2]);
+        assert!(
+            b > 140 && g < 100 && r < 100,
+            "decoded→GPU centre should be blue (B={b} G={g} R={r})"
+        );
+        // The retained pixel buffer keeps the texture valid; drop after use.
+        drop(gpu_frames);
+    }
 }
