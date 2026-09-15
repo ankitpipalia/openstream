@@ -153,3 +153,31 @@ id returned 404 (absent), not 410 (expired). Production issues a fresh pairing
 per connect, so this is a test-fixture limitation, not a regression. The
 cross-NAT direct-media re-run and the signalling-outage-during-session test
 remain to be repeated on a genuinely different network.
+## TURN relay run of 2026-09-15 (turn-relay row: PROVEN over UDP; TCP/TLS: dependency gap)
+
+A coturn TURN server was run on the LAN host (in podman, long-term credential
+`osturn`, realm `openstream.test`, UDP/TCP 3478 and TLS 5349). An OpenStream
+host (synthetic source) and a client on a second machine were both configured
+with `OPENSTREAM_ICE=1`, the TURN URL and credentials, and
+`OPENSTREAM_FORCE_RELAY=1` so only relay candidates could be used.
+
+| check | result |
+| --- | --- |
+| force-relay honored on the ICE path | With the fix in this change set, `establish_with_ice` gathers relay candidates only when `OPENSTREAM_FORCE_RELAY=1`. Without it, same-LAN ICE nominated a direct host pair and never touched the relay |
+| TURN relay over UDP (`turn:...:3478?transport=udp`) | **Media relays through the TURN server.** coturn's own accounting recorded ~1.26 MB relayed per allocation for `username=osturn` across host and client sessions, sustained for the run; the client reported `run path=Ice` with no teardown |
+| TURN over TLS (`turns:...:5349`) and TURN over TCP (`?transport=tcp`) | **Not attempted by the client** -- coturn logged no connection on the TLS listener. Root cause is the ICE dependency, not configuration: `webrtc-ice 0.17.2` `gather_candidates_relay` implements only `proto == Udp && scheme == Turn`; the TURNS and TURN-over-TCP cases are a commented-out `TODO` and fall through to "Unable to handle URL in gather_candidates_relay", so no relay candidate is gathered |
+
+What this establishes and what it does not:
+
+- OpenStream's TURN relay path works for the common case -- a symmetric NAT that
+  still permits UDP to the relay. That is a substantive part of the `wan-turn`
+  gate and de-risks it to deployment (a public TURN server).
+- The **UDP-blocked** case still requires **TURN over TCP/TLS on 443**, which
+  the earlier analysis flagged as unproven. It is now shown to be *unimplemented*
+  in the `webrtc-ice 0.17.2` dependency, not merely unconfigured. Closing it needs
+  either a `webrtc-ice` version that implements the TCP/TLS relay gather (its own
+  `TODO`) or a TURN-over-TCP transport supplied outside the ICE agent.
+
+This run used a LAN-local TURN server to prove the code path; it does **not**
+change the `wan-turn` gate status, which still requires a public TURN server and
+a genuine WAN. No release-gate TSV is updated.
