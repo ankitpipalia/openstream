@@ -193,6 +193,16 @@ describe("tauri adapter", () => {
     expect(settingValue(snapshot, "client.profile")).toBe("balanced");
   });
 
+  it("marks local mode structurally so the notice never depends on prose", async () => {
+    const local = createTauriAdapter(async () => runtimeSnapshotFixture());
+    expect((await local.refresh()).access.localMode).toBe(true);
+
+    const secureFixture = runtimeSnapshotFixture();
+    secureFixture.app.mode = "Secure";
+    const secure = createTauriAdapter(async () => secureFixture);
+    expect((await secure.refresh()).access.localMode).toBe(false);
+  });
+
   it("keeps the fixture adapter outside Tauri", async () => {
     const adapter = createDefaultAdapter({ isTauri: false });
     expect((await adapter.refresh()).product.channel).toBe("Desktop shell");

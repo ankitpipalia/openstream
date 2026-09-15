@@ -89,6 +89,12 @@ export interface AccessSnapshot {
   };
   controlPlane: Capability;
   trustedDevices: TrustedDevice[];
+  /**
+   * True when the desktop runs in local mode (no control plane). Carried as a
+   * structured flag so the UI never has to infer the mode from a human-readable
+   * detail string, which silently broke when the wording or casing changed.
+   */
+  localMode: boolean;
 }
 
 export interface SettingItem {

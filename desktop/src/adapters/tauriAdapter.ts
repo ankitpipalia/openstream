@@ -656,7 +656,7 @@ function mapAccess(app: AppSnapshot, devices: RuntimeTrustedDevice[] = []): Acce
     fingerprint: device.public_key_fingerprint,
   }));
 
-  return { pairing, controlPlane, trustedDevices };
+  return { pairing, controlPlane, trustedDevices, localMode: app.mode === "Local" };
 }
 
 /// Translate Rust's diagnostic state into the shell's capability state.
@@ -815,6 +815,7 @@ function unresolvedSnapshot(): ProductSnapshot {
       pairing: { state: "not-configured", detail: "Waiting for the runtime bridge." },
       controlPlane,
       trustedDevices: [],
+      localMode: false,
     },
     settings: [],
     capabilities: [],
