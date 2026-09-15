@@ -16,7 +16,7 @@ export function AccessPage({
 }) {
   const { access } = snapshot;
   const signedIn = access.pairing.state === "ready";
-  const localMode = access.controlPlane.detail.includes("local mode");
+  const localMode = access.localMode;
   const [authMode, setAuthMode] = useState<"sign-in" | "register">("sign-in");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -191,7 +191,10 @@ export function AccessPage({
                       className="secondary-button"
                       type="button"
                       onClick={() => {
-                        void adapter.setDeviceTrust(device.id, "trusted").then(onSnapshot);
+                        void adapter
+                          .setDeviceTrust(device.id, "trusted")
+                          .then(onSnapshot)
+                          .catch(() => setAuthError("Could not update device trust."));
                       }}
                     >
                       Restore
@@ -201,7 +204,10 @@ export function AccessPage({
                       className="secondary-button"
                       type="button"
                       onClick={() => {
-                        void adapter.setDeviceTrust(device.id, "revoked").then(onSnapshot);
+                        void adapter
+                          .setDeviceTrust(device.id, "revoked")
+                          .then(onSnapshot)
+                          .catch(() => setAuthError("Could not update device trust."));
                       }}
                     >
                       Revoke

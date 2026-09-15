@@ -353,10 +353,15 @@ mod unix_main {
             .map_err(|error| error.to_string())?
             .with_backend(report.selected.label())
             .map_err(|error| error.to_string())?;
-        let heartbeat_path = frame_heartbeat_path()?;
-        config = config
-            .with_frame_heartbeat_file(heartbeat_path)
-            .map_err(|error| error.to_string())?;
+        // Only require a heartbeat from a child that publishes one. The native
+        // DRM child does not, so configuring it there would judge a working
+        // host as silent and restart it forever.
+        if report.selected.publishes_frame_heartbeat() {
+            let heartbeat_path = frame_heartbeat_path()?;
+            config = config
+                .with_frame_heartbeat_file(heartbeat_path)
+                .map_err(|error| error.to_string())?;
+        }
         let selected_capture = match report.selected {
             HostBackend::FfmpegX11 => Some("x11grab"),
             HostBackend::FfmpegPipewire => Some("pipewire"),

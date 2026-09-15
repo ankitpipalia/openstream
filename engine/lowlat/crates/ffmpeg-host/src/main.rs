@@ -65,6 +65,14 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const FRAME_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const INPUT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+/// After this long with no authenticated packet from the peer, the host ends
+/// the session and exits so its supervisor restarts it and it re-registers for
+/// a fresh establishment epoch. A client that drops uncleanly (no
+/// `openstream/end`) would otherwise leave the host streaming into a dead
+/// session for the whole run, and a reconnecting client could never re-pair.
+/// This sits well above the 5s keepalive cadence so a healthy but idle peer,
+/// which sends authenticated keepalives, is never torn down.
+const PEER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wire pacing must sit above the encoder target, not below it. The scheduler
 /// paces the sealed datagram stream, which carries per-packet headers, AEAD
@@ -304,7 +312,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // apply it on a later control tick.
     let mut pending_adaptive_decision: Option<BitrateDecision> = None;
     let mut audio_process = if audio_requested {
-        Some(ChildGuard::new(spawn_audio_ffmpeg()?))
+        // Audio is a secondary stream. If its source cannot start -- most
+        // commonly because audio was enabled in settings but no capture input
+        // is wired (the host agent sets OPENSTREAM_AUDIO=1 without an
+        // OPENSTREAM_AUDIO_FFMPEG_ARGS source) -- degrade to video only rather
+        // than taking the whole session down with it.
+        match spawn_audio_ffmpeg() {
+            Ok(child) => Some(ChildGuard::new(child)),
+            Err(error) => {
+                eprintln!(
+                    "OpenStream audio disabled: the audio source could not start ({error}); \
+continuing with video only"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -603,6 +625,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reliable_control.retry(&mut session).await?;
                 session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
+                let peer_silence = session.last_peer_activity_age();
+                if peer_silence >= PEER_LIVENESS_TIMEOUT {
+                    eprintln!(
+                        "OpenStream ending session: no authenticated peer traffic for {peer_silence:?}; re-registering"
+                    );
+                    break 'stream;
+                }
                 let now = Instant::now();
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
                 telemetry.observe_path(&session.transport_snapshot(now), now_ms);
@@ -1616,6 +1645,24 @@ fn capture_arguments(
     Ok(arguments)
 }
 
+/// Resolve the FFmpeg input arguments for the audio source.
+///
+/// Returns an error only when audio was requested but no source is configured.
+/// The caller treats that as "run video only", never as a session failure, so
+/// enabling audio without wiring a capture input can never take the video
+/// stream down with it.
+fn resolve_audio_source_args(
+    explicit_args: Option<String>,
+    test_tone: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match explicit_args {
+        Some(args) => Ok(args),
+        None if test_tone => Ok("-f lavfi -i sine=frequency=440:sample_rate=48000".to_string()),
+        None => Err("audio was requested but no audio source is configured: set OPENSTREAM_AUDIO_FFMPEG_ARGS to an FFmpeg input, or OPENSTREAM_AUDIO_TEST=1 for a test tone"
+            .into()),
+    }
+}
+
 fn spawn_audio_ffmpeg() -> Result<Child, Box<dyn std::error::Error>> {
     let executable = env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| DEFAULT_FFMPEG.into());
     // Audio is negotiated with the client before this runs, so a bare
@@ -1623,16 +1670,10 @@ fn spawn_audio_ffmpeg() -> Result<Child, Box<dyn std::error::Error>> {
     // "NotPresent" -- no mention of audio, and no mention of what was
     // missing. Name the setting instead; the operator has to know which
     // one to provide.
-    let args = match env::var("OPENSTREAM_AUDIO_FFMPEG_ARGS") {
-        Ok(args) => args,
-        Err(_) if env::var("OPENSTREAM_AUDIO_TEST").as_deref() == Ok("1") => {
-            "-f lavfi -i sine=frequency=440:sample_rate=48000".to_string()
-        }
-        Err(_) => {
-            return Err("audio was requested but no audio source is configured: set OPENSTREAM_AUDIO_FFMPEG_ARGS to an FFmpeg input, or OPENSTREAM_AUDIO_TEST=1 for a test tone"
-                .into());
-        }
-    };
+    let args = resolve_audio_source_args(
+        env::var("OPENSTREAM_AUDIO_FFMPEG_ARGS").ok(),
+        env::var("OPENSTREAM_AUDIO_TEST").as_deref() == Ok("1"),
+    )?;
     let mut command = Command::new(executable);
     command.args(["-hide_banner", "-loglevel", "error"]);
     // Audio must share the live wall clock with video. Without `-re`, lavfi
@@ -1923,10 +1964,32 @@ mod tests {
     use super::{
         AccessUnitizer, MAX_FFMPEG_ARGS, MAX_VIDEO_FILTER_BYTES, capture_arguments,
         configured_video_filter, contains_idr, display_capture_input, enumerate_host_displays,
-        queue_display_selection, remember_adaptive_decision, resolve_display_index,
-        resolve_encode_profile, split_command_line, topology_with_selected,
+        queue_display_selection, remember_adaptive_decision, resolve_audio_source_args,
+        resolve_display_index, resolve_encode_profile, split_command_line, topology_with_selected,
         validate_custom_ffmpeg_args,
     };
+
+    #[test]
+    fn audio_without_a_source_is_a_recoverable_error_not_a_session_failure() {
+        // No explicit source and no test tone: the resolver reports an error
+        // the caller degrades on (video only), naming the settings to provide.
+        let missing = resolve_audio_source_args(None, false);
+        assert!(missing.is_err());
+        assert!(
+            missing
+                .unwrap_err()
+                .to_string()
+                .contains("no audio source is configured"),
+            "the error must name the missing configuration"
+        );
+        // A test tone is a valid source.
+        assert!(resolve_audio_source_args(None, true).is_ok());
+        // An explicit source is used verbatim, even alongside the test-tone flag.
+        assert_eq!(
+            resolve_audio_source_args(Some("-f pulse -i default".to_string()), true).unwrap(),
+            "-f pulse -i default"
+        );
+    }
 
     #[test]
     fn display_switch_does_not_drop_pending_adaptive_decision() {

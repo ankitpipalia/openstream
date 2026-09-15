@@ -15,6 +15,15 @@ use std::env;
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+/// After this long with no authenticated packet from the peer, the host ends
+/// the session and exits so its supervisor restarts it and it re-registers for
+/// a fresh establishment epoch. It sits well above the 5s keepalive cadence so
+/// a healthy but idle peer, which sends authenticated keepalives, is never torn
+/// down; a peer that dropped uncleanly (no `openstream/end`) is caught here
+/// instead of the host streaming into a dead session for the whole run.
+#[cfg(target_os = "linux")]
+const PEER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("openstream-linux-host requires a Linux target");
@@ -448,6 +457,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 reliable_control.retry(&mut session).await?;
                 session.maintain_liveness().await?;
+                let peer_silence = session.last_peer_activity_age();
+                if peer_silence >= PEER_LIVENESS_TIMEOUT {
+                    eprintln!(
+                        "OpenStream ending session: no authenticated peer traffic for {peer_silence:?}; re-registering"
+                    );
+                    return Ok(());
+                }
                 if let Some(adaptive) = adaptive.as_mut()
                     && let Some(decision) = adaptive.tick(
                         started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
