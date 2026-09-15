@@ -305,6 +305,7 @@ mod platform {
     //! That is the same rule the vendor codec runtimes follow.
 
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
+    use std::sync::OnceLock;
 
     use lowlat_common::dynlib::Library;
 
@@ -362,6 +363,9 @@ mod platform {
     type FreePassword = unsafe extern "C" fn(*mut c_char);
 
     struct Secret {
+        /// Held so the library stays mapped. Dropping this would `dlclose`
+        /// libsecret, and a later reload cannot re-register its GObject
+        /// types; see `secret()`. Nothing in this module drops it.
         _library: Library,
         store: StoreSync,
         lookup: LookupSync,
@@ -397,6 +401,20 @@ mod platform {
         }
     }
 
+    /// Resolve libsecret once for the life of the process.
+    ///
+    /// **The handle must never be closed.** libsecret registers GObject types
+    /// on load, and GLib has no way to unregister them: a second `dlopen`
+    /// after a `dlclose` aborts with "cannot register existing type
+    /// 'SecretService'". Opening per call did exactly that -- the first
+    /// lookup succeeded, the store that followed it failed, and every
+    /// identity silently fell back to the file even with the Secret Service
+    /// running. Caching here keeps one load alive for the process.
+    fn secret() -> Option<&'static Secret> {
+        static SECRET: OnceLock<Option<Secret>> = OnceLock::new();
+        SECRET.get_or_init(open).as_ref()
+    }
+
     fn open() -> Option<Secret> {
         // Versioned name first: the unversioned alias ships with the
         // development package, which a plain desktop does not have.
@@ -417,7 +435,7 @@ mod platform {
     }
 
     pub(super) fn load(account: &str) -> Option<Vec<u8>> {
-        let secret = open()?;
+        let secret = secret()?;
         let account = CString::new(account).ok()?;
         let schema = schema();
         // SAFETY: the schema outlives the call; the variadic tail is one
@@ -448,7 +466,7 @@ mod platform {
     }
 
     pub(super) fn store(account: &str, value: &[u8]) -> Result<(), String> {
-        let secret = open().ok_or("libsecret is not available on this machine")?;
+        let secret = secret().ok_or("libsecret is not available on this machine")?;
         let account = CString::new(account).map_err(|_| "the account name is not usable")?;
         // The Secret Service carries a NUL-terminated string, so the key is
         // hex encoded rather than passed as raw bytes.
@@ -477,7 +495,7 @@ mod platform {
 
     #[cfg(test)]
     pub(super) fn remove(account: &str) -> Result<(), String> {
-        let secret = open().ok_or("libsecret is not available on this machine")?;
+        let secret = secret().ok_or("libsecret is not available on this machine")?;
         let account = CString::new(account).map_err(|_| "the account name is not usable")?;
         let schema = schema();
         // SAFETY: as in `load`.
