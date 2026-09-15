@@ -277,6 +277,7 @@ async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>,
             Role::Host,
             "127.0.0.1:0".parse::<SocketAddr>().expect("host bind"),
             &[],
+            false,
         ),
         PeerSession::establish_with_ice(
             &origin,
@@ -284,6 +285,7 @@ async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>,
             Role::Client,
             "127.0.0.1:0".parse::<SocketAddr>().expect("client bind"),
             &[],
+            false,
         ),
     );
     (

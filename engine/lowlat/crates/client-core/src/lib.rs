@@ -1207,6 +1207,33 @@ pub fn full_ice_enabled() -> bool {
         || std::env::var_os("OPENSTREAM_ICE_URLS").is_some()
 }
 
+/// Whether the process asked to force every session through a TURN relay.
+///
+/// Read at the host-facing entry points only, so the establish functions stay
+/// free of process-global state and remain deterministic under test.
+fn force_relay_requested() -> bool {
+    std::env::var("OPENSTREAM_FORCE_RELAY").as_deref() == Ok("1")
+}
+
+/// The ICE candidate types to gather for a session.
+///
+/// With `force_relay`, only relay candidates are gathered, so a network that
+/// blocks every direct path is routed through TURN. Otherwise the full set is
+/// gathered and ICE picks the best working pair. Extracted so the force-relay
+/// selection can be pinned by a test without standing up an ICE agent.
+fn ice_candidate_types(force_relay: bool) -> Vec<CandidateType> {
+    if force_relay {
+        vec![CandidateType::Relay]
+    } else {
+        vec![
+            CandidateType::Host,
+            CandidateType::ServerReflexive,
+            CandidateType::PeerReflexive,
+            CandidateType::Relay,
+        ]
+    }
+}
+
 /// Read the process-level ICE/TURN configuration.
 ///
 /// URLs intentionally contain no credentials. A deployment supplies the
@@ -2484,7 +2511,15 @@ impl PeerSession {
     ) -> Result<Self, Error> {
         if full_ice_enabled() {
             let urls = ice_urls_for_pairing_role(pairing, role)?;
-            Self::establish_with_ice(server_origin, pairing, role, local_bind, &urls).await
+            Self::establish_with_ice(
+                server_origin,
+                pairing,
+                role,
+                local_bind,
+                &urls,
+                force_relay_requested(),
+            )
+            .await
         } else {
             Self::establish_with_stun(server_origin, pairing, role, local_bind, stun_servers).await
         }
@@ -2505,7 +2540,15 @@ impl PeerSession {
         turn_password: Option<&str>,
     ) -> Result<Self, Error> {
         let urls = parse_ice_urls(ice_urls, turn_username, turn_password)?;
-        Self::establish_with_ice(server_origin, pairing, role, local_bind, &urls).await
+        Self::establish_with_ice(
+            server_origin,
+            pairing,
+            role,
+            local_bind,
+            &urls,
+            force_relay_requested(),
+        )
+        .await
     }
 
     /// Establish a standards-based ICE session, optionally allocating a TURN
@@ -2523,6 +2566,7 @@ impl PeerSession {
         role: Role,
         local_bind: SocketAddr,
         ice_urls: &[IceUrl],
+        force_relay: bool,
     ) -> Result<Self, Error> {
         let mut signal = Endpoint::connect(server_origin, pairing, role).await?;
         // Waiting for the server-owned pair is outside the candidate/key
@@ -2538,23 +2582,14 @@ impl PeerSession {
                     .map_err(|error| Error::Ice(error.to_string()))?,
             )
         };
-        // OPENSTREAM_FORCE_RELAY restricts the session to TURN-relayed media.
-        // The direct/STUN path already honors it; the full ICE path did not,
-        // so a caller that asked for relay-only could still nominate a host or
-        // server-reflexive pair. When forced, gather relay candidates only so a
-        // network that blocks every direct path (and TURN over TLS/443 for one
-        // that blocks UDP) is the sole route.
-        let force_relay = std::env::var("OPENSTREAM_FORCE_RELAY").as_deref() == Ok("1");
-        let candidate_types = if force_relay {
-            vec![CandidateType::Relay]
-        } else {
-            vec![
-                CandidateType::Host,
-                CandidateType::ServerReflexive,
-                CandidateType::PeerReflexive,
-                CandidateType::Relay,
-            ]
-        };
+        // `force_relay` restricts the session to TURN-relayed media. The
+        // direct/STUN path already honors OPENSTREAM_FORCE_RELAY; the full ICE
+        // path did not, so a caller that asked for relay-only could still
+        // nominate a host or server-reflexive pair. When forced, gather relay
+        // candidates only so a network that blocks every direct path is routed
+        // through TURN. The env read lives in the host-facing callers, so this
+        // function stays independent of process-global state.
+        let candidate_types = ice_candidate_types(force_relay);
         let agent = Arc::new(
             Agent::new(AgentConfig {
                 urls: ice_urls.to_vec(),
@@ -2997,7 +3032,7 @@ impl PeerSession {
 
         let mut cipher = CipherSession::new(keys.tx, keys.rx);
         let mut transport = transport;
-        let force_relay = std::env::var("OPENSTREAM_FORCE_RELAY").as_deref() == Ok("1");
+        let force_relay = force_relay_requested();
         let candidate_deadline = TokioInstant::now() + PHASE_TIMEOUT;
         for candidate in peer_candidates.iter().copied() {
             if TokioInstant::now() >= candidate_deadline {
@@ -6101,6 +6136,23 @@ mod tests {
             }
         }
         assert_eq!(control.outstanding(), 4);
+    }
+
+    #[test]
+    fn force_relay_gathers_relay_candidates_only() {
+        use super::ice_candidate_types;
+        use webrtc_ice::candidate::CandidateType;
+
+        // Forced: relay only, so a network that blocks direct paths must use TURN.
+        assert_eq!(ice_candidate_types(true), vec![CandidateType::Relay]);
+
+        // Unforced: the full set, with ICE free to pick the best working pair.
+        let full = ice_candidate_types(false);
+        assert!(full.contains(&CandidateType::Host));
+        assert!(full.contains(&CandidateType::ServerReflexive));
+        assert!(full.contains(&CandidateType::PeerReflexive));
+        assert!(full.contains(&CandidateType::Relay));
+        assert!(full.len() > 1);
     }
 
     #[test]

@@ -134,6 +134,7 @@ async fn ice_migration_returns_typed_unsupported_without_reconnect() {
             Role::Host,
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             &[],
+            false,
         ),
         PeerSession::establish_with_ice(
             &origin,
@@ -141,6 +142,7 @@ async fn ice_migration_returns_typed_unsupported_without_reconnect() {
             Role::Client,
             "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             &[],
+            false,
         ),
     );
     let (mut host, mut client) = (
