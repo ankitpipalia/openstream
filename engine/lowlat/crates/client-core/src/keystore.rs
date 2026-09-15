@@ -22,12 +22,34 @@ pub(crate) fn available() -> bool {
     platform::AVAILABLE
 }
 
-/// Read the stored key, or `None` when there is no entry.
+/// What a keystore read found.
 ///
-/// An error is not distinguished from a missing entry on purpose: both mean
-/// "the keystore did not give a key", and the only safe response to either is
-/// to fall back to the file.
-pub(crate) fn load(account: &str) -> Option<Vec<u8>> {
+/// On a target with no keystore backend only `Unavailable` is ever built, and
+/// this workspace denies dead code. The variants are still the right shape
+/// there -- the caller matches all three regardless of target -- so the
+/// expectation is scoped to exactly those targets rather than the enum being
+/// split per platform.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    expect(
+        dead_code,
+        reason = "the unsupported backend only ever reports Unavailable"
+    )
+)]
+#[derive(Debug)]
+pub(crate) enum Lookup {
+    /// The entry was there and came back.
+    Found(Vec<u8>),
+    /// The keystore answered, and has no entry for this account.
+    Absent,
+    /// The keystore could not be asked: no implementation, no library, or no
+    /// running service. Distinct from `Absent` because the two call for
+    /// opposite responses -- one may mint a new identity, the other must not.
+    Unavailable(String),
+}
+
+/// Read the stored key.
+pub(crate) fn load(account: &str) -> Lookup {
     platform::load(account)
 }
 
@@ -177,9 +199,16 @@ mod platform {
         (!raw.is_null()).then_some(Owned(raw))
     }
 
-    pub(super) fn load(account: &str) -> Option<Vec<u8>> {
-        let service = cf_string(SERVICE)?;
-        let account = cf_string(account)?;
+    /// `errSecItemNotFound`: the keychain answered and holds no such item.
+    const ERR_SEC_ITEM_NOT_FOUND: OsStatus = -25300;
+
+    pub(super) fn load(account: &str) -> super::Lookup {
+        let Some(service) = cf_string(SERVICE) else {
+            return super::Lookup::Unavailable("could not build the keychain service name".into());
+        };
+        let Some(account) = cf_string(account) else {
+            return super::Lookup::Unavailable("could not build the keychain account".into());
+        };
         // SAFETY: reading framework string constants.
         let query = unsafe {
             cf_dictionary(&[
@@ -188,15 +217,23 @@ mod platform {
                 (kSecAttrAccount, account.0),
                 (kSecReturnData, kCFBooleanTrue),
                 (kSecMatchLimit, kSecMatchLimitOne),
-            ])?
+            ])
+        };
+        let Some(query) = query else {
+            return super::Lookup::Unavailable("could not build the keychain query".into());
         };
 
         let mut found: CFTypeRef = std::ptr::null();
         // SAFETY: `query` is a valid dictionary; `found` receives an owned
         // reference only when the call succeeds.
         let status = unsafe { SecItemCopyMatching(query.0, &raw mut found) };
+        if status == ERR_SEC_ITEM_NOT_FOUND {
+            return super::Lookup::Absent;
+        }
         if status != ERR_SEC_SUCCESS || found.is_null() {
-            return None;
+            return super::Lookup::Unavailable(format!(
+                "the keychain refused the query (OSStatus {status})"
+            ));
         }
         let data = Owned(found);
         // SAFETY: a successful kSecReturnData query yields a CFData.
@@ -205,12 +242,14 @@ mod platform {
         // `data` is alive.
         let bytes = unsafe { CFDataGetBytePtr(data.0) };
         if bytes.is_null() || length <= 0 {
-            return None;
+            return super::Lookup::Unavailable("the keychain returned an empty item".into());
         }
-        let length = usize::try_from(length).ok()?;
+        let Ok(length) = usize::try_from(length) else {
+            return super::Lookup::Unavailable("the keychain item is impossibly large".into());
+        };
         // SAFETY: `bytes` is valid for `length` bytes for the lifetime of
         // `data`, and the copy finishes before `data` is dropped.
-        Some(unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec())
+        super::Lookup::Found(unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec())
     }
 
     #[cfg(test)]
@@ -347,20 +386,30 @@ mod platform {
 
     // Declared variadic, because that is what these are. Calling a variadic
     // function through a non-variadic pointer is not the same ABI.
+    //
+    // Every one of these takes `GCancellable *` then `GError **`. The error
+    // parameter is a pointer to a pointer: libsecret writes a newly allocated
+    // GError through it. Declaring it as a single pointer happens to compile
+    // wherever a null literal is passed, which is exactly why all three are
+    // spelled out here rather than only the one that passes an address.
     type StoreSync = unsafe extern "C" fn(
         *const Schema,
         *const c_char,
         *const c_char,
         *const c_char,
         *mut c_void,
-        *mut c_void,
+        *mut *mut c_void,
         ...
     ) -> c_int;
     type LookupSync =
-        unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> *mut c_char;
+        unsafe extern "C" fn(*const Schema, *mut c_void, *mut *mut c_void, ...) -> *mut c_char;
     #[cfg(test)]
-    type ClearSync = unsafe extern "C" fn(*const Schema, *mut c_void, *mut c_void, ...) -> c_int;
+    type ClearSync =
+        unsafe extern "C" fn(*const Schema, *mut c_void, *mut *mut c_void, ...) -> c_int;
     type FreePassword = unsafe extern "C" fn(*mut c_char);
+    /// From glib, reached through libsecret's own dependency graph: dlsym on a
+    /// handle searches the library and everything it links.
+    type ErrorFree = unsafe extern "C" fn(*mut c_void);
 
     struct Secret {
         /// Held so the library stays mapped. Dropping this would `dlclose`
@@ -375,6 +424,9 @@ mod platform {
         #[cfg(test)]
         clear: ClearSync,
         free: FreePassword,
+        /// Optional: without it a failed call leaks one small GError, which is
+        /// better than refusing to use the keystore at all.
+        error_free: Option<ErrorFree>,
     }
 
     fn schema() -> Schema {
@@ -429,15 +481,21 @@ mod platform {
                 #[cfg(test)]
                 clear: library.symbol(c"secret_password_clear_sync")?,
                 free: library.symbol(c"secret_password_free")?,
+                error_free: library.symbol(c"g_error_free"),
                 _library: library,
             })
         }
     }
 
-    pub(super) fn load(account: &str) -> Option<Vec<u8>> {
-        let secret = secret()?;
-        let account = CString::new(account).ok()?;
+    pub(super) fn load(account: &str) -> super::Lookup {
+        let Some(secret) = secret() else {
+            return super::Lookup::Unavailable("libsecret is not available on this machine".into());
+        };
+        let Ok(account) = CString::new(account) else {
+            return super::Lookup::Unavailable("the account name is not usable".into());
+        };
         let schema = schema();
+        let mut error: *mut c_void = std::ptr::null_mut();
         // SAFETY: the schema outlives the call; the variadic tail is one
         // attribute name/value pair terminated by NULL, as libsecret requires.
         // A null GError** means "report no detail", which is legal in GLib.
@@ -445,14 +503,24 @@ mod platform {
             (secret.lookup)(
                 &raw const schema,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &raw mut error,
                 ATTRIBUTE_ACCOUNT.as_ptr(),
                 account.as_ptr(),
                 std::ptr::null::<c_char>(),
             )
         };
         if found.is_null() {
-            return None;
+            // A null result with no GError is the service answering "I hold no
+            // such entry". A null result *with* one means it could not answer
+            // at all, which calls for the opposite response.
+            if error.is_null() {
+                return super::Lookup::Absent;
+            }
+            if let Some(free) = secret.error_free {
+                // SAFETY: freeing exactly the GError libsecret allocated.
+                unsafe { free(error) };
+            }
+            return super::Lookup::Unavailable("the Secret Service could not be reached".into());
         }
         // SAFETY: a non-null return is a NUL-terminated string owned by
         // libsecret, valid until freed below.
@@ -462,7 +530,11 @@ mod platform {
             .map(str::to_owned);
         // SAFETY: freeing exactly what libsecret returned, once.
         unsafe { (secret.free)(found) };
-        hex::decode(text?.trim()).ok()
+        match text.and_then(|text| hex::decode(text.trim()).ok()) {
+            Some(bytes) => super::Lookup::Found(bytes),
+            // The entry is there but is not what this code wrote.
+            None => super::Lookup::Unavailable("the stored entry is not readable".into()),
+        }
     }
 
     pub(super) fn store(account: &str, value: &[u8]) -> Result<(), String> {
@@ -520,8 +592,8 @@ mod platform {
 mod platform {
     pub(super) const AVAILABLE: bool = false;
 
-    pub(super) fn load(_account: &str) -> Option<Vec<u8>> {
-        None
+    pub(super) fn load(_account: &str) -> super::Lookup {
+        super::Lookup::Unavailable("no platform keystore is implemented for this target".into())
     }
 
     pub(super) fn store(_account: &str, _secret: &[u8]) -> Result<(), String> {
@@ -541,24 +613,34 @@ mod tests {
         let account = format!("openstream-test-{}", std::process::id());
         let secret: Vec<u8> = (0..64_u8).collect();
         super::store(&account, &secret).expect("store");
-        assert_eq!(super::load(&account).as_deref(), Some(secret.as_slice()));
+        assert!(
+            matches!(super::load(&account), super::Lookup::Found(found) if found == secret),
+            "a stored key must come back byte for byte"
+        );
 
         // Storing again must replace rather than fail or duplicate.
         let replacement: Vec<u8> = (64..128_u8).collect();
         super::store(&account, &replacement).expect("replace");
-        assert_eq!(
-            super::load(&account).as_deref(),
-            Some(replacement.as_slice())
+        assert!(
+            matches!(super::load(&account), super::Lookup::Found(found) if found == replacement),
+            "storing again must replace rather than duplicate"
         );
 
         super::remove(&account).expect("clean up the test item");
-        assert!(super::load(&account).is_none(), "the item must be gone");
+        // Absent, not Unavailable: the service answered and holds nothing.
+        // Conflating the two is what let a lost entry mint a new identity.
+        assert!(
+            matches!(super::load(&account), super::Lookup::Absent),
+            "a removed item must read as absent, not as an unavailable keystore"
+        );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
+    #[ignore = "needs a running Secret Service"]
     fn an_account_with_no_entry_reads_as_absent() {
         let account = format!("openstream-absent-{}", std::process::id());
-        assert!(super::load(&account).is_none());
+        assert!(matches!(super::load(&account), super::Lookup::Absent));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -566,5 +648,11 @@ mod tests {
     fn targets_without_an_implementation_say_so_rather_than_pretending() {
         assert!(!super::available());
         assert!(super::store("account", b"secret").is_err());
+        // Unavailable, never Absent: a target with no keystore must not look
+        // like a keystore that simply has no entry yet.
+        assert!(matches!(
+            super::load("account"),
+            super::Lookup::Unavailable(_)
+        ));
     }
 }

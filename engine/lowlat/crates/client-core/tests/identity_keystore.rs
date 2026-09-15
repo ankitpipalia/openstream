@@ -63,3 +63,53 @@ fn a_fresh_identity_lives_only_in_the_keystore_and_is_stable_across_runs() {
         .status();
     let _ = std::fs::remove_dir_all(&directory);
 }
+
+#[test]
+#[ignore = "writes to the login keychain"]
+fn a_lost_keystore_refuses_rather_than_enrolling_a_different_device() {
+    let directory = scratch("lost");
+    let store = directory.join("device-identity.pk8");
+    let _ = std::fs::remove_dir_all(&directory);
+
+    // SAFETY: this test binary runs alone, which is why it is its own file.
+    unsafe {
+        std::env::set_var("OPENSTREAM_IDENTITY_CUSTODY", "keystore");
+        std::env::set_var("OPENSTREAM_IDENTITY_STORE", &store);
+    }
+
+    let first = openstream_client_core::local_identity_public_key().expect("identity in keystore");
+    assert!(
+        !store.exists(),
+        "keystore custody must not write the key to disk"
+    );
+
+    // Take the keystore away, leaving the custody marker behind. This is a
+    // locked or stopped keyring, and the only safe answer is to refuse: a new
+    // identity here would silently enrol the machine as a different device.
+    let cleared = std::process::Command::new("security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            "com.openstream.device-identity",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    assert!(
+        cleared.map(|s| s.success()).unwrap_or(false),
+        "entry removed"
+    );
+
+    let after = openstream_client_core::local_identity_public_key();
+    assert!(
+        after.is_err(),
+        "a lost keystore must refuse, not mint a replacement identity"
+    );
+    assert!(
+        !store.exists(),
+        "refusing must not leave a freshly generated key on disk"
+    );
+    let _ = first;
+
+    let _ = std::fs::remove_dir_all(&directory);
+}
