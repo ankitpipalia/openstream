@@ -67,7 +67,8 @@ mod vt_gpu;
 // by the (future) runtime dispatch and the loopback harness. Not yet wired into
 // the live network loop.
 mod decode_dispatch;
-#[cfg(test)]
+// Shared ffmpeg-fixture test helpers, used only by the macOS decode tests.
+#[cfg(all(test, target_os = "macos"))]
 mod test_fixtures;
 // Pure lifecycle/input-safety seam; a future winit presenter can consume it
 // without making this minifb path or the dependency graph change in this slice.
