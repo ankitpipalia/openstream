@@ -27,6 +27,22 @@ Behaviour as built:
 - The account name is a digest of the store path, so two stores on one machine
   cannot collide, and the path is not published in keychain listings.
 
+### Why Linux was not done at the same time
+
+macOS cost no dependency: `SecItemAdd` and `SecItemCopyMatching` are C entry
+points in a framework that is always present, reached by raw FFI.
+
+Linux is a different decision, not a smaller one. Secret Service is a D-Bus
+interface, nothing in this workspace speaks D-Bus, and no D-Bus crate is in
+the tree -- so this means adding `zbus` or `secret-service` to
+`openstream-client-core`, which mobile also builds. It also needs a session
+bus and an unlocked keyring to be present, and a headless Linux host running
+only the host role frequently has neither, which would make the file fallback
+the normal case rather than the exception.
+
+Both of those are worth deciding deliberately rather than inheriting from a
+macOS implementation that happened to be cheap.
+
 ### What exists now
 
 The device identity is a PKCS#8 key at `device-identity.pk8` under the XDG
