@@ -87,7 +87,7 @@ linux_package="${OPENSTREAM_LINUX_PACKAGE:-}"
 if [[ -n "$linux_package" ]]; then
     copy_required "$linux_package" "$artifact_root/linux-x86_64/OpenStream-Linux-x86_64.tar.gz"
 else
-    for binary in openstream-host-agent openstream-linux-host openstream-signal-server; do
+    for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
         [[ -x "$engine_dir/target/$linux_target/release/$binary" ]] || {
             echo "missing Linux release binary: $engine_dir/target/$linux_target/release/$binary" >&2
             echo "build the pinned Linux target or set OPENSTREAM_LINUX_PACKAGE" >&2
@@ -103,7 +103,7 @@ else
     trap 'rm -rf -- "$linux_stage"' EXIT
     mkdir -p "$linux_stage/usr/bin" "$linux_stage/usr/lib/systemd/user" \
         "$linux_stage/usr/share/applications"
-    for binary in openstream-host-agent openstream-linux-host openstream-signal-server; do
+    for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
         install -m 0755 "$engine_dir/target/$linux_target/release/$binary" \
             "$linux_stage/usr/bin/$binary"
     done

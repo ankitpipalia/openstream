@@ -34,6 +34,10 @@ case "$package" in
             echo "Debian package is missing the host agent" >&2
             exit 1
         }
+        dpkg-deb --contents "$package" | grep -q '/usr/bin/openstream-ffmpeg-host$' || {
+            echo "Debian package is missing openstream-ffmpeg-host, the default host child" >&2
+            exit 1
+        }
         printf 'package structure verified: Debian package %s\n' "$package"
         ;;
     *.dmg)
@@ -68,6 +72,10 @@ case "$package" in
         listing="$(tar -tzf "$package")"
         grep -q 'usr/bin/openstream-host-agent$' <<<"$listing" || {
             echo "archive is missing openstream-host-agent" >&2
+            exit 1
+        }
+        grep -q 'usr/bin/openstream-ffmpeg-host$' <<<"$listing" || {
+            echo "archive is missing openstream-ffmpeg-host, the default host child" >&2
             exit 1
         }
         grep -q 'usr/bin/openstream-desktop$' <<<"$listing" || {

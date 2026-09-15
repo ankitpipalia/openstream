@@ -68,6 +68,7 @@ jobs:
         run: |
           cargo build --locked --release --target x86_64-unknown-linux-gnu \
             -p openstream-host-agent \
+            -p openstream-ffmpeg-host \
             -p openstream-linux-host \
             -p openstream-signal-server
 
@@ -83,7 +84,7 @@ jobs:
           stage="$(mktemp -d)"
           mkdir -p "$stage/usr/bin" "$stage/usr/lib/systemd/user" \
             "$stage/usr/share/applications"
-          for binary in openstream-host-agent openstream-linux-host openstream-signal-server; do
+          for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
             install -m 0755 \
               "engine/lowlat/target/x86_64-unknown-linux-gnu/release/$binary" \
               "$stage/usr/bin/$binary"
