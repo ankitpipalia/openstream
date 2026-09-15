@@ -5,9 +5,11 @@
 //! away from other processes running as the same user, which is the whole point
 //! of handing it to the platform instead.
 //!
-//! Only macOS is implemented. Everywhere else this reports itself unavailable
-//! and the caller keeps the file, rather than pretending to a protection that
-//! is not there.
+//! macOS uses the login keychain through Security.framework. Linux uses the
+//! Secret Service through libsecret, resolved at runtime so nothing is linked
+//! against it. Everywhere else, and on a Linux machine without libsecret or
+//! without a reachable keyring, this reports itself unavailable and the caller
+//! keeps the file, rather than pretending to a protection that is not there.
 //!
 //! Note on what is deliberately *not* used here: `security add-generic-password`
 //! and `secret-tool store` both take the secret as a command-line argument,

@@ -6,11 +6,11 @@ rediscovering it.
 
 ## OS-backed custody for the device identity key
 
-Status: implemented for macOS, opt-in with `OPENSTREAM_IDENTITY_CUSTODY=keystore`.
-Other platforms report the keystore unavailable and keep the file, rather than
-pretending to a protection that is not there. The rest of this section is kept
-because it is what the implementation had to satisfy, and what a Linux or
-Windows implementation still has to.
+Status: implemented for macOS and Linux, opt-in with
+`OPENSTREAM_IDENTITY_CUSTODY=keystore`. Windows still reports the keystore
+unavailable and keeps the file. The rest of this section is kept because it is
+what the implementation had to satisfy, and what a Windows implementation still
+has to.
 
 Behaviour as built:
 
@@ -27,21 +27,24 @@ Behaviour as built:
 - The account name is a digest of the store path, so two stores on one machine
   cannot collide, and the path is not published in keychain listings.
 
-### Why Linux was not done at the same time
+### How Linux avoided the dependency question
 
-macOS cost no dependency: `SecItemAdd` and `SecItemCopyMatching` are C entry
-points in a framework that is always present, reached by raw FFI.
+The obvious Linux route is a D-Bus crate -- `zbus` or `secret-service` --
+added to `openstream-client-core`, which mobile also builds. That was worth
+avoiding, and it was avoidable: libsecret is a C library, and this workspace
+already resolves vendor runtimes at load time through
+`lowlat_common::dynlib` rather than linking them. The keystore does the same,
+so the only new dependency is an internal crate, and only on Linux.
 
-Linux is a different decision, not a smaller one. Secret Service is a D-Bus
-interface, nothing in this workspace speaks D-Bus, and no D-Bus crate is in
-the tree -- so this means adding `zbus` or `secret-service` to
-`openstream-client-core`, which mobile also builds. It also needs a session
-bus and an unlocked keyring to be present, and a headless Linux host running
-only the host role frequently has neither, which would make the file fallback
-the normal case rather than the exception.
+That choice also settles the deployment worry rather than arguing about it. A
+headless host with no session bus or no unlocked keyring simply fails to
+resolve or fails to store, and falls back to the file with a line saying so.
+Nothing needs the keyring to be present for the binary to start.
 
-Both of those are worth deciding deliberately rather than inheriting from a
-macOS implementation that happened to be cheap.
+Note for anyone testing this: the Secret Service is not reachable over SSH on
+a KDE machine. `secret-tool` answers "The name is not activatable", because
+kwalletd wants a real session with an unlocked wallet. The round trip has to
+be run from inside the desktop session; what SSH can confirm is the fallback.
 
 ### What exists now
 
