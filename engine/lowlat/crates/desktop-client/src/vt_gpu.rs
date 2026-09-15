@@ -480,4 +480,202 @@ mod tests {
         // The retained pixel buffer keeps the texture valid; drop after use.
         drop(gpu_frames);
     }
+
+    // A no-swizzle sampling shader. The imported texture is Bgra8Unorm, which
+    // wgpu already samples as logical RGBA, so -- unlike the CPU presenter's
+    // shader, which swizzles because it uploads BGRA bytes into an RGBA texture
+    // -- this must NOT swizzle. Getting that right is the crux of present_texture.
+    const RENDER_SHADER: &str = r#"
+struct VOut { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VOut {
+    var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var uvs = array<vec2<f32>, 3>(vec2<f32>(0.0, 0.0), vec2<f32>(2.0, 0.0), vec2<f32>(0.0, 2.0));
+    var o: VOut;
+    o.position = vec4<f32>(positions[index], 0.0, 1.0);
+    o.uv = uvs[index];
+    return o;
+}
+@group(0) @binding(0) var frame_texture: texture_2d<f32>;
+@group(0) @binding(1) var frame_sampler: sampler;
+@fragment
+fn fs_main(in: VOut) -> @location(0) vec4<f32> {
+    return textureSample(frame_texture, frame_sampler, in.uv);
+}
+"#;
+
+    /// Render `source` through the no-swizzle pipeline to an offscreen
+    /// Rgba8Unorm target and read it back (bytes R,G,B,A). No CPU pixel copy
+    /// touches the source; only the final verification reads back.
+    fn render_texture_offscreen(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::Texture,
+        width: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("m2 render test"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(RENDER_SHADER)),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let target_format = wgpu::TextureFormat::Rgba8Unorm;
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+        });
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("m2 render target"),
+            size: wgpu::Extent3d {
+                width: u32::try_from(width).unwrap(),
+                height: u32::try_from(height).unwrap(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&source_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        queue.submit(Some(encoder.finish()));
+        read_back_bgra(device, queue, &target, width, height)
+    }
+
+    /// The render half of M2: decode -> import -> GPU shader render -> read a
+    /// correct colour back. Proves the imported Bgra8Unorm texture renders
+    /// through a sampling pipeline without a swizzle -- the format handling the
+    /// live present_texture path will use once the decode worker shares the
+    /// presenter's wgpu device.
+    #[test]
+    fn renders_a_decoded_frame_through_a_shader() {
+        use crate::test_fixtures::{access_units_by_aud, generate_h264};
+        use crate::vt_decoder::VideoToolboxH264Decoder;
+
+        let Some(stream) = generate_h264("color=c=0x0000FF:size=64x48:rate=5", 3, 3) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+        let mut decoder = VideoToolboxH264Decoder::new_gpu();
+        let mut gpu_frames = Vec::new();
+        for (index, au) in access_units.iter().enumerate() {
+            if let Ok(frames) = decoder.decode_gpu(au, index as u64 * 100_000, index == 0) {
+                gpu_frames.extend(frames);
+            }
+        }
+        let Some(frame) = gpu_frames.first() else {
+            panic!("GPU decode produced no frames");
+        };
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            ..Default::default()
+        });
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no Metal adapter; skipping");
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .expect("request device");
+        let importer = MetalTextureImporter::new(&device).expect("create importer");
+        let texture = importer
+            .import(&device, frame.pixel_buffer.as_ptr())
+            .expect("import decoded frame");
+
+        let bytes = render_texture_offscreen(&device, &queue, &texture, 64, 48);
+        // Rgba8Unorm target: bytes are R,G,B,A.
+        let offset = ((48 / 2) * 64 + 32) * 4;
+        let (r, g, b) = (bytes[offset], bytes[offset + 1], bytes[offset + 2]);
+        assert!(
+            b > 140 && r < 100 && g < 100,
+            "rendered pixel should be blue (R={r} G={g} B={b})"
+        );
+        drop(gpu_frames);
+    }
 }
