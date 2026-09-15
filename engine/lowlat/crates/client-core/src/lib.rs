@@ -2459,17 +2459,29 @@ impl PeerSession {
                     .map_err(|error| Error::Ice(error.to_string()))?,
             )
         };
+        // OPENSTREAM_FORCE_RELAY restricts the session to TURN-relayed media.
+        // The direct/STUN path already honors it; the full ICE path did not,
+        // so a caller that asked for relay-only could still nominate a host or
+        // server-reflexive pair. When forced, gather relay candidates only so a
+        // network that blocks every direct path (and TURN over TLS/443 for one
+        // that blocks UDP) is the sole route.
+        let force_relay = std::env::var("OPENSTREAM_FORCE_RELAY").as_deref() == Ok("1");
+        let candidate_types = if force_relay {
+            vec![CandidateType::Relay]
+        } else {
+            vec![
+                CandidateType::Host,
+                CandidateType::ServerReflexive,
+                CandidateType::PeerReflexive,
+                CandidateType::Relay,
+            ]
+        };
         let agent = Arc::new(
             Agent::new(AgentConfig {
                 urls: ice_urls.to_vec(),
                 udp_network,
                 network_types: vec![NetworkType::Udp4, NetworkType::Udp6],
-                candidate_types: vec![
-                    CandidateType::Host,
-                    CandidateType::ServerReflexive,
-                    CandidateType::PeerReflexive,
-                    CandidateType::Relay,
-                ],
+                candidate_types,
                 is_controlling: role == Role::Client,
                 insecure_skip_verify: std::env::var("OPENSTREAM_ICE_INSECURE").as_deref()
                     == Ok("1"),
