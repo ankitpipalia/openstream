@@ -8,11 +8,12 @@
 //! never reads the pixels back to the CPU -- the honest target from the Parsec
 //! analysis, "a GPU-resident path with no CPU pixel readback".
 //!
-//! This module lands the import mechanism in isolation with an on-hardware
-//! readback test (the readback is verification only, not part of the import).
-//! Threading a GPU-backed frame through the mailbox to the presenter -- which
-//! means sharing the presenter's `wgpu::Device` with the decode worker -- is the
-//! integration step that follows.
+//! On-hardware tests here cover the whole GPU-resident chain offscreen: import
+//! (readback verification), a shader render of the imported texture, and a
+//! `GpuDecodedFrame` flowing through the real assembler and latest-frame mailbox
+//! to a render. The one piece they cannot exercise is the live window presenter
+//! (`present_texture` on a surface) plus the decode worker sharing the
+//! presenter's `wgpu::Device` -- that needs a session/window to validate.
 
 #![allow(dead_code)]
 
@@ -244,6 +245,39 @@ impl Drop for MetalTextureImporter {
             }
             self.cache = std::ptr::null_mut();
         }
+    }
+}
+
+/// A decoded frame kept on the GPU: the imported wgpu texture plus the retained
+/// pixel buffer whose IOSurface backs it (it must outlive the texture). This is
+/// the GPU counterpart of the CPU `DecodedFrame`; `wgpu::Texture` is `Send +
+/// Sync` and the pixel buffer is `Send`, so a `GpuDecodedFrame` rides the same
+/// latest-frame mailbox to the presenter.
+pub(crate) struct GpuDecodedFrame {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) presentation_time_us: u64,
+    // Keeps the IOSurface alive for as long as the texture references it.
+    _pixel_buffer: crate::vt_decoder::SendPixelBuffer,
+}
+
+impl GpuDecodedFrame {
+    /// Import a decoded [`crate::vt_decoder::GpuFrame`] into a wgpu texture on
+    /// `device`, keeping the pixel buffer alive behind the texture.
+    pub(crate) fn import(
+        importer: &MetalTextureImporter,
+        device: &wgpu::Device,
+        frame: crate::vt_decoder::GpuFrame,
+    ) -> Result<Self, GpuImportError> {
+        let texture = importer.import(device, frame.pixel_buffer.as_ptr())?;
+        Ok(Self {
+            texture,
+            width: frame.width,
+            height: frame.height,
+            presentation_time_us: frame.presentation_time_us,
+            _pixel_buffer: frame.pixel_buffer,
+        })
     }
 }
 
@@ -677,5 +711,107 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
             "rendered pixel should be blue (R={r} G={g} B={b})"
         );
         drop(gpu_frames);
+    }
+
+    /// GPU frames flow through the REAL client pipeline: fragment -> Assembler ->
+    /// decode_gpu -> import -> latest-frame mailbox -> consume -> render. This is
+    /// the mailbox-integration half the CPU loopback already covers, now for the
+    /// GPU-resident path. The only piece it cannot exercise is the window
+    /// presenter itself (present_texture on a live surface), which needs a
+    /// session/window and the decode worker sharing this device.
+    #[test]
+    fn gpu_frames_flow_through_the_mailbox_and_render() {
+        use crate::test_fixtures::{access_units_by_aud, generate_h264};
+        use crate::vt_decoder::VideoToolboxH264Decoder;
+        use openstream_media::latest_frame::latest_frame;
+        use openstream_media::{Assembler, Fragment, fragment_frame};
+
+        // Keyframe iff the access unit carries an IDR (5) or SPS (7) NAL.
+        fn is_keyframe(au: &[u8]) -> bool {
+            let mut p = 0usize;
+            while p + 4 <= au.len() {
+                if au[p] == 0 && au[p + 1] == 0 && au[p + 2] == 1 {
+                    let t = au[p + 3] & 0x1f;
+                    if t == 5 || t == 7 {
+                        return true;
+                    }
+                    p += 3;
+                } else {
+                    p += 1;
+                }
+            }
+            false
+        }
+
+        let Some(stream) = generate_h264("color=c=0x0000FF:size=64x48:rate=5", 4, 4) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            ..Default::default()
+        });
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no Metal adapter; skipping");
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+                .expect("request device");
+        let importer = MetalTextureImporter::new(&device).expect("create importer");
+        let mut decoder = VideoToolboxH264Decoder::new_gpu();
+        let (publisher, reader) = latest_frame::<GpuDecodedFrame>();
+
+        let mut assembler = Assembler::new(4 * 1024 * 1024, 64);
+        let mut published = 0usize;
+        for (index, au) in access_units.iter().enumerate() {
+            let frame_id = u32::try_from(index).unwrap();
+            let fragments =
+                fragment_frame(frame_id, index as u64 * 100_000, is_keyframe(au), au).unwrap();
+            let mut ready = Vec::new();
+            for bytes in fragments {
+                if let Some(frame) = assembler
+                    .push(Fragment::decode(&bytes).unwrap())
+                    .unwrap()
+                    .into_ready()
+                {
+                    ready.push(frame);
+                }
+            }
+            while let Some(frame) = assembler.pop_ready() {
+                ready.push(frame);
+            }
+            for encoded in ready {
+                let decoded = decoder
+                    .decode_gpu(
+                        &encoded.payload,
+                        encoded.presentation_time_us,
+                        encoded.keyframe,
+                    )
+                    .unwrap_or_default();
+                for gpu_frame in decoded {
+                    let mailbox_frame = GpuDecodedFrame::import(&importer, &device, gpu_frame)
+                        .expect("import to a mailbox frame");
+                    publisher.publish(mailbox_frame);
+                    published += 1;
+                }
+            }
+        }
+        assert!(published >= 1, "no GPU frames were published");
+
+        // Consume the newest mailbox frame and render it -- proving the frame
+        // that survived the mailbox is a valid, correct GPU texture.
+        let frame = reader.take().expect("a GPU frame in the mailbox");
+        let bytes =
+            render_texture_offscreen(&device, &queue, &frame.texture, frame.width, frame.height);
+        let offset = ((frame.height / 2) * frame.width + frame.width / 2) * 4;
+        let (r, g, b) = (bytes[offset], bytes[offset + 1], bytes[offset + 2]);
+        assert!(
+            b > 140 && r < 100 && g < 100,
+            "the mailbox GPU frame should render blue (R={r} G={g} B={b})"
+        );
     }
 }
