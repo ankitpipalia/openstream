@@ -864,7 +864,11 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
       return publish(mapRuntimeSnapshot(raw));
     },
     setDeviceTrust: async (deviceId, trust) => {
-      const raw = (await invokeFn("device_store_set_trust", { device_id: deviceId, trust })) as RuntimeSnapshot;
+      // Tauri v2 deserializes command arguments as camelCase by default, so
+      // the Rust `device_id` parameter is addressed as `deviceId` here. Sending
+      // `device_id` silently failed IPC deserialization and no trust change
+      // ever reached the backend.
+      const raw = (await invokeFn("device_store_set_trust", { deviceId, trust })) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
     },
     signIn: async (username, password) => {
