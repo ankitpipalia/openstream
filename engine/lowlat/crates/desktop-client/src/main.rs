@@ -1969,8 +1969,9 @@ async fn network_session(
         path: format!("{:?}", session.connection_path()),
         profile: format!("{format}-low-delay"),
         decoder: Some(format!(
-            "{} {format}",
-            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+            "{} {format} {}",
+            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
+            DecodeAccel::from_env().name()
         )),
         // The presenter is chosen in `main` and the window is not this
         // task's to inspect, so the backend it settled on is named there
@@ -2530,8 +2531,55 @@ fn spawn_audio_player() -> Result<Option<Child>, Box<dyn std::error::Error + Sen
 /// (1000 ms -> 447 ms glass-to-glass). How that total divides between frame
 /// threading and the demuxer flags has not been measured separately, so no
 /// single figure here is attributed to one of them.
+/// Which decode path FFmpeg is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DecodeAccel {
+    /// libavcodec on the CPU. The default, and the fallback everywhere.
+    #[default]
+    Software,
+    /// Apple's VideoToolbox. FFmpeg decodes on the media engine and hands
+    /// back CPU frames, so the rest of the pipeline is unchanged.
+    VideoToolbox,
+}
+
+impl DecodeAccel {
+    /// Read `OPENSTREAM_DECODER`. Unknown names, and VideoToolbox asked for
+    /// off macOS, fall back to software rather than failing to start: a
+    /// decoder that runs is worth more than one that is exactly as asked.
+    fn from_env() -> Self {
+        let requested = std::env::var("OPENSTREAM_DECODER").unwrap_or_default();
+        match requested.trim().to_ascii_lowercase().as_str() {
+            "videotoolbox" | "vt" if cfg!(target_os = "macos") => Self::VideoToolbox,
+            "videotoolbox" | "vt" => {
+                eprintln!(
+                    "OpenStream decoder videotoolbox is macOS only; using the software decoder"
+                );
+                Self::Software
+            }
+            "" | "software" | "cpu" => Self::Software,
+            other => {
+                eprintln!(
+                    "OpenStream decoder {other} is not recognised; using the software decoder"
+                );
+                Self::Software
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::VideoToolbox => "videotoolbox",
+        }
+    }
+}
+
 fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
-    vec![
+    decoder_args_with(DecodeAccel::from_env(), format, width, height)
+}
+
+fn decoder_args_with(accel: DecodeAccel, format: &str, width: usize, height: usize) -> Vec<String> {
+    let mut arguments: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
@@ -2545,6 +2593,16 @@ fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
         "32".into(),
         "-analyzeduration".into(),
         "0".into(),
+    ];
+    if accel == DecodeAccel::VideoToolbox {
+        // No -hwaccel_output_format: FFmpeg downloads to CPU frames on its
+        // own, which is what the scale filter and the BGRA sink below need.
+        // Asking for hardware frames here would force a hwdownload filter
+        // into the chain for no gain.
+        arguments.push("-hwaccel".into());
+        arguments.push("videotoolbox".into());
+    }
+    arguments.extend([
         "-f".into(),
         format.into(),
         "-i".into(),
@@ -2561,7 +2619,8 @@ fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
         "-fps_mode".into(),
         "passthrough".into(),
         "pipe:1".into(),
-    ]
+    ]);
+    arguments
 }
 
 /// Hand one decoded frame to the window, dropping it if the window is
@@ -3935,6 +3994,51 @@ mod tests {
             .position(|arg| arg == "low_delay")
             .expect("has low_delay");
         assert!(low_delay < input, "input options must precede -i: {args:?}");
+    }
+
+    #[test]
+    fn videotoolbox_flags_reach_the_demuxer_and_ask_for_cpu_frames() {
+        let args = super::decoder_args_with(super::DecodeAccel::VideoToolbox, "h264", 1920, 1080);
+        let hwaccel = args
+            .iter()
+            .position(|arg| arg == "-hwaccel")
+            .expect("hardware decode requested");
+        assert_eq!(args[hwaccel + 1], "videotoolbox");
+        let input = args.iter().position(|arg| arg == "-i").expect("has input");
+        assert!(
+            hwaccel < input,
+            "input options must precede -i or FFmpeg ignores them: {args:?}"
+        );
+        // The pipeline scales and reads BGRA, which needs CPU frames. Asking
+        // for hardware output would force a download filter for no gain.
+        assert!(!args.iter().any(|arg| arg == "-hwaccel_output_format"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-pix_fmt" && w[1] == "bgra")
+        );
+    }
+
+    #[test]
+    fn the_software_decoder_asks_for_no_hardware() {
+        let args = super::decoder_args_with(super::DecodeAccel::Software, "h264", 1920, 1080);
+        assert!(!args.iter().any(|arg| arg == "-hwaccel"), "{args:?}");
+    }
+
+    #[test]
+    fn the_low_delay_flags_survive_hardware_decode() {
+        // The latency work these flags encode is not specific to the CPU
+        // decoder, so selecting hardware must not quietly drop them.
+        let args = super::decoder_args_with(super::DecodeAccel::VideoToolbox, "h264", 1920, 1080);
+        for (flag, value) in [
+            ("-flags", "low_delay"),
+            ("-fflags", "nobuffer"),
+            ("-analyzeduration", "0"),
+        ] {
+            assert!(
+                args.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "{flag} {value} missing: {args:?}"
+            );
+        }
     }
 
     #[test]
