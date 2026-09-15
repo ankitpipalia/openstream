@@ -507,7 +507,30 @@ struct SourceLimiter {
 }
 
 impl SourceLimiter {
-    fn allow(&mut self, source: IpAddr, now: Instant, limit: usize, window: Duration) -> bool {
+    /// Whether this source has room under its per-source cap, without recording.
+    /// The source's last-seen time is refreshed even on a check so a
+    /// throttled-but-active source is not evicted and thereby handed a fresh
+    /// budget.
+    fn has_capacity(
+        &mut self,
+        source: IpAddr,
+        now: Instant,
+        limit: usize,
+        window: Duration,
+    ) -> bool {
+        match self.sources.get_mut(&source) {
+            Some((events, seen)) => {
+                *seen = now;
+                events.has_capacity(now, limit, window)
+            }
+            // A source with no history has room as long as the cap is non-zero.
+            None => limit > 0,
+        }
+    }
+
+    /// Record one event for this source, evicting the stalest tracked source
+    /// first when the table is full and this source is new.
+    fn record(&mut self, source: IpAddr, now: Instant) {
         if self.sources.len() >= MAX_TRACKED_AUTH_SOURCES && !self.sources.contains_key(&source) {
             // Drop whichever source has been quiet longest. Evicting on
             // last-use rather than insertion means an active attacker cannot
@@ -526,7 +549,21 @@ impl SourceLimiter {
             .entry(source)
             .or_insert_with(|| (RateWindow::default(), now));
         entry.1 = now;
-        entry.0.allow(now, limit, window)
+        entry.0.record(now);
+    }
+
+    /// Check this source's budget and, if there is room, record one event.
+    /// The multi-budget auth path uses `has_capacity` + `record` instead, so a
+    /// request refused by another budget consumes nothing here. Retained as a
+    /// single-budget convenience for tests.
+    #[cfg(test)]
+    fn allow(&mut self, source: IpAddr, now: Instant, limit: usize, window: Duration) -> bool {
+        if self.has_capacity(source, now, limit, window) {
+            self.record(source, now);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -614,14 +651,31 @@ struct RateWindow {
 }
 
 impl RateWindow {
-    fn allow(&mut self, now: Instant, limit: usize, window: Duration) -> bool {
+    /// Whether another event fits under `limit` in the trailing `window`,
+    /// pruning expired events. This records nothing, so a caller can check
+    /// several budgets and consume them only when all of them have room.
+    fn has_capacity(&mut self, now: Instant, limit: usize, window: Duration) -> bool {
         self.events
             .retain(|event| now.saturating_duration_since(*event) < window);
-        if self.events.len() >= limit {
-            return false;
-        }
+        self.events.len() < limit
+    }
+
+    /// Record one event at `now`.
+    fn record(&mut self, now: Instant) {
         self.events.push_back(now);
-        true
+    }
+
+    /// Check capacity and, if there is room, record one event. Retained as a
+    /// single-budget convenience for tests; the auth path composes several
+    /// budgets with `has_capacity` + `record` so a rejection consumes nothing.
+    #[cfg(test)]
+    fn allow(&mut self, now: Instant, limit: usize, window: Duration) -> bool {
+        if self.has_capacity(now, limit, window) {
+            self.record(now);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1434,6 +1488,34 @@ impl From<IssuedTokens> for AccountAuthResponse {
     }
 }
 
+/// Consume one slot from a service-wide window and a per-source window, but
+/// only when both have room. Returns whether the request is allowed.
+///
+/// The order matters: an earlier version recorded the service-wide event before
+/// the per-source check, so a source over its own cap still burned the shared
+/// budget on every refused request and could throttle every other client.
+/// Recording only when both budgets have capacity makes a refused request cost
+/// nothing.
+fn consume_dual_budget(
+    attempts: &mut RateWindow,
+    sources: &mut SourceLimiter,
+    source: IpAddr,
+    now: Instant,
+    total_limit: usize,
+    per_source_limit: usize,
+    window: Duration,
+) -> bool {
+    if attempts.has_capacity(now, total_limit, window)
+        && sources.has_capacity(source, now, per_source_limit, window)
+    {
+        attempts.record(now);
+        sources.record(source, now);
+        true
+    } else {
+        false
+    }
+}
+
 fn decode_public_key(value: &str) -> Result<[u8; 32], ControlPlaneError> {
     let bytes =
         hex::decode(value).map_err(|_| ControlPlaneError::InvalidInput("public key is invalid"))?;
@@ -1496,15 +1578,14 @@ constructed either way"
 )]
 async fn allow_auth_attempt(state: &AppState, source: IpAddr) -> Result<(), Response> {
     let now = Instant::now();
-    // Both budgets, service-wide first: the per-source share is a fairness
-    // control, not a replacement for the total cost bound.
-    if state.auth_attempts.lock().await.allow(
-        now,
-        MAX_AUTH_ATTEMPTS_PER_MINUTE,
-        AUTH_ATTEMPT_WINDOW,
-    ) && state.auth_sources.lock().await.allow(
+    let mut attempts = state.auth_attempts.lock().await;
+    let mut sources = state.auth_sources.lock().await;
+    if consume_dual_budget(
+        &mut attempts,
+        &mut sources,
         source,
         now,
+        MAX_AUTH_ATTEMPTS_PER_MINUTE,
         MAX_AUTH_ATTEMPTS_PER_SOURCE,
         AUTH_ATTEMPT_WINDOW,
     ) {
@@ -1526,13 +1607,16 @@ constructed either way"
 )]
 async fn allow_refresh_attempt(state: &AppState, source: IpAddr) -> Result<(), Response> {
     let now = Instant::now();
-    if state.refresh_attempts.lock().await.allow(
-        now,
-        MAX_REFRESH_ATTEMPTS_PER_MINUTE,
-        AUTH_ATTEMPT_WINDOW,
-    ) && state.refresh_sources.lock().await.allow(
+    // Same all-or-nothing accounting as authentication: a request refused by
+    // the per-source cap must not consume the shared renewal budget.
+    let mut attempts = state.refresh_attempts.lock().await;
+    let mut sources = state.refresh_sources.lock().await;
+    if consume_dual_budget(
+        &mut attempts,
+        &mut sources,
         source,
         now,
+        MAX_REFRESH_ATTEMPTS_PER_MINUTE,
         MAX_REFRESH_ATTEMPTS_PER_SOURCE,
         AUTH_ATTEMPT_WINDOW,
     ) {
@@ -4416,9 +4500,9 @@ mod tests {
         admin_allowed, admit_primary_socket as admit_primary_socket_with_cancel,
         authorize_registration, authorized, bearer_token, cleanup_primary_socket,
         close_primary_pair, connect_approve, connect_deny, connect_observe, connect_offline,
-        connect_pending, connect_presence, connect_request, create_session, direct_message_route,
-        dispatch_generic_message, enroll_account_device, is_private_lan_address,
-        list_account_devices, login_account, max_guests_for_new_session,
+        connect_pending, connect_presence, connect_request, consume_dual_budget, create_session,
+        direct_message_route, dispatch_generic_message, enroll_account_device,
+        is_private_lan_address, list_account_devices, login_account, max_guests_for_new_session,
         prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
         register_account, relay_owner_for_ticket, relay_ticket, request_source,
         set_account_device_trust, signal_socket, supplied_token_is_host, validate_signal_message,
@@ -5544,6 +5628,59 @@ mod tests {
             refresh.allow(start, MAX_REFRESH_ATTEMPTS_PER_MINUTE, AUTH_ATTEMPT_WINDOW),
             "an exhausted password budget must not block credential renewal"
         );
+    }
+
+    /// A source that blows past its own cap must not spend the shared budget on
+    /// its refused requests, or it could throttle everyone else. This exercises
+    /// the two windows together, the way the auth handler consumes them.
+    #[test]
+    fn per_source_rejections_do_not_consume_the_shared_authentication_budget() {
+        let start = Instant::now();
+        let mut attempts = RateWindow::default();
+        let mut sources = SourceLimiter::default();
+        let noisy: IpAddr = "203.0.113.10".parse().expect("address");
+        let quiet: IpAddr = "203.0.113.11".parse().expect("address");
+
+        // The noisy source floods far past its per-source cap.
+        let mut noisy_allowed = 0;
+        for _ in 0..MAX_AUTH_ATTEMPTS_PER_MINUTE + 10 {
+            if consume_dual_budget(
+                &mut attempts,
+                &mut sources,
+                noisy,
+                start,
+                MAX_AUTH_ATTEMPTS_PER_MINUTE,
+                MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                AUTH_ATTEMPT_WINDOW,
+            ) {
+                noisy_allowed += 1;
+            }
+        }
+        assert_eq!(
+            noisy_allowed, MAX_AUTH_ATTEMPTS_PER_SOURCE,
+            "a source is capped at its own share"
+        );
+        // The shared window recorded only the allowed requests -- the refused
+        // ones spent nothing -- so a well-behaved source still has room.
+        assert_eq!(
+            attempts.events.len(),
+            MAX_AUTH_ATTEMPTS_PER_SOURCE,
+            "refused per-source requests must not appear in the shared budget"
+        );
+        for _ in 0..MAX_AUTH_ATTEMPTS_PER_SOURCE {
+            assert!(
+                consume_dual_budget(
+                    &mut attempts,
+                    &mut sources,
+                    quiet,
+                    start,
+                    MAX_AUTH_ATTEMPTS_PER_MINUTE,
+                    MAX_AUTH_ATTEMPTS_PER_SOURCE,
+                    AUTH_ATTEMPT_WINDOW,
+                ),
+                "a well-behaved source must not be throttled by the noisy one's refusals"
+            );
+        }
     }
 
     /// One noisy source must not spend everyone else's allowance.
