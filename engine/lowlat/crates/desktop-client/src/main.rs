@@ -1855,11 +1855,16 @@ async fn network_session(
     // Native VideoToolbox decode is opt-in on macOS for H.264
     // (`OPENSTREAM_DECODER=videotoolbox-native`); every other value uses the
     // ffmpeg subprocess, which stays the default and the universal fallback.
-    let backend = if format == "h264" {
-        decode_dispatch::DecodeBackend::from_env()
+    let codec = if format == "h264" {
+        decode_dispatch::DecodeCodec::H264
     } else {
-        decode_dispatch::DecodeBackend::Ffmpeg
+        decode_dispatch::DecodeCodec::H265
     };
+    let backend = decode_dispatch::select_decoder(
+        codec,
+        decode_dispatch::prefer_native_from_env(),
+        &decode_dispatch::available_decoders(),
+    );
     // A mailbox, not a queue (see the consumer below): the decoder outruns the
     // network loop whenever it is busy, and replace-oldest keeps only the
     // freshest picture. `Notify` supplies the wake `select!` needs.

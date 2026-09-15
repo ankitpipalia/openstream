@@ -1,13 +1,13 @@
 //! Decoder-backend selection and the native decode path.
 //!
-//! [`DecodeBackend::from_env`] chooses the decoder; [`NativeVideoDecoder`] (on
-//! macOS) turns reassembled [`EncodedFrame`]s into presentation-ready
-//! [`DecodedFrame`]s using the in-process VideoToolbox decoder, assigning the
-//! client-local sequence number and stamps the mailbox and presenter expect.
+//! [`select_decoder`] chooses the backend by codec, OS and opt-in preference,
+//! with ffmpeg as the universal fallback; [`NativeVideoDecoder`] (on macOS)
+//! turns reassembled [`EncodedFrame`]s into presentation-ready [`DecodedFrame`]s
+//! using the in-process VideoToolbox decoder, assigning the client-local
+//! sequence number and stamps the mailbox and presenter expect.
 //!
-//! This is the unit the loopback harness drives and the unit the runtime
-//! dispatch will call once the native path is wired in. It is not yet reached
-//! from the live network loop, so it is dead-code-allowed for now.
+//! The runtime network loop selects and builds the decoder through here; the
+//! loopback harness drives the native decoder directly.
 
 #![allow(dead_code)]
 
@@ -21,18 +21,135 @@ pub(crate) enum DecodeBackend {
     VideoToolboxNative,
 }
 
-impl DecodeBackend {
-    /// Select from `OPENSTREAM_DECODER`. `videotoolbox-native` (or `native`)
-    /// opts into the in-process macOS path; every other value -- including the
-    /// legacy `videotoolbox`, which means `ffmpeg -hwaccel videotoolbox` -- stays
-    /// on ffmpeg. Default: ffmpeg.
-    pub(crate) fn from_env() -> Self {
-        let requested = std::env::var("OPENSTREAM_DECODER").unwrap_or_default();
-        match requested.trim().to_ascii_lowercase().as_str() {
-            #[cfg(target_os = "macos")]
-            "videotoolbox-native" | "native" => DecodeBackend::VideoToolboxNative,
-            _ => DecodeBackend::Ffmpeg,
-        }
+/// A video codec the client may be asked to decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeCodec {
+    H264,
+    H265,
+}
+
+/// What one decode backend can do on this machine.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecoderCapability {
+    /// The backend.
+    pub(crate) backend: DecodeBackend,
+    /// Codecs it can decode here.
+    pub(crate) codecs: &'static [DecodeCodec],
+    /// Whether it decodes in-process (no external ffmpeg subprocess).
+    pub(crate) in_process: bool,
+}
+
+impl DecoderCapability {
+    fn supports(&self, codec: DecodeCodec) -> bool {
+        self.codecs.contains(&codec)
+    }
+}
+
+/// The decode backends available on this machine, most-preferred first: the
+/// in-process native decoders before ffmpeg, which is always present as the
+/// universal fallback. Extending to Windows Media Foundation / Linux VAAPI is a
+/// matter of adding cfg-gated entries here.
+pub(crate) fn available_decoders() -> Vec<DecoderCapability> {
+    // ffmpeg is always present as the universal fallback.
+    #[allow(unused_mut)]
+    let mut decoders = vec![DecoderCapability {
+        backend: DecodeBackend::Ffmpeg,
+        codecs: &[DecodeCodec::H264, DecodeCodec::H265],
+        in_process: false,
+    }];
+    // Native in-process decoders go first so they win the preference. The native
+    // VideoToolbox path decodes H.264 today; H.265 is a follow-up.
+    #[cfg(target_os = "macos")]
+    decoders.insert(
+        0,
+        DecoderCapability {
+            backend: DecodeBackend::VideoToolboxNative,
+            codecs: &[DecodeCodec::H264],
+            in_process: true,
+        },
+    );
+    decoders
+}
+
+/// Whether the user opted into the in-process native decoder
+/// (`OPENSTREAM_DECODER=videotoolbox-native` / `native`). The legacy
+/// `videotoolbox` value (which meant `ffmpeg -hwaccel videotoolbox`) does not
+/// count, so it stays on ffmpeg.
+pub(crate) fn prefer_native_from_env() -> bool {
+    let requested = std::env::var("OPENSTREAM_DECODER").unwrap_or_default();
+    matches!(
+        requested.trim().to_ascii_lowercase().as_str(),
+        "videotoolbox-native" | "native"
+    )
+}
+
+/// Capability-driven backend selection: when `prefer_in_process` is set, the
+/// first in-process decoder that supports `codec` wins; otherwise, and whenever
+/// no such decoder exists, ffmpeg -- the universal fallback -- is chosen.
+///
+/// The runtime passes `prefer_in_process = prefer_native_from_env()`, so the
+/// default (env unset) stays on ffmpeg until the native path is live-validated;
+/// flipping the default to native-first is then a one-line change at the call
+/// site.
+pub(crate) fn select_decoder(
+    codec: DecodeCodec,
+    prefer_in_process: bool,
+    decoders: &[DecoderCapability],
+) -> DecodeBackend {
+    if prefer_in_process
+        && let Some(decoder) = decoders.iter().find(|d| d.in_process && d.supports(codec))
+    {
+        return decoder.backend;
+    }
+    DecodeBackend::Ffmpeg
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn ffmpeg_is_the_fallback_for_every_codec_when_not_preferring_native() {
+        let decoders = available_decoders();
+        assert_eq!(
+            select_decoder(DecodeCodec::H264, false, &decoders),
+            DecodeBackend::Ffmpeg
+        );
+        assert_eq!(
+            select_decoder(DecodeCodec::H265, false, &decoders),
+            DecodeBackend::Ffmpeg
+        );
+    }
+
+    #[test]
+    fn a_registry_without_an_in_process_decoder_always_uses_ffmpeg() {
+        // Even preferring in-process: with only ffmpeg available, ffmpeg wins.
+        let only_ffmpeg = [DecoderCapability {
+            backend: DecodeBackend::Ffmpeg,
+            codecs: &[DecodeCodec::H264, DecodeCodec::H265],
+            in_process: false,
+        }];
+        assert_eq!(
+            select_decoder(DecodeCodec::H264, true, &only_ffmpeg),
+            DecodeBackend::Ffmpeg
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preferring_native_picks_videotoolbox_for_h264_and_falls_back_for_h265() {
+        let decoders = available_decoders();
+        // H.264 has an in-process decoder (VideoToolbox), so it is chosen.
+        assert_eq!(
+            select_decoder(DecodeCodec::H264, true, &decoders),
+            DecodeBackend::VideoToolboxNative
+        );
+        // VideoToolbox native is H.264-only, so H.265 falls back to ffmpeg even
+        // when the native path is preferred.
+        assert_eq!(
+            select_decoder(DecodeCodec::H265, true, &decoders),
+            DecodeBackend::Ffmpeg
+        );
     }
 }
 
