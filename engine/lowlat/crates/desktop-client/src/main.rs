@@ -67,6 +67,10 @@ mod vt_decoder;
 // Zero-copy import of a decoded CVPixelBuffer into a wgpu texture (macOS, M2).
 #[cfg(target_os = "macos")]
 mod vt_gpu;
+// In-process Media Foundation H.264 decode (Windows). Vendor-neutral OS decoder
+// MFT; compiled and exercised on the Windows CI job against the software MFT.
+#[cfg(target_os = "windows")]
+mod mf_decoder;
 // Decoder-backend selection and the native decode -> DecodedFrame path, shared
 // by the (future) runtime dispatch and the loopback harness. Not yet wired into
 // the live network loop.
@@ -1856,9 +1860,10 @@ async fn network_session(
         VideoCodec::H264 => "h264",
         VideoCodec::H265 => "hevc",
     };
-    // Native VideoToolbox decode is opt-in on macOS for H.264
-    // (`OPENSTREAM_DECODER=videotoolbox-native`); every other value uses the
-    // ffmpeg subprocess, which stays the default and the universal fallback.
+    // In-process native decode is opt-in for H.264 (`OPENSTREAM_DECODER=native`):
+    // VideoToolbox on macOS, Media Foundation on Windows. Every other value, and
+    // every other codec, uses the ffmpeg subprocess, which stays the default and
+    // the universal fallback.
     let codec = if format == "h264" {
         decode_dispatch::DecodeCodec::H264
     } else {
@@ -2621,7 +2626,7 @@ enum SessionDecoder {
         // Held so the subprocess is killed on drop at session end.
         _child: Child,
     },
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     Native {
         au_tx: std::sync::mpsc::Sender<NativeAccessUnit>,
     },
@@ -2629,9 +2634,13 @@ enum SessionDecoder {
 
 impl SessionDecoder {
     /// Submit one reassembled access unit to the decoder.
-    // On non-macOS the native arm is compiled out, so the match has a single
-    // arm and these two fields go unused; both are fine and intentional.
-    #[cfg_attr(not(target_os = "macos"), allow(clippy::match_single_binding))]
+    // On platforms with no in-process decoder the native arm is compiled out, so
+    // the match has a single arm and these two fields go unused; both are fine
+    // and intentional.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows")),
+        allow(clippy::match_single_binding)
+    )]
     async fn feed(
         &mut self,
         payload: &[u8],
@@ -2640,11 +2649,11 @@ impl SessionDecoder {
     ) -> std::io::Result<()> {
         // Consumed only by the native arm; reference them so they are not unused
         // where that arm is compiled out.
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = (presentation_time_us, keyframe);
         match self {
             SessionDecoder::Ffmpeg { stdin, .. } => stdin.write_all(payload).await,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             SessionDecoder::Native { au_tx } => au_tx
                 .send(NativeAccessUnit {
                     payload: payload.to_vec(),
@@ -2661,8 +2670,9 @@ impl SessionDecoder {
     }
 }
 
-/// One access unit handed to the native decoder thread.
-#[cfg(target_os = "macos")]
+/// One access unit handed to a native decoder thread (VideoToolbox on macOS,
+/// Media Foundation on Windows).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct NativeAccessUnit {
     payload: Vec<u8>,
     presentation_time_us: u64,
@@ -2672,9 +2682,13 @@ struct NativeAccessUnit {
 /// Build the session decoder for `backend`: spawn the ffmpeg subprocess plus its
 /// stdout reader, or the native decoder thread. Both feed the same mailbox
 /// through [`publish_decoded_picture`], so everything downstream is identical.
-// On non-macOS the native arm is compiled out, leaving a single-arm match.
+// On platforms with no in-process decoder the native arm is compiled out,
+// leaving a single-arm match.
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(target_os = "macos"), allow(clippy::match_single_binding))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(clippy::match_single_binding)
+)]
 fn build_session_decoder(
     backend: decode_dispatch::DecodeBackend,
     format: &str,
@@ -2694,6 +2708,21 @@ fn build_session_decoder(
                 .spawn(move || native_decode_worker(au_rx, frame_tx, decoded_ready, telemetry))
                 .map_err(|error| {
                     TerminalError::new(format!("could not start native decoder thread: {error}"))
+                })?;
+            Ok(SessionDecoder::Native { au_tx })
+        }
+        #[cfg(target_os = "windows")]
+        decode_dispatch::DecodeBackend::MediaFoundationNative => {
+            let (au_tx, au_rx) = std::sync::mpsc::channel::<NativeAccessUnit>();
+            std::thread::Builder::new()
+                .name("openstream-mf-decode".into())
+                .spawn(move || {
+                    windows_native_decode_worker(au_rx, frame_tx, decoded_ready, telemetry)
+                })
+                .map_err(|error| {
+                    TerminalError::new(format!(
+                        "could not start Media Foundation decoder thread: {error}"
+                    ))
                 })?;
             Ok(SessionDecoder::Native { au_tx })
         }
@@ -2798,6 +2827,73 @@ fn native_decode_worker(
             }
             Err(error) => {
                 eprintln!("native VideoToolbox decode error: {error}");
+            }
+        }
+    }
+}
+
+/// The native decoder thread on Windows: decode each access unit in-process with
+/// the Media Foundation H.264 MFT and publish the pictures to the same mailbox
+/// the ffmpeg reader uses. A decode error is recoverable -- the network loop
+/// keeps requesting keyframes, and the next one re-seeds the decoder.
+#[cfg(target_os = "windows")]
+fn windows_native_decode_worker(
+    au_rx: std::sync::mpsc::Receiver<NativeAccessUnit>,
+    frame_tx: LatestFramePublisher<DecodedFrame>,
+    decoded_ready: Arc<tokio::sync::Notify>,
+    telemetry: SharedTelemetry,
+) {
+    let mut decoder = match mf_decoder::MediaFoundationH264Decoder::new() {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            eprintln!("could not create the Media Foundation decoder: {error}");
+            return;
+        }
+    };
+    while let Ok(au) = au_rx.recv() {
+        // The MFT keys ordering off the sample time, not a keyframe flag.
+        let _ = au.keyframe;
+        let raw_ready_at = Stamp::<ClientClock>::now();
+        let pts = i64::try_from(au.presentation_time_us).unwrap_or(0);
+        match decoder.decode(&au.payload, pts) {
+            Ok(pictures) => {
+                for picture in pictures {
+                    let ready_at = Stamp::<ClientClock>::now();
+                    if !publish_decoded_picture(
+                        picture.pixels,
+                        picture.width,
+                        picture.height,
+                        raw_ready_at,
+                        ready_at,
+                        &telemetry,
+                        &frame_tx,
+                        &decoded_ready,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("native Media Foundation decode error: {error}");
+            }
+        }
+    }
+    // The stream ended (the session dropped the sender): drain any pictures the
+    // decoder still holds so the last frames are not lost at teardown.
+    if let Ok(pictures) = decoder.flush() {
+        for picture in pictures {
+            let now = Stamp::<ClientClock>::now();
+            if !publish_decoded_picture(
+                picture.pixels,
+                picture.width,
+                picture.height,
+                now,
+                now,
+                &telemetry,
+                &frame_tx,
+                &decoded_ready,
+            ) {
+                break;
             }
         }
     }
