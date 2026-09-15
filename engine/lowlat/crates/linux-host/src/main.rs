@@ -723,6 +723,25 @@ fn preflight() -> Result<(), Box<dyn std::error::Error>> {
         &env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string()),
         &["-hide_banner", "-loglevel", "error", "-version"],
     );
+    // Resolving the identity here is the point, not a side effect: an operator
+    // who set OPENSTREAM_IDENTITY_CUSTODY has no other way to find out whether
+    // it took effect short of starting a real session. The device id is a
+    // public, non-credential identifier; the private key never comes near this
+    // report, and where the key actually ended up is reported on stderr by the
+    // loader itself as `OpenStream identity source=...`.
+    let identity = match openstream_client_core::local_device_id() {
+        Ok(device_id) => serde_json::json!({
+            "available": true,
+            "device_id": device_id,
+            "custody_requested": env::var("OPENSTREAM_IDENTITY_CUSTODY")
+                .unwrap_or_else(|_| "file".to_string()),
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "error": error.to_string(),
+        }),
+    };
+
     let report = serde_json::json!({
         "schema": 1,
         "platform": {
@@ -752,6 +771,7 @@ fn preflight() -> Result<(), Box<dyn std::error::Error>> {
             "uinput_present": std::fs::metadata("/dev/uinput").is_ok(),
             "enabled_by_policy": env::var("OPENSTREAM_ENABLE_INPUT").as_deref() == Ok("1"),
         },
+        "identity": identity,
         "audio": {
             "requested": env::var("OPENSTREAM_AUDIO").as_deref() == Ok("1"),
             "server_configured": env::var_os("OPENSTREAM_AUDIO_SERVER").is_some(),

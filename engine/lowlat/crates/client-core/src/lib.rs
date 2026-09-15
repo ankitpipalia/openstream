@@ -4529,14 +4529,14 @@ fn load_or_create_identity_in_keystore(path: &Path) -> Result<IdentityKey, Error
     if let Some(stored) = keystore::load(&account) {
         match identity_from_bytes(stored) {
             Ok(identity) => {
-                println!("OpenStream identity source=keystore");
+                eprintln!("OpenStream identity source=keystore");
                 return Ok(identity);
             }
             // A corrupt entry is not a reason to refuse to start: the file may
             // still hold a usable key, and the entry is replaced below.
-            Err(_) => eprintln!(
-                "OpenStream identity: the keystore entry is unreadable; falling back to the file"
-            ),
+            Err(_) => {
+                eprintln!("OpenStream identity: the keystore entry is unreadable; trying the file")
+            }
         }
     }
 
@@ -4546,14 +4546,16 @@ fn load_or_create_identity_in_keystore(path: &Path) -> Result<IdentityKey, Error
     if path.exists() {
         let identity = load_identity_file(path)?;
         match keystore::store(&account, identity.pkcs8()) {
-            Ok(()) => println!(
+            Ok(()) => eprintln!(
                 "OpenStream identity source=migrated-to-keystore; the file at {} is kept as a \
 fallback, and removing it is what completes the migration",
                 path.display()
             ),
             Err(error) => eprintln!(
-                "OpenStream identity: the keystore refused the key ({error}); continuing with \
-the file"
+                "OpenStream identity source=file-fallback; keystore custody was requested but \
+the keystore refused the key ({error}). The private key remains readable at {} by any process \
+running as this user",
+                path.display()
             ),
         }
         return Ok(identity);
@@ -4565,13 +4567,15 @@ the file"
     let identity = IdentityKey::generate().map_err(Error::Identity)?;
     match keystore::store(&account, identity.pkcs8()) {
         Ok(()) => {
-            println!("OpenStream identity source=keystore");
+            eprintln!("OpenStream identity source=keystore");
             Ok(identity)
         }
         Err(error) => {
             eprintln!(
-                "OpenStream identity: the keystore would not take a new key ({error}); creating \
-the file instead"
+                "OpenStream identity source=file-fallback; keystore custody was requested but \
+the keystore would not take a new key ({error}). The key is being written to {} instead, where \
+any process running as this user can read it",
+                path.display()
             );
             load_or_create_identity_file(path)
         }
@@ -4612,8 +4616,9 @@ fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
             return load_or_create_identity_in_keystore(path);
         }
         eprintln!(
-            "OpenStream identity: OPENSTREAM_IDENTITY_CUSTODY asked for the platform keystore, \
-which this build has no implementation for; continuing with the file"
+            "OpenStream identity source=file-fallback; OPENSTREAM_IDENTITY_CUSTODY asked for the \
+platform keystore, which this build has no implementation for. The key stays in a file that any \
+process running as this user can read"
         );
     }
     load_or_create_identity_file(path)
