@@ -251,6 +251,18 @@ describe("tauri adapter", () => {
     await adapter.dispatch({ Connect: { device_id: "mac-1", requested: permissions } });
   });
 
+  it("sets device trust with the camelCase deviceId key Tauri v2 deserializes", async () => {
+    const adapter = createTauriAdapter(async (command, args) => {
+      expect(command).toBe("device_store_set_trust");
+      // Tauri v2 deserializes command arguments as camelCase; sending the Rust
+      // parameter name `device_id` silently fails IPC and no trust change lands.
+      expect(args).toEqual({ deviceId: "mac-1", trust: "trusted" });
+      return runtimeSnapshotFixture();
+    });
+
+    await adapter.setDeviceTrust("mac-1", "trusted");
+  });
+
   it("surfaces restart_required and pending settings from the runtime snapshot", async () => {
     const fixture = runtimeSnapshotFixture();
     const pending: RuntimeSnapshot = {

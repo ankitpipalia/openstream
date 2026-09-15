@@ -191,7 +191,10 @@ export function AccessPage({
                       className="secondary-button"
                       type="button"
                       onClick={() => {
-                        void adapter.setDeviceTrust(device.id, "trusted").then(onSnapshot);
+                        void adapter
+                          .setDeviceTrust(device.id, "trusted")
+                          .then(onSnapshot)
+                          .catch(() => setAuthError("Could not update device trust."));
                       }}
                     >
                       Restore
@@ -201,7 +204,10 @@ export function AccessPage({
                       className="secondary-button"
                       type="button"
                       onClick={() => {
-                        void adapter.setDeviceTrust(device.id, "revoked").then(onSnapshot);
+                        void adapter
+                          .setDeviceTrust(device.id, "revoked")
+                          .then(onSnapshot)
+                          .catch(() => setAuthError("Could not update device trust."));
                       }}
                     >
                       Revoke
