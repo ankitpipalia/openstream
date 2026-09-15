@@ -48,6 +48,7 @@ use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc_ice::url::Url as IceUrl;
 use webrtc_util::conn::Conn as IceConn;
 
+mod keystore;
 mod path;
 pub mod scheduler;
 pub mod transport_ack;
@@ -486,7 +487,8 @@ pub fn negotiate(
 }
 
 /// The two capabilities a pairing can grant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Host,
     Client,
@@ -583,12 +585,34 @@ impl Role {
     }
 }
 
-/// Short-lived credentials returned by the OpenStream pairing endpoint.
+/// Short-lived credentials for one session.
+///
+/// # Why the role tokens are optional
+///
+/// A pairing used to carry both, because the only way to create a session was
+/// an endpoint that returned both to one caller. That is a provisioning
+/// workflow: whoever holds the file can act as either end of the session, or
+/// hand either end to anybody.
+///
+/// The Connect broker delivers one role capability to each party, so a client
+/// legitimately has no host token and a host has no client token. Making the
+/// fields optional is what lets that be represented at all -- and, more
+/// importantly, what makes [`Pairing::token`] able to *refuse*. A file with
+/// only a client token cannot be used to act as host, because there is no
+/// host token in it to present. Filling the gap with an empty string would
+/// have compiled and then sent an empty bearer token to the signalling
+/// server.
+///
+/// Both remain optional rather than one being required, because the same type
+/// describes a provisioning pairing (both present) and either role's
+/// credential (one present).
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Pairing {
     pub session_id: String,
-    pub host_token: String,
-    pub client_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_token: Option<String>,
     pub websocket_path: String,
     pub expires_in_seconds: u64,
     #[serde(default)]
@@ -611,6 +635,26 @@ pub struct Pairing {
     pub relay_host_ticket: Option<String>,
     #[serde(default)]
     pub relay_client_ticket: Option<String>,
+}
+
+/// One end of an approved session, as the Connect broker delivers it.
+///
+/// Deliberately singular. There is no shape here that can hold both roles,
+/// because the broker will not return both to one caller and a type that
+/// could carry them would be the first step towards asking it to.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleCredential {
+    pub session_id: String,
+    pub role: Role,
+    pub token: String,
+    pub websocket_path: String,
+    pub expires_in_seconds: u64,
+    #[serde(default)]
+    pub relay_address: Option<String>,
+    #[serde(default)]
+    pub relay_ticket: Option<String>,
+    #[serde(default)]
+    pub turn: Option<TurnCredentials>,
 }
 
 /// Maximum pairing-file size accepted by the process boundary.
@@ -892,11 +936,82 @@ impl Pairing {
         ))
     }
 
-    fn token(&self, role: Role) -> &str {
-        match role {
-            Role::Host => &self.host_token,
-            Role::Client => &self.client_token,
+    /// Build a pairing from one role's Connect credential.
+    ///
+    /// The broker hands each end a single capability, so the resulting
+    /// pairing carries exactly one role token and refuses to produce the
+    /// other. That refusal is the security property: a client credential
+    /// written to disk cannot be used to act as the host of its own session,
+    /// however the file is later handed around.
+    #[must_use]
+    pub fn from_role_credential(credential: RoleCredential) -> Self {
+        let RoleCredential {
+            session_id,
+            role,
+            token,
+            websocket_path,
+            expires_in_seconds,
+            relay_address,
+            relay_ticket,
+            turn,
+        } = credential;
+        let (host_token, client_token) = match role {
+            Role::Host => (Some(token), None),
+            Role::Client => (None, Some(token)),
+        };
+        let (relay_host_ticket, relay_client_ticket) = match role {
+            Role::Host => (relay_ticket, None),
+            Role::Client => (None, relay_ticket),
+        };
+        let (turn_host, turn_client) = match role {
+            Role::Host => (turn, None),
+            Role::Client => (None, turn),
+        };
+        Self {
+            session_id,
+            host_token,
+            client_token,
+            websocket_path,
+            expires_in_seconds,
+            relay_address,
+            // The role-blind `turn` field stays empty: it exists for pairing
+            // files written before TURN credentials were role-scoped, and a
+            // credential that knows its own role has no reason to populate a
+            // field whose whole problem is that it does not.
+            turn: None,
+            turn_host,
+            turn_client,
+            relay_host_ticket,
+            relay_client_ticket,
         }
+    }
+
+    /// Which roles this pairing can actually act as.
+    ///
+    /// Useful to a launcher deciding what to start: a credential collected
+    /// from the broker can do exactly one thing.
+    #[must_use]
+    pub fn can_act_as(&self, role: Role) -> bool {
+        self.token(role).is_ok()
+    }
+
+    /// The bearer token for one role, or an error if this pairing does not
+    /// carry it.
+    ///
+    /// Refusing is the point. A credential issued to the client end has no
+    /// host token, and asking for one has to fail rather than produce
+    /// something presentable.
+    fn token(&self, role: Role) -> Result<&str, Error> {
+        let token = match role {
+            Role::Host => self.host_token.as_deref(),
+            Role::Client => self.client_token.as_deref(),
+        };
+        token.filter(|token| !token.is_empty()).ok_or_else(|| {
+            Error::InvalidMessage(format!(
+                "this session credential carries no {} token",
+                role.as_str()
+            ))
+        })
     }
 
     fn relay_ticket(&self, role: Role) -> Option<&str> {
@@ -1246,7 +1361,7 @@ impl Endpoint {
         let mut request = url
             .into_client_request()
             .map_err(|error| Error::InvalidMessage(error.to_string()))?;
-        let authorization = format!("Bearer {}", pairing.token(role));
+        let authorization = format!("Bearer {}", pairing.token(role)?);
         let authorization = HeaderValue::from_str(&authorization)
             .map_err(|error| Error::InvalidMessage(error.to_string()))?;
         request.headers_mut().insert(AUTHORIZATION, authorization);
@@ -4376,7 +4491,135 @@ fn identity_store_path() -> Result<std::path::PathBuf, Error> {
     Ok(base.join("device-identity.pk8"))
 }
 
+/// Account name for this identity in the platform keystore.
+///
+/// Derived from the store path so two stores on one machine -- a test fixture
+/// beside a real install -- cannot collide on one keystore entry.
+fn keystore_account(path: &Path) -> String {
+    let digest = sha2::Sha256::digest(path.as_os_str().as_encoded_bytes());
+    format!("device-identity-{}", hex::encode(&digest[..8]))
+}
+
+/// Whether the operator asked for the identity to live in the platform
+/// keystore. Off by default: losing a device identity is a worse failure than
+/// not having hardware-backed custody, so this earns its place before it
+/// becomes the default.
+fn keystore_custody_requested() -> bool {
+    matches!(
+        std::env::var("OPENSTREAM_IDENTITY_CUSTODY")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "keystore" | "keychain"
+    )
+}
+
+/// Resolve the identity through the platform keystore, falling back to the
+/// file on anything that does not work.
+///
+/// The file is never deleted here. A keystore entry that turns out to be
+/// unreadable on the next boot must not mean the identity is gone, so
+/// migrating copies the key in and leaves the original where it was. The line
+/// printed on migration says that removing the file is what completes it --
+/// that is the operator's call, because it is the irreversible half.
+fn load_or_create_identity_in_keystore(path: &Path) -> Result<IdentityKey, Error> {
+    let account = keystore_account(path);
+
+    if let Some(stored) = keystore::load(&account) {
+        match identity_from_bytes(stored) {
+            Ok(identity) => {
+                println!("OpenStream identity source=keystore");
+                return Ok(identity);
+            }
+            // A corrupt entry is not a reason to refuse to start: the file may
+            // still hold a usable key, and the entry is replaced below.
+            Err(_) => eprintln!(
+                "OpenStream identity: the keystore entry is unreadable; falling back to the file"
+            ),
+        }
+    }
+
+    // Whether a file is already there has to be read before anything creates
+    // one, or a fresh install looks like a migration and, worse, gets its key
+    // written to disk on the way past.
+    if path.exists() {
+        let identity = load_identity_file(path)?;
+        match keystore::store(&account, identity.pkcs8()) {
+            Ok(()) => println!(
+                "OpenStream identity source=migrated-to-keystore; the file at {} is kept as a \
+fallback, and removing it is what completes the migration",
+                path.display()
+            ),
+            Err(error) => eprintln!(
+                "OpenStream identity: the keystore refused the key ({error}); continuing with \
+the file"
+            ),
+        }
+        return Ok(identity);
+    }
+
+    // No file yet, so there is nothing to preserve and no reason to write one:
+    // a key that only ever exists in the keystore is the point of asking for
+    // keystore custody.
+    let identity = IdentityKey::generate().map_err(Error::Identity)?;
+    match keystore::store(&account, identity.pkcs8()) {
+        Ok(()) => {
+            println!("OpenStream identity source=keystore");
+            Ok(identity)
+        }
+        Err(error) => {
+            eprintln!(
+                "OpenStream identity: the keystore would not take a new key ({error}); creating \
+the file instead"
+            );
+            load_or_create_identity_file(path)
+        }
+    }
+}
+
+#[cfg(test)]
+mod keystore_account_tests {
+    use std::path::Path;
+
+    #[test]
+    fn the_account_is_stable_for_one_store_and_distinct_between_stores() {
+        let one = Path::new("/var/lib/openstream/device-identity.pk8");
+        let other = Path::new("/home/someone/.local/state/openstream/device-identity.pk8");
+        assert_eq!(super::keystore_account(one), super::keystore_account(one));
+        assert_ne!(
+            super::keystore_account(one),
+            super::keystore_account(other),
+            "two stores on one machine must not share a keystore entry"
+        );
+    }
+
+    #[test]
+    fn the_account_carries_no_path_text() {
+        // The account name is visible in keychain listings, so it must not
+        // publish where the user keeps their files.
+        let path =
+            Path::new("/home/someone-identifiable/.local/state/openstream/device-identity.pk8");
+        let account = super::keystore_account(path);
+        assert!(!account.contains("someone-identifiable"), "{account}");
+        assert!(account.starts_with("device-identity-"), "{account}");
+    }
+}
+
 fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
+    if keystore_custody_requested() {
+        if keystore::available() {
+            return load_or_create_identity_in_keystore(path);
+        }
+        eprintln!(
+            "OpenStream identity: OPENSTREAM_IDENTITY_CUSTODY asked for the platform keystore, \
+which this build has no implementation for; continuing with the file"
+        );
+    }
+    load_or_create_identity_file(path)
+}
+
+fn load_or_create_identity_file(path: &Path) -> Result<IdentityKey, Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidMessage(
             "identity store path must be absolute".into(),
@@ -4853,12 +5096,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A credential issued to one end cannot act as the other.
+    ///
+    /// This is the property the whole Connect split exists for. Before the
+    /// tokens were optional there was no way to express "client only": the
+    /// field had to hold something, and whatever it held would have been sent
+    /// to the signalling server as a host bearer token.
+    #[test]
+    fn a_role_credential_cannot_act_as_the_other_role() {
+        let client = Pairing::from_role_credential(RoleCredential {
+            session_id: "session-1".into(),
+            role: Role::Client,
+            token: "CLIENT-CAPABILITY".into(),
+            websocket_path: "/v1/signal/session-1/client".into(),
+            expires_in_seconds: 60,
+            relay_address: None,
+            relay_ticket: Some("client-ticket".into()),
+            turn: None,
+        });
+        assert!(client.can_act_as(Role::Client));
+        assert!(
+            !client.can_act_as(Role::Host),
+            "a client credential must not be able to act as host"
+        );
+        assert_eq!(
+            client.token(Role::Client).expect("its own role"),
+            "CLIENT-CAPABILITY"
+        );
+        assert!(client.token(Role::Host).is_err());
+        assert_eq!(client.relay_ticket(Role::Client), Some("client-ticket"));
+        assert_eq!(client.relay_ticket(Role::Host), None);
+
+        let host = Pairing::from_role_credential(RoleCredential {
+            session_id: "session-1".into(),
+            role: Role::Host,
+            token: "HOST-CAPABILITY".into(),
+            websocket_path: "/v1/signal/session-1/host".into(),
+            expires_in_seconds: 60,
+            relay_address: None,
+            relay_ticket: Some("host-ticket".into()),
+            turn: None,
+        });
+        assert!(host.can_act_as(Role::Host));
+        assert!(!host.can_act_as(Role::Client));
+        assert_eq!(host.relay_ticket(Role::Host), Some("host-ticket"));
+        assert_eq!(host.relay_ticket(Role::Client), None);
+    }
+
+    /// An empty token is treated as absent, not as a token.
+    ///
+    /// A hand-written or partially populated file must not be able to make
+    /// the client present `Bearer ` to the signalling server and then report
+    /// whatever that produces as a connection failure.
+    #[test]
+    fn an_empty_token_is_refused_like_a_missing_one() {
+        let pairing = Pairing {
+            session_id: "session-1".into(),
+            host_token: Some(String::new()),
+            client_token: Some("client".into()),
+            websocket_path: "/v1/signal/session-1/{role}".into(),
+            expires_in_seconds: 60,
+            relay_address: None,
+            turn: None,
+            turn_host: None,
+            turn_client: None,
+            relay_host_ticket: None,
+            relay_client_ticket: None,
+        };
+        assert!(pairing.token(Role::Host).is_err());
+        assert!(pairing.token(Role::Client).is_ok());
+    }
+
+    /// A role credential round-trips through the pairing file format.
+    ///
+    /// The launcher writes what the broker returned and the runner reads it
+    /// back, so the two have to agree -- and the file must still carry only
+    /// the one role after the trip.
+    #[test]
+    fn a_role_scoped_pairing_survives_serialisation() {
+        let pairing = Pairing::from_role_credential(RoleCredential {
+            session_id: "session-1".into(),
+            role: Role::Client,
+            token: "CLIENT-CAPABILITY".into(),
+            websocket_path: "/v1/signal/session-1/client".into(),
+            expires_in_seconds: 60,
+            relay_address: Some("203.0.113.9:7000".into()),
+            relay_ticket: Some("ticket".into()),
+            turn: None,
+        });
+        let encoded = serde_json::to_string(&pairing).expect("serialise");
+        assert!(
+            !encoded.contains("host_token"),
+            "an absent role must not appear in the file at all: {encoded}"
+        );
+        let decoded: Pairing = serde_json::from_str(&encoded).expect("deserialise");
+        assert_eq!(decoded, pairing);
+        assert!(!decoded.can_act_as(Role::Host));
+    }
+
+    /// Provisioning pairings, which carry both roles, still work.
+    ///
+    /// The admin endpoint returns both and existing pairing files on disk
+    /// contain both, so the optional fields must not have broken them.
+    #[test]
+    fn a_two_role_provisioning_pairing_still_grants_both() {
+        let json = r#"{
+            "session_id": "session-1",
+            "host_token": "host",
+            "client_token": "client",
+            "websocket_path": "/v1/signal/session-1/{role}",
+            "expires_in_seconds": 60
+        }"#;
+        let pairing: Pairing = serde_json::from_str(json).expect("legacy pairing parses");
+        assert!(pairing.can_act_as(Role::Host));
+        assert!(pairing.can_act_as(Role::Client));
+        assert_eq!(pairing.token(Role::Host).expect("host"), "host");
+        assert_eq!(pairing.token(Role::Client).expect("client"), "client");
+    }
+
     #[test]
     fn pairing_and_turn_credentials_never_print_their_secrets() {
         let pairing = Pairing {
             session_id: "session-1".into(),
-            host_token: "HOST-BEARER-SHOULD-NOT-APPEAR".into(),
-            client_token: "CLIENT-BEARER-SHOULD-NOT-APPEAR".into(),
+            host_token: Some("HOST-BEARER-SHOULD-NOT-APPEAR".into()),
+            client_token: Some("CLIENT-BEARER-SHOULD-NOT-APPEAR".into()),
             websocket_path: "/v1/signal/session-1".into(),
             expires_in_seconds: 3600,
             relay_address: None,
@@ -5741,8 +6102,8 @@ mod tests {
     fn pairing() -> Pairing {
         Pairing {
             session_id: "session".into(),
-            host_token: "host-token".into(),
-            client_token: "client-token".into(),
+            host_token: Some("host-token".into()),
+            client_token: Some("client-token".into()),
             websocket_path: "/v1/signal/session/{host|client}".into(),
             expires_in_seconds: 60,
             relay_address: None,

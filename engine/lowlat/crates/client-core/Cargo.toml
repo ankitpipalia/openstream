@@ -27,6 +27,12 @@ url.workspace = true
 webrtc-ice.workspace = true
 webrtc-util.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Used only to resolve libsecret at runtime for keystore custody. Nothing is
+# linked against it: a machine without libsecret gets a missing backend, not a
+# process that will not start.
+lowlat-common.workspace = true
+
 [dev-dependencies]
 openstream-media = { path = "../media" }
 tokio = { workspace = true, features = ["test-util"] }

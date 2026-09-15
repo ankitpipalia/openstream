@@ -166,6 +166,13 @@ jobs:
       - name: Install Android SDK tooling
         if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android'
         uses: android-actions/setup-android@v4.0.1
+        with:
+          # The action installs "tools platform-tools" by default, and
+          # Google has withdrawn "tools" from the repository: sdkmanager
+          # reports "Failed to find package 'tools'" and exits non-zero,
+          # which failed both Android targets before a line was compiled.
+          # The NDK this build actually needs is installed in the next step.
+          packages: platform-tools
       - name: Install Android NDK
         if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android'
         run: sdkmanager "ndk;26.3.11579264"

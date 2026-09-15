@@ -14,7 +14,8 @@ use runtime::{
 use session::{SessionError, SessionHealth, SessionProcessState, SessionSupervisor};
 use tauri::Manager;
 
-pub mod control_plane;
+pub mod connect_flow;
+mod control_plane;
 pub mod device_store;
 pub mod host_agent;
 pub mod runtime;
@@ -414,9 +415,218 @@ async fn runtime_dispatch(
     state: tauri::State<'_, SharedRuntime>,
     host_lock: tauri::State<'_, SharedHostLock>,
     session: tauri::State<'_, SharedSession>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
     command: RuntimeCommand,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
-    dispatch_command_with_session(state.inner(), host_lock.inner(), session.inner(), command).await
+    dispatch_command_with_session(
+        state.inner(),
+        host_lock.inner(),
+        session.inner(),
+        control_plane.inner(),
+        command,
+    )
+    .await
+}
+
+/// Tell the service whether this device is available to host.
+///
+/// Best effort on purpose. Hosting has already started or stopped locally by
+/// the time this runs, and failing the whole command because a presence
+/// heartbeat did not land would turn a cosmetic problem -- the device shows
+/// as offline until the next beat -- into a refusal to host at all. In local
+/// mode there is no control plane signed in and this is simply a no-op.
+async fn announce_presence_best_effort(control_plane: &SharedControlPlane, online: bool) {
+    let mut client = control_plane.lock().await;
+    if !client.is_authenticated() {
+        return;
+    }
+    let outcome = if online {
+        client.announce_presence().await
+    } else {
+        client.withdraw_presence().await
+    };
+    if outcome.is_err() {
+        // Not surfaced as a command failure; see above. Logged so an
+        // operator wondering why a machine never appears has something to
+        // find.
+        eprintln!("OpenStream could not update host presence with the control plane");
+    }
+}
+
+/// Requests this device is being asked to approve.
+#[tauri::command]
+async fn host_connect_requests(
+    control_plane: tauri::State<'_, SharedControlPlane>,
+) -> Result<Vec<control_plane::PendingConnectRequest>, RuntimeError> {
+    let mut client = control_plane.lock().await;
+    client
+        .pending_connect_requests()
+        .await
+        .map_err(control_plane_error_runtime)
+}
+
+/// Approve a request and start hosting the session it created.
+///
+/// The capability goes to the host agent, which is the process that actually
+/// runs the host end. It travels as a private file rather than as an IPC
+/// field: the agent validates ownership and permissions before opening it,
+/// and the capability never appears in a message, a log, or a crash dump of
+/// either process.
+///
+/// Nothing about the credential is returned to the caller. The UI needs to
+/// know that hosting started, not what the capability was, and handing a
+/// bearer token to a WebView is how it ends up somewhere it cannot be
+/// withdrawn from.
+#[tauri::command]
+async fn approve_connect_request(
+    state: tauri::State<'_, SharedRuntime>,
+    session: tauri::State<'_, SharedSession>,
+    control_plane: tauri::State<'_, SharedControlPlane>,
+    request_id: String,
+) -> Result<(), RuntimeError> {
+    let credential = {
+        let mut client = control_plane.lock().await;
+        client
+            .approve_connect(&request_id)
+            .await
+            .map_err(control_plane_error_runtime)?
+    };
+    if credential.role != "host" {
+        // The broker answers an approval with the host side. Anything else is
+        // a routing mistake above, and starting the host agent against a
+        // client capability would fail later and less legibly.
+        return Err(RuntimeError::StateUnavailable);
+    }
+    let settings = {
+        let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        runtime.settings().clone()
+    };
+    let pairing = openstream_client_core::Pairing::from_role_credential(
+        openstream_client_core::RoleCredential {
+            session_id: credential.session_id,
+            role: openstream_client_core::Role::Host,
+            token: credential.token,
+            websocket_path: credential.websocket_path,
+            expires_in_seconds: 0,
+            relay_address: credential.relay_address,
+            relay_ticket: Some(credential.relay_ticket),
+            turn: None,
+        },
+    );
+    let path = {
+        let supervisor = session.lock().await;
+        supervisor.host_credential_path().to_path_buf()
+    };
+    session::write_private_json(&path, &pairing).map_err(session_error_to_runtime)?;
+    let started = HostAgentClient::new()
+        .map_err(|_| RuntimeError::StateUnavailable)?
+        .start_session(&path, &settings)
+        .await;
+    if started.is_err() {
+        // A capability on disk that nothing is going to read is a capability
+        // nobody is watching.
+        let _ = std::fs::remove_file(&path);
+        return Err(RuntimeError::StateUnavailable);
+    }
+    Ok(())
+}
+
+/// Refuse a request.
+#[tauri::command]
+async fn deny_connect_request(
+    control_plane: tauri::State<'_, SharedControlPlane>,
+    request_id: String,
+) -> Result<(), RuntimeError> {
+    let mut client = control_plane.lock().await;
+    client
+        .deny_connect(&request_id)
+        .await
+        .map_err(control_plane_error_runtime)
+}
+
+/// Ask a device for a session, wait for a person to answer, then start it.
+///
+/// Polling rather than a held connection, matching the broker: a shell that
+/// needed a socket per pending request would make request count a resource
+/// cost, and the wait here is bounded by
+/// [`connect_flow::CONNECT_WAIT`] so a forgotten prompt ends as "nobody
+/// answered" rather than hanging.
+async fn run_secure_connect(
+    state: &Mutex<RuntimeState>,
+    session: &SharedSession,
+    control_plane: &SharedControlPlane,
+    device_id: &str,
+    mut result: RuntimeDispatchResult,
+) -> Result<RuntimeDispatchResult, RuntimeError> {
+    let request_id = {
+        let mut client = control_plane.lock().await;
+        client
+            .request_connect(device_id)
+            .await
+            .map_err(control_plane_error_runtime)?
+            .request_id
+    };
+
+    let deadline = std::time::Instant::now() + connect_flow::CONNECT_WAIT;
+    let credential = loop {
+        let observation = {
+            let mut client = control_plane.lock().await;
+            client
+                .observe_connect(&request_id)
+                .await
+                .map_err(control_plane_error_runtime)?
+        };
+        match connect_flow::interpret(observation, std::time::Instant::now() >= deadline) {
+            connect_flow::ConnectStep::Start(credential) => break *credential,
+            connect_flow::ConnectStep::KeepWaiting => {
+                tokio::time::sleep(connect_flow::CONNECT_POLL_INTERVAL).await;
+            }
+            // A refusal and a timeout are different things to the person who
+            // pressed connect, but both end the attempt the same way: the
+            // model returns to idle rather than waiting on an approval that
+            // is not coming.
+            connect_flow::ConnectStep::Refused | connect_flow::ConnectStep::Abandoned => {
+                let failed = {
+                    let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                    runtime.session_failed(false)?
+                };
+                result.events.extend(failed.events);
+                result.snapshot = failed.snapshot;
+                return Ok(result);
+            }
+        }
+    };
+
+    let settings = {
+        let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+        runtime.settings().clone()
+    };
+    let started = {
+        let mut supervisor = session.lock().await;
+        supervisor
+            .connect_with_credential(&settings, device_id, credential)
+            .await
+    };
+    match started {
+        Ok(_) => {
+            let negotiated = {
+                let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                runtime.begin_session_negotiation()?
+            };
+            result.events.extend(negotiated.events);
+            result.snapshot = negotiated.snapshot;
+            Ok(result)
+        }
+        Err(error) => {
+            let failed = {
+                let mut runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
+                runtime.session_failed(false)?
+            };
+            result.events.extend(failed.events);
+            result.snapshot = failed.snapshot;
+            Err(session_error_to_runtime(error))
+        }
+    }
 }
 
 /// The one dispatch path. Tauri-independent so it can be exercised directly
@@ -425,11 +635,24 @@ async fn dispatch_command_with_session(
     state: &Mutex<RuntimeState>,
     host_lock: &HostLifecycleLock,
     session: &SharedSession,
+    control_plane: &SharedControlPlane,
     command: RuntimeCommand,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     match command {
-        RuntimeCommand::EnableHosting => dispatch_host_lifecycle(state, host_lock, true).await,
-        RuntimeCommand::DisableHosting => dispatch_host_lifecycle(state, host_lock, false).await,
+        RuntimeCommand::EnableHosting => {
+            let result = dispatch_host_lifecycle(state, host_lock, true).await?;
+            // Presence follows hosting. A device that is not hosting must not
+            // appear connectable: offering it would produce a request nobody
+            // can approve, and the person who pressed connect would watch it
+            // time out with no explanation.
+            announce_presence_best_effort(control_plane, true).await;
+            Ok(result)
+        }
+        RuntimeCommand::DisableHosting => {
+            let result = dispatch_host_lifecycle(state, host_lock, false).await?;
+            announce_presence_best_effort(control_plane, false).await;
+            Ok(result)
+        }
         RuntimeCommand::RestartHosting => dispatch_restart_hosting(state, host_lock).await,
         RuntimeCommand::Connect {
             device_id,
@@ -462,13 +685,12 @@ async fn dispatch_command_with_session(
                 result.events.extend(approved.events);
                 result.snapshot = approved.snapshot;
             } else {
-                // Secure deployments need a control-plane request/approval
-                // round trip before a session runner may receive a pairing
-                // file or touch the network. The control-plane broker is not
-                // part of this local shell bridge yet; leave the model in
-                // WaitingForApproval rather than starting a runner behind an
-                // unapproved request.
-                return Ok(result);
+                // Secure deployments go through the Connect broker: the host
+                // device is asked, a person there approves, and only then is
+                // a capability issued -- to each end separately. The runner
+                // is started from that capability rather than from a pairing
+                // file carrying both roles.
+                return run_secure_connect(state, session, control_plane, &device_id, result).await;
             }
             let started = start_session_if_connecting(state, session, &device_id).await;
             match started {
@@ -1117,7 +1339,10 @@ pub fn run() {
             host_agent_health,
             session_health,
             device_store_snapshot,
-            device_store_set_trust
+            device_store_set_trust,
+            host_connect_requests,
+            approve_connect_request,
+            deny_connect_request
         ])
         .run(tauri::generate_context!())
         .expect("error while running OpenStream desktop shell");

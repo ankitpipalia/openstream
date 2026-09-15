@@ -1095,6 +1095,21 @@ pub enum AgentIpcCommand {
     StartWithSettings {
         settings: Box<AppConfig>,
     },
+    /// Start a session against a role capability the Connect broker issued.
+    ///
+    /// Only a *path* crosses this boundary, never the capability itself. The
+    /// agent opens it through the same protected file check every other
+    /// pairing goes through -- absolute, a regular file, owned by this user,
+    /// no group or other permissions, no symlink -- so a caller cannot use
+    /// this to make the agent read something it would otherwise refuse, and
+    /// the credential never appears in an IPC frame, a log, or a crash dump
+    /// of either process.
+    ///
+    /// Boxed for the same reason as `StartWithSettings`.
+    StartSession {
+        pairing_file: String,
+        settings: Box<AppConfig>,
+    },
     Stop,
     Tick,
     Health,
@@ -2102,6 +2117,54 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o600))
                 .expect("private heartbeat file");
         }
+    }
+
+    /// A session credential is opened only through the protected-file check.
+    ///
+    /// The path arrives over a local socket and names a bearer capability, so
+    /// the ownership and permission checks are what stop `StartSession` being
+    /// a way to make the agent read an arbitrary file as a credential.
+    #[test]
+    fn a_session_credential_path_is_held_to_the_protected_file_rules() {
+        let directory = std::env::temp_dir().join(format!(
+            "openstream-session-credential-{}-{}",
+            std::process::id(),
+            {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            }
+        ));
+        fs::create_dir_all(&directory).expect("credential directory");
+        let path = directory.join("host-credential.json");
+        fs::write(&path, b"{}").expect("write credential");
+
+        let config = config();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // World-readable: refused.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                .expect("permissive credential");
+            assert!(
+                config.clone().with_pairing_file(&path).is_err(),
+                "a capability anyone can read must not be accepted"
+            );
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("private credential");
+            assert!(config.clone().with_pairing_file(&path).is_ok());
+        }
+
+        // A relative path is refused wherever it points.
+        assert!(config.clone().with_pairing_file("relative.json").is_err());
+        // So is a path that names nothing.
+        assert!(
+            config
+                .with_pairing_file(directory.join("absent.json"))
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(&directory);
     }
 
     /// The two pid values `kill` reserves must never be treated as a child's

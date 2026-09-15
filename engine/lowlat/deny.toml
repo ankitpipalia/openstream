@@ -10,13 +10,28 @@ targets = [
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "aarch64-unknown-linux-gnu" },
     { triple = "x86_64-pc-windows-msvc" },
+    # The product ships a macOS client, so the Apple link graph has to be
+    # checked by the same rule. Without these the GPL denial above did not
+    # cover a macOS-only dependency at all.
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
 ]
 all-features = true
 
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # `paste` is unmaintained. It reaches this tree only on Apple targets,
+    # through metal -> wgpu-hal -> wgpu, and wgpu pins it: there is no safe
+    # upgrade to take. It is a proc-macro that pastes identifiers at compile
+    # time, so it contributes no code to the shipped binary and no runtime
+    # surface. Accepted deliberately, and only until wgpu moves off it.
+    #
+    # This was invisible until the Apple triples were added to the graph
+    # above; it is the first finding that gap was hiding.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2

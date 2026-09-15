@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window};
+use minifb::{Key, MouseButton, MouseMode, Window};
 use openstream_client_core::{
     Capabilities, ConnectionPath, FlushOutcome, PeerSession, ReliableControl, Role, VideoCodec,
     load_pairing_from_environment, parse_stun_servers,
@@ -52,7 +52,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 mod display;
+mod fullscreen;
 mod mic;
+mod raw_pointer;
 mod render;
 // Pure lifecycle/input-safety seam; a future winit presenter can consume it
 // without making this minifb path or the dependency graph change in this slice.
@@ -348,6 +350,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_HEIGHT,
         display_mode.window_options(),
     )?;
+    let keyboard_connected = Arc::new(AtomicBool::new(false));
+    window.set_input_callback(Box::new(KeyboardEvents {
+        input_tx: input_tx.clone(),
+        connected: Arc::clone(&keyboard_connected),
+    }));
+    if display_mode.wants_whole_screen() && fullscreen::enter(window.get_window_handle()) {
+        // Said out loud because the mode is otherwise indistinguishable from
+        // a window that simply failed to resize.
+        println!("OpenStream run window=fullscreen requested from the platform");
+    }
     let render_backend = render::RenderBackend::from_env();
     let mut native_presenter = if render_backend.is_native() {
         match render::GpuPresenter::new(&window, render_backend) {
@@ -400,6 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = vec![0_u32; DEFAULT_WIDTH * DEFAULT_HEIGHT];
     let mut buffer_width = DEFAULT_WIDTH;
     let mut buffer_height = DEFAULT_HEIGHT;
+    let immersive_requested = env::var("OPENSTREAM_IMMERSIVE").as_deref() == Ok("1");
     let mut input_state = InputState {
         last_mouse: None,
         last_window_mouse: None,
@@ -407,8 +420,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         gamepads: None,
         gamepad_ids: HashMap::new(),
         rumble_effects: HashMap::new(),
-        immersive: env::var("OPENSTREAM_IMMERSIVE").as_deref() == Ok("1"),
+        immersive: immersive_requested,
+        raw_pointer: if immersive_requested {
+            raw_pointer::RawPointer::capture()
+        } else {
+            // Not immersive: leave the cursor associated with the device.
+            raw_pointer::RawPointer::inactive()
+        },
     };
+    if immersive_requested {
+        // Which path is running decides whether a turn can continue past the
+        // window edge, so it is worth saying out loud rather than leaving the
+        // operator to infer it from behaviour.
+        println!(
+            "OpenStream run pointer={}",
+            if input_state.raw_pointer.is_active() {
+                "raw device capture"
+            } else {
+                "relative from window position (stops at the window edge)"
+            }
+        );
+    }
+    // Optional pixel-level diagnostic; off unless the operator asks for it.
+    let mut frame_dump = FrameDump::from_env();
     let mut connected = false;
     let mut base_title = String::from("OpenStream");
     let mut displays = Vec::<RemoteDisplay>::new();
@@ -434,6 +468,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     input,
                 }) => {
                     connected = true;
+                    // Only now may key transitions reach the host.
+                    keyboard_connected.store(true, Ordering::Relaxed);
                     base_title = format!(
                         "{width}x{height} @ {fps}fps -- {path:?} -- audio={audio} input={input}"
                     );
@@ -462,6 +498,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     buffer_width = width;
                     buffer_height = height;
                     buffer = frame.into_pixels();
+                    if let Some(dump) = frame_dump.as_mut() {
+                        dump.offer(width, height, &buffer);
+                    }
 
                     // Everything below this stamp is the presenter's own
                     // time: texture upload, surface acquisition, or a
@@ -588,9 +627,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             window.update_with_buffer(&buffer, buffer_width, buffer_height)?;
         }
+        // Capture is held only while the session is live and the window has
+        // focus. Keying it on both is what stops a window left open after a
+        // disconnect from keeping the pointer hidden, and it must run outside
+        // the connected branch below, which stops being entered at exactly
+        // the moment the capture needs releasing.
+        let focused = window.is_active();
+        input_state.raw_pointer.follow_focus(connected && focused);
+        if !connected {
+            keyboard_connected.store(false, Ordering::Relaxed);
+        }
         if connected {
             forward_input(
                 &window,
+                focused,
                 &input_tx,
                 (buffer_width, buffer_height),
                 // A GPU present stretches to the surface; only the software
@@ -679,6 +729,105 @@ struct PresentedRect {
     y: usize,
     width: usize,
     height: usize,
+}
+
+/// Diagnostic capture of decoded frames, enabled by `OPENSTREAM_DUMP_FRAMES`.
+///
+/// Presenting is the last point where this process still owns the picture as
+/// pixels. Counters can report a frame as presented while the window shows
+/// nothing, so "the screen is blank" cannot be settled from telemetry alone.
+/// Writing the pixels here separates "the decoder produced a picture" from
+/// "the window displayed it", which is the split that tells a capture or
+/// encode fault apart from a presentation fault.
+///
+/// Frames are written as binary PPM: no image encoder is needed and every
+/// common image tool reads it.
+#[derive(Debug)]
+struct FrameDump {
+    directory: PathBuf,
+    every: u64,
+    limit: u64,
+    seen: u64,
+    written: u64,
+}
+
+impl FrameDump {
+    /// `OPENSTREAM_DUMP_FRAMES` names the destination directory and turns the
+    /// capture on. `OPENSTREAM_DUMP_FRAME_EVERY` keeps one frame in N
+    /// (default 30) and `OPENSTREAM_DUMP_FRAME_LIMIT` caps how many are
+    /// written (default 8), so a long session cannot fill the disk.
+    fn from_env() -> Option<Self> {
+        let directory = PathBuf::from(env::var("OPENSTREAM_DUMP_FRAMES").ok()?);
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            eprintln!(
+                "OpenStream frame dump disabled: {} is not usable: {error}",
+                directory.display()
+            );
+            return None;
+        }
+        Some(Self {
+            directory,
+            every: env_u64("OPENSTREAM_DUMP_FRAME_EVERY", 30).max(1),
+            limit: env_u64("OPENSTREAM_DUMP_FRAME_LIMIT", 8),
+            seen: 0,
+            written: 0,
+        })
+    }
+
+    /// Offer one frame that passed validation and is about to be presented.
+    /// Sampling and the write both happen on the UI thread, which is why the
+    /// default cadence is coarse: this is a diagnostic, not a recorder.
+    fn offer(&mut self, width: usize, height: usize, pixels: &[u32]) {
+        let index = self.seen;
+        self.seen += 1;
+        if self.written >= self.limit || index % self.every != 0 {
+            return;
+        }
+        let path = self.directory.join(format!("frame-{index:06}.ppm"));
+        match Self::write_ppm(&path, width, height, pixels) {
+            Ok(()) => {
+                self.written += 1;
+                println!(
+                    "OpenStream dumped frame {index} ({width}x{height}) to {}",
+                    path.display()
+                );
+            }
+            Err(error) => {
+                // One failed write means the destination is not usable.
+                // Stop rather than repeat the same error every frame.
+                eprintln!("OpenStream frame dump stopped: {error}");
+                self.limit = 0;
+            }
+        }
+    }
+
+    fn write_ppm(
+        path: &std::path::Path,
+        width: usize,
+        height: usize,
+        pixels: &[u32],
+    ) -> io::Result<()> {
+        let mut out = Vec::with_capacity(32 + pixels.len() * 3);
+        out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+        for pixel in pixels {
+            // The decoder packs BGRA bytes into a little-endian word, so the
+            // native byte order is already blue, green, red, alpha.
+            let [blue, green, red, _alpha] = pixel.to_le_bytes();
+            out.push(red);
+            out.push(green);
+            out.push(blue);
+        }
+        std::fs::write(path, out)
+    }
+}
+
+/// Read a non-negative integer from the environment, falling back when the
+/// variable is absent or does not parse.
+fn env_u64(name: &str, fallback: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(fallback)
 }
 
 /// Compute the rectangle the picture occupies.
@@ -786,33 +935,45 @@ struct InputState {
     gamepad_ids: HashMap<u32, GamepadId>,
     rumble_effects: HashMap<u32, Effect>,
     immersive: bool,
+    /// Held only in immersive mode, and only where the platform supports it.
+    /// When it is active the window-position path above is not used at all.
+    raw_pointer: raw_pointer::RawPointer,
 }
 
 fn forward_input(
     window: &Window,
+    focused: bool,
     input_tx: &InputSender,
     stream: (usize, usize),
     preserve_aspect: bool,
     state: &mut InputState,
 ) {
+    if !focused {
+        // Drop the reference sample. Keeping it would turn the gap between
+        // leaving the window and returning to it into one large relative
+        // jump the user never made.
+        state.last_window_mouse = None;
+    }
+
     // Strictly increasing, because the host orders pointer motion by this
     // and equal stamps would leave it breaking ties.
     let timestamp = monotonic_input_stamp();
-    for &(key, usage) in keyboard_usages() {
-        if window.is_key_pressed(key, KeyRepeat::No) {
-            let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
-                usage, 0, true, timestamp,
+    // A held capture reports device motion whether or not the cursor is over
+    // the window -- it is deliberately not over the window, since capture
+    // decouples the two. Reading it must not be gated on a window-relative
+    // position, or the deltas the capture exists to deliver would be dropped
+    // exactly when they start arriving.
+    if let Some((dx, dy)) = state.raw_pointer.delta() {
+        if dx != 0 || dy != 0 {
+            let _ = input_tx.try_send(UiInput::Event(InputEvent::pointer_motion(
+                true, dx, dy, timestamp,
             )));
         }
-        if window.is_key_released(key) {
-            let _ = input_tx.try_send(UiInput::Event(InputEvent::keyboard(
-                usage, 0, false, timestamp,
-            )));
-        }
-    }
-
-    if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
+    } else if let Some((x, y)) = window.get_mouse_pos(MouseMode::Clamp) {
         if state.immersive {
+            // Compatibility relative path: window positions are clamped, so
+            // this stops producing motion at an edge. It is what runs where
+            // the platform cannot capture the device.
             if let Some((last_x, last_y)) = state.last_window_mouse {
                 #[allow(clippy::cast_possible_truncation)]
                 let dx = (x - last_x).round() as i32;
@@ -1054,6 +1215,59 @@ fn axis_value(value: f32) -> i32 {
 /// needs to know which desktop window backend generated the event. Unknown
 /// keys are intentionally omitted instead of sending a platform-specific
 /// scan-code guess.
+/// Event-driven keyboard forwarding.
+///
+/// The frame loop samples key state once per presented frame. A press and its
+/// release that both land between two samples collapse into no observed
+/// change, so keystrokes shorter than a frame interval were dropped outright
+/// -- at 45 fps that is any press under about 22 ms, which ordinary fast
+/// typing produces. Measured on the acceptance rig: holding each key 200 ms
+/// delivered 13 of 13, and holding 30 ms delivered 3.
+///
+/// minifb reports every transition here as the platform delivers it, so
+/// delivery no longer depends on when the frame loop next looks.
+struct KeyboardEvents {
+    input_tx: InputSender,
+    /// Nothing is forwarded before the session is up, so keys pressed while
+    /// the window is still connecting are not replayed into the host.
+    connected: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for KeyboardEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyboardEvents").finish_non_exhaustive()
+    }
+}
+
+impl minifb::InputCallback for KeyboardEvents {
+    /// Text input is not forwarded: the host is sent HID usages and applies
+    /// its own layout, so a translated character here would arrive twice.
+    fn add_char(&mut self, _uni_char: u32) {}
+
+    fn set_key_state(&mut self, key: Key, state: bool) {
+        if !self.connected.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(usage) = usage_for_key(key) else {
+            return;
+        };
+        let _ = self.input_tx.try_send(UiInput::Event(InputEvent::keyboard(
+            usage,
+            0,
+            state,
+            monotonic_input_stamp(),
+        )));
+    }
+}
+
+/// HID usage for a window key, or `None` for keys this client does not map.
+fn usage_for_key(key: Key) -> Option<u32> {
+    keyboard_usages()
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+        .map(|(_, usage)| *usage)
+}
+
 fn keyboard_usages() -> &'static [(Key, u32)] {
     &[
         (Key::Key0, 0x27),
@@ -1755,8 +1969,9 @@ async fn network_session(
         path: format!("{:?}", session.connection_path()),
         profile: format!("{format}-low-delay"),
         decoder: Some(format!(
-            "{} {format}",
-            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
+            "{} {format} {}",
+            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
+            DecodeAccel::from_env().name()
         )),
         // The presenter is chosen in `main` and the window is not this
         // task's to inspect, so the backend it settled on is named there
@@ -2316,8 +2531,55 @@ fn spawn_audio_player() -> Result<Option<Child>, Box<dyn std::error::Error + Sen
 /// (1000 ms -> 447 ms glass-to-glass). How that total divides between frame
 /// threading and the demuxer flags has not been measured separately, so no
 /// single figure here is attributed to one of them.
+/// Which decode path FFmpeg is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DecodeAccel {
+    /// libavcodec on the CPU. The default, and the fallback everywhere.
+    #[default]
+    Software,
+    /// Apple's VideoToolbox. FFmpeg decodes on the media engine and hands
+    /// back CPU frames, so the rest of the pipeline is unchanged.
+    VideoToolbox,
+}
+
+impl DecodeAccel {
+    /// Read `OPENSTREAM_DECODER`. Unknown names, and VideoToolbox asked for
+    /// off macOS, fall back to software rather than failing to start: a
+    /// decoder that runs is worth more than one that is exactly as asked.
+    fn from_env() -> Self {
+        let requested = std::env::var("OPENSTREAM_DECODER").unwrap_or_default();
+        match requested.trim().to_ascii_lowercase().as_str() {
+            "videotoolbox" | "vt" if cfg!(target_os = "macos") => Self::VideoToolbox,
+            "videotoolbox" | "vt" => {
+                eprintln!(
+                    "OpenStream decoder videotoolbox is macOS only; using the software decoder"
+                );
+                Self::Software
+            }
+            "" | "software" | "cpu" => Self::Software,
+            other => {
+                eprintln!(
+                    "OpenStream decoder {other} is not recognised; using the software decoder"
+                );
+                Self::Software
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            Self::VideoToolbox => "videotoolbox",
+        }
+    }
+}
+
 fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
-    vec![
+    decoder_args_with(DecodeAccel::from_env(), format, width, height)
+}
+
+fn decoder_args_with(accel: DecodeAccel, format: &str, width: usize, height: usize) -> Vec<String> {
+    let mut arguments: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
@@ -2331,6 +2593,16 @@ fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
         "32".into(),
         "-analyzeduration".into(),
         "0".into(),
+    ];
+    if accel == DecodeAccel::VideoToolbox {
+        // No -hwaccel_output_format: FFmpeg downloads to CPU frames on its
+        // own, which is what the scale filter and the BGRA sink below need.
+        // Asking for hardware frames here would force a hwdownload filter
+        // into the chain for no gain.
+        arguments.push("-hwaccel".into());
+        arguments.push("videotoolbox".into());
+    }
+    arguments.extend([
         "-f".into(),
         format.into(),
         "-i".into(),
@@ -2347,7 +2619,8 @@ fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
         "-fps_mode".into(),
         "passthrough".into(),
         "pipe:1".into(),
-    ]
+    ]);
+    arguments
 }
 
 /// Hand one decoded frame to the window, dropping it if the window is
@@ -2760,6 +3033,55 @@ fn monotonic_input_stamp() -> u64 {
 impl From<io::Error> for UiMessage {
     fn from(error: io::Error) -> Self {
         Self::Error(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod frame_dump_tests {
+    use super::FrameDump;
+
+    fn dump(directory: &std::path::Path, every: u64, limit: u64) -> FrameDump {
+        FrameDump {
+            directory: directory.to_path_buf(),
+            every,
+            limit,
+            seen: 0,
+            written: 0,
+        }
+    }
+
+    #[test]
+    fn ppm_carries_the_pixels_in_red_green_blue_order() {
+        let directory =
+            std::env::temp_dir().join(format!("openstream-dump-order-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        let path = directory.join("one.ppm");
+        // A single pixel packed the way the decoder packs BGRA: blue in the
+        // low byte, red in bits 16-23.
+        FrameDump::write_ppm(&path, 1, 1, &[0x00_11_22_33]).expect("write");
+        let written = std::fs::read(&path).expect("read back");
+        assert_eq!(&written[..11], b"P6\n1 1\n255\n");
+        assert_eq!(&written[11..], &[0x11, 0x22, 0x33]);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn sampling_keeps_one_frame_in_every_n_and_stops_at_the_limit() {
+        let directory =
+            std::env::temp_dir().join(format!("openstream-dump-cadence-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp directory");
+        let mut dump = dump(&directory, 3, 2);
+        for _ in 0..12 {
+            dump.offer(1, 1, &[0]);
+        }
+        // Frames 0 and 3 are written; the limit stops 6 and 9 rather than
+        // letting a long session fill the disk.
+        assert_eq!(dump.written, 2);
+        assert_eq!(dump.seen, 12);
+        assert!(directory.join("frame-000000.ppm").exists());
+        assert!(directory.join("frame-000003.ppm").exists());
+        assert!(!directory.join("frame-000006.ppm").exists());
+        std::fs::remove_dir_all(&directory).ok();
     }
 }
 
@@ -3672,6 +3994,51 @@ mod tests {
             .position(|arg| arg == "low_delay")
             .expect("has low_delay");
         assert!(low_delay < input, "input options must precede -i: {args:?}");
+    }
+
+    #[test]
+    fn videotoolbox_flags_reach_the_demuxer_and_ask_for_cpu_frames() {
+        let args = super::decoder_args_with(super::DecodeAccel::VideoToolbox, "h264", 1920, 1080);
+        let hwaccel = args
+            .iter()
+            .position(|arg| arg == "-hwaccel")
+            .expect("hardware decode requested");
+        assert_eq!(args[hwaccel + 1], "videotoolbox");
+        let input = args.iter().position(|arg| arg == "-i").expect("has input");
+        assert!(
+            hwaccel < input,
+            "input options must precede -i or FFmpeg ignores them: {args:?}"
+        );
+        // The pipeline scales and reads BGRA, which needs CPU frames. Asking
+        // for hardware output would force a download filter for no gain.
+        assert!(!args.iter().any(|arg| arg == "-hwaccel_output_format"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-pix_fmt" && w[1] == "bgra")
+        );
+    }
+
+    #[test]
+    fn the_software_decoder_asks_for_no_hardware() {
+        let args = super::decoder_args_with(super::DecodeAccel::Software, "h264", 1920, 1080);
+        assert!(!args.iter().any(|arg| arg == "-hwaccel"), "{args:?}");
+    }
+
+    #[test]
+    fn the_low_delay_flags_survive_hardware_decode() {
+        // The latency work these flags encode is not specific to the CPU
+        // decoder, so selecting hardware must not quietly drop them.
+        let args = super::decoder_args_with(super::DecodeAccel::VideoToolbox, "h264", 1920, 1080);
+        for (flag, value) in [
+            ("-flags", "low_delay"),
+            ("-fflags", "nobuffer"),
+            ("-analyzeduration", "0"),
+        ] {
+            assert!(
+                args.windows(2).any(|w| w[0] == flag && w[1] == value),
+                "{flag} {value} missing: {args:?}"
+            );
+        }
     }
 
     #[test]

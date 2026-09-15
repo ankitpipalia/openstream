@@ -106,8 +106,8 @@ async fn websocket_bridge() -> (String, JoinHandle<()>) {
 fn pairing() -> Pairing {
     Pairing {
         session_id: "ice-migration-test".into(),
-        host_token: "host-token".into(),
-        client_token: "client-token".into(),
+        host_token: Some("host-token".into()),
+        client_token: Some("client-token".into()),
         websocket_path: "/v1/signal/ice-migration-test/{host|client}".into(),
         expires_in_seconds: 60,
         relay_address: None,

@@ -1149,6 +1149,16 @@ impl Role {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Answer --version before anything starts. A release binary that cannot
+    // say what it is gives the packaging gate nothing to check, and starting
+    // a server in reply to a version query is worse than staying silent.
+    if std::env::args()
+        .skip(1)
+        .any(|argument| argument == "--version")
+    {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let configured_bind = std::env::var("OPENSTREAM_SIGNAL_BIND").ok();
     let bind = configured_bind
         .as_deref()
