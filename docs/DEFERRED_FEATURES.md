@@ -167,6 +167,21 @@ Anything multi-planar across separate descriptors needs `Imports` widened to
 an fd per plane, which is a change to an interface the scanout path also uses
 and should be made deliberately rather than as a side effect.
 
+### The rig can host this work
+
+Checked on the acceptance rig (SteamOS, NVIDIA) on 2026-09-15, so the target
+is not in doubt:
+
+- `VK_EXT_external_memory_dma_buf`, `VK_EXT_image_drm_format_modifier` and
+  `VK_KHR_external_memory_fd` are all present, which is exactly what the
+  existing importer requires.
+- `libpipewire-0.3.so` is present at runtime.
+- PipeWire development headers are **not** installed. That matters only for
+  building: the `pipewire` crate needs them and bindgen at compile time. Build
+  in CI on a runner that has `libpipewire-0.3-dev` and ship the binary to the
+  rig, rather than installing build dependencies onto a SteamOS image where
+  they do not survive an update.
+
 ### Dependency question to answer before starting
 
 A PipeWire client means either the `pipewire` crate's libpipewire bindings or
