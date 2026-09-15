@@ -173,6 +173,7 @@ export function createEmptySnapshot(): ProductSnapshot {
     },
     controlPlane,
     trustedDevices: [],
+    localMode: false,
   };
 
   return {
