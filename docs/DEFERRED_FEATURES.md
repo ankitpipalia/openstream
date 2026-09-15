@@ -99,10 +99,59 @@ implementation gap, and should be taken as one.
 
 ## PipeWire DMA-BUF capture
 
-Status: not implemented, not investigated in depth.
+Status: not implemented, but closer than "not started". The importing half
+already exists and has a working producer; what is missing is a second
+producer.
 
-The Linux host currently converts captured frames to raw BGRA before the
-encoder. A DMA-BUF path would keep the frame on the GPU from the portal's
-PipeWire node through to the encoder. This is a capture-pipeline rewrite
-rather than a flag, and it interacts with the encoder selection and the
-NVIDIA runtime, so it wants its own design pass.
+### What is already built
+
+`lowlat-capture` has a device-side DMA-BUF import path in `vulkan.rs`, using
+`VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier`, and
+it is already fed in production by the DRM/KMS scanout source in
+`scanout.rs`. The tiling modifier and per-plane pitches are passed explicitly
+rather than inferred, which is the whole reason that interface was chosen: a
+tiled or compressed buffer read as plain rows is garbage.
+
+The interface a producer has to satisfy is small:
+
+```rust
+pub struct Imports<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub format: DrmFourcc,
+    pub modifier: u64,
+    pub fd: RawFd,
+    pub planes: &'a [PlaneLayout],  // { offset, pitch }
+}
+```
+
+### What PipeWire has to supply
+
+Every field above has a direct source in a PipeWire buffer: `format` and size
+from `spa_video_info_raw`, `modifier` from the negotiated format parameter,
+and per-plane `fd`, `mapoffset` and `chunk->stride` from `spa_buffer.datas`
+where the data type is `SPA_DATA_DmaBuf`. The portal side is already solved
+elsewhere in this work: the ScreenCast session hands back a node id, and a
+restore token makes the session reusable without a prompt.
+
+So the work is a PipeWire client that negotiates DMA-BUF buffers on that
+node and calls the existing importer, not a rewrite of the conversion or
+encode path.
+
+### The one structural limit to settle first
+
+`Imports` carries a single `fd` with several plane layouts inside it, and
+says so deliberately: "Several distinct descriptors are not handled". PipeWire
+may hand back one file descriptor per plane. For single-plane formats such as
+BGRx that does not arise, so a first implementation can be honest and narrow.
+Anything multi-planar across separate descriptors needs `Imports` widened to
+an fd per plane, which is a change to an interface the scanout path also uses
+and should be made deliberately rather than as a side effect.
+
+### Dependency question to answer before starting
+
+A PipeWire client means either the `pipewire` crate's libpipewire bindings or
+direct FFI. Note that `engine/lowlat/deny.toml` only recently began checking
+Apple targets; a new Linux-only dependency is covered by the existing Linux
+triples, but should still be introduced with `cargo deny check` run rather
+than assumed clean.
