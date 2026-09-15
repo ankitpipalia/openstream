@@ -1,6 +1,7 @@
 import type {
   AccessSnapshot,
   Capability,
+  ConnectRequest,
   DiagnosticsSnapshot,
   ProductSnapshot,
   RuntimeCommand,
@@ -19,6 +20,12 @@ export interface ProductAdapter {
   signIn(username: string, password: string): Promise<ProductSnapshot>;
   registerAccount(username: string, password: string): Promise<ProductSnapshot>;
   signOut(): Promise<ProductSnapshot>;
+  /** Incoming Secure Connect requests awaiting this device's answer. */
+  hostConnectRequests(): Promise<ConnectRequest[]>;
+  /** Approve one request and start hosting the session it created. */
+  approveConnectRequest(requestId: string): Promise<void>;
+  /** Refuse one request. */
+  denyConnectRequest(requestId: string): Promise<void>;
 }
 
 export interface LocalProductAdapter extends ProductAdapter {
@@ -211,6 +218,11 @@ export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmpt
     signIn: async () => currentSnapshot,
     registerAccount: async () => currentSnapshot,
     signOut: async () => currentSnapshot,
+    // The fixture adapter has no control-plane broker, so it never receives
+    // Secure Connect requests and its approve/deny are no-ops.
+    hostConnectRequests: async () => [],
+    approveConnectRequest: async () => {},
+    denyConnectRequest: async () => {},
     setSnapshot: (snapshot) => {
       currentSnapshot = snapshot;
       for (const listener of listeners) {

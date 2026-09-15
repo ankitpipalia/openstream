@@ -4,6 +4,8 @@ import { AppShell } from "./components/AppShell";
 import { createRuntimeUnavailableSnapshot } from "./adapters/productAdapter";
 import type { ProductAdapter } from "./adapters/productAdapter";
 import { createDefaultAdapter } from "./adapters/tauriAdapter";
+import { ConnectApprovalModal } from "./components/ConnectApprovalModal";
+import { useConnectApprovals } from "./hooks/useConnectApprovals";
 import type { PageId, ProductSnapshot } from "./model";
 import { AboutPage } from "./pages/AboutPage";
 import { AccessPage } from "./pages/AccessPage";
@@ -98,9 +100,37 @@ export function App({ adapter = defaultAdapter, initialPage = "computers" }: App
     };
   }, [adapter]);
 
+  // Incoming Secure Connect requests are answered app-wide, not on one page, so
+  // a request is never missed because of where the operator happened to be. The
+  // poll runs only while this device is both hosting and signed in to the
+  // control-plane broker; nothing to receive otherwise.
+  const hosting = snapshot.diagnostics.session.state === "running";
+  const authenticated = snapshot.access.pairing.state === "ready";
+  const approvals = useConnectApprovals(adapter, {
+    enabled: hosting && authenticated,
+    onResolved: () => {
+      adapter
+        .refresh()
+        .then(setSnapshot)
+        .catch(() => {});
+    },
+  });
+
   return (
-    <AppShell activePage={activePage} snapshot={snapshot} onNavigate={setActivePage}>
-      <Page page={activePage} adapter={adapter} snapshot={snapshot} onSnapshot={setSnapshot} />
-    </AppShell>
+    <>
+      <AppShell activePage={activePage} snapshot={snapshot} onNavigate={setActivePage}>
+        <Page page={activePage} adapter={adapter} snapshot={snapshot} onSnapshot={setSnapshot} />
+      </AppShell>
+      {approvals.current ? (
+        <ConnectApprovalModal
+          request={approvals.current}
+          secondsRemaining={approvals.secondsRemaining}
+          pending={approvals.pending}
+          error={approvals.error}
+          onApprove={approvals.approve}
+          onDeny={approvals.deny}
+        />
+      ) : null}
+    </>
   );
 }
