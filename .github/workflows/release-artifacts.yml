@@ -18,10 +18,6 @@ on:
         default: 1.0.0
   push:
     tags: ["v*"]
-    # Temporary: lets this workflow be exercised before it reaches the
-    # default branch, where workflow_dispatch first becomes available.
-    # Remove this branch entry once the workflow has landed on main.
-    branches: ["feat/role-scoped-pairing"]
 
 permissions:
   contents: read
