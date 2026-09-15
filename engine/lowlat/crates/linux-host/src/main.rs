@@ -110,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{}", device_capabilities.log_line());
     let input_enabled = device_capabilities.input.can_advertise();
     let gamepad_enabled = device_capabilities.gamepad.can_advertise();
+    let mut motion_gate = openstream_media::input::MotionGate::default();
     let grants = InputGrants {
         keyboard: host_policy.keyboard && input_enabled,
         mouse: host_policy.mouse && input_enabled,
@@ -338,6 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     injector,
                                     devices,
                                     grants,
+                                    &mut motion_gate,
                                     &mut input_lease,
                                     started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
                                 );
@@ -407,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     injector,
                     devices,
                     grants,
+                    &mut motion_gate,
                     &mut input_lease,
                     started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
                 );
@@ -1009,10 +1012,17 @@ fn apply_input_payload(
     injector: &mut lowlat_inject::event::Injector,
     devices: &mut lowlat_inject::uinput::Devices,
     grants: InputGrants,
+    motion: &mut openstream_media::input::MotionGate,
     input_lease: &mut openstream_media::input::InputLease,
     now_us: u64,
 ) {
     if let Ok(event) = openstream_media::input::InputEvent::decode(payload) {
+        // Motion rides an unreliable, unordered path, so a stale position can
+        // arrive after a newer one. Applying it would teleport the pointer
+        // backwards and leave it there until the next event.
+        if !motion.admit(event) {
+            return;
+        }
         if !input_event_allowed(event, grants) {
             eprintln!("OpenStream rejected an input event without a local adapter");
             return;

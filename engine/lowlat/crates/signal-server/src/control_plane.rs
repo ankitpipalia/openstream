@@ -23,6 +23,12 @@ const MAX_STORE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACCOUNTS: usize = 10_000;
 const MAX_DEVICES_PER_ACCOUNT: usize = 256;
 const MAX_REFRESH_TOKENS_PER_ACCOUNT: usize = 16;
+/// Tombstones kept per account for replay detection.
+///
+/// Larger than the live allowance because one live token can be rotated many
+/// times over its lifetime and every rotation leaves evidence behind. Still
+/// bounded: an aggressive client must not be able to grow this without end.
+const MAX_RETIRED_REFRESH_TOKENS_PER_ACCOUNT: usize = 256;
 const PASSWORD_MIN_BYTES: usize = 12;
 const PASSWORD_MAX_BYTES: usize = 256;
 const USERNAME_MIN_BYTES: usize = 3;
@@ -32,7 +38,17 @@ const DEVICE_NAME_MAX_BYTES: usize = 128;
 const PLATFORM_MAX_BYTES: usize = 64;
 const ACCESS_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-const PBKDF2_ITERATIONS: NonZeroU32 = NonZeroU32::new(600_000).expect("non-zero PBKDF2 cost");
+/// PBKDF2-HMAC-SHA256 cost for new and rehashed passwords.
+///
+/// Matches OWASP's current FIPS-oriented recommendation. It is a `u32` rather
+/// than a `NonZeroU32` because it is also serialised into each account
+/// record; the non-zero invariant is re-established at the one place that
+/// derives.
+const PBKDF2_ITERATIONS_CURRENT: u32 = 600_000;
+
+/// What builds before [`PasswordScheme`] existed used, and therefore what a
+/// record with no stored scheme must be verified with.
+const PBKDF2_ITERATIONS_LEGACY: u32 = 600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +82,13 @@ pub(crate) struct PublicUser {
     pub account_id: String,
     pub username: String,
     pub created_at_ms: u64,
+}
+
+/// Where a token sits in its chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshFamily {
+    family_id: String,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,15 +164,81 @@ impl From<serde_json::Error> for ControlPlaneError {
     }
 }
 
+/// How an account's password verifier was derived.
+///
+/// Stored per account rather than assumed globally. Without this the
+/// iteration count is baked into every existing record: raising it locks out
+/// every user, because their stored hash was produced with the old cost and
+/// there is no way to tell which. A self-describing record makes the upgrade
+/// mechanical -- derive with what the record says, and if that is not the
+/// current recommendation, rehash on the next successful sign-in.
+///
+/// Serialised as a tagged enum so a future scheme -- Argon2id, which OWASP
+/// prefers where FIPS is not a constraint -- is an added variant rather than
+/// a migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "algorithm", rename_all = "kebab-case")]
+pub(crate) enum PasswordScheme {
+    Pbkdf2HmacSha256 { iterations: u32 },
+}
+
+impl PasswordScheme {
+    /// What a new or rehashed password is derived with today.
+    pub(crate) const fn current() -> Self {
+        Self::Pbkdf2HmacSha256 {
+            iterations: PBKDF2_ITERATIONS_CURRENT,
+        }
+    }
+
+    /// Whether a record using this scheme should be upgraded.
+    ///
+    /// Only ever upgrades. A record derived with *more* work than the current
+    /// recommendation is not weakened by staying where it is, and rehashing
+    /// it down would be a downgrade performed automatically, which is the
+    /// opposite of the point.
+    pub(crate) const fn is_outdated(self) -> bool {
+        match self {
+            Self::Pbkdf2HmacSha256 { iterations } => iterations < PBKDF2_ITERATIONS_CURRENT,
+        }
+    }
+}
+
+impl Default for PasswordScheme {
+    /// What a record written before schemes were stored must have used.
+    ///
+    /// Load-bearing for existing stores: an account saved by an earlier build
+    /// has no `password_scheme` field, and guessing the current value for it
+    /// would be wrong the moment the current value changes. This is the
+    /// constant that build actually used.
+    fn default() -> Self {
+        Self::Pbkdf2HmacSha256 {
+            iterations: PBKDF2_ITERATIONS_LEGACY,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountRecord {
     account_id: String,
     username: String,
     password_salt: [u8; 16],
     password_hash: [u8; 32],
+    /// Absent in stores written before schemes were recorded; see
+    /// [`PasswordScheme::default`].
+    #[serde(default)]
+    password_scheme: PasswordScheme,
     created_at_ms: u64,
     devices: BTreeMap<String, DeviceRecord>,
     refresh_tokens: Vec<RefreshTokenRecord>,
+    /// Digests of refresh tokens that have been rotated away.
+    ///
+    /// Retained, not forgotten, because rotation alone detects nothing: if a
+    /// stolen token is simply deleted on use, the thief's replay is
+    /// indistinguishable from an unknown token and the legitimate client
+    /// carries on unaware. Keeping the relationship is what turns a replay
+    /// into evidence. See [`RetiredRefreshToken`].
+    #[serde(default)]
+    retired_refresh_tokens: Vec<RetiredRefreshToken>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,8 +253,41 @@ struct DeviceRecord {
 struct RefreshTokenRecord {
     digest: [u8; 32],
     device_id: Option<String>,
+    /// The chain this token belongs to.
+    ///
+    /// One sign-in starts one family; every rotation extends it. Reuse of any
+    /// token in a family condemns the whole family, because the only two
+    /// explanations are a stolen token and a client that replayed -- and a
+    /// replayed token cannot be told apart from a stolen one, so the safe
+    /// reading is the unsafe one.
+    #[serde(default = "legacy_family_id")]
+    family_id: String,
+    #[serde(default)]
+    generation: u64,
     issued_at_ms: u64,
     expires_at_ms: u64,
+}
+
+/// A refresh token that has been rotated away, kept as evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RetiredRefreshToken {
+    digest: [u8; 32],
+    family_id: String,
+    /// When this tombstone may be forgotten.
+    ///
+    /// The family's own expiry, not the token's: forgetting a tombstone while
+    /// its family is still live would reopen exactly the replay window it
+    /// exists to close.
+    expires_at_ms: u64,
+}
+
+/// Family id for records written before families existed.
+///
+/// Distinct per record rather than shared, so a store upgraded in place does
+/// not treat every pre-existing token as one family that any single reuse
+/// would condemn together.
+fn legacy_family_id() -> String {
+    format!("legacy-{}", Uuid::new_v4().simple())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +309,14 @@ pub(crate) struct AccountStore {
 #[derive(Debug, Clone)]
 struct AccessTokenRecord {
     principal: AccountPrincipal,
+    /// The refresh family this access token was issued alongside.
+    ///
+    /// Without it, condemning a family has to fall back to revoking by
+    /// device, which is wrong in both directions: it takes down unrelated
+    /// families signed in on the same device, and it takes down nothing at
+    /// all for a sign-in that has no device. Revocation has to reach exactly
+    /// the credentials descended from the compromised sign-in.
+    family_id: String,
     expires_at_ms: u64,
 }
 
@@ -226,11 +356,56 @@ impl AccountStore {
     /// way, and it happens without this store's lock held -- which is the
     /// point: a 600,000-iteration PBKDF2 run must not serialize every other
     /// control-plane request behind it.
-    pub(crate) fn password_challenge(&self, username: &str) -> [u8; 16] {
+    /// The salt and scheme a sign-in attempt must derive with.
+    ///
+    /// The scheme travels with the salt because verification has to reproduce
+    /// what the stored record was made with, not what the current build would
+    /// choose. An unknown username gets the decoy salt and the *current*
+    /// scheme, so a probe costs exactly the same work as a real account and
+    /// leaves no cheaper path to measure.
+    pub(crate) fn password_challenge_scheme(&self, username: &str) -> ([u8; 16], PasswordScheme) {
         self.accounts
             .values()
             .find(|account| account.username == username)
-            .map_or(DECOY_PASSWORD_SALT, |account| account.password_salt)
+            .map_or_else(
+                || (DECOY_PASSWORD_SALT, PasswordScheme::current()),
+                |account| (account.password_salt, account.password_scheme),
+            )
+    }
+
+    /// Whether this account's verifier should be rehashed after a successful
+    /// sign-in.
+    pub(crate) fn password_is_outdated(&self, username: &str) -> bool {
+        self.accounts
+            .values()
+            .find(|account| account.username == username)
+            .is_some_and(|account| account.password_scheme.is_outdated())
+    }
+
+    /// Replace an account's verifier with one derived under a new scheme.
+    ///
+    /// Called after the password has already been proven, so this does not
+    /// re-authenticate; it re-encodes. Failing here is not a sign-in failure
+    /// -- the user is already through -- so the caller is expected to ignore
+    /// the outcome rather than turn a successful login into an error.
+    pub(crate) fn rehash_password(
+        &mut self,
+        username: &str,
+        salt: [u8; 16],
+        derived: [u8; 32],
+        scheme: PasswordScheme,
+    ) -> Result<(), ControlPlaneError> {
+        let Some(account) = self
+            .accounts
+            .values_mut()
+            .find(|account| account.username == username)
+        else {
+            return Err(ControlPlaneError::NotFound);
+        };
+        account.password_salt = salt;
+        account.password_hash = derived;
+        account.password_scheme = scheme;
+        self.save()
     }
 
     /// A salt for a new account, generated before the lock is taken.
@@ -274,6 +449,8 @@ impl AccountStore {
         }
         let account_id = Uuid::new_v4().simple().to_string();
         let mut account = AccountRecord {
+            password_scheme: PasswordScheme::current(),
+            retired_refresh_tokens: Vec::new(),
             account_id: account_id.clone(),
             username: username.to_string(),
             password_salt: salt,
@@ -407,6 +584,23 @@ impl AccountStore {
     ) -> Result<IssuedTokens, ControlPlaneError> {
         validate_token(refresh_token)?;
         let digest = token_digest(refresh_token);
+
+        // Replay first, before anything else looks at the live tokens.
+        //
+        // A token presented here that has already been rotated away has two
+        // explanations: it was stolen and the thief is using it, or the
+        // legitimate client replayed one. Neither can be distinguished from
+        // the other, and one of them is a compromise, so the whole family is
+        // condemned -- every refresh token descended from that sign-in, and
+        // every access token issued to the device. The legitimate client is
+        // forced to sign in again, which is the cost of the only reading that
+        // is safe to act on.
+        if let Some((account_id, family_id)) = self.find_retired_family(&digest, now_ms) {
+            self.revoke_refresh_family(&account_id, &family_id);
+            self.save()?;
+            return Err(ControlPlaneError::Unauthorized);
+        }
+
         let mut principal = None;
         let mut expired = false;
         for account in self.accounts.values_mut() {
@@ -420,7 +614,24 @@ impl AccountStore {
                     expired = true;
                     break;
                 }
-                principal = Some((account.account_id.clone(), record.device_id));
+                // The consumed token becomes a tombstone, kept for as long as
+                // its family could still be presented. Deleting it instead --
+                // which is what rotation alone does -- makes a later replay
+                // indistinguishable from an unknown token, so the theft goes
+                // unnoticed and the thief simply carries on.
+                account.retired_refresh_tokens.push(RetiredRefreshToken {
+                    digest: record.digest,
+                    family_id: record.family_id.clone(),
+                    expires_at_ms: record.expires_at_ms,
+                });
+                principal = Some((
+                    account.account_id.clone(),
+                    record.device_id,
+                    RefreshFamily {
+                        family_id: record.family_id,
+                        generation: record.generation.saturating_add(1),
+                    },
+                ));
                 break;
             }
         }
@@ -428,7 +639,7 @@ impl AccountStore {
             self.save()?;
             return Err(ControlPlaneError::Unauthorized);
         }
-        let (account_id, device_id) = principal.ok_or(ControlPlaneError::Unauthorized)?;
+        let (account_id, device_id, family) = principal.ok_or(ControlPlaneError::Unauthorized)?;
         if let Some(device_id) = device_id.as_deref() {
             let trust = self
                 .accounts
@@ -449,8 +660,65 @@ impl AccountStore {
                 });
             }
         }
+        self.prune_retired_refresh_tokens(&account_id, now_ms);
         self.save()?;
-        self.issue_tokens(&account_id, device_id, now_ms)
+        self.issue_tokens_in_family(&account_id, device_id, family, now_ms)
+    }
+
+    /// The family a retired token belonged to, if this digest is one.
+    fn find_retired_family(&self, digest: &[u8; 32], now_ms: u64) -> Option<(String, String)> {
+        self.accounts.values().find_map(|account| {
+            account
+                .retired_refresh_tokens
+                .iter()
+                .find(|retired| &retired.digest == digest && retired.expires_at_ms > now_ms)
+                .map(|retired| (account.account_id.clone(), retired.family_id.clone()))
+        })
+    }
+
+    /// Condemn every credential descended from one sign-in.
+    ///
+    /// Both halves matter. Dropping the refresh tokens stops the chain from
+    /// being extended; dropping the access tokens stops the ones already
+    /// issued from being used for the rest of their lifetime, which is the
+    /// window an attacker would otherwise still hold.
+    fn revoke_refresh_family(&mut self, account_id: &str, family_id: &str) {
+        // By family, not by device. Revoking by device was wrong in both
+        // directions: it took down unrelated families signed in on the same
+        // device, and it took down nothing at all for a sign-in with no
+        // device, leaving the condemned family's access token live for the
+        // rest of its lifetime -- which is precisely the window an attacker
+        // holding it would use.
+        self.access_tokens.retain(|_, token| {
+            token.principal.account_id != account_id || token.family_id != family_id
+        });
+        let Some(account) = self.accounts.get_mut(account_id) else {
+            return;
+        };
+        account
+            .refresh_tokens
+            .retain(|record| record.family_id != family_id);
+        account
+            .retired_refresh_tokens
+            .retain(|retired| retired.family_id != family_id);
+    }
+
+    /// Forget tombstones whose families can no longer be presented.
+    ///
+    /// Bounded as well as expiring: a client that rotates aggressively would
+    /// otherwise grow this list for the token lifetime. The oldest go first,
+    /// which are the ones least likely to still be held by anybody.
+    fn prune_retired_refresh_tokens(&mut self, account_id: &str, now_ms: u64) {
+        if let Some(account) = self.accounts.get_mut(account_id) {
+            account
+                .retired_refresh_tokens
+                .retain(|retired| retired.expires_at_ms > now_ms);
+            if account.retired_refresh_tokens.len() > MAX_RETIRED_REFRESH_TOKENS_PER_ACCOUNT {
+                let remove =
+                    account.retired_refresh_tokens.len() - MAX_RETIRED_REFRESH_TOKENS_PER_ACCOUNT;
+                account.retired_refresh_tokens.drain(..remove);
+            }
+        }
     }
 
     pub(crate) fn authorize_access(
@@ -622,10 +890,28 @@ impl AccountStore {
         }
     }
 
+    /// Issue a fresh token pair at the head of a new family.
+    ///
+    /// Used by sign-in and registration. Rotation goes through
+    /// [`Self::issue_tokens_in_family`] so the chain is preserved.
     fn issue_tokens(
         &mut self,
         account_id: &str,
         device_id: Option<String>,
+        now_ms: u64,
+    ) -> Result<IssuedTokens, ControlPlaneError> {
+        let family = RefreshFamily {
+            family_id: Uuid::new_v4().simple().to_string(),
+            generation: 0,
+        };
+        self.issue_tokens_in_family(account_id, device_id, family, now_ms)
+    }
+
+    fn issue_tokens_in_family(
+        &mut self,
+        account_id: &str,
+        device_id: Option<String>,
+        family: RefreshFamily,
         now_ms: u64,
     ) -> Result<IssuedTokens, ControlPlaneError> {
         let access_token = Uuid::new_v4().simple().to_string();
@@ -639,6 +925,7 @@ impl AccountStore {
                     account_id: account_id.to_string(),
                     device_id: device_id.clone(),
                 },
+                family_id: family.family_id.clone(),
                 expires_at_ms: access_expires_at,
             },
         );
@@ -650,6 +937,8 @@ impl AccountStore {
             account.refresh_tokens.push(RefreshTokenRecord {
                 digest: token_digest(&refresh_token),
                 device_id: device_id.clone(),
+                family_id: family.family_id.clone(),
+                generation: family.generation,
                 issued_at_ms: now_ms,
                 expires_at_ms: refresh_expires_at,
             });
@@ -975,17 +1264,26 @@ fn validate_device_registration(device: &DeviceRegistration) -> Result<(), Contr
 /// account cost exactly the same work and produce no variance to measure.
 const DECOY_PASSWORD_SALT: [u8; 16] = [0x5a; 16];
 
-/// Derive a password verifier. Deliberately expensive, and deliberately
-/// callable without the account store's lock held.
-pub(crate) fn derive_password(password: &str, salt: &[u8; 16]) -> [u8; 32] {
-    password_hash(password, salt)
-}
-
-fn password_hash(password: &str, salt: &[u8; 16]) -> [u8; 32] {
+/// Derive a password verifier with the scheme a record actually used.
+///
+/// Deliberately expensive, and deliberately callable without the account
+/// store's lock held. The scheme is a parameter rather than a constant
+/// because verification must use whatever the stored record was made with,
+/// while new and rehashed passwords use [`PasswordScheme::current`].
+pub(crate) fn derive_password_with(
+    password: &str,
+    salt: &[u8; 16],
+    scheme: PasswordScheme,
+) -> [u8; 32] {
+    let PasswordScheme::Pbkdf2HmacSha256 { iterations } = scheme;
+    // A zero cost would be a stored record claiming no work at all. Clamped
+    // rather than trusted: the record is on disk, and a file that has been
+    // edited must not be able to turn verification into a plain digest.
+    let iterations = NonZeroU32::new(iterations.max(1)).expect("clamped to at least one");
     let mut output = [0_u8; 32];
     pbkdf2::derive(
         pbkdf2::PBKDF2_HMAC_SHA256,
-        PBKDF2_ITERATIONS,
+        iterations,
         salt,
         password.as_bytes(),
         &mut output,
@@ -1067,6 +1365,320 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    /// Register an account and return the store plus its first refresh token.
+    fn registered(store: &mut AccountStore, now_ms: u64) -> String {
+        let salt = AccountStore::registration_salt().expect("salt");
+        let derived = derive_password_with(PASSWORD, &salt, PasswordScheme::current());
+        store
+            .register_derived(
+                "operator",
+                salt,
+                derived,
+                Some(test_device("device-1", 0x11)),
+                false,
+                now_ms,
+            )
+            .expect("register")
+            .refresh_token
+    }
+
+    const PASSWORD: &str = "a-sufficiently-long-password";
+
+    /// Replaying a rotated refresh token condemns the whole family.
+    ///
+    /// Rotation alone detects nothing: if the consumed token is simply
+    /// deleted, a thief's replay is indistinguishable from an unknown token
+    /// and the legitimate client carries on unaware. RFC 9700's model is
+    /// rotation *with the relationship retained*, so a replay is evidence.
+    #[test]
+    fn replaying_a_rotated_refresh_token_revokes_the_family() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let first = registered(&mut store, now);
+
+        let second = store.refresh(&first, now).expect("rotate").refresh_token;
+        let third = store
+            .refresh(&second, now)
+            .expect("rotate again")
+            .refresh_token;
+
+        // A stolen copy of the first token surfaces later.
+        assert!(
+            store.refresh(&first, now).is_err(),
+            "a rotated token must not be accepted again"
+        );
+
+        // The whole chain is now dead, including the token the legitimate
+        // client is holding. That is the intended cost: the two explanations
+        // for a replay are theft and a client bug, and they cannot be told
+        // apart, so the safe reading is the unsafe one.
+        assert!(
+            store.refresh(&third, now).is_err(),
+            "the live token descended from the replayed one must also be revoked"
+        );
+        assert!(store.refresh(&second, now).is_err());
+        cleanup(&directory);
+    }
+
+    /// Revoking a family also kills the access tokens already issued to it.
+    #[test]
+    fn a_revoked_family_takes_its_access_tokens_with_it() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let first = registered(&mut store, now);
+        let rotated = store.refresh(&first, now).expect("rotate");
+        let access = rotated.access_token.clone();
+        assert!(
+            store.authorize_access(&access, now).is_some(),
+            "the access token works before the replay"
+        );
+
+        store.refresh(&first, now).expect_err("replay is refused");
+        assert!(
+            store.authorize_access(&access, now).is_none(),
+            "an access token outliving its condemned family is the window an \
+             attacker would still hold"
+        );
+        cleanup(&directory);
+    }
+
+    /// One account's replay does not disturb another's sessions.
+    #[test]
+    fn revocation_is_confined_to_the_family_that_was_replayed() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let first = registered(&mut store, now);
+
+        // A second sign-in starts a second family on the same account.
+        let (salt, scheme) = store.password_challenge_scheme("operator");
+        let derived = derive_password_with(PASSWORD, &salt, scheme);
+        let other = store
+            .login_derived("operator", salt, derived, None, now)
+            .expect("second sign-in")
+            .refresh_token;
+
+        let rotated = store.refresh(&first, now).expect("rotate").refresh_token;
+        store.refresh(&first, now).expect_err("replay is refused");
+        assert!(store.refresh(&rotated, now).is_err(), "family is condemned");
+        assert!(
+            store.refresh(&other, now).is_ok(),
+            "an unrelated sign-in must survive another family's compromise"
+        );
+        cleanup(&directory);
+    }
+
+    /// Two sign-ins on one device are two families, and condemning one must
+    /// not take the other down.
+    ///
+    /// Revocation used to fall back to "every credential on this device",
+    /// which signed the user out of a session that had nothing to do with the
+    /// compromise.
+    #[test]
+    fn a_replay_does_not_revoke_another_family_on_the_same_device() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let compromised = registered(&mut store, now);
+
+        // A second sign-in from the same device: same account, same device,
+        // different family.
+        let (salt, scheme) = store.password_challenge_scheme("operator");
+        let derived = derive_password_with(PASSWORD, &salt, scheme);
+        let innocent = store
+            .login_derived(
+                "operator",
+                salt,
+                derived,
+                Some(test_device("device-1", 0x11)),
+                now,
+            )
+            .expect("second sign-in on the same device");
+
+        store.refresh(&compromised, now).expect("rotate");
+        store
+            .refresh(&compromised, now)
+            .expect_err("replay is refused");
+
+        assert!(
+            store
+                .authorize_access(&innocent.access_token, now)
+                .is_some(),
+            "the other family's access token must survive"
+        );
+        assert!(
+            store.refresh(&innocent.refresh_token, now).is_ok(),
+            "the other family's refresh token must survive"
+        );
+        cleanup(&directory);
+    }
+
+    /// A sign-in with no device still has its access token revoked.
+    ///
+    /// Device-scoped revocation could not reach these at all, so the
+    /// condemned family's access token stayed live for its full lifetime --
+    /// exactly the window an attacker holding it would use.
+    #[test]
+    fn a_device_less_family_still_loses_its_access_token() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        registered(&mut store, now);
+
+        let (salt, scheme) = store.password_challenge_scheme("operator");
+        let derived = derive_password_with(PASSWORD, &salt, scheme);
+        let headless = store
+            .login_derived("operator", salt, derived, None, now)
+            .expect("sign-in with no device");
+        assert!(headless.device.is_none());
+
+        let rotated = store.refresh(&headless.refresh_token, now).expect("rotate");
+        assert!(
+            store.authorize_access(&rotated.access_token, now).is_some(),
+            "the access token works before the replay"
+        );
+
+        store
+            .refresh(&headless.refresh_token, now)
+            .expect_err("replay is refused");
+        assert!(
+            store.authorize_access(&rotated.access_token, now).is_none(),
+            "a device-less family's access token must be revoked too"
+        );
+        cleanup(&directory);
+    }
+
+    /// A tombstone does not outlive the family it protects.
+    #[test]
+    fn retired_token_evidence_expires_with_its_family() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let first = registered(&mut store, now);
+        store.refresh(&first, now).expect("rotate");
+
+        let after = now + REFRESH_TOKEN_TTL_MS + 1;
+        // Past the family's lifetime the replay is simply unknown rather than
+        // evidence: nothing it could condemn is still live.
+        assert!(store.refresh(&first, after).is_err());
+        cleanup(&directory);
+    }
+
+    /// The stored scheme is what verification uses.
+    ///
+    /// Without this the iteration count is baked into every existing record,
+    /// and raising it locks out every user.
+    #[test]
+    fn a_password_is_verified_with_the_scheme_its_record_was_written_under() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        registered(&mut store, now);
+
+        // Rewrite the record as if an older build had made it, with a cost
+        // this build no longer chooses.
+        let legacy = PasswordScheme::Pbkdf2HmacSha256 { iterations: 1_000 };
+        let salt = AccountStore::registration_salt().expect("salt");
+        let derived = derive_password_with(PASSWORD, &salt, legacy);
+        store
+            .rehash_password("operator", salt, derived, legacy)
+            .expect("rewrite as legacy");
+
+        let (challenge_salt, challenge_scheme) = store.password_challenge_scheme("operator");
+        assert_eq!(challenge_scheme, legacy, "the record describes itself");
+        let verifier = derive_password_with(PASSWORD, &challenge_salt, challenge_scheme);
+        assert!(
+            store
+                .login_derived("operator", challenge_salt, verifier, None, now)
+                .is_ok(),
+            "an account written under an older cost must still be able to sign in"
+        );
+        assert!(
+            store.password_is_outdated("operator"),
+            "and must be marked for upgrade"
+        );
+        cleanup(&directory);
+    }
+
+    /// An unknown username is challenged at the current cost.
+    ///
+    /// A cheaper decoy would be measurable, which is the leak the decoy salt
+    /// exists to prevent.
+    #[test]
+    fn an_unknown_username_is_challenged_at_the_current_cost() {
+        let (store, directory) = test_store();
+        let (_, scheme) = store.password_challenge_scheme("nobody");
+        assert_eq!(scheme, PasswordScheme::current());
+        cleanup(&directory);
+    }
+
+    /// Rehashing replaces the verifier without changing who the account is.
+    #[test]
+    fn rehashing_upgrades_the_verifier_and_keeps_the_account() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        registered(&mut store, now);
+        let legacy = PasswordScheme::Pbkdf2HmacSha256 { iterations: 1_000 };
+        let salt = AccountStore::registration_salt().expect("salt");
+        store
+            .rehash_password(
+                "operator",
+                salt,
+                derive_password_with(PASSWORD, &salt, legacy),
+                legacy,
+            )
+            .expect("downgrade for the test");
+        assert!(store.password_is_outdated("operator"));
+
+        let new_salt = AccountStore::registration_salt().expect("salt");
+        let current = PasswordScheme::current();
+        store
+            .rehash_password(
+                "operator",
+                new_salt,
+                derive_password_with(PASSWORD, &new_salt, current),
+                current,
+            )
+            .expect("upgrade");
+        assert!(!store.password_is_outdated("operator"));
+
+        let (challenge_salt, challenge_scheme) = store.password_challenge_scheme("operator");
+        assert_eq!(challenge_scheme, current);
+        assert!(
+            store
+                .login_derived(
+                    "operator",
+                    challenge_salt,
+                    derive_password_with(PASSWORD, &challenge_salt, challenge_scheme),
+                    None,
+                    now
+                )
+                .is_ok(),
+            "the same password still works after the upgrade"
+        );
+        cleanup(&directory);
+    }
+
+    /// A record claiming zero work is not taken at its word.
+    #[test]
+    fn a_zero_cost_scheme_is_clamped_rather_than_trusted() {
+        let salt = [0x22_u8; 16];
+        let zero = PasswordScheme::Pbkdf2HmacSha256 { iterations: 0 };
+        let one = PasswordScheme::Pbkdf2HmacSha256 { iterations: 1 };
+        assert_eq!(
+            derive_password_with(PASSWORD, &salt, zero),
+            derive_password_with(PASSWORD, &salt, one),
+            "an edited store must not be able to turn verification into a digest"
+        );
+    }
+
+    /// Only upgrades are automatic.
+    #[test]
+    fn a_stronger_than_current_record_is_left_alone() {
+        let stronger = PasswordScheme::Pbkdf2HmacSha256 {
+            iterations: PBKDF2_ITERATIONS_CURRENT * 2,
+        };
+        assert!(
+            !stronger.is_outdated(),
+            "rehashing this down would be an automatic downgrade"
+        );
+    }
+
     /// The three steps a handler performs, in one call.
     ///
     /// Production derives between two short locked sections so a key
@@ -1100,7 +1712,7 @@ mod tests {
         ) -> Result<IssuedTokens, ControlPlaneError> {
             validate_password(password)?;
             let salt = AccountStore::registration_salt()?;
-            let derived = derive_password(password, &salt);
+            let derived = derive_password_with(password, &salt, PasswordScheme::current());
             self.register_derived(username, salt, derived, device, false, now_ms)
         }
 
@@ -1112,8 +1724,8 @@ mod tests {
             now_ms: u64,
         ) -> Result<IssuedTokens, ControlPlaneError> {
             validate_password(password)?;
-            let salt = self.password_challenge(username);
-            let derived = derive_password(password, &salt);
+            let (salt, scheme) = self.password_challenge_scheme(username);
+            let derived = derive_password_with(password, &salt, scheme);
             self.login_derived(username, salt, derived, device, now_ms)
         }
     }

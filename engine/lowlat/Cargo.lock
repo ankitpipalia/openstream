@@ -1953,7 +1953,9 @@ dependencies = [
 name = "openstream-platform"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "lowlat-inject",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2016,6 +2018,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "tower",
  "uuid",
  "webrtc-ice",
  "windows-sys 0.59.0",

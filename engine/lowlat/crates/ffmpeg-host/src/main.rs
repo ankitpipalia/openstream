@@ -197,6 +197,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let negotiated = session
         .negotiate_host_with_capabilities(host_capabilities)
         .await?;
+    let mut host_motion = openstream_media::input::MotionGate::default();
     let mut host_input = input::HostInput::from_environment(
         negotiated.width,
         negotiated.height,
@@ -414,7 +415,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // it here as well as on ReliableControl so every host
                     // adapter has one input policy regardless of which
                     // client generation produced the packet.
-                    if let Err(error) = host_input.apply(&packet.payload) {
+                    if let Err(error) = host_input.apply(&packet.payload, &mut host_motion) {
                         eprintln!("OpenStream host input event rejected: {error}");
                     }
                     continue;
@@ -464,7 +465,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             ) {
                                 // A monitor change is applied by the bounded
                                 // restart in the control tick below.
-                            } else if let Err(error) = host_input.apply(&payload) {
+                            } else if let Err(error) = host_input.apply(&payload, &mut host_motion) {
                                 eprintln!("OpenStream host input event rejected: {error}");
                             }
                         }
@@ -506,7 +507,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // A monitor change is applied by the bounded restart
                         // in the control tick below.
                     } else if packet.payload != b"openstream/end"
-                        && let Err(error) = host_input.apply(&packet.payload)
+                        && let Err(error) = host_input.apply(&packet.payload, &mut host_motion)
                     {
                         eprintln!("OpenStream host input event rejected: {error}");
                     }

@@ -11,6 +11,7 @@ pub mod clipboard_policy;
 pub mod host_heartbeat;
 pub mod hwaccel;
 pub mod policy;
+pub mod process_containment;
 
 /// Build-time and product capability report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

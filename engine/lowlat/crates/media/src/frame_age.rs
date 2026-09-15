@@ -187,6 +187,17 @@ impl DecodedFrame {
 pub enum FrameOffer {
     /// Accepted by the queue.
     Enqueued,
+    /// Accepted, and an older frame the consumer had not yet taken was
+    /// discarded to make room.
+    ///
+    /// This is the latest-frame outcome, and it is the *good* one for an
+    /// interactive stream: the consumer is behind, and what it should be
+    /// shown when it catches up is the newest picture, not a queued stale
+    /// one. Counted separately from [`Self::Enqueued`] because a stream
+    /// producing these constantly is telling you the presenter cannot keep
+    /// up, which is worth seeing even though no frame the viewer wanted was
+    /// lost.
+    ReplacedOlder,
     /// The queue was full, so *this* frame -- the newest one -- was
     /// discarded. Note the direction: a full `try_send` drops the frame
     /// being offered, not the stale frame already queued, which is the
@@ -201,7 +212,7 @@ impl FrameOffer {
     /// Whether the consumer will see this frame.
     #[must_use]
     pub const fn delivered(self) -> bool {
-        matches!(self, Self::Enqueued)
+        matches!(self, Self::Enqueued | Self::ReplacedOlder)
     }
 
     /// Whether the producer should stop. A dropped frame is not a reason to
@@ -217,6 +228,8 @@ impl FrameOffer {
 pub struct QueueCounters {
     /// Frames the queue accepted.
     pub enqueued: u64,
+    /// Frames accepted after displacing an older undelivered frame.
+    pub replaced_older: u64,
     /// Frames discarded because the queue was full.
     pub dropped_newest: u64,
     /// Frames discarded because the consumer was gone.
@@ -227,6 +240,7 @@ impl QueueCounters {
     fn record(&mut self, offer: FrameOffer) {
         let counter = match offer {
             FrameOffer::Enqueued => &mut self.enqueued,
+            FrameOffer::ReplacedOlder => &mut self.replaced_older,
             FrameOffer::DroppedNewest => &mut self.dropped_newest,
             FrameOffer::Closed => &mut self.closed,
         };
@@ -237,14 +251,15 @@ impl QueueCounters {
     #[must_use]
     pub const fn offered(&self) -> u64 {
         self.enqueued
+            .saturating_add(self.replaced_older)
             .saturating_add(self.dropped_newest)
             .saturating_add(self.closed)
     }
 
     fn render(&self, name: &str) -> String {
         format!(
-            "{name} enqueued={} dropped_newest={} closed={}",
-            self.enqueued, self.dropped_newest, self.closed
+            "{name} enqueued={} replaced_older={} dropped_newest={} closed={}",
+            self.enqueued, self.replaced_older, self.dropped_newest, self.closed
         )
     }
 }

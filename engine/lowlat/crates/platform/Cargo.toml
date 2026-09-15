@@ -9,6 +9,24 @@ authors = ["OpenStream contributors"]
 
 [dependencies]
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Job objects are the Windows equivalent of a process group, and the only way
+# to make a session's whole tree die with its supervisor.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # `CreateJobObjectW` takes a `SECURITY_ATTRIBUTES` pointer, so its binding
+    # is gated on this even though a null is passed for it.
+    "Win32_Security",
+    # A suspended child's initial thread has to be found to resume it; Rust's
+    # `Child` does not expose the thread handle.
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 # Test-only, and Unix-only.
 #
 # The capability report and the injector must agree about which grants a

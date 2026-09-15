@@ -25,6 +25,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
+mod connect;
 mod control_plane;
 mod turn;
 use control_plane::{
@@ -432,6 +433,9 @@ struct AppState {
     /// [`authorize_registration`].
     open_registration: bool,
     accounts: Arc<Mutex<AccountStore>>,
+    /// The secure Connect broker: presence, connection requests, approvals,
+    /// and single-delivery role credentials. See [`connect`].
+    connect: Arc<Mutex<connect::ConnectBroker>>,
     admin_token: Option<String>,
     /// Explicit loopback development mode. With no admin token and without
     /// this flag, management endpoints refuse every request.
@@ -475,6 +479,12 @@ struct CreationLimiter {
 }
 
 impl CreationLimiter {
+    /// How much of the window's budget is currently spent.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
     fn allow(&mut self, now: Instant) -> bool {
         self.events
             .retain(|created| now.saturating_duration_since(*created) < SESSION_CREATE_WINDOW);
@@ -617,6 +627,15 @@ impl RateWindow {
 
 struct Session {
     expires_at: Instant,
+    /// Who this session belongs to, and who the two ends are.
+    ///
+    /// A session used to be an anonymous pair of capabilities with a TTL.
+    /// That is enough to stream and not enough to administer: an operator
+    /// cannot see whose session is running, cannot revoke every session
+    /// belonging to a compromised account, and cannot answer "which device
+    /// was this" after the fact. `None` means a provisioning session created
+    /// through the admin endpoint, which by construction has no account.
+    ownership: Option<SessionOwnership>,
     host_token: String,
     client_token: String,
     host: Option<mpsc::Sender<Message>>,
@@ -655,6 +674,7 @@ impl core::fmt::Debug for Session {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Session")
             .field("expires_at", &self.expires_at)
+            .field("ownership", &self.ownership)
             .field("host_token", &"[redacted]")
             .field("client_token", &"[redacted]")
             .field("host_connected", &self.host.is_some())
@@ -671,6 +691,18 @@ impl core::fmt::Debug for Session {
             .field("max_guests", &self.max_guests)
             .finish_non_exhaustive()
     }
+}
+
+/// Who a session belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionOwnership {
+    account_id: String,
+    /// The device that asked for the session, which holds the client role.
+    requester_device_id: String,
+    /// The device that approved it, which holds the host role.
+    target_device_id: String,
+    /// The broker request this session came from, for audit.
+    request_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1188,6 +1220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         open_registration: std::env::var("OPENSTREAM_ALLOW_OPEN_REGISTRATION").as_deref()
             == Ok("1"),
         accounts: Arc::new(Mutex::new(accounts)),
+        connect: Arc::new(Mutex::new(connect::ConnectBroker::default())),
         admin_token,
         allow_no_auth: std::env::var("OPENSTREAM_ALLOW_NO_AUTH").as_deref() == Ok("1"),
         local_no_auth: std::env::var("OPENSTREAM_LOCAL_NO_AUTH").as_deref() == Ok("1"),
@@ -1232,6 +1265,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "/v1/devices/{device_id}/trust",
             patch(set_account_device_trust),
         )
+        .route(
+            "/v1/presence",
+            post(connect_presence).delete(connect_offline),
+        )
+        .route("/v1/connect", post(connect_request))
+        .route("/v1/connect/pending", get(connect_pending))
+        .route("/v1/connect/{request_id}", get(connect_observe))
+        .route("/v1/connect/{request_id}/approve", post(connect_approve))
+        .route("/v1/connect/{request_id}/deny", post(connect_deny))
         .route("/v1/session", post(create_session))
         .route(
             "/v1/session/{session_id}",
@@ -1530,6 +1572,26 @@ async fn derive_password_bounded(
     password: &str,
     salt: [u8; 16],
 ) -> Result<[u8; 32], Response> {
+    derive_password_bounded_with(
+        state,
+        password,
+        salt,
+        control_plane::PasswordScheme::current(),
+    )
+    .await
+}
+
+/// Derive under an explicit scheme, still bounded and still off the executor.
+///
+/// Verification must reproduce the scheme the stored record was written with,
+/// so the cost cannot be a constant at this layer.
+#[allow(clippy::result_large_err, reason = "the error is an HTTP response")]
+async fn derive_password_bounded_with(
+    state: &AppState,
+    password: &str,
+    salt: [u8; 16],
+    scheme: control_plane::PasswordScheme,
+) -> Result<[u8; 32], Response> {
     let Ok(_permit) = state.password_derivations.clone().acquire_owned().await else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1538,7 +1600,7 @@ async fn derive_password_bounded(
             .into_response());
     };
     Ok(without_blocking_the_executor(|| {
-        control_plane::derive_password(password, &salt)
+        control_plane::derive_password_with(password, &salt, scheme)
     }))
 }
 
@@ -1680,25 +1742,53 @@ async fn login_account(
     // Three steps: read the challenge under the lock, derive without it, then
     // verify and mutate under it again. The expensive middle step is what
     // must not be serialized behind the store.
-    let salt = {
+    let (salt, scheme) = {
         let accounts = state.accounts.lock().await;
-        accounts.password_challenge(&request.username)
+        accounts.password_challenge_scheme(&request.username)
     };
-    let derived = match derive_password_bounded(&state, &request.password, salt).await {
+    // Verified with the scheme the stored record was made under, not with
+    // whatever this build would choose today. That is what makes the cost
+    // changeable at all: without it, raising the iteration count locks out
+    // every existing account.
+    let derived = match derive_password_bounded_with(&state, &request.password, salt, scheme).await
+    {
         Ok(derived) => derived,
         Err(response) => return response,
     };
+    let outdated = {
+        let mut accounts = state.accounts.lock().await;
+        let response = match accounts.login_derived(
+            &request.username,
+            salt,
+            derived,
+            device,
+            control_plane::now_ms(),
+        ) {
+            Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+            Err(error) => return control_error_response(error),
+        };
+        if !accounts.password_is_outdated(&request.username) {
+            return response;
+        }
+        response
+    };
+
+    // The sign-in has already succeeded. Rehashing is an upgrade performed
+    // on the way past, so every failure below is swallowed: turning a
+    // successful login into an error because a re-encode did not work would
+    // lock the user out of their account for the sake of tidiness.
+    let Ok(new_salt) = AccountStore::registration_salt() else {
+        return outdated;
+    };
+    let current = control_plane::PasswordScheme::current();
+    let Ok(rehashed) =
+        derive_password_bounded_with(&state, &request.password, new_salt, current).await
+    else {
+        return outdated;
+    };
     let mut accounts = state.accounts.lock().await;
-    match accounts.login_derived(
-        &request.username,
-        salt,
-        derived,
-        device,
-        control_plane::now_ms(),
-    ) {
-        Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
-        Err(error) => control_error_response(error),
-    }
+    let _ = accounts.rehash_password(&request.username, new_salt, rehashed, current);
+    outdated
 }
 
 async fn refresh_account(
@@ -1842,20 +1932,460 @@ async fn reap_expired_sessions(state: &AppState) -> Vec<mpsc::Sender<Message>> {
     senders
 }
 
+// ---------------------------------------------------------------------------
+// Secure Connect: presence, requests, approval, and split role credentials.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ConnectRequestBody {
+    target_device_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectRequestCreated {
+    request_id: String,
+    state: connect::ConnectState,
+    expires_in_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingConnectRequest {
+    request_id: String,
+    requester_device_id: String,
+    expires_in_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectObserved {
+    state: connect::ConnectState,
+}
+
+/// One end of an approved session: a session id and exactly one role token.
+///
+/// There is deliberately no shape in this API that carries both. The absence
+/// is the security property -- a struct with two token fields is one careless
+/// handler away from being returned to the wrong party.
+#[derive(Debug, Serialize)]
+struct ConnectCredential {
+    session_id: String,
+    role: &'static str,
+    token: String,
+    websocket_path: String,
+    relay_address: Option<String>,
+    relay_ticket: String,
+}
+
+fn connect_error_response(error: connect::ConnectError) -> Response {
+    use connect::ConnectError;
+    let status = match error {
+        // Collapsed on purpose. Distinguishing "no such request" from "not
+        // yours" turns request ids into an existence oracle: a caller could
+        // enumerate ids and learn which ones belong to somebody else.
+        ConnectError::NotFound | ConnectError::Forbidden => StatusCode::NOT_FOUND,
+        ConnectError::InvalidState => StatusCode::CONFLICT,
+        // Retryable: the credentials exist but their session does not yet.
+        // 503 rather than 409 so a client knows to try again rather than to
+        // give up on the request.
+        ConnectError::NotPublished => StatusCode::SERVICE_UNAVAILABLE,
+        // Never rendered: the approve handler turns this into a collection.
+        // Mapped anyway so a future caller cannot reach a panic through it.
+        ConnectError::AlreadyApproved => StatusCode::CONFLICT,
+        ConnectError::TargetOffline | ConnectError::TargetNotConnectable => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ConnectError::Busy => StatusCode::TOO_MANY_REQUESTS,
+    };
+    (status, "connect request failed\n").into_response()
+}
+
+/// The device behind an authenticated request.
+///
+/// Every Connect operation is device-scoped: presence belongs to a device,
+/// a request is made by one and answered by another, and a credential is
+/// delivered to exactly one. An account token with no device cannot take part,
+/// which is why this is a separate step from [`account_principal`].
+// `Response` is large, and deliberately so: it is axum's own type and the
+// error path here returns a real HTTP response rather than a code to be
+// rendered later. Boxing it would add an allocation to every refusal to buy
+// back stack that is never hot.
+#[allow(clippy::result_large_err, reason = "the error is an HTTP response")]
+async fn connect_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(String, String), Response> {
+    let principal = account_principal(state, headers).await?;
+    let Some(device_id) = principal.device_id.clone() else {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this operation requires an enrolled device\n",
+        )
+            .into_response());
+    };
+    Ok((principal.account_id, device_id))
+}
+
+fn seconds_until(deadline: Instant, now: Instant) -> u64 {
+    deadline.saturating_duration_since(now).as_secs()
+}
+
+/// Announce that this device is online and able to host.
+async fn connect_presence(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (account_id, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    // Presence is a claim about a device being ready to host, so it is only
+    // accepted from a device the account has actually trusted. A pending or
+    // revoked device announcing itself would appear in its owner's list as a
+    // connectable machine.
+    {
+        let accounts = state.accounts.lock().await;
+        if let Err(error) = accounts.can_create_session(&control_plane::AccountPrincipal {
+            account_id: account_id.clone(),
+            device_id: Some(device_id.clone()),
+        }) {
+            return control_error_response(error);
+        }
+    }
+    state
+        .connect
+        .lock()
+        .await
+        .heartbeat(&account_id, &device_id, Instant::now());
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Stop advertising this device as available.
+async fn connect_offline(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (_, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    state.connect.lock().await.go_offline(&device_id);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Ask a device of this account for a session.
+async fn connect_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ConnectRequestBody>,
+) -> Response {
+    let (account_id, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    // The target has to be a device this account owns and trusts. Checked
+    // against the store rather than inferred from the broker, because
+    // presence is soft state and trust is not.
+    {
+        let accounts = state.accounts.lock().await;
+        let devices = match accounts.list_devices(&account_id) {
+            Ok(devices) => devices,
+            Err(error) => return control_error_response(error),
+        };
+        let connectable = devices.iter().any(|device| {
+            device.device_id == body.target_device_id
+                && device.trust == control_plane::DeviceTrust::Trusted
+        });
+        if !connectable {
+            return connect_error_response(connect::ConnectError::TargetNotConnectable);
+        }
+    }
+    let now = Instant::now();
+    let request_id = Uuid::new_v4().simple().to_string();
+    let mut broker = state.connect.lock().await;
+    match broker.request(
+        request_id,
+        &account_id,
+        &device_id,
+        &body.target_device_id,
+        now,
+    ) {
+        Ok(request) => Json(ConnectRequestCreated {
+            request_id: request.request_id,
+            state: request.state,
+            expires_in_seconds: seconds_until(request.expires_at, now),
+        })
+        .into_response(),
+        Err(error) => connect_error_response(error),
+    }
+}
+
+/// What this device is being asked to approve.
+async fn connect_pending(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let (account_id, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let pending = state
+        .connect
+        .lock()
+        .await
+        .pending_for_target(&account_id, &device_id, now);
+    let body: Vec<PendingConnectRequest> = pending
+        .into_iter()
+        .map(|request| PendingConnectRequest {
+            request_id: request.request_id,
+            requester_device_id: request.requester_device_id,
+            expires_in_seconds: seconds_until(request.expires_at, now),
+        })
+        .collect();
+    Json(body).into_response()
+}
+
+/// Approve a request, and receive the host capability -- only the host one.
+async fn connect_approve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    let (account_id, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let party = connect::Party {
+        account_id: &account_id,
+        device_id: &device_id,
+    };
+
+    // Approve first. If this is refused -- the request expired, or this is
+    // not the device being asked -- no session is created, so a rejected
+    // approval cannot leave an orphan session behind holding capacity.
+    //
+    // An approval this device already made is *not* a refusal. Its response
+    // was lost, and the only thing it can usefully be sent now is the
+    // credential it never received, so that case falls through to collection
+    // below. Anything else, including the rate limit, applies only to an
+    // approval that is actually creating a session: a retry must not consume
+    // a creation slot for a session that already exists.
+    let fresh = {
+        let mut broker = state.connect.lock().await;
+        match broker.approve(
+            &request_id,
+            party,
+            connect::SessionGrant {
+                session_id: Uuid::new_v4().simple().to_string(),
+                host_credential: Uuid::new_v4().simple().to_string(),
+                client_credential: Uuid::new_v4().simple().to_string(),
+            },
+            now,
+        ) {
+            Ok(request) => Some(request),
+            Err(connect::ConnectError::AlreadyApproved) => None,
+            Err(error) => return connect_error_response(error),
+        }
+    };
+
+    if let Some(approved) = fresh {
+        if !state.session_creates.lock().await.allow(Instant::now()) {
+            state.connect.lock().await.withdraw(&request_id);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "session creation rate limit exceeded\n",
+            )
+                .into_response();
+        }
+        let Some(session_id) = approved.session_id.clone() else {
+            state.connect.lock().await.withdraw(&request_id);
+            return connect_error_response(connect::ConnectError::InvalidState);
+        };
+        let (host_token, client_token) = match state
+            .connect
+            .lock()
+            .await
+            .minted_credentials(&request_id, party)
+        {
+            Ok(pair) => pair,
+            Err(error) => return connect_error_response(error),
+        };
+        let session = build_session(
+            DEFAULT_TTL_SECONDS,
+            host_token,
+            client_token,
+            Some(SessionOwnership {
+                account_id: account_id.clone(),
+                requester_device_id: approved.requester_device_id.clone(),
+                target_device_id: device_id.clone(),
+                request_id: request_id.clone(),
+            }),
+        );
+        if let Err(response) = insert_session(&state, session_id, session).await {
+            // The session could not be published, so the approval must not
+            // stand: leaving it would hand out credentials for a session that
+            // does not exist, which the client cannot distinguish from a
+            // network fault.
+            state.connect.lock().await.withdraw(&request_id);
+            return response;
+        }
+        // Only now may either end collect. Between the mint above and this
+        // line the credentials name a session that does not exist.
+        state.connect.lock().await.mark_published(&request_id);
+    }
+
+    let mut broker = state.connect.lock().await;
+    match broker.collect_host_credential(&request_id, party, now) {
+        Ok((session_id, token)) => Json(ConnectCredential {
+            websocket_path: format!("/v1/signal/{session_id}/host"),
+            relay_ticket: relay_ticket::mint(&state.relay_secret, &session_id, "host", "host", 1),
+            relay_address: state.relay_address.map(|address| address.to_string()),
+            session_id,
+            role: "host",
+            token,
+        })
+        .into_response(),
+        Err(error) => connect_error_response(error),
+    }
+}
+
+/// Refuse a request.
+async fn connect_deny(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    let (account_id, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    match state
+        .connect
+        .lock()
+        .await
+        .deny(&request_id, &account_id, &device_id, Instant::now())
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => connect_error_response(error),
+    }
+}
+
+/// Poll a request, and collect the client capability once it is approved.
+async fn connect_observe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    let (account_id, device_id) = match connect_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let now = Instant::now();
+    let mut broker = state.connect.lock().await;
+    let observed = match broker.observe(&request_id, &account_id, &device_id, now) {
+        Ok(state) => state,
+        Err(error) => return connect_error_response(error),
+    };
+    if observed != connect::ConnectState::Approved {
+        return Json(ConnectObserved { state: observed }).into_response();
+    }
+    match broker.collect_client_credential(
+        &request_id,
+        connect::Party {
+            account_id: &account_id,
+            device_id: &device_id,
+        },
+        now,
+    ) {
+        Ok((session_id, token)) => Json(ConnectCredential {
+            websocket_path: format!("/v1/signal/{session_id}/client"),
+            relay_ticket: relay_ticket::mint(
+                &state.relay_secret,
+                &session_id,
+                "client",
+                "client",
+                1,
+            ),
+            relay_address: state.relay_address.map(|address| address.to_string()),
+            session_id,
+            role: "client",
+            token,
+        })
+        .into_response(),
+        Err(error) => connect_error_response(error),
+    }
+}
+
+/// Build an empty session with the given lifetime, role tokens and owner.
+///
+/// Shared by the provisioning endpoint and the Connect broker so the two
+/// cannot drift: a session created through an approval must be the same kind
+/// of object as one created by an operator, or every downstream check has two
+/// cases to get right.
+fn build_session(
+    ttl: u64,
+    host_token: String,
+    client_token: String,
+    ownership: Option<SessionOwnership>,
+) -> Session {
+    Session {
+        expires_at: Instant::now() + Duration::from_secs(ttl),
+        ownership,
+        host_token,
+        client_token,
+        host: None,
+        client: None,
+        host_relay_proof: None,
+        client_relay_proof: None,
+        host_cancel: None,
+        client_cancel: None,
+        host_generation: 0,
+        client_generation: 0,
+        establishment_generation: 0,
+        ready_pair: None,
+        pending_host: VecDeque::new(),
+        pending_client: VecDeque::new(),
+        pending_host_bytes: 0,
+        pending_client_bytes: 0,
+        relay_host: None,
+        relay_client: None,
+        guests: VecDeque::new(),
+        max_guests: max_guests_for_new_session(),
+    }
+}
+
+/// Publish a session, refusing if the service is at capacity.
+///
+/// The expiry sweep runs here rather than only on the reaper's timer, so
+/// capacity is measured against sessions that are actually live.
+#[allow(clippy::result_large_err, reason = "the error is an HTTP response")]
+async fn insert_session(state: &AppState, id: String, session: Session) -> Result<(), Response> {
+    let mut sessions = state.sessions.lock().await;
+    let now = Instant::now();
+    sessions.retain(|_, existing| existing.expires_at > now);
+    if sessions.len() >= MAX_LIVE_SESSIONS {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session capacity reached\n",
+        )
+            .into_response());
+    }
+    sessions.insert(id, session);
+    Ok(())
+}
+
 async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateSession>,
 ) -> Response {
+    // Provisioning only.
+    //
+    // This endpoint returns *both* role capabilities to one caller, which is
+    // a developer and operator workflow: whoever calls it can act as either
+    // end, or hand either end to anybody. That is the wrong shape for a
+    // product, where the person asking for a session must never receive the
+    // capability that controls the machine they are asking to use. Account
+    // holders go through `/v1/connect`, which delivers one role to each
+    // party and nothing to anyone else.
     if !admin_allowed(&state, &headers) {
-        let principal = match account_principal(&state, &headers).await {
-            Ok(principal) => principal,
-            Err(response) => return response,
-        };
-        let accounts = state.accounts.lock().await;
-        if let Err(error) = accounts.can_create_session(&principal) {
-            return control_error_response(error);
-        }
+        return (
+            StatusCode::FORBIDDEN,
+            "session provisioning requires admin authorization; \
+             account holders use POST /v1/connect\n",
+        )
+            .into_response();
     }
     if !state.session_creates.lock().await.allow(Instant::now()) {
         return (
@@ -1874,6 +2404,10 @@ async fn create_session(
 
     let session = Session {
         expires_at: Instant::now() + Duration::from_secs(ttl),
+        // No account owns a provisioning session: this endpoint exists for
+        // an operator or a developer with the admin token, and there is no
+        // principal behind it to attribute the session to.
+        ownership: None,
         host_token: host_token.clone(),
         client_token: client_token.clone(),
         host: None,
@@ -1895,17 +2429,9 @@ async fn create_session(
         guests: VecDeque::new(),
         max_guests: max_guests_for_new_session(),
     };
-    let mut sessions = state.sessions.lock().await;
-    let now = Instant::now();
-    sessions.retain(|_, existing| existing.expires_at > now);
-    if sessions.len() >= MAX_LIVE_SESSIONS {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "session capacity reached\n",
-        )
-            .into_response();
+    if let Err(response) = insert_session(&state, id.clone(), session).await {
+        return response;
     }
-    sessions.insert(id.clone(), session);
 
     let websocket_path = format!("/v1/signal/{id}/{{host|client}}");
     // The first admitted primary socket for each role is generation one. The
@@ -3879,16 +4405,21 @@ mod tests {
         RegistrationAuthorization, RelaySlot, Role, SESSION_CREATE_WINDOW, Session, SourceLimiter,
         admin_allowed, admit_primary_socket as admit_primary_socket_with_cancel,
         authorize_registration, authorized, bearer_token, cleanup_primary_socket,
-        close_primary_pair, direct_message_route, dispatch_generic_message, is_private_lan_address,
-        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
-        queue_pending, reap_expired_sessions, relay_owner_for_ticket, relay_ticket, request_source,
-        signal_socket, supplied_token_is_host, validate_signal_message, validate_startup_auth,
+        close_primary_pair, connect_approve, connect_deny, connect_observe, connect_offline,
+        connect_pending, connect_presence, connect_request, create_session, direct_message_route,
+        dispatch_generic_message, enroll_account_device, is_private_lan_address,
+        list_account_devices, login_account, max_guests_for_new_session,
+        prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
+        register_account, relay_owner_for_ticket, relay_ticket, request_source,
+        set_account_device_trust, signal_socket, supplied_token_is_host, validate_signal_message,
+        validate_startup_auth,
     };
     use axum::Router;
     use axum::body::to_bytes;
+    use axum::extract::ConnectInfo;
     use axum::extract::ws::Message;
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use futures_util::task::{Context, Poll};
     use futures_util::{Sink, SinkExt, StreamExt};
     use openstream_protocol::relay;
@@ -3910,6 +4441,7 @@ mod tests {
 
     fn test_session() -> Session {
         Session {
+            ownership: None,
             expires_at: Instant::now() + Duration::from_secs(60),
             host_token: "host-token".into(),
             client_token: "client-token".into(),
@@ -4309,6 +4841,7 @@ mod tests {
             )),
             open_registration: true,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: true,
@@ -4621,6 +5154,7 @@ mod tests {
             )),
             open_registration: true,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -4812,6 +5346,7 @@ mod tests {
             )),
             open_registration: true,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -4822,6 +5357,7 @@ mod tests {
         state.sessions.lock().await.insert(
             "session-1".into(),
             Session {
+                ownership: None,
                 expires_at: Instant::now() + Duration::from_secs(60),
                 host_token: "host-token".into(),
                 client_token: "client-token".into(),
@@ -5232,6 +5768,7 @@ mod tests {
             )),
             open_registration: false,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: Some("a-sufficiently-long-admin-token".to_string()),
             allow_no_auth: false,
             local_no_auth: false,
@@ -5311,6 +5848,7 @@ mod tests {
             )),
             open_registration: false,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: Some("a-sufficiently-long-admin-token".to_string()),
             allow_no_auth: false,
             local_no_auth: false,
@@ -5376,6 +5914,7 @@ mod tests {
             )),
             open_registration: true,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -5386,6 +5925,7 @@ mod tests {
         state.sessions.lock().await.insert(
             "expired".into(),
             Session {
+                ownership: None,
                 expires_at: Instant::now() - Duration::from_secs(1),
                 host_token: "host-token".into(),
                 client_token: "client-token".into(),
@@ -5436,6 +5976,7 @@ mod tests {
             )),
             open_registration: true,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -5446,6 +5987,7 @@ mod tests {
         state.sessions.lock().await.insert(
             "session-1".into(),
             Session {
+                ownership: None,
                 expires_at: Instant::now() + Duration::from_secs(60),
                 host_token: "host-token".into(),
                 client_token: "client-token".into(),
@@ -5569,6 +6111,7 @@ mod tests {
             )),
             open_registration: true,
             accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
             admin_token: None,
             allow_no_auth: false,
             local_no_auth: false,
@@ -6471,6 +7014,624 @@ mod tests {
                 .pending_host
                 .iter()
                 .any(|message| message_text(message.clone()).contains("path_candidate"))
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Secure Connect, end to end over the real router.
+    // -----------------------------------------------------------------------
+
+    /// The whole product surface in one state, with registration open so the
+    /// test can create the two accounts' devices the way a client would.
+    fn connect_test_state() -> AppState {
+        AppState {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+            auth_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            refresh_attempts: Arc::new(Mutex::new(RateWindow::default())),
+            auth_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            refresh_sources: Arc::new(Mutex::new(SourceLimiter::default())),
+            trusted_proxies: Arc::new(Vec::new()),
+            password_derivations: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_PASSWORD_DERIVATIONS,
+            )),
+            open_registration: true,
+            accounts: test_accounts(),
+            connect: Arc::new(Mutex::new(super::connect::ConnectBroker::default())),
+            admin_token: None,
+            allow_no_auth: false,
+            local_no_auth: false,
+            relay_address: None,
+            turn: None,
+            relay_secret: b"test-relay-secret".to_vec(),
+        }
+    }
+
+    fn connect_router(state: AppState) -> Router {
+        Router::new()
+            .route("/v1/auth/register", post(register_account))
+            .route("/v1/auth/login", post(login_account))
+            .route(
+                "/v1/devices",
+                get(list_account_devices).post(enroll_account_device),
+            )
+            .route(
+                "/v1/devices/{device_id}/trust",
+                axum::routing::patch(set_account_device_trust),
+            )
+            .route(
+                "/v1/presence",
+                post(connect_presence).delete(connect_offline),
+            )
+            .route("/v1/connect", post(connect_request))
+            .route("/v1/connect/pending", get(connect_pending))
+            .route("/v1/connect/{request_id}", get(connect_observe))
+            .route("/v1/connect/{request_id}/approve", post(connect_approve))
+            .route("/v1/connect/{request_id}/deny", post(connect_deny))
+            .route("/v1/session", post(create_session))
+            .with_state(state)
+    }
+
+    /// Drive the real router, so routing and extractors are under test too.
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let body = body.map_or_else(axum::body::Body::empty, |value| {
+            axum::body::Body::from(value.to_string())
+        });
+        let mut request = request.body(body).expect("request");
+        // The auth handlers attribute rate limiting to the peer address, so
+        // they extract `ConnectInfo`. `oneshot` bypasses the connection layer
+        // that normally supplies it, and a missing extension is a 500 rather
+        // than a routing error -- which is exactly the kind of failure that
+        // looks like a broken handler.
+        request.extensions_mut().insert(ConnectInfo::<SocketAddr>(
+            "203.0.113.5:4000".parse().expect("peer address"),
+        ));
+        let response = app.clone().oneshot(request).await.expect("router responds");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body");
+        let value = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, value)
+    }
+
+    /// Register an account with one enrolled device and return its access
+    /// token and device id.
+    async fn register_with_device(
+        app: &Router,
+        username: &str,
+        device_name: &str,
+        key_byte: u8,
+    ) -> (String, String) {
+        let public_key = hex::encode([key_byte; 32]);
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/auth/register",
+            None,
+            Some(serde_json::json!({
+                "username": username,
+                "password": "a-sufficiently-long-password",
+                "device": {
+                    "device_id": device_name,
+                    "name": device_name,
+                    "platform": "test",
+                    "public_key": public_key,
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "register: {body}");
+        let token = body["access_token"]
+            .as_str()
+            .expect("access token")
+            .to_string();
+        (token, device_name.to_string())
+    }
+
+    /// Enrol a second device on an existing account and trust it.
+    async fn enroll_trusted_device(
+        app: &Router,
+        token: &str,
+        device_id: &str,
+        key_byte: u8,
+    ) -> String {
+        let public_key = hex::encode([key_byte; 32]);
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/devices",
+            Some(token),
+            Some(serde_json::json!({
+                "device_id": device_id,
+                "name": device_id,
+                "platform": "test",
+                "public_key": public_key,
+            })),
+        )
+        .await;
+        // A device that signed in has already enrolled itself as pending, so
+        // a conflict here means "already known", which is the state this
+        // helper wants it in.
+        assert!(
+            status == StatusCode::OK || status == StatusCode::CONFLICT,
+            "enroll: {status} {body}"
+        );
+        let (status, body) = call(
+            app,
+            "PATCH",
+            &format!("/v1/devices/{device_id}/trust"),
+            Some(token),
+            Some(serde_json::json!({ "trust": "trusted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "trust: {body}");
+        device_id.to_string()
+    }
+
+    /// Sign a device in on an existing account, binding a token to it.
+    async fn sign_in_as_device(
+        app: &Router,
+        username: &str,
+        device_id: &str,
+        key_byte: u8,
+    ) -> String {
+        let (status, body) = call(
+            app,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(serde_json::json!({
+                "username": username,
+                "password": "a-sufficiently-long-password",
+                "device": {
+                    "device_id": device_id,
+                    "name": device_id,
+                    "platform": "test",
+                    "public_key": hex::encode([key_byte; 32]),
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "login as {device_id}: {body}");
+        body["access_token"]
+            .as_str()
+            .expect("access token")
+            .to_string()
+    }
+
+    /// The product flow, end to end, and the boundary it exists to draw.
+    ///
+    /// Each end receives exactly one role capability and neither can obtain
+    /// the other's. Before the broker there was no way to start a session
+    /// except to hand one caller both, which is a developer workflow wearing
+    /// a product's clothes: the person asking to use a machine received the
+    /// capability that controls it.
+    #[tokio::test]
+    async fn connect_delivers_one_role_capability_to_each_end() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        // The host device signs in as itself; the owner then trusts it.
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+
+        // The host announces it is available.
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "host announces presence");
+
+        // The client asks for it by name.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "connect request: {body}");
+        assert_eq!(body["state"], "pending");
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        // The host sees the prompt.
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["request_id"], serde_json::json!(request_id));
+        assert_eq!(body[0]["requester_device_id"], "device-client");
+
+        // Before approval the client learns only that it is waiting -- no
+        // session, and certainly no capability.
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"], "pending");
+        assert!(body["token"].is_null(), "no capability before approval");
+
+        // The host approves, and receives the host capability only.
+        let (status, host_grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {host_grant}");
+        assert_eq!(host_grant["role"], "host");
+        let session_id = host_grant["session_id"].as_str().expect("session id");
+        let host_capability = host_grant["token"].as_str().expect("host token");
+        assert_eq!(
+            host_grant.as_object().expect("object").keys().count(),
+            6,
+            "the approval response carries one capability and nothing that \
+             could be mistaken for a second: {host_grant}"
+        );
+
+        // The client collects the client capability only.
+        let (status, client_grant) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "observe: {client_grant}");
+        assert_eq!(client_grant["role"], "client");
+        assert_eq!(client_grant["session_id"], serde_json::json!(session_id));
+        let client_capability = client_grant["token"].as_str().expect("client token");
+
+        assert_ne!(
+            host_capability, client_capability,
+            "the two roles must not share one capability"
+        );
+
+        // And the session the pair now shares is attributed to them, so an
+        // operator can answer "whose session is this" and revoke by account.
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(session_id).expect("the session exists");
+        let ownership = session.ownership.as_ref().expect("an owned session");
+        assert_eq!(ownership.requester_device_id, "device-client");
+        assert_eq!(ownership.target_device_id, "device-host");
+        assert_eq!(ownership.request_id, request_id);
+        assert!(!ownership.account_id.is_empty());
+        assert_eq!(session.host_token, host_capability);
+        assert_eq!(session.client_token, client_capability);
+    }
+
+    /// Neither end can take the other's capability, and a retry of one's own
+    /// is answered rather than refused.
+    #[tokio::test]
+    async fn a_role_capability_reaches_only_its_party_and_survives_a_retry() {
+        let app = connect_router(connect_test_state());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        // The requester cannot approve its own request: that would be asking
+        // permission and granting it in one step.
+        let (status, _) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+
+        // The host polling the requester's endpoint gets nothing: it is not
+        // the requesting device, so the request is not addressed to it.
+        let (status, _) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The client collects...
+        let (status, first) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // ...and can collect again if it never received that answer. A
+        // dropped connection must not leave a good session with one end
+        // permanently unable to join it.
+        let (status, again) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(first, again, "a retry gets the same credential");
+    }
+
+    /// An approval whose response was lost can be repeated.
+    ///
+    /// The host has no separate collection route: approving *is* how it
+    /// receives its credential. So a dropped response left a live session the
+    /// host could never join -- the same unrecoverable failure that once-only
+    /// collection produced, one layer up. This drives the exact sequence:
+    /// approve, discard the answer, approve again with the identical request.
+    #[tokio::test]
+    async fn a_lost_approval_response_can_be_repeated_by_the_host() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        // The host approves and the response is lost on the way back.
+        let (status, first) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {first}");
+        let session_id = first["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        // The host repeats the identical request.
+        let (status, again) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a retried approval must not be a conflict: {again}"
+        );
+        assert_eq!(
+            first, again,
+            "and must return the same session and host credential"
+        );
+
+        // Exactly one session exists: the retry did not mint a second.
+        let sessions = state.sessions.lock().await;
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a retry must not create a second session"
+        );
+        assert!(sessions.contains_key(&session_id));
+        drop(sessions);
+
+        // And the client can still collect its own side afterwards.
+        let (status, client_grant) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(client_grant["role"], "client");
+        assert_eq!(client_grant["session_id"], serde_json::json!(session_id));
+        assert_ne!(
+            client_grant["token"], first["token"],
+            "the two roles still hold different capabilities"
+        );
+    }
+
+    /// A retried approval does not spend a session-creation slot.
+    ///
+    /// The limit exists to bound how many sessions can be created. A retry
+    /// creates none, so charging it would let a flaky network exhaust the
+    /// budget for sessions that already exist.
+    #[tokio::test]
+    async fn a_retried_approval_does_not_consume_the_creation_budget() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        let spent_after_first = state.session_creates.lock().await.len();
+        for _ in 0..5 {
+            let (status, _) = call(
+                &app,
+                "POST",
+                &format!("/v1/connect/{request_id}/approve"),
+                Some(&host_token),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            state.session_creates.lock().await.len(),
+            spent_after_first,
+            "retries must not be charged against session creation"
+        );
+    }
+
+    /// An untrusted or unknown device is not connectable.
+    #[tokio::test]
+    async fn only_a_trusted_device_of_this_account_can_be_asked() {
+        let app = connect_router(connect_test_state());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+
+        // Enrolled but still pending: announcing presence is refused, so a
+        // device the owner has not accepted never appears connectable.
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // And asking for it is refused independently of presence.
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "a-device-that-does-not-exist" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A refusal is reported as a refusal.
+    #[tokio::test]
+    async fn a_denied_request_is_visible_to_the_asker() {
+        let app = connect_router(connect_test_state());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        let (status, _) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/deny"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["state"], "denied",
+            "a refusal the asker never sees reads as the host being broken"
+        );
+    }
+
+    /// The two-capability endpoint is no longer reachable by account holders.
+    #[tokio::test]
+    async fn session_provisioning_is_admin_only() {
+        let app = connect_router(connect_test_state());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/session",
+            Some(&client_token),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "an account holder must not be able to mint both role capabilities"
         );
     }
 }

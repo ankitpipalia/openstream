@@ -7,6 +7,7 @@
 //! input never cross Tauri IPC.
 
 use openstream_client_core::load_pairing_from_file;
+use openstream_platform::process_containment::{self, Containment};
 use openstream_settings::AppConfig;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -102,8 +103,14 @@ struct RunnerStatus {
 /// the seam rather than pretending the platform difference does not exist.
 #[derive(Debug, Clone)]
 enum CleanupTarget {
-    /// Every process in the session runner's process group.
-    ProcessGroup(i32),
+    /// Whatever this platform uses to hold a session's process tree: a
+    /// process group on Unix, a job object on Windows.
+    ///
+    /// `Arc` because the supervisor clones the target to sweep it without
+    /// holding a borrow across an await, and a Windows job is an owned handle
+    /// that must not be duplicated -- closing one copy early would terminate
+    /// the tree, since the job is created with `KILL_ON_JOB_CLOSE`.
+    Contained(std::sync::Arc<Containment>),
     /// Test-only: a target whose drain outcome the test decides.
     ///
     /// The supervisor's retry contract cannot be tested deterministically
@@ -122,7 +129,7 @@ enum CleanupTarget {
 impl CleanupTarget {
     async fn sweep(&self, grace: Duration, drain: Duration) -> Result<(), SessionError> {
         match self {
-            Self::ProcessGroup(group) => sweep_process_group(*group, grace, drain).await,
+            Self::Contained(containment) => sweep_containment(containment, grace, drain).await,
             #[cfg(test)]
             Self::Controlled(drains) => {
                 if drains.load(std::sync::atomic::Ordering::SeqCst) {
@@ -311,27 +318,61 @@ impl SessionSupervisor {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // Keep FFmpeg and any helper it creates in a session-owned
-            // process group. The supervisor can therefore release capture,
-            // decoder and audio resources together on disconnect.
-            command.as_std_mut().process_group(0);
-        }
+        // Whatever this platform needs before the child exists: a new process
+        // group on Unix, a suspended start on Windows so the runner cannot
+        // spawn FFmpeg before it has been put in its job.
+        //
+        // No `cfg` here on purpose. This shell is built for Windows nowhere --
+        // not on a developer machine, not in CI -- so a platform branch
+        // written here would be verified by nothing. It lives in
+        // `openstream-platform`, which the target matrix compiles for both
+        // Windows targets.
+        process_containment::prepare_command(command.as_std_mut());
+        let prepared = Containment::prepare().map_err(|_| SessionError::SpawnFailed)?;
         // Remove a status left by a previous runner before spawning the new
         // one. Removing it after spawn creates a race in which a fast runner
         // writes `starting` and the supervisor immediately deletes the only
         // proof that it exists.
         let _ = std::fs::remove_file(&self.status_file);
         let child = command.spawn().map_err(|_| SessionError::SpawnFailed)?;
-        // Recorded now, while the pid is certainly live. Taking it later --
-        // after `wait` has reaped the leader -- is how the group id gets lost
+        // Bound now, while the pid is certainly live. Taking it later -- after
+        // `wait` has reaped the leader -- is how the container gets lost
         // precisely in the case where it is still needed.
-        self.cleanup = child
+        //
+        // No platform branch here on purpose: `prepare` returns the job that
+        // Windows must create beforehand and nothing on Unix, and `bind` does
+        // whichever of "assign into the job" or "name the group" applies.
+        // Putting that difference in the caller is how one platform ends up
+        // uncontained without anybody noticing.
+        // Contain, then start. On Windows the child is suspended until this
+        // succeeds, so it cannot spawn anything outside its job; on Unix it
+        // is already in its own group and `resume` is a no-op.
+        //
+        // An uncontained session is the leak this exists to stop and would
+        // only be discovered when the next connect failed, so a failure here
+        // kills the child rather than running it loose. While it is still
+        // suspended, killing the runner and killing the tree are the same
+        // thing.
+        let contained = child
             .id()
-            .and_then(|pid| i32::try_from(pid).ok())
-            .map(CleanupTarget::ProcessGroup);
+            .ok_or(SessionError::SpawnFailed)
+            .and_then(|pid| Containment::bind(prepared, pid).map_err(|_| SessionError::SpawnFailed))
+            .and_then(|containment| {
+                containment
+                    .resume()
+                    .map(|()| containment)
+                    .map_err(|_| SessionError::SpawnFailed)
+            });
+        let containment = match contained {
+            Ok(containment) => containment,
+            Err(error) => {
+                let mut child = child;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(error);
+            }
+        };
+        self.cleanup = Some(CleanupTarget::Contained(std::sync::Arc::new(containment)));
         self.child = Some(child);
         self.device_id = Some(device_id.into());
         self.session_id = Some(pairing.session_id);
@@ -360,19 +401,23 @@ impl SessionSupervisor {
         // the remote desktop in the meantime. So the graceful signal gets the
         // full `STOP_TIMEOUT` before anything escalates.
         //
-        // On a platform with no graceful process-group signal,
-        // `signal_process_group` is a no-op and the wait below simply times
-        // out into the kill, which is the only mechanism available there.
-        signal_process_group(&child, false);
+        // On a platform with no graceful group signal -- Windows -- this is
+        // refused and the wait below simply times out into the forced stop,
+        // which is the only mechanism available there.
+        if let Some(CleanupTarget::Contained(containment)) = self.cleanup.as_ref() {
+            let _ = containment.terminate(false);
+        }
         let status = match tokio::time::timeout(STOP_TIMEOUT, child.wait()).await {
             Ok(Ok(status)) => status,
             Ok(Err(_)) => return Err(SessionError::StopFailed),
             Err(_) => {
-                // It ignored the request or is wedged. Take the group with
-                // it: the runner owns an FFmpeg child of its own, and a
+                // It ignored the request or is wedged. Take the whole tree
+                // with it: the runner owns an FFmpeg child of its own, and a
                 // decoder left holding the pairing file and a UDP socket is
                 // exactly what makes the next connect fail.
-                signal_process_group(&child, true);
+                if let Some(CleanupTarget::Contained(containment)) = self.cleanup.as_ref() {
+                    let _ = containment.terminate(true);
+                }
                 let _ = child.kill().await;
                 child.wait().await.map_err(|_| SessionError::StopFailed)?
             }
@@ -635,119 +680,70 @@ fn validate_pairing_path(path: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// Whether a group id may be signalled with a negated pid.
+/// How long a descendant gets between the container's polite stop and its
+/// forced one.
 ///
-/// **This is a safety gate, not a validation nicety.** `kill` gives two pid
-/// values a meaning that has nothing to do with the number itself:
-///
-/// ```text
-/// kill(-1, sig)   every process the caller may signal
-/// kill(0, sig)    the caller's own process group -- including the caller
-/// ```
-///
-/// So negating a group id of 1 does not target "process group 1"; it targets
-/// the entire session, the desktop shell, and everything else this user is
-/// running. A group id of 0 would kill the supervisor itself. Neither can be
-/// a real session runner's group, so both are refused here rather than
-/// anywhere a caller might forget.
-#[cfg(unix)]
-const fn is_signallable_group(group: i32) -> bool {
-    group > 1
-}
-
-#[cfg(unix)]
-fn signal_process_group(child: &Child, force: bool) {
-    let Some(pid) = child
-        .id()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .filter(|pid| is_signallable_group(*pid))
-    else {
-        return;
-    };
-    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-    // SAFETY: `child.id()` is a live positive process id owned by this
-    // supervisor, and negating it targets the process group created for the
-    // session runner rather than an unrelated process.
-    let result = unsafe { libc::kill(-pid, signal) };
-    if result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-        // The direct child kill below remains the authoritative fallback. A
-        // group that cannot be signalled must not make disconnect hang.
-    }
-}
-
-#[cfg(not(unix))]
-fn signal_process_group(_child: &Child, _force: bool) {}
-
-/// How long a descendant gets between the group's SIGTERM and its SIGKILL.
-///
-/// Short on purpose: the group has already had the full [`STOP_TIMEOUT`] to
-/// respond to the first SIGTERM by the time this runs. This is the grace for
+/// Short on purpose: the tree has already had the full [`STOP_TIMEOUT`] to
+/// respond to the first request by the time this runs. This is the grace for
 /// a process that only started shutting down when its parent went away.
 const GROUP_SWEEP_GRACE: Duration = Duration::from_millis(500);
 
-/// How long to wait for a SIGKILLed group to actually disappear.
+/// How long to wait for a terminated tree to actually disappear.
 ///
-/// SIGKILL is not catchable, so this is only scheduling and reaping latency.
-/// It is bounded because "wait until it is gone" must not become "wait
-/// forever" when something is unkillable -- a process stuck in uninterruptible
-/// I/O, or one this user may signal but not reap.
+/// A forced termination is not catchable, so this is only scheduling and
+/// reaping latency. It is bounded because "wait until it is gone" must not
+/// become "wait forever" when something is unkillable -- a process stuck in
+/// uninterruptible I/O, or one this user may signal but not reap.
 const GROUP_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Make sure nothing is left running in the session's process group.
+/// Make sure nothing is left running in the session's container.
 ///
-/// Returns only once the group is observably empty. Returning after merely
-/// *sending* SIGKILL would be reporting an intention rather than a result: the
+/// Returns only once the container is observably empty. Returning after
+/// merely *asking* would be reporting an intention rather than a result: the
 /// caller marks the session idle and deletes its state on the strength of
 /// this, so it has to be a fact by then.
 ///
-/// `Err` means the group could not be proven empty within
-/// [`GROUP_DRAIN_TIMEOUT`]. The caller must not claim a clean shutdown in that
-/// case -- something is still holding the pairing file and the UDP port, and
-/// saying otherwise makes the next connect fail for reasons that look nothing
-/// like this one.
+/// `Err` means the tree could not be proven empty within
+/// [`GROUP_DRAIN_TIMEOUT`]. The caller must not claim a clean shutdown in
+/// that case -- something is still holding the pairing file and the UDP port,
+/// and saying otherwise makes the next connect fail for reasons that look
+/// nothing like this one.
 ///
-/// There is a narrow pid-reuse hazard worth stating rather than hiding: the
-/// group id is the exited runner's pid, so between its reaping and the probe
-/// below the operating system could in principle recycle that pid as a new
-/// group leader. The window is microseconds and requires the recycled process
-/// to become a group leader; against that, skipping the sweep leaves an
-/// orphaned decoder every time a descendant ignores SIGTERM, which is a
-/// certainty rather than a race.
-#[cfg(unix)]
-async fn sweep_process_group(
-    group: i32,
+/// There is a narrow pid-reuse hazard on Unix worth stating rather than
+/// hiding: the group id is the exited runner's pid, so between its reaping
+/// and the probe below the operating system could in principle recycle that
+/// pid as a new group leader. The window is microseconds and requires the
+/// recycled process to become a group leader; against that, skipping the
+/// sweep leaves an orphaned decoder every time a descendant ignores a polite
+/// stop, which is a certainty rather than a race. Windows job objects have no
+/// equivalent hazard: the handle names the job directly.
+async fn sweep_containment(
+    containment: &Containment,
     grace: Duration,
     drain: Duration,
 ) -> Result<(), SessionError> {
-    if !is_signallable_group(group) {
-        // Not a group this may sweep. See `is_signallable_group`: negating 1
-        // or 0 would reach far beyond this session.
+    if containment.is_empty() {
         return Ok(());
     }
-    if !process_group_has_members(group) {
+    // Something is still there. Ask it to leave, then insist.
+    let _ = containment.terminate(false);
+    if drain_containment(containment, grace).await {
         return Ok(());
     }
-    // Signal 0 above proved something is still there. Ask it to leave, then
-    // insist.
-    unsafe { libc::kill(-group, libc::SIGTERM) };
-    if drain_process_group(group, grace).await {
-        return Ok(());
-    }
-    unsafe { libc::kill(-group, libc::SIGKILL) };
-    if drain_process_group(group, drain).await {
+    let _ = containment.terminate(true);
+    if drain_containment(containment, drain).await {
         return Ok(());
     }
     Err(SessionError::StopFailed)
 }
 
-/// Poll until the group is empty or `budget` elapses. Reports whether it
+/// Poll until the container is empty or `budget` elapses. Reports whether it
 /// actually drained.
-#[cfg(unix)]
-async fn drain_process_group(group: i32, budget: Duration) -> bool {
+async fn drain_containment(containment: &Containment, budget: Duration) -> bool {
     const POLL: Duration = Duration::from_millis(20);
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if !process_group_has_members(group) {
+        if containment.is_empty() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -757,50 +753,11 @@ async fn drain_process_group(group: i32, budget: Duration) -> bool {
     }
 }
 
-/// Whether any process remains in `group`.
-///
-/// Signal 0 performs the permission and existence checks without delivering
-/// anything, which is exactly the probe wanted here.
-#[cfg(unix)]
-fn process_group_has_members(group: i32) -> bool {
-    if !is_signallable_group(group) {
-        return false;
-    }
-    // SAFETY: signal 0 delivers nothing; it only reports whether the target
-    // group exists and is signallable by this process.
-    let result = unsafe { libc::kill(-group, 0) };
-    if result == 0 {
-        return true;
-    }
-    // ESRCH means the group is empty, which is the outcome wanted. Anything
-    // else (EPERM, say) means something is there that cannot be signalled,
-    // and reporting it as empty would be the wrong answer.
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-/// No containment primitive is wired up off Unix yet.
-///
-/// This returns `Ok` because the supervisor must still be able to end a
-/// session on those platforms, but it proves nothing: `kill_on_drop` and
-/// `Child::kill` reach the runner alone, so a descendant it spawned survives.
-/// A Windows Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is
-/// the equivalent guarantee and is what should replace this, at which point
-/// [`CleanupTarget`] gains the variant that owns its handle.
-#[cfg(not(unix))]
-async fn sweep_process_group(
-    _group: i32,
-    _grace: Duration,
-    _drain: Duration,
-) -> Result<(), SessionError> {
-    Ok(())
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        is_signallable_group, process_group_has_members, sweep_process_group, CleanupTarget,
-        SessionError, SessionProcessState, SessionSupervisor, GROUP_DRAIN_TIMEOUT,
-        GROUP_SWEEP_GRACE,
+        sweep_containment, CleanupTarget, Containment, SessionError, SessionProcessState,
+        SessionSupervisor, GROUP_DRAIN_TIMEOUT, GROUP_SWEEP_GRACE,
     };
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -817,6 +774,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Whether anything is still running in `group`.
+    ///
+    /// The supervisor no longer owns this check -- it belongs to the shared
+    /// containment primitive -- but the process tests still need it to assert
+    /// that a sweep did something.
+    fn group_has_members(group: i32) -> bool {
+        u32::try_from(group)
+            .ok()
+            .and_then(|pid| Containment::adopt(pid).ok())
+            .is_some_and(|containment| !containment.is_empty())
     }
 
     fn supervisor() -> (SessionSupervisor, RuntimeDir) {
@@ -868,16 +837,20 @@ mod tests {
              anything if the group is already empty"
         );
 
-        sweep_process_group(group, GROUP_SWEEP_GRACE, GROUP_DRAIN_TIMEOUT)
-            .await
-            .expect("the sweep proves the group drained");
+        sweep_containment(
+            &Containment::adopt(u32::try_from(group).expect("group id")).expect("containment"),
+            GROUP_SWEEP_GRACE,
+            GROUP_DRAIN_TIMEOUT,
+        )
+        .await
+        .expect("the sweep proves the group drained");
 
         // Asserted immediately, with no polling of its own. The sweep is what
         // the caller relies on before reporting a stopped session, so it has
         // to return a fact rather than an intention -- a test that waits after
         // the call would hide exactly that gap.
         assert!(
-            !process_group_has_members(group),
+            !group_has_members(group),
             "the group must already be empty when the sweep returns"
         );
     }
@@ -892,14 +865,16 @@ mod tests {
     /// the machine with it.
     #[test]
     fn wildcard_and_self_group_ids_are_never_signallable() {
-        assert!(!is_signallable_group(-1));
-        assert!(!is_signallable_group(0));
+        // The gate itself is asserted in `openstream_platform`, which owns
+        // it. What matters here is that the supervisor cannot construct a
+        // containment around one of those values at all.
+        assert!(Containment::adopt(0).is_err());
         assert!(
-            !is_signallable_group(1),
+            Containment::adopt(1).is_err(),
             "negating 1 is kill's every-process wildcard, not process group 1"
         );
-        assert!(is_signallable_group(2));
-        assert!(!process_group_has_members(1));
+        assert!(Containment::adopt(2).is_ok());
+        assert!(!group_has_members(1));
     }
 
     /// A group that will not drain must never be reported as a finished
@@ -940,7 +915,7 @@ mod tests {
     /// author would pick -- while a fast one makes the wait pure delay.
     async fn await_group_members(group: i32) -> bool {
         for _ in 0..200 {
-            if process_group_has_members(group) {
+            if group_has_members(group) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1118,19 +1093,21 @@ mod tests {
         let mut exited = false;
         for _ in 0..200 {
             exited = exited || child.try_wait().expect("try_wait").is_some();
-            if exited && process_group_has_members(group) {
+            if exited && group_has_members(group) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(exited, "the runner should have exited on its own");
         assert!(
-            process_group_has_members(group),
+            group_has_members(group),
             "the descendant must be running or this test proves nothing"
         );
 
         supervisor.child = Some(child);
-        supervisor.cleanup = Some(CleanupTarget::ProcessGroup(group));
+        supervisor.cleanup = Some(CleanupTarget::Contained(std::sync::Arc::new(
+            Containment::adopt(u32::try_from(group).expect("group id")).expect("containment"),
+        )));
         supervisor.session_id = Some("session-2".to_string());
         supervisor.state = SessionProcessState::Running;
 
@@ -1142,7 +1119,7 @@ mod tests {
         );
         assert!(!health.cleanup_pending);
         assert!(
-            !process_group_has_members(group),
+            !group_has_members(group),
             "poll must sweep the group, not merely forget the child"
         );
     }
@@ -1163,9 +1140,13 @@ mod tests {
 
         // Nothing to signal, and nothing to wait for.
         let started = std::time::Instant::now();
-        sweep_process_group(group, GROUP_SWEEP_GRACE, GROUP_DRAIN_TIMEOUT)
-            .await
-            .expect("an empty group sweeps cleanly");
+        sweep_containment(
+            &Containment::adopt(u32::try_from(group).expect("group id")).expect("containment"),
+            GROUP_SWEEP_GRACE,
+            GROUP_DRAIN_TIMEOUT,
+        )
+        .await
+        .expect("an empty group sweeps cleanly");
         assert!(
             started.elapsed() < GROUP_SWEEP_GRACE,
             "an empty group must not cost the escalation grace period"
