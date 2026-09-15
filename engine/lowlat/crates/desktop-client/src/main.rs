@@ -2619,12 +2619,19 @@ enum SessionDecoder {
 
 impl SessionDecoder {
     /// Submit one reassembled access unit to the decoder.
+    // On non-macOS the native arm is compiled out, so the match has a single
+    // arm and these two fields go unused; both are fine and intentional.
+    #[cfg_attr(not(target_os = "macos"), allow(clippy::match_single_binding))]
     async fn feed(
         &mut self,
         payload: &[u8],
         presentation_time_us: u64,
         keyframe: bool,
     ) -> std::io::Result<()> {
+        // Consumed only by the native arm; reference them so they are not unused
+        // where that arm is compiled out.
+        #[cfg(not(target_os = "macos"))]
+        let _ = (presentation_time_us, keyframe);
         match self {
             SessionDecoder::Ffmpeg { stdin, .. } => stdin.write_all(payload).await,
             #[cfg(target_os = "macos")]
@@ -2655,7 +2662,9 @@ struct NativeAccessUnit {
 /// Build the session decoder for `backend`: spawn the ffmpeg subprocess plus its
 /// stdout reader, or the native decoder thread. Both feed the same mailbox
 /// through [`publish_decoded_picture`], so everything downstream is identical.
+// On non-macOS the native arm is compiled out, leaving a single-arm match.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_os = "macos"), allow(clippy::match_single_binding))]
 fn build_session_decoder(
     backend: decode_dispatch::DecodeBackend,
     format: &str,
