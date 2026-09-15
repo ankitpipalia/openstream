@@ -367,4 +367,91 @@ mod loopback {
             "ffmpeg fallback centre should be blue (B={blue} G={green} R={red})"
         );
     }
+
+    /// Sustained run through the real decode → mailbox pipeline: loop a clip
+    /// until `target` frames decode, asserting the decoder and mailbox stay
+    /// healthy — every access unit decodes without error, the hardware decoder
+    /// stays selected, and a consumer that keeps pace loses nothing. Ignored by
+    /// default; run for several minutes with, e.g.:
+    ///
+    ///   OPENSTREAM_REQUIRE_VT_TEST=1 OPENSTREAM_SOAK_FRAMES=5400 \
+    ///     cargo test -p openstream-desktop-client -- --ignored loopback_soak
+    ///
+    /// (5400 frames ≈ 3 minutes at 30 fps.)
+    #[test]
+    #[ignore = "soak; run explicitly with --ignored"]
+    fn loopback_soak_stays_healthy_over_many_frames() {
+        let target: usize = std::env::var("OPENSTREAM_SOAK_FRAMES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(600);
+        let Some(stream) = generate_h264("testsrc2=size=320x240:rate=30", 30, 30) else {
+            return;
+        };
+        let access_units = access_units_by_aud(&stream);
+        assert!(!access_units.is_empty(), "fixture produced no access units");
+
+        let mut assembler = Assembler::new(4 * 1024 * 1024, 64);
+        let mut decoder = NativeVideoDecoder::new();
+        let (publisher, reader) = latest_frame::<DecodedFrame>();
+
+        let mut decoded = 0usize;
+        let mut consumed = 0usize;
+        let mut replaced = 0usize;
+        let mut frame_id = 0u32;
+
+        'soak: loop {
+            for au in &access_units {
+                let fragments = fragment_frame(
+                    frame_id,
+                    u64::from(frame_id) * 33_000,
+                    au_is_keyframe(au),
+                    au,
+                )
+                .expect("fragment");
+                frame_id = frame_id
+                    .checked_add(1)
+                    .expect("frame id fits u32 for a soak");
+                let mut ready = Vec::new();
+                for bytes in fragments {
+                    if let Some(frame) = assembler
+                        .push(Fragment::decode(&bytes).expect("decode fragment"))
+                        .expect("assemble")
+                        .into_ready()
+                    {
+                        ready.push(frame);
+                    }
+                }
+                while let Some(frame) = assembler.pop_ready() {
+                    ready.push(frame);
+                }
+                for encoded in ready {
+                    let frames = decoder
+                        .decode(&encoded)
+                        .expect("native decode stayed healthy");
+                    for frame in frames {
+                        decoded += 1;
+                        if publisher.publish(frame) == FrameOffer::ReplacedOlder {
+                            replaced += 1;
+                        }
+                        if reader.take().is_some() {
+                            consumed += 1;
+                        }
+                        if decoded >= target {
+                            break 'soak;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(decoded >= target, "decoded {decoded} of target {target}");
+        assert_eq!(
+            decoder.hardware_accelerated(),
+            Some(true),
+            "the hardware decoder stayed selected for the whole run"
+        );
+        assert_eq!(replaced, 0, "a consumer that keeps pace replaces nothing");
+        assert_eq!(consumed, decoded, "every decoded frame was consumed");
+    }
 }
