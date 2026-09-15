@@ -54,6 +54,10 @@ use tokio::process::{Child, Command};
 mod display;
 mod fullscreen;
 mod mic;
+// NV12 -> BGRA conversion shared by the vendor-neutral hardware decoders
+// (Windows Media Foundation, Linux VAAPI) and VideoToolbox surface mode. Pure
+// and platform-agnostic, unit-tested on every target.
+mod nv12;
 mod raw_pointer;
 mod render;
 // In-process VideoToolbox H.264 decode (macOS). Landed and tested in isolation;
