@@ -60,6 +60,9 @@ mod render;
 // the DecodeAccel dispatch wires it into the hot path in a follow-up commit.
 #[cfg(target_os = "macos")]
 mod vt_decoder;
+// Zero-copy import of a decoded CVPixelBuffer into a wgpu texture (macOS, M2).
+#[cfg(target_os = "macos")]
+mod vt_gpu;
 // Decoder-backend selection and the native decode -> DecodedFrame path, shared
 // by the (future) runtime dispatch and the loopback harness. Not yet wired into
 // the live network loop.

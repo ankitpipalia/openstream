@@ -1847,6 +1847,7 @@ dependencies = [
  "libc",
  "lowlat-audio",
  "lowlat-core",
+ "metal",
  "minifb",
  "openstream-client-core",
  "openstream-media",
