@@ -16,7 +16,7 @@ export function AccessPage({
 }) {
   const { access } = snapshot;
   const signedIn = access.pairing.state === "ready";
-  const localMode = access.controlPlane.detail.includes("local mode");
+  const localMode = access.localMode;
   const [authMode, setAuthMode] = useState<"sign-in" | "register">("sign-in");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
