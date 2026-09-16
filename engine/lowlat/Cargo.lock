@@ -1935,6 +1935,9 @@ dependencies = [
 [[package]]
 name = "openstream-macos-host"
 version = "0.1.0"
+dependencies = [
+ "openstream-macos-media",
+]
 
 [[package]]
 name = "openstream-macos-media"
