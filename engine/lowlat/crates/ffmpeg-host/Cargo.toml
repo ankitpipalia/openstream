@@ -31,5 +31,11 @@ lowlat-inject.workspace = true
 openstream-windows-host.workspace = true
 openstream-windows-media.workspace = true
 
+# The in-process macOS pipeline (CoreGraphics capture -> VideoToolbox), selected
+# the same way; no FFmpeg involved.
+[target.'cfg(target_os = "macos")'.dependencies]
+openstream-macos-host = { path = "../macos-host" }
+openstream-macos-media = { path = "../macos-media" }
+
 [lints]
 workspace = true

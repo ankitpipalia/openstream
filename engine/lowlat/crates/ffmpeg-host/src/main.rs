@@ -842,7 +842,7 @@ enum VideoSource {
         stdout: ChildStdout,
         units: AccessUnitizer,
     },
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     Native(native_video::NativePipeline),
 }
 
@@ -867,47 +867,67 @@ impl VideoSource {
         ))
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn spawn_native(
         request: SpawnRequest,
     ) -> Result<(Self, EncodeProfile), Box<dyn std::error::Error>> {
         if !matches!(request.codec, VideoCodec::H264) || request.ten_bit || request.four_four_four {
-            return Err("the native Windows encoder produces 8-bit 4:2:0 H.264 only; negotiate h264 or use an FFmpeg backend".into());
+            return Err("the native encoder produces 8-bit 4:2:0 H.264 only; negotiate h264 or use an FFmpeg backend".into());
         }
         let bitrate_mbps = configured_bitrate_mbps(request.bitrate_override_mbps);
-        // Hardware encode (NVENC/AMF/QSV via the MF hardware MFT) is opt-in
-        // until physically verified; the software MFT stays the default.
-        let prefer_hardware_encoder = env::var("OPENSTREAM_MF_HARDWARE_ENCODE")
-            .map(|value| {
-                let value = value.trim();
-                value == "1" || value.eq_ignore_ascii_case("true")
-            })
-            .unwrap_or(false);
-        let pipeline = native_video::NativePipeline::start(native_video::NativeConfig {
-            width: u32::from(request.width),
-            height: u32::from(request.height),
-            fps: u32::from(request.fps),
-            bitrate_bps: mbps_to_bps(bitrate_mbps),
-            output_index: None,
-            prefer_hardware_encoder,
-        })?;
-        eprintln!(
-            "OpenStream native encoder: media-foundation-h264 pix_fmt=nv12 bitrate={bitrate_mbps:.2} Mbps hardware_preferred={prefer_hardware_encoder}"
-        );
+        #[cfg(windows)]
+        let pipeline = {
+            // Hardware encode (NVENC/AMF/QSV via the MF hardware MFT) is opt-in
+            // until physically verified; the software MFT stays the default.
+            let prefer_hardware_encoder = env::var("OPENSTREAM_MF_HARDWARE_ENCODE")
+                .map(|value| {
+                    let value = value.trim();
+                    value == "1" || value.eq_ignore_ascii_case("true")
+                })
+                .unwrap_or(false);
+            let pipeline = native_video::NativePipeline::start(native_video::NativeConfig {
+                width: u32::from(request.width),
+                height: u32::from(request.height),
+                fps: u32::from(request.fps),
+                bitrate_bps: mbps_to_bps(bitrate_mbps),
+                output_index: None,
+                prefer_hardware_encoder,
+            })?;
+            eprintln!(
+                "OpenStream native encoder: media-foundation-h264 pix_fmt=nv12 bitrate={bitrate_mbps:.2} Mbps hardware_preferred={prefer_hardware_encoder}"
+            );
+            pipeline
+        };
+        #[cfg(target_os = "macos")]
+        let pipeline = {
+            // VideoToolbox is always the hardware encoder on Apple silicon; the
+            // capture is the display's native BGRA scaled to the negotiated size.
+            let pipeline = native_video::NativePipeline::start(native_video::NativeConfig {
+                width: u32::from(request.width),
+                height: u32::from(request.height),
+                fps: u32::from(request.fps),
+                bitrate_bps: mbps_to_bps(bitrate_mbps),
+                display_id: None,
+            })?;
+            eprintln!(
+                "OpenStream native encoder: videotoolbox-h264 pix_fmt=bgra bitrate={bitrate_mbps:.2} Mbps"
+            );
+            pipeline
+        };
         Ok((Self::Native(pipeline), native_profile(bitrate_mbps)))
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     fn spawn_native(
         _request: SpawnRequest,
     ) -> Result<(Self, EncodeProfile), Box<dyn std::error::Error>> {
-        Err("OPENSTREAM_CAPTURE_BACKEND=native is the in-process Windows pipeline; this build has no native capture for this platform".into())
+        Err("OPENSTREAM_CAPTURE_BACKEND=native is the in-process native pipeline; this build has no native capture for this platform".into())
     }
 
     fn label(&self) -> &'static str {
         match self {
             Self::Ffmpeg { .. } => "FFmpeg",
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Native(_) => "native",
         }
     }
@@ -925,7 +945,7 @@ impl VideoSource {
                 }
                 Ok(Some(units.push(&buffer[..length])?))
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Native(pipeline) => Ok(pipeline.next_unit().await.map(|unit| vec![unit])),
         }
     }
@@ -960,7 +980,7 @@ impl VideoSource {
                 *units = AccessUnitizer::for_codec(codec);
                 Ok(profile)
             }
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Native(pipeline) => {
                 let bitrate_mbps = configured_bitrate_mbps(request.bitrate_override_mbps);
                 pipeline
@@ -976,7 +996,7 @@ impl VideoSource {
     fn finish(&mut self) -> Option<Vec<u8>> {
         match self {
             Self::Ffmpeg { units, .. } => units.finish(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Native(_) => None,
         }
     }
@@ -984,17 +1004,21 @@ impl VideoSource {
     async fn terminate(&mut self) {
         match self {
             Self::Ffmpeg { process, .. } => process.terminate().await,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             Self::Native(pipeline) => pipeline.stop(),
         }
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn native_profile(bitrate_mbps: f64) -> EncodeProfile {
+    #[cfg(windows)]
+    let (encoder, pix_fmt) = ("media-foundation-h264", "nv12");
+    #[cfg(target_os = "macos")]
+    let (encoder, pix_fmt) = ("videotoolbox-h264", "bgra");
     EncodeProfile {
-        encoder: "media-foundation-h264".into(),
-        pix_fmt: "nv12".into(),
+        encoder: encoder.into(),
+        pix_fmt: pix_fmt.into(),
         bitrate_mbps,
     }
 }
@@ -1002,7 +1026,7 @@ fn native_profile(bitrate_mbps: f64) -> EncodeProfile {
 /// Megabits per second to the whole bits per second an encoder API takes.
 // Clamped to u32's range before the cast, so neither truncation nor sign loss
 // can occur.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn mbps_to_bps(mbps: f64) -> u32 {
     (mbps * 1_000_000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32

@@ -1879,6 +1879,8 @@ dependencies = [
  "lowlat-core",
  "lowlat-inject",
  "openstream-client-core",
+ "openstream-macos-host",
+ "openstream-macos-media",
  "openstream-media",
  "openstream-platform",
  "openstream-protocol",
@@ -1935,6 +1937,9 @@ dependencies = [
 [[package]]
 name = "openstream-macos-host"
 version = "0.1.0"
+dependencies = [
+ "openstream-macos-media",
+]
 
 [[package]]
 name = "openstream-macos-media"
