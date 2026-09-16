@@ -7587,8 +7587,7 @@ mod tests {
     async fn permissions_negotiate_through_the_connect_flow() {
         let state = connect_test_state();
         let app = connect_router(state.clone());
-        let (client_token, _) =
-            register_with_device(&app, "operator", "device-client", 0x31).await;
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x31).await;
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x32).await;
         enroll_trusted_device(&app, &client_token, "device-host", 0x32).await;
         let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
