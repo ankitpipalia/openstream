@@ -841,10 +841,17 @@ impl Display {
         let converter = Converter::new(&device)?;
         let mut targets = Vec::with_capacity(depth);
         for _ in 0..depth {
-            let frame = device.allocate_nv12(shape.width, shape.height)?;
+            // Each encoder is handed the descriptor kind it has a name for, and
+            // the target is built for exactly that kind: a driver may export
+            // both individually yet refuse one allocation that carries both, so
+            // asking for the pair yields a target exportable as neither.
+            let kind = match register {
+                Register::Vendor(_) => lowlat_capture::convert::ExportKind::Opaque,
+                Register::Open(_) => lowlat_capture::convert::ExportKind::DmaBuf,
+                Register::VulkanRing { .. } => return Err(Error::NotTogether),
+            };
+            let frame = device.allocate_nv12_for(shape.width, shape.height, kind)?;
             let registration = match register {
-                // Each encoder is handed the descriptor kind it has a name for;
-                // the allocation is built able to produce either.
                 Register::Vendor(encoder) => {
                     let (fd, exported) = device.export_nv12(&frame, false)?;
                     Self::register_vendor(encoder, fd, &exported)
@@ -1133,7 +1140,11 @@ impl Display {
         fd: std::os::fd::OwnedFd,
         exported: &lowlat_capture::convert::Exported,
     ) -> Result<Registration, Error> {
-        let bytes = u64::from(exported.pitch) * u64::from(exported.height) * 3 / 2;
+        // The exact allocation size, not one reconstructed from pitch x height:
+        // a CUDA OPAQUE_FD import must be given the whole allocation, and an
+        // alignment-padded chroma plane makes the reconstructed figure too
+        // small, which the import rejects.
+        let bytes = exported.size;
         let cuda = lowlat_encode::cuda::Cuda::load().map_err(|_| Error::Register)?;
         // SAFETY: the encoder's context is current on this thread, the
         // descriptor was exported for the platform's opaque kind, and the size
