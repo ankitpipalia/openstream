@@ -28,6 +28,15 @@ function hostingAuthedSnapshot(): ProductSnapshot {
   return snapshot;
 }
 
+/** A snapshot in Secure mode (a control plane configured) and signed out, which
+ * is the only state that shows the login front door. `createEmptySnapshot` is
+ * local mode, so the shell tests below reach the shell directly. */
+function signedOutSecureSnapshot(): ProductSnapshot {
+  const snapshot = createEmptySnapshot();
+  snapshot.access = { ...snapshot.access, localMode: false };
+  return snapshot;
+}
+
 function approvalAdapter(overrides: Partial<ProductAdapter>): ProductAdapter {
   const snapshot = hostingAuthedSnapshot();
   return {
@@ -55,6 +64,16 @@ const INCOMING: ConnectRequest = {
 };
 
 describe("OpenStream desktop shell", () => {
+  it("shows the login front door when signed out on a control plane", async () => {
+    // Secure mode (control plane configured) and not signed in: the app must
+    // gate on login rather than land on Computers.
+    render(<App adapter={createLocalAdapter(signedOutSecureSnapshot())} />);
+
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "Primary" })).toBeNull();
+    expect(screen.queryByRole("heading", { name: "Computers" })).toBeNull();
+  });
+
   it("renders the honest empty Computers state", async () => {
     render(<App adapter={createLocalAdapter(createEmptySnapshot())} />);
 
