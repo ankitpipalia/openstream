@@ -1540,7 +1540,9 @@ fn control_error_response(error: ControlPlaneError) -> Response {
         ControlPlaneError::InvalidInput(_) => StatusCode::BAD_REQUEST,
         ControlPlaneError::AlreadyExists => StatusCode::CONFLICT,
         ControlPlaneError::NotFound => StatusCode::NOT_FOUND,
-        ControlPlaneError::Unauthorized => StatusCode::UNAUTHORIZED,
+        ControlPlaneError::Unauthorized | ControlPlaneError::DeviceIdentityRevoked { .. } => {
+            StatusCode::UNAUTHORIZED
+        }
         ControlPlaneError::DevicePending | ControlPlaneError::DeviceRevoked => {
             StatusCode::FORBIDDEN
         }
@@ -1859,6 +1861,20 @@ async fn login_account(
             control_plane::now_ms(),
         ) {
             Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+            // A changed device key auto-revoked the device: end its live sessions
+            // too, not just its tokens, then answer with the same 401 an ordinary
+            // rejection gives so the mismatch stays indistinguishable to a caller.
+            Err(ControlPlaneError::DeviceIdentityRevoked {
+                account_id,
+                device_id,
+            }) => {
+                drop(accounts);
+                let senders = revoke_owned_sessions(&state, &account_id, Some(&device_id)).await;
+                for sender in senders {
+                    let _ = sender.try_send(Message::Close(None));
+                }
+                return control_error_response(ControlPlaneError::Unauthorized);
+            }
             Err(error) => return control_error_response(error),
         };
         if !accounts.password_is_outdated(&request.username) {
