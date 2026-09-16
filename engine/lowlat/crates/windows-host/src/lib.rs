@@ -11,3 +11,4 @@
 //! hardware, and none of these are production defaults until then.
 
 pub mod capture;
+pub mod input;
