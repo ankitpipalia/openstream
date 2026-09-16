@@ -1941,6 +1941,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-macos-media"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+]
+
+[[package]]
 name = "openstream-media"
 version = "0.1.0"
 dependencies = [
