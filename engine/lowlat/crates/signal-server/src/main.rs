@@ -7393,6 +7393,10 @@ mod tests {
             .route("/v1/connect/{request_id}/approve", post(connect_approve))
             .route("/v1/connect/{request_id}/deny", post(connect_deny))
             .route("/v1/session", post(create_session))
+            // The signalling socket, so a test can present a broker-issued
+            // credential to it and prove the connect flow and the relay are one
+            // product rather than two subsystems that only work in isolation.
+            .route("/v1/signal/{session_id}/{role}", get(signal_socket))
             .with_state(state)
     }
 
@@ -7540,6 +7544,100 @@ mod tests {
             .as_str()
             .expect("access token")
             .to_string()
+    }
+
+    /// The connect broker and the signalling relay are one product: a
+    /// credential the broker mints from an approval authenticates the
+    /// signalling socket, and the socket then delivers its first frame.
+    ///
+    /// Every other test drives the two in isolation -- the connect flow over
+    /// HTTP with `oneshot`, the socket with a hand-built session. This one runs
+    /// the whole path against a single real served router: register, approve,
+    /// then present the issued host credential to `/v1/signal` over a real
+    /// WebSocket. If the token the broker mints did not match the token the
+    /// socket checks, each half would pass its own test and they would fail
+    /// only here.
+    #[tokio::test]
+    async fn a_broker_issued_credential_authenticates_the_signalling_socket() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) =
+            register_with_device(&app, "operator", "device-client", 0x41).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x42).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x42).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Client asks, host approves -> the host credential (session, token, ws
+        // path). This is the value the socket must accept.
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (status, grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {grant}");
+        let ws_path = grant["websocket_path"]
+            .as_str()
+            .expect("websocket path")
+            .to_string();
+        let host_capability = grant["token"].as_str().expect("host capability").to_string();
+
+        // Serve the same router (so the same in-memory session) over TCP for
+        // the WebSocket half.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        // Present the broker-issued credential to the signalling socket. A
+        // token the socket does not recognise fails the handshake here.
+        let mut request = format!("ws://{address}{ws_path}")
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {host_capability}")
+                .parse()
+                .expect("authorization header"),
+        );
+        let (mut socket, response) = connect_async(request)
+            .await
+            .expect("the broker-issued credential authenticates the signalling socket");
+        assert_eq!(
+            response.status().as_u16(),
+            101,
+            "the socket switches protocols for a credential it recognises",
+        );
+
+        // The host side receives a first frame on connect, proving the socket
+        // is live for this session rather than merely accepting the upgrade.
+        let first = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("a first frame arrives before the timeout")
+            .expect("the socket yields a frame")
+            .expect("the frame is a valid websocket message");
+        assert!(
+            matches!(first, ClientMessage::Text(_) | ClientMessage::Binary(_)),
+            "the signalling socket delivers its first frame to the host",
+        );
+
+        server.abort();
     }
 
     /// The product flow, end to end, and the boundary it exists to draw.
