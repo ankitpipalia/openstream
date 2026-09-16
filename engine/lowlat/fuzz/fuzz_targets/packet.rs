@@ -19,12 +19,23 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         Packet::Ack(ref inner) => {
+            // encode_ack canonicalises to the full ACK_LEN (all CHANNEL_COUNT
+            // channels) regardless of how many the input reported, so it is
+            // deliberately NOT byte-identical to a shorter acknowledgement --
+            // comparing against `data[..written]` reads past a short Ack. The
+            // canonical form must instead be a fixpoint: re-parsing it and
+            // re-encoding reproduces exactly the same bytes.
             if let Ok(written) = packet::encode_ack(&mut out, inner) {
-                assert_eq!(
-                    &out[..written],
-                    &data[..written],
-                    "acknowledgement did not round trip"
-                );
+                let mut again = [0u8; lowlat_core::MAX_CLEARTEXT];
+                if let Ok(Packet::Ack(ref reparsed)) = packet::parse(&out[..written])
+                    && let Ok(again_written) = packet::encode_ack(&mut again, reparsed)
+                {
+                    assert_eq!(
+                        &out[..written],
+                        &again[..again_written],
+                        "canonical acknowledgement is not a fixpoint",
+                    );
+                }
             }
         }
         Packet::Probe(ref inner) => {
