@@ -21,15 +21,17 @@
 //!   - [`peercred`]: the peer-credential (`SO_PEERCRED`) authorisation each side
 //!     applies -- the broker admits only the machine-service uid, the service
 //!     obeys only a root broker.
+//!   - [`transport`]: the async length-prefixed framing that carries the
+//!     messages over a Unix socket (or an in-memory pipe in tests).
 //!
-//! Everything here is pure and cross-platform apart from one Linux syscall
-//! wrapper ([`peercred::read_peer_identity`]), so the whole contract is
-//! unit-tested off-target. The DRM reader, the `uinput` sink, and the socket
-//! transport live in the broker and service binaries that depend on this crate,
-//! not here.
+//! The logic modules are pure and cross-platform; the only OS-specific code is
+//! one Linux syscall wrapper ([`peercred::read_peer_identity`]), and the only
+//! runtime dependency is `tokio` for [`transport`]. The DRM reader and the
+//! `uinput` sink live in the broker binary that depends on this crate, not here.
 
 pub mod lifecycle;
 pub mod peercred;
 pub mod protocol;
 pub mod token;
+pub mod transport;
 pub mod wire;

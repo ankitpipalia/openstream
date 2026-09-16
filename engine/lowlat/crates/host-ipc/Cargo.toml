@@ -17,7 +17,11 @@ name = "openstream_host_ipc"
 path = "src/lib.rs"
 
 # The wire codec is hand-rolled (see src/wire.rs), so there is no serialization
-# dependency; the only dependency is libc, for the Linux SO_PEERCRED read.
+# dependency. tokio drives the async framed transport (src/transport.rs).
+[dependencies]
+tokio = { workspace = true }
+
+# libc is only for the Linux SO_PEERCRED read in src/peercred.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 
