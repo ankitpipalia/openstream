@@ -1908,11 +1908,7 @@ async fn network_session(
         fps: negotiated.fps,
         path: format!("{:?}", session.connection_path()),
         profile: format!("{format}-low-delay"),
-        decoder: Some(format!(
-            "{} {format} {}",
-            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
-            DecodeAccel::from_env().name()
-        )),
+        decoder: Some(decoder_report(backend, format)),
         // The presenter is chosen in `main` and the window is not this
         // task's to inspect, so the backend it settled on is named there
         // and not guessed here.
@@ -2519,6 +2515,10 @@ impl DecodeAccel {
                 Self::Software
             }
             "" | "software" | "cpu" => Self::Software,
+            // The in-process decoder is selected by `decode_dispatch`; when
+            // it is chosen no ffmpeg runs, so there is no acceleration to
+            // pick here and nothing to warn about.
+            "native" | "videotoolbox-native" => Self::Software,
             other => {
                 eprintln!(
                     "OpenStream decoder {other} is not recognised; using the software decoder"
@@ -2538,6 +2538,27 @@ impl DecodeAccel {
 
 fn decoder_args(format: &str, width: usize, height: usize) -> Vec<String> {
     decoder_args_with(DecodeAccel::from_env(), format, width, height)
+}
+
+/// The decoder line of the run context: the in-process backend by name, or
+/// the ffmpeg command and acceleration the subprocess is asked for. It names
+/// what `select_decoder` chose, not what the environment asked for.
+fn decoder_report(backend: decode_dispatch::DecodeBackend, format: &str) -> String {
+    match backend {
+        #[cfg(target_os = "macos")]
+        decode_dispatch::DecodeBackend::VideoToolboxNative => {
+            format!("videotoolbox in-process {format} (no ffmpeg subprocess)")
+        }
+        #[cfg(target_os = "windows")]
+        decode_dispatch::DecodeBackend::MediaFoundationNative => {
+            format!("media-foundation in-process {format} (no ffmpeg subprocess)")
+        }
+        decode_dispatch::DecodeBackend::Ffmpeg => format!(
+            "{} {format} {}",
+            env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| "ffmpeg".into()),
+            DecodeAccel::from_env().name()
+        ),
+    }
 }
 
 fn decoder_args_with(accel: DecodeAccel, format: &str, width: usize, height: usize) -> Vec<String> {
@@ -2796,10 +2817,27 @@ fn native_decode_worker(
     telemetry: SharedTelemetry,
 ) {
     let mut decoder = vt_decoder::VideoToolboxH264Decoder::new();
+    eprintln!(
+        "OpenStream in-process decoder: VideoToolbox H.264 on this thread; no ffmpeg subprocess"
+    );
+    // VideoToolbox only says whether it is on the media engine once a session
+    // exists, so the acceleration state is reported with the first pictures.
+    let mut acceleration_reported = false;
     while let Ok(au) = au_rx.recv() {
         let raw_ready_at = Stamp::<ClientClock>::now();
         match decoder.decode(&au.payload, au.presentation_time_us, au.keyframe) {
             Ok(pictures) => {
+                if !acceleration_reported && !pictures.is_empty() {
+                    acceleration_reported = true;
+                    eprintln!(
+                        "OpenStream VideoToolbox decoder: {}",
+                        match decoder.hardware_accelerated() {
+                            Some(true) => "hardware accelerated",
+                            Some(false) => "software (VideoToolbox reports no hardware decoder)",
+                            None => "acceleration not reported by the session",
+                        }
+                    );
+                }
                 for picture in pictures {
                     let ready_at = Stamp::<ClientClock>::now();
                     if !publish_decoded_picture(
@@ -2844,6 +2882,14 @@ fn windows_native_decode_worker(
             return;
         }
     };
+    eprintln!(
+        "OpenStream in-process decoder: Media Foundation H.264 on this thread ({}); no ffmpeg subprocess",
+        if decoder.is_hardware() {
+            "D3D11/DXVA hardware"
+        } else {
+            "software MFT"
+        }
+    );
     while let Ok(au) = au_rx.recv() {
         // The MFT keys ordering off the sample time, not a keyframe flag.
         let _ = au.keyframe;
