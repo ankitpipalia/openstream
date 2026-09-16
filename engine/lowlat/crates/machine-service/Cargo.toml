@@ -1,0 +1,35 @@
+[package]
+name = "openstream-machine-service"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+# The unprivileged, network-facing machine service. It owns the peer connection
+# (signaling, ICE, transport, approval) and drives the privileged broker over
+# the host-ipc socket for capture and input -- so the network-facing half never
+# runs as root. Cross-platform handshake logic is unit-tested; the peer loop is
+# Linux-only for now (it drives the Linux broker).
+[[bin]]
+name = "openstream-machine-service"
+path = "src/main.rs"
+
+[lib]
+name = "openstream_machine_service"
+path = "src/lib.rs"
+
+[dependencies]
+openstream-host-ipc = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openstream-client-core = { path = "../client-core" }
+openstream-media = { path = "../media" }
+openstream-platform = { path = "../platform" }
+openstream-protocol = { path = "../protocol" }
+libc = { workspace = true }
+
+[lints]
+workspace = true
