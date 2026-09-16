@@ -54,10 +54,6 @@ use tokio::process::{Child, Command};
 mod display;
 mod fullscreen;
 mod mic;
-// NV12 -> BGRA conversion shared by the vendor-neutral hardware decoders
-// (Windows Media Foundation, Linux VAAPI) and VideoToolbox surface mode. Pure
-// and platform-agnostic, unit-tested on every target.
-mod nv12;
 mod raw_pointer;
 mod render;
 // In-process VideoToolbox H.264 decode (macOS). Landed and tested in isolation;
@@ -67,10 +63,8 @@ mod vt_decoder;
 // Zero-copy import of a decoded CVPixelBuffer into a wgpu texture (macOS, M2).
 #[cfg(target_os = "macos")]
 mod vt_gpu;
-// In-process Media Foundation H.264 decode (Windows). Vendor-neutral OS decoder
-// MFT; compiled and exercised on the Windows CI job against the software MFT.
-#[cfg(target_os = "windows")]
-mod mf_decoder;
+// In-process Media Foundation H.264 decode (Windows) lives in the shared
+// openstream-windows-media codec crate; the worker below drives it.
 // Decoder-backend selection and the native decode -> DecodedFrame path, shared
 // by the (future) runtime dispatch and the loopback harness. Not yet wired into
 // the live network loop.
@@ -2843,7 +2837,7 @@ fn windows_native_decode_worker(
     decoded_ready: Arc<tokio::sync::Notify>,
     telemetry: SharedTelemetry,
 ) {
-    let mut decoder = match mf_decoder::MediaFoundationH264Decoder::new() {
+    let mut decoder = match openstream_windows_media::MediaFoundationH264Decoder::new() {
         Ok(decoder) => decoder,
         Err(error) => {
             eprintln!("could not create the Media Foundation decoder: {error}");
