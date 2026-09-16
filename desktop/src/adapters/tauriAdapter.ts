@@ -76,6 +76,9 @@ interface PendingConnectRequestRaw {
   request_id: string;
   requester_device_id: string;
   expires_in_seconds: number;
+  /** The classes the requester asked for. Absent from a control plane that
+   * predates permission negotiation. */
+  requested?: PermissionSet;
 }
 
 /// Runtime truth for one probe, decided in Rust. The state is a closed set
@@ -897,6 +900,7 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
         requestId: request.request_id,
         requesterDeviceId: request.requester_device_id,
         expiresInSeconds: request.expires_in_seconds,
+        requested: request.requested,
       }));
     },
     // The Rust `request_id` parameter is addressed as camelCase `requestId`,

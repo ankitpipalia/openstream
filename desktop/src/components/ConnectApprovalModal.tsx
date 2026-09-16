@@ -1,12 +1,13 @@
+import { requestedPermissionLabels } from "../model";
 import type { ConnectRequest } from "../model";
 
 /**
  * The approval prompt for one incoming Secure Connect request.
  *
  * Rendered app-wide (above every page) so an approval is never missed because
- * of where the operator happened to be. It shows only what the broker's
- * pending-request payload carries today -- the requesting device and the time
- * left -- and leaves granted permissions to the host's configured policy.
+ * of where the operator happened to be. It shows the requesting device, the
+ * time left, and -- when the broker carries them -- the permission classes the
+ * requester asked for, so the host approves against the actual request.
  */
 export function ConnectApprovalModal({
   request,
@@ -29,6 +30,10 @@ export function ConnectApprovalModal({
       : secondsRemaining > 0
         ? `Expires in ${secondsRemaining}s`
         : "Expiring…";
+
+  const requestedLabels = request.requested
+    ? requestedPermissionLabels(request.requested)
+    : [];
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -54,10 +59,24 @@ export function ConnectApprovalModal({
           ) : null}
         </dl>
 
-        <p className="modal-note">
-          The session is granted the input and device access allowed by this host's
-          configured policy. Deny if you did not expect this request.
-        </p>
+        {requestedLabels.length > 0 ? (
+          <div className="modal-permissions">
+            <p className="modal-note">This device is requesting access to:</p>
+            <ul className="modal-permission-list" aria-label="Requested access">
+              {requestedLabels.map((label) => (
+                <li key={label}>{label}</li>
+              ))}
+            </ul>
+            <p className="modal-note">
+              Approving grants exactly what is listed. Deny if you did not expect this request.
+            </p>
+          </div>
+        ) : (
+          <p className="modal-note">
+            The session is granted the input and device access allowed by this host's
+            configured policy. Deny if you did not expect this request.
+          </p>
+        )}
 
         {error ? (
           <div className="error-banner" role="alert">
