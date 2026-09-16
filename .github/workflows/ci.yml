@@ -126,6 +126,13 @@ jobs:
       - name: Install Linux gamepad dependency
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - name: Install ffmpeg for VideoToolbox test fixtures (macOS)
+        # ffmpeg only *generates* the H.264 clips the native VideoToolbox tests
+        # decode; end users never need it. Installing it here lets those tests
+        # run instead of silently skipping, and the require-flag step below turns
+        # a missing/broken fixture generator into a hard failure.
+        if: matrix.os == 'macos-latest'
+        run: brew install ffmpeg
       - name: Install toolchain
         run: rustup component add rustfmt
       - name: Format OpenStream additions
@@ -133,6 +140,16 @@ jobs:
         run: cargo fmt --all --check
       - name: Test portable protocol/service/client crates
         run: cargo test --locked -p openstream-client-core -p openstream-protocol -p openstream-transport -p openstream-signal-server -p openstream-reference-peer -p openstream-media -p openstream-platform -p openstream-windows-media -p openstream-windows-host -p openstream-client -p openstream-desktop-client -p openstream-ffmpeg-host -p openstream-mobile-ffi -p openstream-bridge -- --test-threads=1
+      - name: VideoToolbox hardware decode tests must run, not skip (macOS)
+        # OPENSTREAM_REQUIRE_VT_TEST makes a missing/failed ffmpeg fixture a hard
+        # error instead of a silent skip, so the native decode coverage cannot
+        # quietly vanish from the gate. Re-runs the desktop client with the flag.
+        if: matrix.os == 'macos-latest'
+        env:
+          OPENSTREAM_REQUIRE_VT_TEST: "1"
+        # --include-ignored also runs the long-duration soak loopback (fast, ~3s)
+        # so that long-session coverage cannot silently rot either.
+        run: cargo test --locked -p openstream-desktop-client -- --include-ignored --test-threads=1
       - name: Test native Linux host adapters (X11/PipeWire/HWACCEL parsing)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --locked -p openstream-linux-host
