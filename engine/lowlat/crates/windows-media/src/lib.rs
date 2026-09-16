@@ -14,8 +14,12 @@
 //! The pixel-format conversion the MFTs need is in the private, cross-platform
 //! `nv12` module, unit-tested on every target; the Media Foundation FFI is
 //! Windows-only and exercised against the real MFTs on the Windows CI job.
+//! [`bgra_bytes_to_nv12`] is the capture-side conversion a host feeds the
+//! encoder with, exported for every target so it can be tested anywhere.
 
 mod nv12;
+
+pub use nv12::bgra_bytes_to_nv12;
 
 #[cfg(target_os = "windows")]
 mod mf_decoder;
@@ -28,3 +32,5 @@ mod mf_startup;
 pub use mf_decoder::{MediaFoundationH264Decoder, MfError, MfFrame};
 #[cfg(target_os = "windows")]
 pub use mf_encoder::{EncodedAccessUnit, MediaFoundationH264Encoder, MfEncError};
+#[cfg(target_os = "windows")]
+pub use mf_startup::prepare_media_thread;

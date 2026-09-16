@@ -17,16 +17,21 @@
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MSH264EncoderMFT, IMFSample, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_END_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MFVideoInterlace_Progressive, eAVEncH264VProfile_Main,
+    CLSID_MSH264EncoderMFT, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncCommonRealTime, CODECAPI_AVEncMPVDefaultBPictureCount,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFSample,
+    IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+    MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MPEG_SEQUENCE_HEADER,
+    MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Main,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::System::Variant::VARIANT;
+use windows::core::Interface;
 
 use crate::mf_startup::ensure_media_foundation_started;
 
@@ -44,6 +49,8 @@ pub enum MfEncError {
     Windows(windows::core::Error),
     /// The frame did not match the configured size.
     FrameTooLarge,
+    /// The encoder exposes no `ICodecAPI`, so live changes are unavailable.
+    NoCodecApi,
 }
 
 impl std::fmt::Display for MfEncError {
@@ -51,6 +58,7 @@ impl std::fmt::Display for MfEncError {
         match self {
             MfEncError::Windows(error) => write!(f, "media foundation encode error: {error}"),
             MfEncError::FrameTooLarge => write!(f, "input frame exceeded the configured size"),
+            MfEncError::NoCodecApi => write!(f, "the encoder exposes no ICodecAPI"),
         }
     }
 }
@@ -68,11 +76,39 @@ fn pack_ratio(high: u32, low: u32) -> u64 {
     (u64::from(high) << 32) | u64::from(low)
 }
 
+/// Ask the encoder for real-time, low-delay behaviour: low-latency mode, no
+/// B-frames (they hold frames back for reordering), real-time priority and
+/// constant bitrate. Returns whether low-latency mode itself was accepted; the
+/// other properties are refinements and their refusal is not an error.
+fn configure_low_latency(api: &ICodecAPI) -> bool {
+    // SAFETY: FFI. Each call passes a documented property GUID and a VARIANT of
+    // the type the property is documented to take (VT_BOOL / VT_UI4).
+    unsafe {
+        let low_latency = api
+            .SetValue(&CODECAPI_AVLowLatencyMode, &VARIANT::from(true))
+            .is_ok();
+        let _ = api.SetValue(&CODECAPI_AVEncCommonRealTime, &VARIANT::from(1_u32));
+        let _ = api.SetValue(
+            &CODECAPI_AVEncMPVDefaultBPictureCount,
+            &VARIANT::from(0_u32),
+        );
+        let _ = api.SetValue(
+            &CODECAPI_AVEncCommonRateControlMode,
+            &VARIANT::from(u32::try_from(eAVEncCommonRateControlMode_CBR.0).unwrap_or(0)),
+        );
+        low_latency
+    }
+}
+
 /// The in-process Media Foundation H.264 encoder.
 #[derive(Debug)]
 pub struct MediaFoundationH264Encoder {
     transform: IMFTransform,
+    /// The encoder's codec property interface, for live changes (forced
+    /// keyframes, bitrate). `None` if the MFT does not expose one.
+    codec_api: Option<ICodecAPI>,
     output_provides_samples: bool,
+    low_latency: bool,
 }
 
 impl MediaFoundationH264Encoder {
@@ -85,6 +121,13 @@ impl MediaFoundationH264Encoder {
         // requires the output type set before the input type.
         let transform: IMFTransform =
             unsafe { CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)? };
+
+        // Real-time properties go through ICodecAPI and belong before the
+        // output type. Best effort: the OS encoder supports them, a vendor
+        // MFT may not, and the stream is valid without them (with more
+        // buffering), so only the outcome is recorded.
+        let codec_api: Option<ICodecAPI> = transform.cast().ok();
+        let low_latency = codec_api.as_ref().is_some_and(configure_low_latency);
 
         // SAFETY: fresh media types; documented GUID keys/values.
         unsafe {
@@ -119,8 +162,38 @@ impl MediaFoundationH264Encoder {
 
         Ok(Self {
             transform,
+            codec_api,
             output_provides_samples,
+            low_latency,
         })
+    }
+
+    /// Whether the encoder accepted low-latency mode at creation.
+    pub fn low_latency_configured(&self) -> bool {
+        self.low_latency
+    }
+
+    /// Make the next encoded frame a keyframe, so a client that lost the
+    /// reference chain (or just joined) can resume without a new encoder.
+    pub fn force_keyframe(&mut self) -> Result<(), MfEncError> {
+        self.set_property(&CODECAPI_AVEncVideoForceKeyFrame, VARIANT::from(1_u32))
+    }
+
+    /// Change the running encoder's average bitrate (bits per second).
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), MfEncError> {
+        self.set_property(&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate))
+    }
+
+    fn set_property(
+        &self,
+        property: &windows::core::GUID,
+        value: VARIANT,
+    ) -> Result<(), MfEncError> {
+        let api = self.codec_api.as_ref().ok_or(MfEncError::NoCodecApi)?;
+        // SAFETY: FFI. A documented codec property GUID and a VARIANT of the
+        // type that property is documented to take; both outlive the call.
+        unsafe { api.SetValue(property, &value)? }
+        Ok(())
     }
 
     /// The SPS/PPS parameter sets for the stream, as an Annex-B byte sequence,

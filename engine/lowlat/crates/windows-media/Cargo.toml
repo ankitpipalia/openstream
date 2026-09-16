@@ -23,6 +23,9 @@ windows = { version = "0.59", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi_Common",
+    # ICodecAPI::SetValue takes a VARIANT, which windows-rs gates on all three.
+    "Win32_System_Ole",
+    "Win32_System_Variant",
 ] }
 
 [lints]

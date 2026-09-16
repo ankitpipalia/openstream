@@ -1882,6 +1882,8 @@ dependencies = [
  "openstream-media",
  "openstream-platform",
  "openstream-protocol",
+ "openstream-windows-host",
+ "openstream-windows-media",
  "serde_json",
  "tokio",
 ]

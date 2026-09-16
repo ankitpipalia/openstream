@@ -102,29 +102,98 @@ pub(crate) fn nv12_contiguous_planes(
 pub(crate) fn bgra_to_nv12(pixels: &[u32], width: usize, height: usize) -> Vec<u8> {
     let mut out = vec![0u8; width * height + width * height / 2];
     let (y_plane, uv_plane) = out.split_at_mut(width * height);
+    fill_nv12_band(y_plane, uv_plane, width, 0, &|index| {
+        unpack_bgr(pixels[index])
+    });
+    out
+}
 
-    for row in 0..height {
+/// [`bgra_to_nv12`] for a tightly packed BGRA byte frame (4 bytes per pixel in
+/// memory order B, G, R, A -- what Desktop Duplication's `B8G8R8A8` readback
+/// produces), converting `threads` horizontal bands in parallel.
+///
+/// A 2560x1440 frame is 3.7 million pixels, and converting it on one core
+/// costs a good part of a 60 Hz frame budget; each band is an independent run
+/// of whole 2x2 chroma blocks, so bands split cleanly across threads.
+/// `threads` is clamped to the number of chroma block rows; `1` converts
+/// inline on the caller's thread. Panics if the buffer is shorter than the
+/// frame or a dimension is odd: either is a programming error, not a runtime
+/// condition.
+pub fn bgra_bytes_to_nv12(bgra: &[u8], width: usize, height: usize, threads: usize) -> Vec<u8> {
+    assert!(
+        width % 2 == 0 && height % 2 == 0,
+        "NV12 needs even dimensions"
+    );
+    assert!(
+        bgra.len() >= width * height * 4,
+        "BGRA buffer is shorter than the frame"
+    );
+    let bgr_at = |index: usize| {
+        let pixel = &bgra[index * 4..index * 4 + 3];
+        (
+            i32::from(pixel[0]),
+            i32::from(pixel[1]),
+            i32::from(pixel[2]),
+        )
+    };
+    let mut out = vec![0u8; width * height + width * height / 2];
+    let (y_plane, uv_plane) = out.split_at_mut(width * height);
+    let threads = threads.clamp(1, (height / 2).max(1));
+    if threads == 1 {
+        fill_nv12_band(y_plane, uv_plane, width, 0, &bgr_at);
+        return out;
+    }
+    // Rows per band, rounded up to even so every band owns whole chroma
+    // blocks; the last band is whatever remains (also even, as `height` is).
+    let band_rows = height.div_ceil(threads).next_multiple_of(2);
+    std::thread::scope(|scope| {
+        let y_bands = y_plane.chunks_mut(band_rows * width);
+        let uv_bands = uv_plane.chunks_mut(band_rows / 2 * width);
+        for (band, (y_out, uv_out)) in y_bands.zip(uv_bands).enumerate() {
+            let bgr_at = &bgr_at;
+            scope.spawn(move || {
+                fill_nv12_band(y_out, uv_out, width, band * band_rows, bgr_at);
+            });
+        }
+    });
+    out
+}
+
+/// Fill one band of an NV12 frame. `y_out` holds the band's luma rows and
+/// `uv_out` its interleaved chroma rows; `first_row` (even) is where the band
+/// starts in the whole frame, and `bgr_at(row * width + col)` supplies a
+/// source pixel's `(B, G, R)`.
+fn fill_nv12_band(
+    y_out: &mut [u8],
+    uv_out: &mut [u8],
+    width: usize,
+    first_row: usize,
+    bgr_at: &(impl Fn(usize) -> (i32, i32, i32) + Sync),
+) {
+    let rows = y_out.len() / width;
+    for local_row in 0..rows {
+        let row = first_row + local_row;
         for col in 0..width {
-            let (b, g, r) = unpack_bgr(pixels[row * width + col]);
+            let (b, g, r) = bgr_at(row * width + col);
             // BT.601 limited-range luma: coefficients are the float transform in
             // the tests scaled by 256 (for the >>8 fixed point), so white maps to
             // Y=235 not 255. Sum 220.
             let y = (66 * r + 129 * g + 25 * b + 128) >> 8;
-            y_plane[row * width + col] = clamp_u8(16 + y);
+            y_out[local_row * width + col] = clamp_u8(16 + y);
         }
     }
 
     // One U/V pair per 2x2 block, averaging the block's chroma.
     let uv_width = width / 2;
-    for block_row in 0..height / 2 {
+    for local_block_row in 0..rows / 2 {
+        let block_row = first_row / 2 + local_block_row;
         for block_col in 0..uv_width {
             let mut r_sum = 0i32;
             let mut g_sum = 0i32;
             let mut b_sum = 0i32;
             for dy in 0..2 {
                 for dx in 0..2 {
-                    let px = pixels[(block_row * 2 + dy) * width + (block_col * 2 + dx)];
-                    let (b, g, r) = unpack_bgr(px);
+                    let (b, g, r) = bgr_at((block_row * 2 + dy) * width + (block_col * 2 + dx));
                     r_sum += r;
                     g_sum += g;
                     b_sum += b;
@@ -135,12 +204,11 @@ pub(crate) fn bgra_to_nv12(pixels: &[u32], width: usize, height: usize) -> Vec<u
             // the luma above and the decode-side inverse.
             let u = 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8);
             let v = 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8);
-            let uv_index = block_row * width + block_col * 2;
-            uv_plane[uv_index] = clamp_u8(u);
-            uv_plane[uv_index + 1] = clamp_u8(v);
+            let uv_index = local_block_row * width + block_col * 2;
+            uv_out[uv_index] = clamp_u8(u);
+            uv_out[uv_index + 1] = clamp_u8(v);
         }
     }
-    out
 }
 
 /// Unpack a BGRA `u32` into its `(B, G, R)` channels as `i32`.
@@ -257,6 +325,52 @@ mod tests {
         assert_eq!(uv.len(), 8);
         assert_eq!(y[0], 0);
         assert_eq!(uv[0], 16, "UV plane starts right after the Y plane");
+    }
+
+    /// A gradient exercising all channels, as packed `u32`s and as bytes.
+    fn gradient(width: usize, height: usize) -> (Vec<u32>, Vec<u8>) {
+        let mut pixels = Vec::with_capacity(width * height);
+        let mut bytes = Vec::with_capacity(width * height * 4);
+        for row in 0..height {
+            for col in 0..width {
+                let b = u8::try_from((col * 255) / width.max(1)).unwrap();
+                let g = u8::try_from((row * 255) / height.max(1)).unwrap();
+                let r = u8::try_from((row * 37 + col * 91) % 256).unwrap();
+                pixels.push(
+                    u32::from(b) | (u32::from(g) << 8) | (u32::from(r) << 16) | (0xFF_u32 << 24),
+                );
+                bytes.extend_from_slice(&[b, g, r, 0xFF]);
+            }
+        }
+        (pixels, bytes)
+    }
+
+    #[test]
+    fn byte_frames_convert_exactly_like_packed_pixels_on_any_thread_count() {
+        let (width, height) = (16, 12);
+        let (pixels, bytes) = gradient(width, height);
+        let expected = bgra_to_nv12(&pixels, width, height);
+        // 1 = inline; 3 = even bands; 5 = rounded-up bands with a short last
+        // band; 64 = more threads than chroma rows, clamped.
+        for threads in [1, 3, 5, 64] {
+            assert_eq!(
+                bgra_bytes_to_nv12(&bytes, width, height, threads),
+                expected,
+                "threads={threads}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_solid_bgra_byte_frame_lands_on_its_bt601_values() {
+        let (y, u, v) = rgb_to_yuv601(0, 0, 255); // blue
+        let bytes: Vec<u8> = [255u8, 0, 0, 255].repeat(8 * 8); // B, G, R, A
+        let out = bgra_bytes_to_nv12(&bytes, 8, 8, 2);
+        assert_eq!(out.len(), 8 * 8 + 8 * 8 / 2);
+        let close = |a: u8, b: u8| (i32::from(a) - i32::from(b)).abs() <= 2;
+        assert!(close(out[0], y), "Y {} vs {y}", out[0]);
+        assert!(close(out[64], u), "U {} vs {u}", out[64]);
+        assert!(close(out[65], v), "V {} vs {v}", out[65]);
     }
 
     #[test]
