@@ -1,18 +1,17 @@
 //! In-process H.264 decode on Windows via the Media Foundation decoder MFT.
 //!
-//! This is the Windows counterpart to the macOS VideoToolbox path
-//! ([`crate::vt_decoder`]): it decodes H.264 access units in-process, with no
-//! external ffmpeg subprocess, so the client matches Parsec's model of a native
-//! decoder linked into the app. It uses the OS "H.264 Video Decoder" MFT
-//! (`CLSID_CMSH264DecoderMFT`), which is vendor-neutral -- it runs on NVIDIA,
-//! AMD and Intel GPUs through the OS, and falls back to the OS software decoder
-//! where no hardware decoder is present -- so it is preferred over any single
-//! vendor SDK (NVDEC/AMF/QSV).
+//! This is the Windows counterpart to the macOS VideoToolbox decode path: it
+//! decodes H.264 access units in-process, with no external ffmpeg subprocess,
+//! so the client matches Parsec's model of a native decoder linked into the
+//! app. It uses the OS "H.264 Video Decoder" MFT (`CLSID_MSH264DecoderMFT`),
+//! which is vendor-neutral -- it runs on NVIDIA, AMD and Intel GPUs through the
+//! OS, and falls back to the OS software decoder where no hardware decoder is
+//! present -- so it is preferred over any single vendor SDK (NVDEC/AMF/QSV).
 //!
-//! The MFT emits NV12; [`crate::nv12`] converts that to the BGRA the presenter
-//! consumes. The buffer geometry and colour conversion live in that pure,
-//! cross-platform-tested module; this file is the COM/MFT plumbing that feeds
-//! it and is therefore compiled and exercised only on Windows.
+//! The MFT emits NV12; the crate's `nv12` module converts that to the BGRA the
+//! presenter consumes. The buffer geometry and colour conversion live in that
+//! pure, cross-platform-tested module; this file is the COM/MFT plumbing that
+//! feeds it and is therefore compiled and exercised only on Windows.
 //!
 //! Verification: the test at the bottom decodes a committed H.264 fixture and
 //! checks the frame count, dimensions and centre colour. It runs on the Windows
@@ -24,15 +23,13 @@
 #![cfg(target_os = "windows")]
 
 use std::mem::ManuallyDrop;
-use std::sync::Once;
-use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MSH264DecoderMFT, IMFMediaType, IMFSample, IMFTransform, MF_E_TRANSFORM_NEED_MORE_INPUT,
     MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MF_VERSION, MFCreateMediaType,
-    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFSTARTUP_NOSOCKET, MFStartup,
-    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MFCreateMediaType,
+    MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFT_MESSAGE_COMMAND_DRAIN,
+    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFVideoArea, MFVideoFormat_H264,
     MFVideoFormat_NV12,
@@ -40,19 +37,21 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::core::GUID;
 
+use crate::mf_startup::ensure_media_foundation_started;
 use crate::nv12::{nv12_contiguous_planes, nv12_to_bgra};
 
 /// A decoded picture: BGRA pixels (one per `u32`, `B | G<<8 | R<<16 | A<<24`)
 /// ready for the presenter, plus its dimensions.
-pub(crate) struct MfFrame {
-    pub(crate) width: usize,
-    pub(crate) height: usize,
-    pub(crate) pixels: Vec<u32>,
+#[derive(Debug)]
+pub struct MfFrame {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u32>,
 }
 
 /// Why a Media Foundation decode failed.
 #[derive(Debug)]
-pub(crate) enum MfError {
+pub enum MfError {
     /// A Media Foundation / COM call returned a failure `HRESULT`.
     Windows(windows::core::Error),
     /// The MFT advertised no NV12 output type (only NV12 is handled today).
@@ -82,29 +81,6 @@ impl From<windows::core::Error> for MfError {
     }
 }
 
-/// Start Media Foundation once for the process.
-///
-/// `MFStartup` is reference counted, but this program only ever needs it
-/// running; starting it once and never shutting it down avoids racing a
-/// shutdown against a decoder on another thread. The resulting `HRESULT` is
-/// cached so a second decoder observes the same outcome.
-fn ensure_media_foundation_started() -> Result<(), MfError> {
-    static START: Once = Once::new();
-    static CODE: AtomicI32 = AtomicI32::new(0);
-    START.call_once(|| {
-        // SAFETY: FFI. `MFStartup` takes a version and flags and returns an
-        // `HRESULT`; no pointers are involved.
-        let code = match unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) } {
-            Ok(()) => 0,
-            Err(error) => error.code().0,
-        };
-        CODE.store(code, Ordering::SeqCst);
-    });
-    windows::core::HRESULT(CODE.load(Ordering::SeqCst))
-        .ok()
-        .map_err(MfError::from)
-}
-
 /// Unpack a `width << 32 | height` attribute (Media Foundation's `MF_MT_FRAME_SIZE`
 /// layout).
 fn attribute_size(media_type: &IMFMediaType, key: &GUID) -> Result<(u32, u32), MfError> {
@@ -118,7 +94,8 @@ fn attribute_size(media_type: &IMFMediaType, key: &GUID) -> Result<(u32, u32), M
 }
 
 /// The in-process Media Foundation H.264 decoder.
-pub(crate) struct MediaFoundationH264Decoder {
+#[derive(Debug)]
+pub struct MediaFoundationH264Decoder {
     transform: IMFTransform,
     /// Visible picture width (the display aperture), the width of an emitted
     /// frame.
@@ -140,8 +117,8 @@ impl MediaFoundationH264Decoder {
     /// The output type is negotiated lazily: the MFT cannot describe its output
     /// until it has parsed the stream's parameter sets, so [`Self::decode`]
     /// configures NV12 output on the first stream-change signal.
-    pub(crate) fn new() -> Result<Self, MfError> {
-        ensure_media_foundation_started()?;
+    pub fn new() -> Result<Self, MfError> {
+        ensure_media_foundation_started().map_err(MfError::from)?;
 
         // SAFETY: FFI to Media Foundation. `CoCreateInstance` yields a live
         // `IMFTransform`; the type object and messages below are used per the
@@ -204,7 +181,7 @@ impl MediaFoundationH264Decoder {
     ///
     /// `presentation_time_us` stamps the input sample so the decoder can order
     /// output; the client assigns its own sequence numbers downstream.
-    pub(crate) fn decode(
+    pub fn decode(
         &mut self,
         access_unit: &[u8],
         presentation_time_us: i64,
@@ -215,7 +192,7 @@ impl MediaFoundationH264Decoder {
 
     /// Signal end of stream and pull every remaining picture. Call once after
     /// the last access unit so frames the decoder still holds are emitted.
-    pub(crate) fn flush(&mut self) -> Result<Vec<MfFrame>, MfError> {
+    pub fn flush(&mut self) -> Result<Vec<MfFrame>, MfError> {
         // SAFETY: draining an MFT is a documented message on a live transform.
         unsafe {
             self.transform
@@ -471,7 +448,7 @@ mod tests {
             let starts_au = if is_vcl {
                 seen_vcl
             } else {
-                seen_vcl && matches!(nal_type, 6 | 7 | 8 | 9)
+                seen_vcl && matches!(nal_type, 6..=9)
             };
             if starts_au {
                 au_starts.push(index);

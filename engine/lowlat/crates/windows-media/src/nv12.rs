@@ -88,6 +88,70 @@ pub(crate) fn nv12_contiguous_planes(
     Some((&buffer[..y_len], &buffer[y_len..total]))
 }
 
+/// Convert a BGRA frame (one pixel per `u32`, `B | G<<8 | R<<16 | A<<24`) to a
+/// contiguous NV12 buffer: a full-resolution Y plane (`width * height` bytes)
+/// followed by an interleaved, half-resolution U/V plane (`width * height / 2`
+/// bytes). This is the inverse of [`nv12_to_bgra`] and the input the Windows
+/// Media Foundation encoder (and future VAAPI encoder) expects; Windows Desktop
+/// Duplication and most capture paths hand back BGRA.
+///
+/// `width` and `height` must be even (4:2:0 subsampling). Each chroma sample
+/// averages its 2x2 block of source pixels, which is more faithful than point
+/// sampling. BT.601 limited range, matching the decode side so an encode ->
+/// decode round trip is stable.
+pub(crate) fn bgra_to_nv12(pixels: &[u32], width: usize, height: usize) -> Vec<u8> {
+    let mut out = vec![0u8; width * height + width * height / 2];
+    let (y_plane, uv_plane) = out.split_at_mut(width * height);
+
+    for row in 0..height {
+        for col in 0..width {
+            let (b, g, r) = unpack_bgr(pixels[row * width + col]);
+            // BT.601 limited-range luma: coefficients are the float transform in
+            // the tests scaled by 256 (for the >>8 fixed point), so white maps to
+            // Y=235 not 255. Sum 220.
+            let y = (66 * r + 129 * g + 25 * b + 128) >> 8;
+            y_plane[row * width + col] = clamp_u8(16 + y);
+        }
+    }
+
+    // One U/V pair per 2x2 block, averaging the block's chroma.
+    let uv_width = width / 2;
+    for block_row in 0..height / 2 {
+        for block_col in 0..uv_width {
+            let mut r_sum = 0i32;
+            let mut g_sum = 0i32;
+            let mut b_sum = 0i32;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let px = pixels[(block_row * 2 + dy) * width + (block_col * 2 + dx)];
+                    let (b, g, r) = unpack_bgr(px);
+                    r_sum += r;
+                    g_sum += g;
+                    b_sum += b;
+                }
+            }
+            let (r, g, b) = (r_sum / 4, g_sum / 4, b_sum / 4);
+            // BT.601 limited-range chroma, coefficients scaled by 256 to match
+            // the luma above and the decode-side inverse.
+            let u = 128 + ((-38 * r - 74 * g + 112 * b + 128) >> 8);
+            let v = 128 + ((112 * r - 94 * g - 18 * b + 128) >> 8);
+            let uv_index = block_row * width + block_col * 2;
+            uv_plane[uv_index] = clamp_u8(u);
+            uv_plane[uv_index + 1] = clamp_u8(v);
+        }
+    }
+    out
+}
+
+/// Unpack a BGRA `u32` into its `(B, G, R)` channels as `i32`.
+fn unpack_bgr(pixel: u32) -> (i32, i32, i32) {
+    (
+        (pixel & 0xff) as i32,
+        ((pixel >> 8) & 0xff) as i32,
+        ((pixel >> 16) & 0xff) as i32,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +264,45 @@ mod tests {
         // One byte short of the 24 the planes need.
         let buffer = vec![0u8; 23];
         assert!(nv12_contiguous_planes(&buffer, 8, 2).is_none());
+    }
+
+    #[test]
+    fn bgra_round_trips_through_nv12() {
+        // A solid colour survives BGRA -> NV12 -> BGRA within 4:2:0 + integer
+        // BT.601 tolerance, proving the encoder-side forward transform matches
+        // the decoder-side inverse.
+        let colors: [(u8, u8, u8); 5] = [
+            (200, 30, 40),
+            (20, 180, 60),
+            (30, 40, 210),
+            (128, 128, 128),
+            (240, 240, 240),
+        ];
+        for (r, g, b) in colors {
+            let (w, h) = (8, 8);
+            let px = u32::from(b) | (u32::from(g) << 8) | (u32::from(r) << 16) | (0xFF_u32 << 24);
+            let frame = vec![px; w * h];
+
+            let nv12 = bgra_to_nv12(&frame, w, h);
+            assert_eq!(nv12.len(), w * h + w * h / 2);
+            let (y, uv) = nv12_contiguous_planes(&nv12, w, h).expect("planes fit");
+            let back = nv12_to_bgra(y, w, uv, w, w, h);
+
+            let (bb, gg, rr) = channels(back[w * 4 + 4]);
+            let close = |actual: u8, want: u8| (i32::from(actual) - i32::from(want)).abs() <= 6;
+            assert!(
+                close(rr, r) && close(gg, g) && close(bb, b),
+                "({r},{g},{b}) -> nv12 -> ({rr},{gg},{bb})"
+            );
+        }
+    }
+
+    #[test]
+    fn bgra_to_nv12_limited_range_white_is_235() {
+        // White clamps to the studio-swing luma ceiling, not 255 -- the check
+        // that the forward transform is limited range, not full range.
+        let white = (0xFF_u32) | (0xFF_u32 << 8) | (0xFF_u32 << 16) | (0xFF_u32 << 24);
+        let nv12 = bgra_to_nv12(&[white; 16], 4, 4);
+        assert_eq!(nv12[0], 235, "limited-range white luma");
     }
 }
