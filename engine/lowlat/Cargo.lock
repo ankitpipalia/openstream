@@ -1904,6 +1904,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-host-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "openstream-linux-host"
 version = "0.1.0"
 dependencies = [

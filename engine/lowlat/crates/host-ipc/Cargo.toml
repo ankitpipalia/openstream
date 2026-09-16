@@ -1,0 +1,25 @@
+[package]
+name = "openstream-host-ipc"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+# The shared contract between the unprivileged machine service and the
+# privileged device broker: the wire protocol, per-session capability tokens,
+# peer-credential authorisation, and the capture/login lifecycle state machine.
+# Pure and cross-platform so the whole contract is unit-testable off-target; the
+# only OS-gated code is the thin `libc` credential read on Unix.
+[lib]
+name = "openstream_host_ipc"
+path = "src/lib.rs"
+
+# The wire codec is hand-rolled (see src/wire.rs), so there is no serialization
+# dependency; the only dependency is libc, for the Linux SO_PEERCRED read.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true
