@@ -124,6 +124,9 @@ mod pipeline {
         pub(crate) bitrate_bps: u32,
         /// DXGI output to duplicate; `None` is the first attached output.
         pub(crate) output_index: Option<usize>,
+        /// Prefer a hardware encoder MFT (NVENC/AMF/QSV), falling back to the
+        /// software MFT. Off by default until physically verified.
+        pub(crate) prefer_hardware_encoder: bool,
     }
 
     enum Control {
@@ -274,18 +277,33 @@ mod pipeline {
         }
 
         fn create_encoder(config: &NativeConfig) -> Result<MediaFoundationH264Encoder, String> {
-            MediaFoundationH264Encoder::new(
-                config.width,
-                config.height,
-                config.fps,
-                config.bitrate_bps,
-            )
-            .map_err(|error| format!("media foundation h264 encoder: {error}"))
+            let result = if config.prefer_hardware_encoder {
+                MediaFoundationH264Encoder::new_preferring_hardware(
+                    config.width,
+                    config.height,
+                    config.fps,
+                    config.bitrate_bps,
+                )
+            } else {
+                MediaFoundationH264Encoder::new(
+                    config.width,
+                    config.height,
+                    config.fps,
+                    config.bitrate_bps,
+                )
+            };
+            result.map_err(|error| format!("media foundation h264 encoder: {error}"))
         }
 
         fn describe(&self) -> String {
             format!(
-                "Desktop Duplication -> Media Foundation H.264, {}x{} @ {} fps, {:.2} Mbps, low-latency codec mode {}, {} conversion threads",
+                "Desktop Duplication -> Media Foundation H.264 [{} encoder: {}], {}x{} @ {} fps, {:.2} Mbps, low-latency codec mode {}, {} conversion threads",
+                if self.encoder.is_hardware() {
+                    "hardware"
+                } else {
+                    "software"
+                },
+                self.encoder.friendly_name(),
                 self.config.width,
                 self.config.height,
                 self.config.fps,

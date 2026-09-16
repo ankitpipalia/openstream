@@ -875,15 +875,24 @@ impl VideoSource {
             return Err("the native Windows encoder produces 8-bit 4:2:0 H.264 only; negotiate h264 or use an FFmpeg backend".into());
         }
         let bitrate_mbps = configured_bitrate_mbps(request.bitrate_override_mbps);
+        // Hardware encode (NVENC/AMF/QSV via the MF hardware MFT) is opt-in
+        // until physically verified; the software MFT stays the default.
+        let prefer_hardware_encoder = env::var("OPENSTREAM_MF_HARDWARE_ENCODE")
+            .map(|value| {
+                let value = value.trim();
+                value == "1" || value.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
         let pipeline = native_video::NativePipeline::start(native_video::NativeConfig {
             width: u32::from(request.width),
             height: u32::from(request.height),
             fps: u32::from(request.fps),
             bitrate_bps: mbps_to_bps(bitrate_mbps),
             output_index: None,
+            prefer_hardware_encoder,
         })?;
         eprintln!(
-            "OpenStream native encoder: media-foundation-h264 pix_fmt=nv12 bitrate={bitrate_mbps:.2} Mbps"
+            "OpenStream native encoder: media-foundation-h264 pix_fmt=nv12 bitrate={bitrate_mbps:.2} Mbps hardware_preferred={prefer_hardware_encoder}"
         );
         Ok((Self::Native(pipeline), native_profile(bitrate_mbps)))
     }
