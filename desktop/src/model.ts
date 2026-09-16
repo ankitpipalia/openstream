@@ -40,14 +40,17 @@ export interface ConnectionSnapshot {
 /**
  * An incoming Secure Connect request this device is being asked to answer.
  *
- * The broker's pending-request payload carries only these fields today; the
- * requester's account, requested permissions, and target host are not part of
- * it yet, so the approval UI shows the device and the expiry it does have.
+ * `requested` is what the requester asked for, carried through the broker so
+ * the host approves against the actual request rather than a blanket grant. It
+ * is optional so a control plane that predates permission negotiation still
+ * renders (the modal then falls back to the host's policy note). The
+ * requester's account and target host are still not part of the payload.
  */
 export interface ConnectRequest {
   requestId: string;
   requesterDeviceId: string;
   expiresInSeconds: number;
+  requested?: PermissionSet;
 }
 
 export interface PermissionSet {
@@ -207,4 +210,23 @@ export function sessionStateLabel(state: SessionState): string {
     case "unavailable":
       return "Unavailable";
   }
+}
+
+/**
+ * The permission classes a request is asking for, as human labels in a stable
+ * order. Empty when nothing is requested, so the caller can fall back to the
+ * host's policy note.
+ */
+export function requestedPermissionLabels(requested: PermissionSet): string[] {
+  const labels: Array<[keyof PermissionSet, string]> = [
+    ["view", "Screen"],
+    ["keyboard", "Keyboard"],
+    ["mouse", "Mouse"],
+    ["gamepad", "Gamepad"],
+    ["clipboard", "Clipboard"],
+    ["microphone", "Microphone"],
+    ["tablet", "Tablet"],
+    ["virtual_usb", "USB devices"],
+  ];
+  return labels.filter(([key]) => requested[key]).map(([, label]) => label);
 }
