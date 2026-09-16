@@ -8179,7 +8179,6 @@ mod tests {
             "a device that never announced is not online"
         );
     }
-    }
 
     /// The product flow, end to end, and the boundary it exists to draw.
     ///
