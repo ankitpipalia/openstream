@@ -1318,6 +1318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/version", get(version_info))
         .route("/v1/auth/register", post(register_account))
         .route("/v1/auth/login", post(login_account))
         .route("/v1/auth/refresh", post(refresh_account))
@@ -1434,6 +1435,28 @@ async fn shutdown_signal() {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+/// What revision is actually running.
+///
+/// `/healthz` proves the process answers; it says nothing about which commit
+/// it was built from, which is exactly what makes a stale or partial deploy
+/// indistinguishable from a good one. `git_sha` is baked in at compile time
+/// (see `build.rs`) rather than read at runtime, so it can't be spoofed by
+/// anything reachable through the network stack this binary serves.
+async fn version_info() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+        git_sha: env!("OPENSTREAM_BUILD_SHA"),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct VersionInfo {
+    name: &'static str,
+    version: &'static str,
+    git_sha: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4648,12 +4671,12 @@ mod tests {
         authorized, bearer_token, cleanup_primary_socket, close_primary_pair, connect_approve,
         connect_deny, connect_observe, connect_offline, connect_pending, connect_presence,
         connect_request, consume_dual_budget, create_session, direct_message_route,
-        dispatch_generic_message, enroll_account_device, is_private_lan_address,
+        dispatch_generic_message, enroll_account_device, healthz, is_private_lan_address,
         list_account_devices, login_account, max_guests_for_new_session,
         prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
         register_account, relay_owner_for_ticket, relay_ticket, request_source,
         revoke_owned_sessions, sessions_owned_by, set_account_device_trust, signal_socket,
-        supplied_token_is_host, validate_signal_message, validate_startup_auth,
+        supplied_token_is_host, validate_signal_message, validate_startup_auth, version_info,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -7423,6 +7446,8 @@ mod tests {
 
     fn connect_router(state: AppState) -> Router {
         Router::new()
+            .route("/healthz", get(healthz))
+            .route("/version", get(version_info))
             .route("/v1/auth/register", post(register_account))
             .route("/v1/auth/login", post(login_account))
             .route(
@@ -7489,6 +7514,35 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
         };
         (status, value)
+    }
+
+    /// `/version` reports a build identity, not just that the process answers.
+    ///
+    /// `/healthz` alone cannot distinguish a good deploy from a stale or
+    /// partial one; this is the endpoint an operator checks to prove which
+    /// commit is actually serving traffic.
+    #[tokio::test]
+    async fn version_reports_a_non_empty_build_identity() {
+        let app = connect_router(connect_test_state());
+        let (status, body) = call(&app, "GET", "/version", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["name"].as_str(),
+            Some("openstream-signal-server"),
+            "unexpected package name in {body}"
+        );
+        assert!(
+            body["version"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "version must be present: {body}"
+        );
+        assert!(
+            body["git_sha"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "git_sha must be present even when it falls back to \"unknown\": {body}"
+        );
     }
 
     /// Register an account with one enrolled device and return its access
