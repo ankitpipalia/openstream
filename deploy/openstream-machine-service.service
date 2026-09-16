@@ -27,11 +27,12 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# Reaching the broker socket: during bring-up the broker socket is root-owned
-# 0660, so run this unit as root too (User/Group root, OPENSTREAM_BROKER_SERVICE_UID=0
-# on the broker) to prove the path end to end. For the unprivileged deployment,
-# the broker must share the socket with this account's group (a small broker
-# follow-up), after which this User=openstream unit connects with no elevation.
+# Reaching the broker socket: the broker (running as root) gives the socket to
+# this account's group via OPENSTREAM_BROKER_SOCKET_GID and admits this account's
+# uid via OPENSTREAM_BROKER_SERVICE_UID, so this User=openstream unit connects to
+# the root-owned socket with no elevation. Verified 2026-09-16: a non-root
+# (uid 1000) consumer connected and captured the live session end to end.
+# The installer sets both ids to this account (see the broker unit's env file).
 
 [Install]
 WantedBy=multi-user.target

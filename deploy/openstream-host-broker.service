@@ -14,10 +14,15 @@ Type=simple
 # is), so it is locked to local sockets and handed only the devices it needs.
 ExecStart=/usr/local/bin/openstream-host-broker
 Environment=OPENSTREAM_BROKER_SOCKET=/run/openstream/broker.sock
-# The machine-service account the broker admits over SO_PEERCRED. 0 (root) during
-# bring-up; set to the dedicated service uid once the machine service runs
-# unprivileged.
+# The machine-service account: OPENSTREAM_BROKER_SERVICE_UID is the uid the broker
+# admits over SO_PEERCRED, and OPENSTREAM_BROKER_SOCKET_GID is the group it gives
+# the socket so that account can connect unprivileged (owner stays root, mode
+# 0660). Both are provisioned by the installer in the env file below; 0 (root) is
+# the bring-up default. Verified 2026-09-16 on the GTX 970: with these set to a
+# non-root account, a uid-1000 consumer connected (socket came up root:<gid> 0660)
+# and captured the live session end to end.
 Environment=OPENSTREAM_BROKER_SERVICE_UID=0
+EnvironmentFile=-/etc/openstream/broker.env
 Restart=on-failure
 RestartSec=2s
 # /run/openstream, where the broker socket is created.

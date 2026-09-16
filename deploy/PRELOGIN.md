@@ -51,10 +51,14 @@ LD_LIBRARY_PATH=$(cat ~/nvlib.path)   # NVENC/Vulkan libs
 HOME=/root                            # driver caches for a root service
 ```
 
-For the fully unprivileged deployment the broker must share the socket with the
-machine-service account's group (a small follow-up); then the machine service
-runs as `User=openstream` with no elevation and the broker's
-`OPENSTREAM_BROKER_SERVICE_UID` is set to that account's uid.
+For the fully unprivileged deployment the broker gives the socket to the
+machine-service account's group with `OPENSTREAM_BROKER_SOCKET_GID` (owner stays
+root, mode stays `0660`) and admits that account's uid with
+`OPENSTREAM_BROKER_SERVICE_UID`; the machine service then runs as
+`User=openstream` with no elevation. **Verified 2026-09-16 on the GTX 970:** with
+those set, a non-root (uid 1000) consumer connected to the root broker (socket
+came up `root:<gid> 0660`) and captured the live session end to end
+(`{"frames":4,"bytes":70125,"keyframes":1,"streaming":true}`).
 
 ## Runtime evidence (2026-09-16, GTX 970 / KDE Wayland)
 
