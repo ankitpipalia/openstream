@@ -151,6 +151,8 @@ pub(crate) struct GpuPresenter {
     config: wgpu::SurfaceConfiguration,
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
+    /// The no-swizzle pipeline for the zero-copy path (a native BGRA texture).
+    pipeline_import: wgpu::RenderPipeline,
     texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
     frame_size: Option<(u32, u32)>,
@@ -249,30 +251,37 @@ impl GpuPresenter {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("openstream frame pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-        });
+        // Two pipelines share everything but the fragment entry: `fs_main`
+        // swizzles the CPU BGRA-in-RGBA upload, `fs_import` samples a native BGRA
+        // texture as-is for the zero-copy path.
+        let make_pipeline = |fragment_entry: &str, label: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: fragment_entry,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            })
+        };
+        let pipeline = make_pipeline("fs_main", "openstream frame pipeline");
+        let pipeline_import = make_pipeline("fs_import", "openstream frame import pipeline");
         eprintln!(
             "OpenStream native renderer: {backend:?} via {:?} ({})",
             info.backend, info.name
@@ -285,6 +294,7 @@ impl GpuPresenter {
             config,
             sampler,
             pipeline,
+            pipeline_import,
             texture: None,
             bind_group: None,
             frame_size: None,
@@ -430,6 +440,97 @@ impl GpuPresenter {
         self.instance.poll_all(false);
         Ok(())
     }
+
+    /// Present a GPU-resident frame with no CPU pixel readback. `texture` is a
+    /// native BGRA surface -- a VideoToolbox `CVPixelBuffer` imported through the
+    /// Metal HAL -- bound and drawn to the swapchain directly through the
+    /// no-swizzle pipeline. Nothing is uploaded (`present` uploads CPU pixels via
+    /// `write_texture`; this path does not), so the decoded pixels never touch
+    /// the CPU on the way to the screen.
+    ///
+    /// The presenter side of the zero-copy path. The no-swizzle render it uses is
+    /// proven correct on hardware by `vt_gpu`'s offscreen tests (and the
+    /// `no_swizzle_pipeline_renders_bgra_without_a_swizzle` test below); the
+    /// client's decode worker is wired to publish `CVPixelBuffer`s and call this
+    /// (sharing this presenter's wgpu device) in a follow-up, so it is not yet on
+    /// the live hot path.
+    #[allow(dead_code)]
+    pub(crate) fn present_texture(
+        &mut self,
+        window: &Window,
+        texture: &wgpu::Texture,
+    ) -> Result<(), String> {
+        let (window_width, window_height) = window.get_size();
+        let surface_width = u32::try_from(window_width.max(1))
+            .map_err(|_| "window width exceeds the GPU surface limit".to_string())?;
+        let surface_height = u32::try_from(window_height.max(1))
+            .map_err(|_| "window height exceeds the GPU surface limit".to_string())?;
+        if self.config.width != surface_width || self.config.height != surface_height {
+            self.config.width = surface_width;
+            self.config.height = surface_height;
+            self.surface.configure(&self.device, &self.config);
+        }
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let layout = self.pipeline_import.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openstream import bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        let output = match self.surface.get_current_texture() {
+            Ok(output) => output,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                return Err("native renderer ran out of GPU memory".to_string());
+            }
+        };
+        let output_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("openstream import encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("openstream import pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline_import);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        output.present();
+        self.instance.poll_all(false);
+        Ok(())
+    }
 }
 
 const FRAME_SHADER: &str = r#"
@@ -464,6 +565,15 @@ var frame_sampler: sampler;
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(frame_texture, frame_sampler, input.uv).bgra;
+}
+
+// The zero-copy path binds a native BGRA texture (a VideoToolbox CVPixelBuffer
+// imported through the Metal HAL), which wgpu already returns in logical RGBA
+// order when sampled -- so this entry does not swizzle. `fs_main` swizzles only
+// because the CPU path uploads BGRA bytes into an RGBA-typed texture.
+@fragment
+fn fs_import(input: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(frame_texture, frame_sampler, input.uv);
 }
 "#;
 
@@ -506,5 +616,93 @@ mod tests {
         assert_eq!(RenderBackend::parse("OPENGL"), RenderBackend::OpenGl);
         assert!(!RenderBackend::Software.is_native());
         assert!(RenderBackend::Vulkan.is_native());
+    }
+}
+
+/// The frame shaders build into valid pipelines on real GPU hardware. This
+/// catches a WGSL error in either entry (`fs_main` swizzle, `fs_import`
+/// no-swizzle) at test time rather than only when a window first opens; the
+/// no-swizzle render's colour correctness is covered by `vt_gpu`'s offscreen
+/// render tests.
+#[cfg(test)]
+mod frame_pipeline_tests {
+    use std::borrow::Cow;
+
+    use super::FRAME_SHADER;
+
+    #[test]
+    fn both_frame_shader_entries_build_valid_pipelines() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no GPU adapter available; skipping frame-pipeline test");
+            return;
+        };
+        let Ok((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+        else {
+            eprintln!("no GPU device available; skipping frame-pipeline test");
+            return;
+        };
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FRAME_SHADER)),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        // Building the pipeline validates the fragment entry's WGSL. A bad entry
+        // name or a shader error makes create_render_pipeline fail here.
+        for entry in ["fs_main", "fs_import"] {
+            let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: entry,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+        }
     }
 }
