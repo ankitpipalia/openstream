@@ -486,8 +486,22 @@ async fn approve_connect_request(
 ) -> Result<(), RuntimeError> {
     let credential = {
         let mut client = control_plane.lock().await;
+        // Approve as requested: the host was shown this request from the
+        // pending list, and approving grants what was asked. The granted set is
+        // taken from the broker's own pending record rather than from the
+        // WebView, so this path cannot widen it beyond the request. A request
+        // no longer pending (already approved, or expired) grants the empty
+        // set, which the broker ignores on the idempotent retry.
+        let granted = client
+            .pending_connect_requests()
+            .await
+            .map_err(control_plane_error_runtime)?
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .map(|request| request.requested)
+            .unwrap_or_else(openstream_app_core::PermissionSet::none);
         client
-            .approve_connect(&request_id)
+            .approve_connect(&request_id, granted)
             .await
             .map_err(control_plane_error_runtime)?
     };
