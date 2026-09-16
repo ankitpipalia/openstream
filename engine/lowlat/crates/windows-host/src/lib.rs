@@ -14,3 +14,7 @@ pub mod audio;
 pub mod capture;
 pub mod input;
 pub mod lifecycle;
+
+// Physical runtime smoke tests: real OS FFI, gated so CI only compiles them.
+#[cfg(all(test, target_os = "windows"))]
+mod runtime_smoke;
