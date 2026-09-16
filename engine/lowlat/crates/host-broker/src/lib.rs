@@ -15,3 +15,10 @@
 
 pub mod device;
 pub mod session;
+
+#[cfg(target_os = "linux")]
+pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod inject;
+#[cfg(target_os = "linux")]
+pub mod server;
