@@ -44,7 +44,7 @@ mod linux {
         Capabilities, PeerSession, ReliableControl, Role, VideoCodec,
         load_pairing_from_environment, parse_stun_servers,
     };
-    use openstream_host_ipc::lifecycle::CaptureKind;
+    use openstream_host_ipc::lifecycle::{Action, Event, Lifecycle};
     use openstream_host_ipc::protocol::{BrokerEvent, CaptureParams, ServiceRequest};
     use openstream_host_ipc::token::Capabilities as BrokerCaps;
     use openstream_host_ipc::transport::{recv_event, send_request};
@@ -148,56 +148,52 @@ mod linux {
             return Err("the machine service currently emits H.264 only".into());
         }
 
-        // Ask the broker to capture the seat as it stands now (greeter or user),
-        // with the capabilities the peer negotiated. The broker clamps this to
-        // its own policy and to the seat (the login screen never gets clipboard).
-        let seat = current_seat();
+        // The capabilities the peer negotiated; the broker clamps them to its
+        // own policy and to the seat (the login screen never gets clipboard).
         let mut requested = BrokerCaps::CAPTURE;
         if negotiated.input {
             requested = requested.with(BrokerCaps::KEYBOARD).with(BrokerCaps::MOUSE);
         }
         let mbps = configured_mbps();
-        let bitrate_kbps = kbps_from_mbps(mbps);
+        let capture = CaptureContext {
+            requested,
+            width: negotiated.width,
+            height: negotiated.height,
+            fps: u8::try_from(negotiated.fps.clamp(1, 240)).unwrap_or(60),
+            bitrate_kbps: kbps_from_mbps(mbps),
+        };
         session
             .set_wire_pacing_rate((mbps * 1.5).max(30.0))
             .map_err(|error| format!("wire pacing rate: {error:?}"))?;
 
-        send_request(
+        // Drive capture through the lifecycle state machine, so logging in
+        // (greeter -> user) or out re-points capture WITHOUT dropping the peer.
+        // The peer stays approved across every seat change; only PeerLost ends
+        // it. CaptureStarted/CaptureError come back through the loop below.
+        let mut lifecycle = Lifecycle::new();
+        let mut last_seat = current_seat();
+        eprintln!("machine-service: initial seat {last_seat:?}");
+        apply_actions(
+            lifecycle.on(Event::SeatObserved(last_seat)),
             &mut broker.writer,
-            &ServiceRequest::OpenCapture {
-                token_id: session_token_id(),
-                requested,
-                params: CaptureParams {
-                    seat,
-                    kind: CaptureKind::Scanout,
-                    width: negotiated.width,
-                    height: negotiated.height,
-                    fps: u8::try_from(negotiated.fps.clamp(1, 240)).unwrap_or(60),
-                    bitrate_kbps,
-                },
-            },
+            &capture,
         )
         .await?;
-        match recv_event(&mut broker.reader).await? {
-            BrokerEvent::CaptureStarted {
-                width,
-                height,
-                granted,
-                ..
-            } => {
-                eprintln!("machine-service: capture started {width}x{height}, granted {granted:?}");
-            }
-            BrokerEvent::CaptureError { code, message } => {
-                return Err(format!("broker refused capture ({code}): {message}").into());
-            }
-            other => return Err(format!("unexpected first broker event: {other:?}").into()),
-        }
+        apply_actions(
+            lifecycle.on(Event::PeerApproved),
+            &mut broker.writer,
+            &capture,
+        )
+        .await?;
 
         let mut reliable_control =
             ReliableControl::new(openstream_client_core::MAX_CONTROL_PENDING);
         let mut adaptive = AdaptiveBitrate::new(mbps, (mbps / 4.0).max(1.0), mbps);
         let started = Instant::now();
         let mut tick = tokio::time::interval(Duration::from_millis(1));
+        // Watch the seat a few times a second; a login transition is not
+        // latency-critical, and this keeps the logind read off the hot path.
+        let mut seat_poll = tokio::time::interval(Duration::from_millis(500));
 
         loop {
             tokio::select! {
@@ -243,6 +239,22 @@ mod linux {
                         send_request(&mut broker.writer, &ServiceRequest::SetBitrate { kbps }).await?;
                     }
                 }
+                _ = seat_poll.tick() => {
+                    // A login or logout changes the seat; feed it to the
+                    // lifecycle, which re-points capture (SwitchCapture) and
+                    // asks for a keyframe -- never dropping the approved peer.
+                    let seat = current_seat();
+                    if seat != last_seat {
+                        eprintln!("machine-service: seat {last_seat:?} -> {seat:?}, re-pointing capture");
+                        last_seat = seat;
+                        apply_actions(
+                            lifecycle.on(Event::SeatObserved(seat)),
+                            &mut broker.writer,
+                            &capture,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -257,6 +269,49 @@ mod linux {
 
     fn broker_client_default_socket() -> &'static str {
         "/run/openstream/broker.sock"
+    }
+
+    /// The fixed capture parameters negotiated with the peer, used to fill in an
+    /// `OpenCapture` whenever the lifecycle asks to (re)start capture.
+    #[derive(Debug, Clone, Copy)]
+    struct CaptureContext {
+        requested: BrokerCaps,
+        width: u16,
+        height: u16,
+        fps: u8,
+        bitrate_kbps: u32,
+    }
+
+    /// Turn lifecycle actions into broker requests. `StartCapture` opens a new
+    /// capture with the negotiated geometry; `SwitchCapture` re-points a live one
+    /// without dropping the peer. This is the only place capture is opened or
+    /// moved, so a login transition is always a switch, never a teardown.
+    async fn apply_actions(
+        actions: Vec<Action>,
+        broker_writer: &mut tokio::net::unix::OwnedWriteHalf,
+        capture: &CaptureContext,
+    ) -> std::io::Result<()> {
+        for action in actions {
+            let request = match action {
+                Action::StartCapture(seat, kind) => ServiceRequest::OpenCapture {
+                    token_id: session_token_id(),
+                    requested: capture.requested,
+                    params: CaptureParams {
+                        seat,
+                        kind,
+                        width: capture.width,
+                        height: capture.height,
+                        fps: capture.fps,
+                        bitrate_kbps: capture.bitrate_kbps,
+                    },
+                },
+                Action::SwitchCapture(seat, kind) => ServiceRequest::SwitchCapture { seat, kind },
+                Action::StopCapture => ServiceRequest::CloseCapture,
+                Action::RequestKeyframe => ServiceRequest::RequestKeyframe,
+            };
+            send_request(broker_writer, &request).await?;
+        }
+        Ok(())
     }
 
     /// Forward one broker event to the peer. Returns `true` when a fatal capture
