@@ -1149,7 +1149,7 @@ impl Display {
         // SAFETY: the encoder's context is current on this thread, the
         // descriptor was exported for the platform's opaque kind, and the size
         // is the whole allocation behind it.
-        let taken = unsafe { cuda.import(fd, bytes) }.map_err(|_| Error::Register)?;
+        let mut taken = unsafe { cuda.import(fd, bytes) }.map_err(|_| Error::Register)?;
         let plane = taken
             .plane(0, bytes, exported.pitch as usize)
             .map_err(|_| Error::Register)?;
