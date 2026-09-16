@@ -694,6 +694,69 @@ pub struct Pairing {
     pub relay_host_ticket: Option<String>,
     #[serde(default)]
     pub relay_client_ticket: Option<String>,
+    /// The input and device classes granted to this pairing's role, carried
+    /// from the role credential. `None` for a provisioning pairing and for
+    /// older pairing files written before permission negotiation; the session
+    /// runner treats a present set as the ceiling on what it will drive.
+    #[serde(default)]
+    pub permissions: Option<Permissions>,
+}
+
+/// The input and device classes a session may drive, as the Connect broker
+/// negotiated them.
+///
+/// The broker returns the *granted* set with each role credential -- a host
+/// narrows what the client asked for during approval -- and the client carries
+/// it so the session runner can scope input, clipboard and audio to what was
+/// actually granted rather than to whatever a peer sends. Enforcement is a
+/// later step; this type only transports the decision.
+///
+/// The fields are field-for-field wire-compatible with the signal server's
+/// `connect::Permissions` object and `app-core`'s `PermissionSet`. It is a
+/// distinct type here only because `client-core` sits below both and shares no
+/// crate with them; the three should collapse into one once a common low crate
+/// exists to hold it. Absent fields deserialize to "not granted", so a partial
+/// object can only narrow, never silently widen, the granted set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "snake_case")]
+pub struct Permissions {
+    pub view: bool,
+    pub keyboard: bool,
+    pub mouse: bool,
+    pub gamepad: bool,
+    pub clipboard: bool,
+    pub microphone: bool,
+    pub tablet: bool,
+    pub virtual_usb: bool,
+}
+
+impl Permissions {
+    /// The empty set: every class denied. Identical to `Default`.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Every class granted.
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            view: true,
+            keyboard: true,
+            mouse: true,
+            gamepad: true,
+            clipboard: true,
+            microphone: true,
+            tablet: true,
+            virtual_usb: true,
+        }
+    }
+
+    /// True when no class is granted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::none()
+    }
 }
 
 /// One end of an approved session, as the Connect broker delivers it.
@@ -714,6 +777,11 @@ pub struct RoleCredential {
     pub relay_ticket: Option<String>,
     #[serde(default)]
     pub turn: Option<TurnCredentials>,
+    /// The input and device classes the broker granted this role, or `None` for
+    /// a credential minted before permission negotiation. Carried into the
+    /// pairing so the session runner can scope what it drives to the grant.
+    #[serde(default)]
+    pub permissions: Option<Permissions>,
 }
 
 /// Maximum pairing-file size accepted by the process boundary.
@@ -1013,6 +1081,7 @@ impl Pairing {
             relay_address,
             relay_ticket,
             turn,
+            permissions,
         } = credential;
         let (host_token, client_token) = match role {
             Role::Host => (Some(token), None),
@@ -1042,6 +1111,9 @@ impl Pairing {
             turn_client,
             relay_host_ticket,
             relay_client_ticket,
+            // Role-blind: the broker already scoped this grant to the one role
+            // the credential carries, so it passes straight through.
+            permissions,
         }
     }
 
@@ -5522,6 +5594,7 @@ mod tests {
             relay_address: None,
             relay_ticket: Some("client-ticket".into()),
             turn: None,
+            permissions: None,
         });
         assert!(client.can_act_as(Role::Client));
         assert!(
@@ -5545,6 +5618,7 @@ mod tests {
             relay_address: None,
             relay_ticket: Some("host-ticket".into()),
             turn: None,
+            permissions: None,
         });
         assert!(host.can_act_as(Role::Host));
         assert!(!host.can_act_as(Role::Client));
@@ -5571,6 +5645,7 @@ mod tests {
             turn_client: None,
             relay_host_ticket: None,
             relay_client_ticket: None,
+            permissions: None,
         };
         assert!(pairing.token(Role::Host).is_err());
         assert!(pairing.token(Role::Client).is_ok());
@@ -5592,6 +5667,7 @@ mod tests {
             relay_address: Some("203.0.113.9:7000".into()),
             relay_ticket: Some("ticket".into()),
             turn: None,
+            permissions: None,
         });
         let encoded = serde_json::to_string(&pairing).expect("serialise");
         assert!(
@@ -5601,6 +5677,111 @@ mod tests {
         let decoded: Pairing = serde_json::from_str(&encoded).expect("deserialise");
         assert_eq!(decoded, pairing);
         assert!(!decoded.can_act_as(Role::Host));
+    }
+
+    /// A role credential carries the permission classes the broker granted, and
+    /// they travel into the pairing the runner reads.
+    ///
+    /// The host narrows what the client asked for during approval; the granted
+    /// set rides with the credential so the runner can scope input, clipboard
+    /// and audio to it rather than to whatever a peer happens to send.
+    #[test]
+    fn a_role_credential_carries_its_granted_permissions() {
+        let json = r#"{
+            "session_id": "session-1",
+            "role": "client",
+            "token": "CLIENT-CAPABILITY",
+            "websocket_path": "/v1/signal/session-1/client",
+            "expires_in_seconds": 60,
+            "permissions": { "view": true, "keyboard": true, "mouse": true, "clipboard": true }
+        }"#;
+        let credential: RoleCredential =
+            serde_json::from_str(json).expect("a credential with a permission grant parses");
+        let granted = credential.permissions.expect("the grant is present");
+        assert!(granted.view && granted.keyboard && granted.mouse && granted.clipboard);
+        // A class the object omitted is denied, never silently granted.
+        assert!(
+            !granted.gamepad && !granted.microphone && !granted.tablet && !granted.virtual_usb,
+            "an omitted class must default to denied, not granted"
+        );
+        // The pairing the runner consumes carries the identical grant.
+        assert_eq!(
+            Pairing::from_role_credential(credential).permissions,
+            Some(granted),
+            "the grant travels from the credential into the pairing"
+        );
+    }
+
+    /// A credential minted before permission negotiation carries no grant.
+    ///
+    /// The field is optional so an older broker -- and the provisioning path,
+    /// which does not negotiate per-class permissions -- still parses. Absent
+    /// is `None` (decide at enforcement), never an empty set that would quietly
+    /// deny everything.
+    #[test]
+    fn a_credential_without_a_permission_block_carries_none() {
+        let json = r#"{
+            "session_id": "session-1",
+            "role": "host",
+            "token": "HOST-CAPABILITY",
+            "websocket_path": "/v1/signal/session-1/host",
+            "expires_in_seconds": 60
+        }"#;
+        let credential: RoleCredential =
+            serde_json::from_str(json).expect("a pre-permission credential parses");
+        assert_eq!(credential.permissions, None);
+        assert_eq!(Pairing::from_role_credential(credential).permissions, None);
+    }
+
+    /// The granted permissions survive the pairing-file round trip.
+    ///
+    /// The launcher writes the pairing and the runner reads it back, so a grant
+    /// written to disk must decode to the identical set.
+    #[test]
+    fn granted_permissions_survive_the_pairing_file_roundtrip() {
+        let granted = Permissions {
+            view: true,
+            keyboard: true,
+            mouse: true,
+            gamepad: false,
+            clipboard: true,
+            microphone: false,
+            tablet: false,
+            virtual_usb: false,
+        };
+        let pairing = Pairing::from_role_credential(RoleCredential {
+            session_id: "session-1".into(),
+            role: Role::Client,
+            token: "CLIENT-CAPABILITY".into(),
+            websocket_path: "/v1/signal/session-1/client".into(),
+            expires_in_seconds: 60,
+            relay_address: None,
+            relay_ticket: None,
+            turn: None,
+            permissions: Some(granted),
+        });
+        let encoded = serde_json::to_string(&pairing).expect("serialise");
+        let decoded: Pairing = serde_json::from_str(&encoded).expect("deserialise");
+        assert_eq!(decoded.permissions, Some(granted));
+    }
+
+    /// The permission-set helpers mean what they say.
+    #[test]
+    fn permission_set_helpers_are_consistent() {
+        assert!(Permissions::none().is_empty());
+        assert_eq!(Permissions::none(), Permissions::default());
+        let all = Permissions::all();
+        assert!(!all.is_empty());
+        assert!(
+            all.view
+                && all.keyboard
+                && all.mouse
+                && all.gamepad
+                && all.clipboard
+                && all.microphone
+                && all.tablet
+                && all.virtual_usb
+        );
     }
 
     /// Provisioning pairings, which carry both roles, still work.
@@ -5643,6 +5824,7 @@ mod tests {
             turn_client: None,
             relay_host_ticket: Some("RELAY-HOST-TICKET-SHOULD-NOT-APPEAR".into()),
             relay_client_ticket: Some("RELAY-CLIENT-TICKET-SHOULD-NOT-APPEAR".into()),
+            permissions: None,
         };
 
         let rendered = format!("{pairing:?}");
@@ -6635,6 +6817,7 @@ mod tests {
             turn_client: None,
             relay_host_ticket: None,
             relay_client_ticket: None,
+            permissions: None,
         }
     }
 
