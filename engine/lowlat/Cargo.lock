@@ -2046,6 +2046,13 @@ name = "openstream-transport-policy"
 version = "0.0.0"
 
 [[package]]
+name = "openstream-windows-host"
+version = "0.1.0"
+dependencies = [
+ "windows 0.59.0",
+]
+
+[[package]]
 name = "openstream-windows-media"
 version = "0.1.0"
 dependencies = [

@@ -22,6 +22,7 @@ members = [
     "crates/platform",
     "crates/media",
     "crates/windows-media",
+    "crates/windows-host",
     "crates/linux-host",
     "crates/client",
     "crates/desktop-client",
@@ -58,6 +59,7 @@ lowlat-host = { path = "crates/host" }
 lowlat-kessel = { path = "crates/kessel" }
 openstream-transport-policy = { path = "crates/transport-policy" }
 openstream-windows-media = { path = "crates/windows-media" }
+openstream-windows-host = { path = "crates/windows-host" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 base64 = "0.22"
