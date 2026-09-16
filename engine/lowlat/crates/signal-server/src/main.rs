@@ -7640,6 +7640,88 @@ mod tests {
         server.abort();
     }
 
+    /// The signalling socket refuses a credential it never minted.
+    ///
+    /// The positive path proves a broker-issued token is accepted; this proves
+    /// that acceptance is a check, not a formality. A real session exists, but a
+    /// token the socket never issued for it does not open a live socket: either
+    /// the handshake is refused, or the upgrade completes and the socket closes
+    /// without ever delivering the session's first frame.
+    #[tokio::test]
+    async fn the_signalling_socket_refuses_a_credential_it_did_not_mint() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) =
+            register_with_device(&app, "operator", "device-client", 0x43).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x44).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x44).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (_, grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        let ws_path = grant["websocket_path"]
+            .as_str()
+            .expect("websocket path")
+            .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        let mut request = format!("ws://{address}{ws_path}")
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            "Bearer not-a-credential-this-socket-issued"
+                .parse()
+                .expect("authorization header"),
+        );
+
+        match connect_async(request).await {
+            // The handshake itself was refused: an unambiguous rejection.
+            Err(_) => {}
+            // The upgrade completed; the socket must not then act as a live
+            // session socket. It closes, errors, or yields nothing -- never a
+            // usable first frame.
+            Ok((mut socket, _)) => {
+                match timeout(Duration::from_secs(2), socket.next()).await {
+                    Ok(Some(Ok(ClientMessage::Text(text)))) => {
+                        panic!("a credential the socket did not mint received a text frame: {text}")
+                    }
+                    Ok(Some(Ok(ClientMessage::Binary(bytes)))) => panic!(
+                        "a credential the socket did not mint received a binary frame ({} bytes)",
+                        bytes.len()
+                    ),
+                    // Close, transport error, end of stream, or timeout: all are
+                    // a rejection, none is authentication.
+                    _ => {}
+                }
+            }
+        }
+
+        server.abort();
+    }
+
     /// The product flow, end to end, and the boundary it exists to draw.
     ///
     /// Each end receives exactly one role capability and neither can obtain
