@@ -250,11 +250,17 @@ fn to_runtime_trusted_device(device: &control_plane::PublicDevice) -> TrustedDev
 }
 
 fn to_directory_device(device: &control_plane::PublicDevice) -> openstream_app_core::DeviceSummary {
-    // The account/device API does not yet expose host presence. Keep the
-    // record visible for trust management but deliberately mark it offline so
-    // the shell cannot offer a connection that has not been discovered.
-    let mut summary =
-        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone());
+    // Presence now reaches the shell through the device listing, so a device
+    // the control plane last saw announcing itself is offered as connectable
+    // and everything else stays visible for trust management only. The online
+    // flag is advisory: the broker re-checks presence when a session is
+    // actually requested, so a stale "online" costs one refused request, never
+    // a session started against a machine that is not there.
+    let mut summary = if device.online {
+        openstream_app_core::DeviceSummary::online(device.device_id.clone(), device.name.clone())
+    } else {
+        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone())
+    };
     summary.platform = device.platform.clone();
     summary
 }
@@ -1390,6 +1396,37 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::task::JoinHandle;
+
+    /// Presence from the control plane decides whether the shell offers a
+    /// connection. This is the desktop half of surfacing host presence: an
+    /// online record maps to a connectable summary, an offline one does not,
+    /// and the platform is carried through either way. Before presence was
+    /// surfaced every device mapped to offline and the connect button was
+    /// never live.
+    #[test]
+    fn to_directory_device_reflects_presence() {
+        let base = super::control_plane::PublicDevice {
+            device_id: "device-host".to_string(),
+            name: "Studio".to_string(),
+            platform: "macos".to_string(),
+            trust: super::control_plane::DeviceTrust::Trusted,
+            enrolled_at_ms: 0,
+            last_seen_ms: None,
+            public_key_fingerprint: "abcd1234".to_string(),
+            online: true,
+        };
+
+        let online = super::to_directory_device(&base);
+        assert!(online.online, "an online device is offered as connectable");
+        assert_eq!(online.platform, "macos", "platform is carried through");
+
+        let offline = super::to_directory_device(&super::control_plane::PublicDevice {
+            online: false,
+            ..base
+        });
+        assert!(!offline.online, "an offline device is not offered");
+        assert_eq!(offline.platform, "macos", "platform is carried through");
+    }
 
     #[test]
     fn local_no_auth_private_lan_origin_does_not_abort_startup() {

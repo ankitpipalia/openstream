@@ -1925,14 +1925,31 @@ async fn list_account_devices(State(state): State<AppState>, headers: HeaderMap)
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    let accounts = state.accounts.lock().await;
-    if let Err(error) = accounts.can_manage_devices(&principal) {
-        return control_error_response(error);
+    let mut devices = {
+        let accounts = state.accounts.lock().await;
+        if let Err(error) = accounts.can_manage_devices(&principal) {
+            return control_error_response(error);
+        }
+        match accounts.list_devices(&principal.account_id) {
+            Ok(devices) => devices,
+            Err(error) => return control_error_response(error),
+        }
+    };
+    // Layer live presence over the stored records. The account store knows a
+    // device exists and whether it is trusted; only the Connect broker knows
+    // whether it is online right now, and a device the owner cannot see as
+    // online is one the shell will never offer to connect to. The accounts
+    // lock is released above before the broker lock is taken, so this adds no
+    // new lock-ordering edge. `is_online` is scoped to the caller's account,
+    // so one account's listing can never reveal another's presence.
+    {
+        let now = Instant::now();
+        let broker = state.connect.lock().await;
+        for device in &mut devices {
+            device.online = broker.is_online(&principal.account_id, &device.device_id, now);
+        }
     }
-    match accounts.list_devices(&principal.account_id) {
-        Ok(devices) => Json(devices).into_response(),
-        Err(error) => control_error_response(error),
-    }
+    Json(devices).into_response()
 }
 
 async fn enroll_account_device(
@@ -7540,6 +7557,57 @@ mod tests {
             .as_str()
             .expect("access token")
             .to_string()
+    }
+
+    /// The device listing carries live presence, which is what lets the owner's
+    /// shell offer a connection at all.
+    ///
+    /// The broker already tracks and enforces presence, but until it was
+    /// surfaced here the shell had no readable online status and marked every
+    /// device offline -- so discovery could never happen and the connect
+    /// button was never live. Presence must appear in `GET /v1/devices` for
+    /// exactly the device that announced it, and only within the owner's own
+    /// account.
+    #[tokio::test]
+    async fn presence_is_reported_in_the_device_listing() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        // The owner account, with its own (client) device.
+        let (client_token, _) =
+            register_with_device(&app, "operator", "device-client", 0x11).await;
+        // A host device on the same account, trusted by the owner.
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+
+        let online_of = |body: &serde_json::Value, id: &str| -> bool {
+            body.as_array()
+                .expect("device array")
+                .iter()
+                .find(|device| device["device_id"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("device {id} present in listing: {body}"))["online"]
+                .as_bool()
+                .expect("online is a bool")
+        };
+
+        // Before any heartbeat, nothing is online.
+        let (status, body) = call(&app, "GET", "/v1/devices", Some(&client_token), None).await;
+        assert_eq!(status, StatusCode::OK, "list devices: {body}");
+        assert!(!online_of(&body, "device-host"), "host offline before heartbeat");
+        assert!(!online_of(&body, "device-client"), "client never announces");
+
+        // The host announces it is available.
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "host announces presence");
+
+        // Now the owner sees the host as online, and only the host: a device
+        // that never announced stays offline.
+        let (status, body) = call(&app, "GET", "/v1/devices", Some(&client_token), None).await;
+        assert_eq!(status, StatusCode::OK, "list devices: {body}");
+        assert!(online_of(&body, "device-host"), "the announced host is online");
+        assert!(
+            !online_of(&body, "device-client"),
+            "a device that never announced is not online"
+        );
     }
 
     /// The product flow, end to end, and the boundary it exists to draw.
