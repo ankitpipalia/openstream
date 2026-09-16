@@ -536,6 +536,7 @@ async fn approve_connect_request(
             relay_address: credential.relay_address,
             relay_ticket: Some(credential.relay_ticket),
             turn: None,
+            permissions: None,
         },
     );
     let path = {

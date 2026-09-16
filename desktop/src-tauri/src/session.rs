@@ -1214,6 +1214,7 @@ mod tests {
             relay_address: None,
             relay_ticket: Some("ticket".to_string()),
             turn: None,
+            permissions: None,
         }
     }
 
