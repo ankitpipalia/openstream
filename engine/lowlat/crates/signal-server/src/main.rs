@@ -2129,6 +2129,20 @@ async fn revoke_owned_sessions(
 #[derive(Debug, Deserialize)]
 struct ConnectRequestBody {
     target_device_id: String,
+    /// The permission classes the requester is asking for. Defaulted so a
+    /// client that predates permission negotiation asks for nothing rather
+    /// than failing to parse.
+    #[serde(default)]
+    requested: connect::Permissions,
+}
+
+/// The optional body of an approval: the permission classes the target grants.
+/// Absent or partial defaults to the empty set, so an old client that approves
+/// with no body grants nothing rather than everything.
+#[derive(Debug, Default, Deserialize)]
+struct ConnectApproveBody {
+    #[serde(default)]
+    granted: connect::Permissions,
 }
 
 #[derive(Debug, Serialize)]
@@ -2143,6 +2157,9 @@ struct PendingConnectRequest {
     request_id: String,
     requester_device_id: String,
     expires_in_seconds: u64,
+    /// What the requester asked for, so the target approves against the actual
+    /// request rather than granting blind.
+    requested: connect::Permissions,
 }
 
 #[derive(Debug, Serialize)]
@@ -2163,6 +2180,9 @@ struct ConnectCredential {
     websocket_path: String,
     relay_address: Option<String>,
     relay_ticket: String,
+    /// The classes the target granted, delivered to each end so both agree on
+    /// the session's scope. The runner enforces it; the broker only negotiates.
+    permissions: connect::Permissions,
 }
 
 fn connect_error_response(error: connect::ConnectError) -> Response {
@@ -2285,11 +2305,12 @@ async fn connect_request(
     let now = Instant::now();
     let request_id = Uuid::new_v4().simple().to_string();
     let mut broker = state.connect.lock().await;
-    match broker.request(
+    match broker.request_scoped(
         request_id,
         &account_id,
         &device_id,
         &body.target_device_id,
+        body.requested,
         now,
     ) {
         Ok(request) => Json(ConnectRequestCreated {
@@ -2320,6 +2341,7 @@ async fn connect_pending(State(state): State<AppState>, headers: HeaderMap) -> R
             request_id: request.request_id,
             requester_device_id: request.requester_device_id,
             expires_in_seconds: seconds_until(request.expires_at, now),
+            requested: request.requested,
         })
         .collect();
     Json(body).into_response()
@@ -2330,11 +2352,19 @@ async fn connect_approve(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
     let (account_id, device_id) = match connect_principal(&state, &headers).await {
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    // The classes the target is granting. An empty or absent body -- a client
+    // that predates permission negotiation -- parses to the empty set rather
+    // than a blanket grant, and a malformed one is treated the same way rather
+    // than failing an approval the person already made.
+    let granted = serde_json::from_slice::<ConnectApproveBody>(&body)
+        .map(|body| body.granted)
+        .unwrap_or_default();
     let now = Instant::now();
     let party = connect::Party {
         account_id: &account_id,
@@ -2353,7 +2383,7 @@ async fn connect_approve(
     // a creation slot for a session that already exists.
     let fresh = {
         let mut broker = state.connect.lock().await;
-        match broker.approve(
+        match broker.approve_scoped(
             &request_id,
             party,
             connect::SessionGrant {
@@ -2361,6 +2391,7 @@ async fn connect_approve(
                 host_credential: Uuid::new_v4().simple().to_string(),
                 client_credential: Uuid::new_v4().simple().to_string(),
             },
+            granted,
             now,
         ) {
             Ok(request) => Some(request),
@@ -2421,6 +2452,7 @@ async fn connect_approve(
             websocket_path: format!("/v1/signal/{session_id}/host"),
             relay_ticket: relay_ticket::mint(&state.relay_secret, &session_id, "host", "host", 1),
             relay_address: state.relay_address.map(|address| address.to_string()),
+            permissions: broker.granted_permissions(&request_id),
             session_id,
             role: "host",
             token,
@@ -2488,6 +2520,7 @@ async fn connect_observe(
                 1,
             ),
             relay_address: state.relay_address.map(|address| address.to_string()),
+            permissions: broker.granted_permissions(&request_id),
             session_id,
             role: "client",
             token,
@@ -7542,6 +7575,81 @@ mod tests {
             .to_string()
     }
 
+    /// Permission classes negotiate through the broker: the requester asks, the
+    /// target sees the request and grants a (possibly smaller) set, and both
+    /// ends receive the granted set in their credential.
+    ///
+    /// The broker only carries the decision; nothing here enforces it. But a
+    /// class that never reached the host to be granted, or never reached each
+    /// end to be enforced, is a permission the product cannot honour -- so this
+    /// round trip is the foundation enforcement sits on.
+    #[tokio::test]
+    async fn permissions_negotiate_through_the_connect_flow() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) =
+            register_with_device(&app, "operator", "device-client", 0x31).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x32).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x32).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The client asks for view + keyboard + mouse, and nothing else.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({
+                "target_device_id": "device-host",
+                "requested": { "view": true, "keyboard": true, "mouse": true },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "connect: {body}");
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        // The host sees exactly what was asked, including the classes left off.
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["requested"]["view"], serde_json::json!(true));
+        assert_eq!(body[0]["requested"]["keyboard"], serde_json::json!(true));
+        assert_eq!(body[0]["requested"]["mouse"], serde_json::json!(true));
+        assert_eq!(body[0]["requested"]["clipboard"], serde_json::json!(false));
+        assert_eq!(body[0]["requested"]["microphone"], serde_json::json!(false));
+
+        // The host grants a subset: view + keyboard, but not mouse.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            Some(serde_json::json!({ "granted": { "view": true, "keyboard": true } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {body}");
+        // The host's own credential carries the granted set.
+        assert_eq!(body["permissions"]["view"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["keyboard"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["mouse"], serde_json::json!(false));
+
+        // The client polls and receives the same granted set: both ends agree.
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "observe: {body}");
+        assert_eq!(body["role"], serde_json::json!("client"));
+        assert_eq!(body["permissions"]["view"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["keyboard"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["mouse"], serde_json::json!(false));
+    }
+
     /// The product flow, end to end, and the boundary it exists to draw.
     ///
     /// Each end receives exactly one role capability and neither can obtain
@@ -7611,9 +7719,10 @@ mod tests {
         let host_capability = host_grant["token"].as_str().expect("host token");
         assert_eq!(
             host_grant.as_object().expect("object").keys().count(),
-            6,
-            "the approval response carries one capability and nothing that \
-             could be mistaken for a second: {host_grant}"
+            7,
+            "the approval response carries one capability plus the granted \
+             permission set, and nothing that could be mistaken for a second \
+             capability: {host_grant}"
         );
 
         // The client collects the client capability only.

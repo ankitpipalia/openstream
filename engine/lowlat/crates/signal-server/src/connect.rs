@@ -117,6 +117,30 @@ pub(crate) struct Party<'a> {
     pub device_id: &'a str,
 }
 
+/// The input and device classes a session is scoped to.
+///
+/// The requester asks for a set; the approving device grants a (possibly
+/// smaller) one. Every field defaults to `false`, so an omitted or partial
+/// object is the least-privilege reading, and a client or control plane that
+/// predates the field negotiates no permissions rather than failing to parse.
+/// Enforcement -- a session runner honouring only the granted classes -- is a
+/// separate step; this type carries the negotiated decision through the broker
+/// so the host decides against what was asked and each end learns what it got.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(default, rename_all = "snake_case")]
+pub(crate) struct Permissions {
+    pub view: bool,
+    pub keyboard: bool,
+    pub mouse: bool,
+    pub gamepad: bool,
+    pub clipboard: bool,
+    pub microphone: bool,
+    pub tablet: bool,
+    pub virtual_usb: bool,
+}
+
 /// The session an approval creates, and its two role capabilities.
 ///
 /// Passed in as one value and immediately split apart inside the broker, so
@@ -187,6 +211,12 @@ pub(crate) struct ConnectRequest {
     pub state: ConnectState,
     pub created_at: Instant,
     pub expires_at: Instant,
+    /// The classes the requester asked for. Shown to the target so it approves
+    /// against what was actually requested rather than a blanket grant.
+    pub requested: Permissions,
+    /// The classes the target granted, set on approval. Default (none) until
+    /// then; carried into both role credentials so each end learns its scope.
+    pub granted: Permissions,
     /// Set on approval. The session these credentials belong to.
     pub session_id: Option<String>,
     /// Whether that session actually exists yet.
@@ -277,17 +307,41 @@ impl ConnectBroker {
         self.presence.remove(device_id);
     }
 
-    /// Ask a device for a session.
+    /// Ask a device for a session, requesting no permissions.
     ///
-    /// The caller has already established that `target_device_id` is an
-    /// enrolled, trusted device of `account_id`; this refuses on presence and
-    /// capacity, which are the broker's own concerns.
+    /// Test-only thin default over [`Self::request_scoped`]; the live handler
+    /// negotiates a set and goes through `request_scoped` directly.
+    #[cfg(test)]
     pub(crate) fn request(
         &mut self,
         request_id: String,
         account_id: &str,
         requester_device_id: &str,
         target_device_id: &str,
+        now: Instant,
+    ) -> Result<ConnectRequest, ConnectError> {
+        self.request_scoped(
+            request_id,
+            account_id,
+            requester_device_id,
+            target_device_id,
+            Permissions::default(),
+            now,
+        )
+    }
+
+    /// Ask a device for a session, requesting a permission set.
+    ///
+    /// The caller has already established that `target_device_id` is an
+    /// enrolled, trusted device of `account_id`; this refuses on presence and
+    /// capacity, which are the broker's own concerns.
+    pub(crate) fn request_scoped(
+        &mut self,
+        request_id: String,
+        account_id: &str,
+        requester_device_id: &str,
+        target_device_id: &str,
+        requested: Permissions,
         now: Instant,
     ) -> Result<ConnectRequest, ConnectError> {
         self.expire(now);
@@ -319,6 +373,8 @@ impl ConnectBroker {
             state: ConnectState::Pending,
             created_at: now,
             expires_at: now + REQUEST_TTL,
+            requested,
+            granted: Permissions::default(),
             session_id: None,
             published: false,
             host_credential: None,
@@ -351,16 +407,33 @@ impl ConnectBroker {
         pending
     }
 
-    /// Approve a request, attaching the session and its two role credentials.
+    /// Approve a request, granting no permissions.
     ///
-    /// The credentials go in here and come out one at a time, to one party
-    /// each. This is the whole point of the type: there is no accessor that
-    /// returns both.
+    /// Test-only thin default over [`Self::approve_scoped`]; the live handler
+    /// records the granted set and goes through `approve_scoped` directly.
+    #[cfg(test)]
     pub(crate) fn approve(
         &mut self,
         request_id: &str,
         answered_by: Party<'_>,
         grant: SessionGrant,
+        now: Instant,
+    ) -> Result<ConnectRequest, ConnectError> {
+        self.approve_scoped(request_id, answered_by, grant, Permissions::default(), now)
+    }
+
+    /// Approve a request, attaching the session and its two role credentials
+    /// and recording the permission classes the target granted.
+    ///
+    /// The credentials go in here and come out one at a time, to one party
+    /// each. This is the whole point of the type: there is no accessor that
+    /// returns both.
+    pub(crate) fn approve_scoped(
+        &mut self,
+        request_id: &str,
+        answered_by: Party<'_>,
+        grant: SessionGrant,
+        granted: Permissions,
         now: Instant,
     ) -> Result<ConnectRequest, ConnectError> {
         let (account_id, target_device_id) = (answered_by.account_id, answered_by.device_id);
@@ -389,6 +462,7 @@ impl ConnectBroker {
             return Err(ConnectError::InvalidState);
         }
         request.state = ConnectState::Approved;
+        request.granted = granted;
         request.session_id = Some(session_id);
         request.host_credential = Some(host_credential);
         request.client_credential = Some(client_credential);
@@ -498,6 +572,19 @@ impl ConnectBroker {
             .clone()
             .ok_or(ConnectError::InvalidState)?;
         Ok((session_id, credential))
+    }
+
+    /// The permissions the target granted for a request.
+    ///
+    /// Read after a credential collection has already authorised the caller and
+    /// confirmed the request is approved, so it is a plain read of the
+    /// negotiated set; an unknown request yields the empty, least-privilege
+    /// default rather than an error.
+    pub(crate) fn granted_permissions(&self, request_id: &str) -> Permissions {
+        self.requests
+            .get(request_id)
+            .map(|request| request.granted)
+            .unwrap_or_default()
     }
 
     /// The pair of credentials an approval just minted.
