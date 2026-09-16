@@ -18,7 +18,7 @@ command -v dpkg-deb >/dev/null 2>&1 || {
     exit 2
 }
 
-for binary in openstream-host-agent openstream-linux-host openstream-signal-server; do
+for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
     [[ -x "$artifact_dir/$binary" ]] || {
         echo "missing release binary: $artifact_dir/$binary" >&2
         exit 1
@@ -43,10 +43,11 @@ Section: net
 Priority: optional
 Architecture: amd64
 Maintainer: OpenStream contributors
+Depends: ffmpeg
 Description: Self-hosted low-latency desktop streaming
 EOF
 
-for binary in openstream-host-agent openstream-linux-host openstream-signal-server; do
+for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
     install -m 0755 "$artifact_dir/$binary" "$stage/usr/bin/$binary"
 done
 install -m 0755 "$shell_dir/openstream-desktop" "$stage/usr/bin/openstream-desktop"

@@ -193,6 +193,16 @@ describe("tauri adapter", () => {
     expect(settingValue(snapshot, "client.profile")).toBe("balanced");
   });
 
+  it("marks local mode structurally so the notice never depends on prose", async () => {
+    const local = createTauriAdapter(async () => runtimeSnapshotFixture());
+    expect((await local.refresh()).access.localMode).toBe(true);
+
+    const secureFixture = runtimeSnapshotFixture();
+    secureFixture.app.mode = "Secure";
+    const secure = createTauriAdapter(async () => secureFixture);
+    expect((await secure.refresh()).access.localMode).toBe(false);
+  });
+
   it("keeps the fixture adapter outside Tauri", async () => {
     const adapter = createDefaultAdapter({ isTauri: false });
     expect((await adapter.refresh()).product.channel).toBe("Desktop shell");
@@ -249,6 +259,18 @@ describe("tauri adapter", () => {
     });
 
     await adapter.dispatch({ Connect: { device_id: "mac-1", requested: permissions } });
+  });
+
+  it("sets device trust with the camelCase deviceId key Tauri v2 deserializes", async () => {
+    const adapter = createTauriAdapter(async (command, args) => {
+      expect(command).toBe("device_store_set_trust");
+      // Tauri v2 deserializes command arguments as camelCase; sending the Rust
+      // parameter name `device_id` silently fails IPC and no trust change lands.
+      expect(args).toEqual({ deviceId: "mac-1", trust: "trusted" });
+      return runtimeSnapshotFixture();
+    });
+
+    await adapter.setDeviceTrust("mac-1", "trusted");
   });
 
   it("surfaces restart_required and pending settings from the runtime snapshot", async () => {

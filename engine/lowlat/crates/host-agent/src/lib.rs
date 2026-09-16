@@ -795,6 +795,21 @@ impl HostBackend {
             Self::Unavailable => "unavailable",
         }
     }
+
+    /// Whether this backend's child publishes the encoded-frame heartbeat the
+    /// agent uses to judge liveness.
+    ///
+    /// The FFmpeg backends run `openstream-ffmpeg-host`, which writes the
+    /// heartbeat file. The native DRM backend runs `openstream-linux-host`,
+    /// which does not: requiring a heartbeat from it would judge a working
+    /// native host as silent and kill it in a loop at the end of the startup
+    /// grace. Configure the heartbeat only where the child actually writes one.
+    pub const fn publishes_frame_heartbeat(self) -> bool {
+        match self {
+            Self::FfmpegX11 | Self::FfmpegPipewire | Self::FfmpegFallback => true,
+            Self::NativeDrm | Self::Unavailable => false,
+        }
+    }
 }
 
 /// Redacted capability result; it contains no command output or paths.
@@ -1842,8 +1857,8 @@ mod tests {
     use super::{
         AgentError, ChildExit, ChildExitReason, ChildFactory, ChildSpec, ChildState,
         FIRST_FRAME_DEADLINE, FRAME_LIVENESS_STRIKES, FrameLiveness, HostAgent, HostAgentConfig,
-        HostAgentEvent, HostErrorCode, HostPhase, ManagedChild, configure_child_environment,
-        host_heartbeat,
+        HostAgentEvent, HostBackend, HostErrorCode, HostPhase, ManagedChild,
+        configure_child_environment, host_heartbeat,
     };
     use openstream_settings::default_config;
     use std::collections::{BTreeMap, VecDeque};
@@ -1853,6 +1868,19 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_ffmpeg_backends_are_expected_to_publish_a_heartbeat() {
+        // The FFmpeg backends run openstream-ffmpeg-host, which writes the
+        // heartbeat file; the native DRM backend runs openstream-linux-host,
+        // which does not. Requiring one from the native child would restart a
+        // working host in a loop, so it must not be asked for a heartbeat.
+        assert!(HostBackend::FfmpegX11.publishes_frame_heartbeat());
+        assert!(HostBackend::FfmpegPipewire.publishes_frame_heartbeat());
+        assert!(HostBackend::FfmpegFallback.publishes_frame_heartbeat());
+        assert!(!HostBackend::NativeDrm.publishes_frame_heartbeat());
+        assert!(!HostBackend::Unavailable.publishes_frame_heartbeat());
+    }
 
     #[derive(Clone, Default)]
     struct FakeFactory {

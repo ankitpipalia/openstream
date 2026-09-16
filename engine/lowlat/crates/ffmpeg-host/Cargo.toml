@@ -25,5 +25,11 @@ tokio.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 lowlat-inject.workspace = true
 
+# The in-process Windows pipeline (Desktop Duplication -> Media Foundation),
+# selected with OPENSTREAM_CAPTURE_BACKEND=native; no FFmpeg involved.
+[target.'cfg(windows)'.dependencies]
+openstream-windows-host.workspace = true
+openstream-windows-media.workspace = true
+
 [lints]
 workspace = true

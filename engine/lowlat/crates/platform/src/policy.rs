@@ -343,9 +343,22 @@ impl HostPolicy {
     /// Approval mode comes from `OPENSTREAM_APPROVAL` (`auto`/`owner`).
     pub fn from_env() -> Self {
         let flag = |name: &str| std::env::var(name).as_deref() == Ok("1");
+        // Per-class grants are three-state: explicitly on ("1"), explicitly
+        // off ("0"), or unset. An explicit value is authoritative, so a caller
+        // that enables input but revokes one class keeps that class off; an
+        // unset class inherits the master input grant as a convenience. Reading
+        // it as `input || flag(class)` instead let the master flag re-enable a
+        // class the caller had explicitly disabled -- the host agent emits
+        // ENABLE_INPUT=1 with ENABLE_MOUSE=0 for keyboard-only, which then
+        // granted pointer control the user had revoked.
+        let class = |name: &str, default: bool| match std::env::var(name).as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => default,
+        };
         let input = flag("OPENSTREAM_ENABLE_INPUT");
-        let keyboard = input || flag("OPENSTREAM_ENABLE_KEYBOARD");
-        let mouse = input || flag("OPENSTREAM_ENABLE_MOUSE");
+        let keyboard = class("OPENSTREAM_ENABLE_KEYBOARD", input);
+        let mouse = class("OPENSTREAM_ENABLE_MOUSE", input);
         Self {
             // `input` is the adapter-level grant. Explicit keyboard/mouse
             // grants are also input grants so a caller can revoke one class
@@ -531,6 +544,73 @@ mod tests {
         assert_eq!(policy.approval, Approval::OwnerOnly);
         let line = policy.log_line();
         assert!(line.contains("clipboard=on") && line.contains("approval=OwnerOnly"));
+        restore(saved);
+    }
+
+    #[test]
+    fn master_input_does_not_override_an_explicit_per_class_disable() {
+        let _environment = lock_environment();
+        let keys = [
+            "OPENSTREAM_ENABLE_INPUT",
+            "OPENSTREAM_ENABLE_KEYBOARD",
+            "OPENSTREAM_ENABLE_MOUSE",
+        ];
+        let saved = save(&keys);
+        // Exactly what the host agent emits for keyboard-on, mouse-off:
+        // the master input grant plus an explicit per-class disable.
+        unsafe {
+            std::env::set_var("OPENSTREAM_ENABLE_INPUT", "1");
+            std::env::set_var("OPENSTREAM_ENABLE_KEYBOARD", "1");
+            std::env::set_var("OPENSTREAM_ENABLE_MOUSE", "0");
+        }
+        let policy = HostPolicy::from_env();
+        assert!(policy.keyboard, "the granted class stays on");
+        assert!(
+            !policy.mouse,
+            "an explicitly revoked class must not be re-enabled by the master flag"
+        );
+        assert!(policy.input, "input is still on because a class is granted");
+        restore(saved);
+    }
+
+    #[test]
+    fn master_input_enables_unset_classes_by_default() {
+        let _environment = lock_environment();
+        let keys = [
+            "OPENSTREAM_ENABLE_INPUT",
+            "OPENSTREAM_ENABLE_KEYBOARD",
+            "OPENSTREAM_ENABLE_MOUSE",
+        ];
+        let saved = save(&keys);
+        unsafe {
+            std::env::set_var("OPENSTREAM_ENABLE_INPUT", "1");
+            std::env::remove_var("OPENSTREAM_ENABLE_KEYBOARD");
+            std::env::remove_var("OPENSTREAM_ENABLE_MOUSE");
+        }
+        let policy = HostPolicy::from_env();
+        assert!(
+            policy.keyboard && policy.mouse,
+            "unset classes inherit the master input grant"
+        );
+        restore(saved);
+    }
+
+    #[test]
+    fn a_per_class_grant_without_the_master_flag_still_enables_input() {
+        let _environment = lock_environment();
+        let keys = [
+            "OPENSTREAM_ENABLE_INPUT",
+            "OPENSTREAM_ENABLE_KEYBOARD",
+            "OPENSTREAM_ENABLE_MOUSE",
+        ];
+        let saved = save(&keys);
+        unsafe {
+            std::env::remove_var("OPENSTREAM_ENABLE_INPUT");
+            std::env::set_var("OPENSTREAM_ENABLE_KEYBOARD", "1");
+            std::env::remove_var("OPENSTREAM_ENABLE_MOUSE");
+        }
+        let policy = HostPolicy::from_env();
+        assert!(policy.keyboard && policy.input && !policy.mouse);
         restore(saved);
     }
 

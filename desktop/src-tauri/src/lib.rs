@@ -1264,6 +1264,30 @@ fn device_store_error(_error: DeviceStoreError) -> RuntimeError {
     RuntimeError::InvalidSettings
 }
 
+/// Build the account control-plane client for startup.
+///
+/// The account client is intentionally stricter about its origin than the
+/// settings layer: it refuses a private-LAN plaintext origin so account
+/// credentials can never travel in the clear. But `local_no_auth` deployments
+/// have no accounts and never use this client, and the settings layer
+/// legitimately accepts a numeric private-LAN origin there. Constructing the
+/// client unconditionally therefore aborted startup in exactly the mode the
+/// settings allow. In `local_no_auth` mode we fall back to a loopback
+/// placeholder so the Tauri state exists; account commands, which the
+/// local-mode UI does not expose, would fail against loopback rather than
+/// bringing the whole shell down.
+fn control_plane_for_startup(
+    signal_origin: &str,
+    local_no_auth: bool,
+) -> Result<ControlPlaneClient, RuntimeError> {
+    match ControlPlaneClient::new(signal_origin) {
+        Ok(client) => Ok(client),
+        Err(_) if local_no_auth => Ok(ControlPlaneClient::new("http://127.0.0.1")
+            .expect("a loopback origin is always a valid control-plane origin")),
+        Err(_) => Err(RuntimeError::InvalidSettings),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1279,9 +1303,10 @@ pub fn run() {
                 .join("devices.json");
             let device_store = DeviceStore::open(device_store_path).map_err(device_store_error)?;
             let mut runtime_state = RuntimeState::from_settings_path(Some(settings_path))?;
-            let control_plane =
-                ControlPlaneClient::new(&runtime_state.settings().client.signal_origin)
-                    .map_err(|_| RuntimeError::InvalidSettings)?;
+            let control_plane = control_plane_for_startup(
+                &runtime_state.settings().client.signal_origin,
+                runtime_state.settings().network.local_no_auth,
+            )?;
             let trusted_devices = device_store
                 .snapshots()
                 .into_iter()
@@ -1351,8 +1376,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch_host_lifecycle_with, HostAgentClient, HostLifecycleLock, RuntimeError,
-        RuntimeState,
+        control_plane_for_startup, dispatch_host_lifecycle_with, HostAgentClient,
+        HostLifecycleLock, RuntimeError, RuntimeState,
     };
     use openstream_app_core::HostStatus;
     use openstream_host_agent::{
@@ -1365,6 +1390,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::task::JoinHandle;
+
+    #[test]
+    fn local_no_auth_private_lan_origin_does_not_abort_startup() {
+        // The settings layer accepts a numeric private-LAN origin when
+        // local_no_auth is on; the account client refuses it. Startup must not
+        // abort in that mode -- it falls back to a usable client instead.
+        let origin = "http://192.168.1.69:8080";
+        assert!(
+            super::ControlPlaneClient::new(origin).is_err(),
+            "precondition: the account client rejects a private-LAN plaintext origin"
+        );
+        assert!(
+            control_plane_for_startup(origin, true).is_ok(),
+            "local_no_auth startup must tolerate a private-LAN origin"
+        );
+    }
+
+    #[test]
+    fn private_lan_origin_still_aborts_when_accounts_are_required() {
+        // With accounts enabled (not local_no_auth), a rejected origin must
+        // still fail rather than silently pointing account traffic at loopback.
+        assert!(matches!(
+            control_plane_for_startup("http://192.168.1.69:8080", false),
+            Err(RuntimeError::InvalidSettings)
+        ));
+    }
+
+    #[test]
+    fn valid_origins_build_a_client_in_either_mode() {
+        for origin in ["https://signal.example.test", "http://127.0.0.1:8080"] {
+            assert!(control_plane_for_startup(origin, false).is_ok());
+            assert!(control_plane_for_startup(origin, true).is_ok());
+        }
+    }
 
     /// A socket path nothing is listening on, private to this call.
     fn unreachable_endpoint() -> Endpoint {

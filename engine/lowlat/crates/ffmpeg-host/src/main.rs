@@ -41,6 +41,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
 
 mod input;
+mod native_video;
 mod reconfigure;
 
 const DEFAULT_SIGNAL_ORIGIN: &str = "http://127.0.0.1:8080";
@@ -65,6 +66,14 @@ const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
 const DISPLAY_SWITCH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const FRAME_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const INPUT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+/// After this long with no authenticated packet from the peer, the host ends
+/// the session and exits so its supervisor restarts it and it re-registers for
+/// a fresh establishment epoch. A client that drops uncleanly (no
+/// `openstream/end`) would otherwise leave the host streaming into a dead
+/// session for the whole run, and a reconnecting client could never re-pair.
+/// This sits well above the 5s keepalive cadence so a healthy but idle peer,
+/// which sends authenticated keepalives, is never torn down.
+const PEER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wire pacing must sit above the encoder target, not below it. The scheduler
 /// paces the sealed datagram stream, which carries per-packet headers, AEAD
@@ -254,7 +263,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let (ffmpeg_child, mut profile) = spawn_ffmpeg(SpawnRequest {
+    // The source owns its process or thread under a drop guard. The streaming
+    // loop has several fallible async operations (transport, encoder,
+    // clipboard), and a plain `?` on any of them must not orphan an FFmpeg
+    // process or leave a capture thread running.
+    let (mut source, mut profile) = VideoSource::spawn(SpawnRequest {
         codec: negotiated.video,
         width: negotiated.width,
         height: negotiated.height,
@@ -264,11 +277,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         bitrate_override_mbps: None,
         capture_input: display_capture_input(&host_displays, display_index),
     })?;
-    // Keep every external process under a drop guard. The streaming loop has
-    // several fallible async operations (transport, encoder, clipboard), and
-    // a plain `?` on any of them must not orphan an FFmpeg process.
-    let mut ffmpeg = ChildGuard::new(ffmpeg_child);
-    let mut stdout = ffmpeg.take_stdout().ok_or("FFmpeg stdout was not piped")?;
     // Congestion response for the external encoder. The adaptive controller
     // tracks assembly ACKs; because FFmpeg exposes no in-place rate control,
     // decisions are applied as bounded rolling restarts (see reconfigure).
@@ -304,7 +312,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // apply it on a later control tick.
     let mut pending_adaptive_decision: Option<BitrateDecision> = None;
     let mut audio_process = if audio_requested {
-        Some(ChildGuard::new(spawn_audio_ffmpeg()?))
+        // Audio is a secondary stream. If its source cannot start -- most
+        // commonly because audio was enabled in settings but no capture input
+        // is wired (the host agent sets OPENSTREAM_AUDIO=1 without an
+        // OPENSTREAM_AUDIO_FFMPEG_ARGS source) -- degrade to video only rather
+        // than taking the whole session down with it.
+        match spawn_audio_ffmpeg() {
+            Ok(child) => Some(ChildGuard::new(child)),
+            Err(error) => {
+                eprintln!(
+                    "OpenStream audio disabled: the audio source could not start ({error}); \
+continuing with video only"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -328,7 +350,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer = vec![0_u8; MAX_FRAGMENT_BYTES * 8];
     let mut audio_read = vec![0_u8; lowlat_audio::FRAME_BYTES * 2];
     let mut audio_pcm = Vec::with_capacity(lowlat_audio::FRAME_BYTES * 2);
-    let mut access_units = AccessUnitizer::for_codec(negotiated.video);
     // This host hands a capture source to FFmpeg and reads an encoded byte
     // stream back. It never sees a frame go in, so there is no identity to
     // correlate between "a frame was captured" and "an access unit came
@@ -513,14 +534,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            result = stdout.read(&mut buffer) => {
-                let length = result?;
-                if length == 0 {
+            result = source.next_units(&mut buffer) => {
+                let Some(units) = result? else {
                     break;
-                }
+                };
                 let read_at = Stamp::<HostClock>::now();
                 let mut first_byte = *unit_first_byte.get_or_insert(read_at);
-                for payload in access_units.push(&buffer[..length])? {
+                for payload in units {
                     // `begin` stamps the first stage this backend can
                     // observe, which here is `EncoderFirstByte`: everything
                     // before it belongs to FFmpeg and is not measured.
@@ -603,6 +623,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 reliable_control.retry(&mut session).await?;
                 session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
+                let peer_silence = session.last_peer_activity_age();
+                if peer_silence >= PEER_LIVENESS_TIMEOUT {
+                    eprintln!(
+                        "OpenStream ending session: no authenticated peer traffic for {peer_silence:?}; re-registering"
+                    );
+                    break 'stream;
+                }
                 let now = Instant::now();
                 let now_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
                 telemetry.observe_path(&session.transport_snapshot(now), now_ms);
@@ -614,35 +641,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 if let Some(target) = display_target {
                     eprintln!(
-                        "OpenStream switching FFmpeg capture from display {} to {}",
-                        display_index, target
+                        "OpenStream switching {} capture from display {} to {}",
+                        source.label(),
+                        display_index,
+                        target
                     );
-                    match spawn_ffmpeg(SpawnRequest {
-                        codec: negotiated.video,
-                        width: negotiated.width,
-                        height: negotiated.height,
-                        fps: negotiated.fps,
-                        ten_bit: negotiated.video_10_bit,
-                        four_four_four: negotiated.video_444,
-                        bitrate_override_mbps: Some(profile.bitrate_mbps),
-                        capture_input: display_capture_input(&host_displays, target),
-                    }) {
-                        Ok((child, next_profile)) => {
-                            let mut replacement = ChildGuard::new(child);
-                            let Some(replacement_stdout) = replacement.take_stdout() else {
-                                replacement.terminate().await;
-                                eprintln!("OpenStream display switch produced no FFmpeg stdout; keeping the current capture");
-                                pending_display = None;
-                                continue;
-                            };
-                            // Spawn the replacement before terminating the old
-                            // process. A failed display/device open therefore
-                            // leaves the existing stream alive.
-                            ffmpeg.terminate().await;
-                            ffmpeg = replacement;
+                    match source
+                        .restart(
+                            SpawnRequest {
+                                codec: negotiated.video,
+                                width: negotiated.width,
+                                height: negotiated.height,
+                                fps: negotiated.fps,
+                                ten_bit: negotiated.video_10_bit,
+                                four_four_four: negotiated.video_444,
+                                bitrate_override_mbps: Some(profile.bitrate_mbps),
+                                capture_input: display_capture_input(&host_displays, target),
+                            },
+                            true,
+                        )
+                        .await
+                    {
+                        Ok(next_profile) => {
+                            // The replacement came up before the old capture
+                            // went away, so a failed display/device open has
+                            // left the existing stream alive.
                             profile = next_profile;
-                            stdout = replacement_stdout;
-                            access_units = AccessUnitizer::for_codec(negotiated.video);
                             display_index = target;
                             pending_display = None;
                             last_display_switch = Some(now);
@@ -687,37 +711,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "adaptive bitrate change"
                     };
                     eprintln!(
-                        "OpenStream restarting FFmpeg encoder at {target:.2} Mbps ({reason})",
+                        "OpenStream restarting the {} encoder at {target:.2} Mbps ({reason})",
+                        source.label()
                     );
-                    match spawn_ffmpeg(SpawnRequest {
-                        codec: negotiated.video,
-                        width: negotiated.width,
-                        height: negotiated.height,
-                        fps: negotiated.fps,
-                        ten_bit: negotiated.video_10_bit,
-                        four_four_four: negotiated.video_444,
-                        bitrate_override_mbps: Some(target),
-                        capture_input: display_capture_input(&host_displays, display_index),
-                    }) {
-                        Ok((child, next)) => {
-                            let mut replacement = ChildGuard::new(child);
-                            let Some(replacement_stdout) = replacement.take_stdout() else {
-                                replacement.terminate().await;
-                                eprintln!(
-                                    "OpenStream FFmpeg restart produced no stdout; keeping the current capture"
-                                );
-                                last_restart = Some(now);
-                                continue;
-                            };
-                            // Start and validate the replacement before
-                            // terminating the current encoder. A transient
-                            // device/driver failure therefore causes a retry,
-                            // not an avoidable black stream.
-                            ffmpeg.terminate().await;
-                            ffmpeg = replacement;
+                    match source
+                        .restart(
+                            SpawnRequest {
+                                codec: negotiated.video,
+                                width: negotiated.width,
+                                height: negotiated.height,
+                                fps: negotiated.fps,
+                                ten_bit: negotiated.video_10_bit,
+                                four_four_four: negotiated.video_444,
+                                bitrate_override_mbps: Some(target),
+                                capture_input: display_capture_input(&host_displays, display_index),
+                            },
+                            force_keyframe_restart,
+                        )
+                        .await
+                    {
+                        Ok(next) => {
+                            // The replacement is validated before the current
+                            // encoder goes away, so a transient device/driver
+                            // failure causes a retry, not an avoidable black
+                            // stream.
                             profile = next;
-                            stdout = replacement_stdout;
-                            access_units = AccessUnitizer::for_codec(negotiated.video);
                             last_restart = Some(now);
                             keyframe_requested = false;
                             if applied_adaptive_decision {
@@ -726,7 +744,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(error) => {
                             eprintln!(
-                                "OpenStream could not restart FFmpeg; keeping the current capture: {error}"
+                                "OpenStream could not restart the encoder; keeping the current capture: {error}"
                             );
                             // Rate-limit failed attempts just like successful
                             // ones. Otherwise a missing encoder/device turns
@@ -757,7 +775,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if !peer_ended && let Some(payload) = access_units.finish() {
+    if !peer_ended && let Some(payload) = source.finish() {
         send_access_unit(
             &mut session,
             frame_id,
@@ -771,7 +789,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if !peer_ended {
         let _ = reliable_control.send(&mut session, b"openstream/end").await;
     }
-    ffmpeg.terminate().await;
+    source.terminate().await;
     if let Some(mut audio_process) = audio_process {
         audio_process.terminate().await;
     }
@@ -807,6 +825,187 @@ fn queue_stream_packet(
         eprintln!("OpenStream dropped oldest queued {kind:?} packet");
     }
     Ok(())
+}
+
+/// The session's encoded-video source.
+///
+/// Either FFmpeg's stdout (an Annex-B byte stream split into access units
+/// here) or, on Windows with `OPENSTREAM_CAPTURE_BACKEND=native`, the
+/// in-process Desktop Duplication -> Media Foundation pipeline, which hands
+/// over complete access units and needs no delimiter parsing. The streaming
+/// loop sees one interface; keyframe requests, bitrate changes and display
+/// switches are applied per source (a fresh FFmpeg process, or an in-place
+/// encoder change).
+enum VideoSource {
+    Ffmpeg {
+        process: ChildGuard,
+        stdout: ChildStdout,
+        units: AccessUnitizer,
+    },
+    #[cfg(windows)]
+    Native(native_video::NativePipeline),
+}
+
+impl VideoSource {
+    fn spawn(request: SpawnRequest) -> Result<(Self, EncodeProfile), Box<dyn std::error::Error>> {
+        let backend = env::var("OPENSTREAM_CAPTURE_BACKEND").unwrap_or_default();
+        if native_video::selects_native(&backend) && env::var_os("OPENSTREAM_FFMPEG_ARGS").is_none()
+        {
+            return Self::spawn_native(request);
+        }
+        let codec = request.codec;
+        let (child, profile) = spawn_ffmpeg(request)?;
+        let mut process = ChildGuard::new(child);
+        let stdout = process.take_stdout().ok_or("FFmpeg stdout was not piped")?;
+        Ok((
+            Self::Ffmpeg {
+                process,
+                stdout,
+                units: AccessUnitizer::for_codec(codec),
+            },
+            profile,
+        ))
+    }
+
+    #[cfg(windows)]
+    fn spawn_native(
+        request: SpawnRequest,
+    ) -> Result<(Self, EncodeProfile), Box<dyn std::error::Error>> {
+        if !matches!(request.codec, VideoCodec::H264) || request.ten_bit || request.four_four_four {
+            return Err("the native Windows encoder produces 8-bit 4:2:0 H.264 only; negotiate h264 or use an FFmpeg backend".into());
+        }
+        let bitrate_mbps = configured_bitrate_mbps(request.bitrate_override_mbps);
+        // Hardware encode (NVENC/AMF/QSV via the MF hardware MFT) is opt-in
+        // until physically verified; the software MFT stays the default.
+        let prefer_hardware_encoder = env::var("OPENSTREAM_MF_HARDWARE_ENCODE")
+            .map(|value| {
+                let value = value.trim();
+                value == "1" || value.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        let pipeline = native_video::NativePipeline::start(native_video::NativeConfig {
+            width: u32::from(request.width),
+            height: u32::from(request.height),
+            fps: u32::from(request.fps),
+            bitrate_bps: mbps_to_bps(bitrate_mbps),
+            output_index: None,
+            prefer_hardware_encoder,
+        })?;
+        eprintln!(
+            "OpenStream native encoder: media-foundation-h264 pix_fmt=nv12 bitrate={bitrate_mbps:.2} Mbps hardware_preferred={prefer_hardware_encoder}"
+        );
+        Ok((Self::Native(pipeline), native_profile(bitrate_mbps)))
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_native(
+        _request: SpawnRequest,
+    ) -> Result<(Self, EncodeProfile), Box<dyn std::error::Error>> {
+        Err("OPENSTREAM_CAPTURE_BACKEND=native is the in-process Windows pipeline; this build has no native capture for this platform".into())
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Ffmpeg { .. } => "FFmpeg",
+            #[cfg(windows)]
+            Self::Native(_) => "native",
+        }
+    }
+
+    /// The next complete access units; `None` once the source has ended.
+    async fn next_units(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> Result<Option<Vec<Vec<u8>>>, Box<dyn std::error::Error>> {
+        match self {
+            Self::Ffmpeg { stdout, units, .. } => {
+                let length = stdout.read(buffer).await?;
+                if length == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(units.push(&buffer[..length])?))
+            }
+            #[cfg(windows)]
+            Self::Native(pipeline) => Ok(pipeline.next_unit().await.map(|unit| vec![unit])),
+        }
+    }
+
+    /// Rebuild the encoder from `request`, forcing a keyframe when asked. The
+    /// replacement is brought up before the current source is torn down, so a
+    /// failed open leaves the existing stream alive and returns the error.
+    async fn restart(
+        &mut self,
+        request: SpawnRequest,
+        force_keyframe: bool,
+    ) -> Result<EncodeProfile, Box<dyn std::error::Error>> {
+        match self {
+            Self::Ffmpeg {
+                process,
+                stdout,
+                units,
+            } => {
+                // FFmpeg has no in-place actuator: a keyframe or a new bitrate
+                // is a fresh process either way.
+                let _ = force_keyframe;
+                let codec = request.codec;
+                let (child, profile) = spawn_ffmpeg(request)?;
+                let mut replacement = ChildGuard::new(child);
+                let Some(replacement_stdout) = replacement.take_stdout() else {
+                    replacement.terminate().await;
+                    return Err("FFmpeg restart produced no stdout".into());
+                };
+                process.terminate().await;
+                *process = replacement;
+                *stdout = replacement_stdout;
+                *units = AccessUnitizer::for_codec(codec);
+                Ok(profile)
+            }
+            #[cfg(windows)]
+            Self::Native(pipeline) => {
+                let bitrate_mbps = configured_bitrate_mbps(request.bitrate_override_mbps);
+                pipeline
+                    .reconfigure(mbps_to_bps(bitrate_mbps), force_keyframe)
+                    .await?;
+                Ok(native_profile(bitrate_mbps))
+            }
+        }
+    }
+
+    /// Whatever a byte-stream source still holds once it ends: a final access
+    /// unit with no delimiter after it.
+    fn finish(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Self::Ffmpeg { units, .. } => units.finish(),
+            #[cfg(windows)]
+            Self::Native(_) => None,
+        }
+    }
+
+    async fn terminate(&mut self) {
+        match self {
+            Self::Ffmpeg { process, .. } => process.terminate().await,
+            #[cfg(windows)]
+            Self::Native(pipeline) => pipeline.stop(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn native_profile(bitrate_mbps: f64) -> EncodeProfile {
+    EncodeProfile {
+        encoder: "media-foundation-h264".into(),
+        pix_fmt: "nv12".into(),
+        bitrate_mbps,
+    }
+}
+
+/// Megabits per second to the whole bits per second an encoder API takes.
+// Clamped to u32's range before the cast, so neither truncation nor sign loss
+// can occur.
+#[cfg(windows)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn mbps_to_bps(mbps: f64) -> u32 {
+    (mbps * 1_000_000.0).round().clamp(1.0, f64::from(u32::MAX)) as u32
 }
 
 /// Own an external encoder process and make early-return cleanup reliable.
@@ -1382,28 +1581,31 @@ fn resolve_encode_profile(
         }
     });
     validate_pix_fmt(pix_fmt.trim(), negotiated_10_bit, negotiated_444)?;
-    let bitrate_mbps = bitrate_override_mbps
-        .filter(|value| {
-            value.is_finite()
-                && *value > 0.0
-                && *value <= openstream_platform::hwaccel::MAX_VIDEO_BITRATE_MBPS
-        })
+    Ok(EncodeProfile {
+        encoder,
+        pix_fmt: pix_fmt.trim().to_string(),
+        bitrate_mbps: configured_bitrate_mbps(bitrate_override_mbps),
+    })
+}
+
+/// The session bitrate in Mbps: a valid override wins, then
+/// `OPENSTREAM_VIDEO_MBPS`, then 10. Shared by every encoder backend so a
+/// restart at a new rate means the same thing for all of them.
+fn configured_bitrate_mbps(bitrate_override_mbps: Option<f64>) -> f64 {
+    let valid = |value: &f64| {
+        value.is_finite()
+            && *value > 0.0
+            && *value <= openstream_platform::hwaccel::MAX_VIDEO_BITRATE_MBPS
+    };
+    bitrate_override_mbps
+        .filter(valid)
         .or_else(|| {
             env::var("OPENSTREAM_VIDEO_MBPS")
                 .ok()
                 .and_then(|value| value.parse::<f64>().ok())
-                .filter(|value| {
-                    value.is_finite()
-                        && *value > 0.0
-                        && *value <= openstream_platform::hwaccel::MAX_VIDEO_BITRATE_MBPS
-                })
+                .filter(valid)
         })
-        .unwrap_or(10.0);
-    Ok(EncodeProfile {
-        encoder,
-        pix_fmt: pix_fmt.trim().to_string(),
-        bitrate_mbps,
-    })
+        .unwrap_or(10.0)
 }
 
 /// Enumerate host displays for the multi-monitor topology message.
@@ -1616,6 +1818,24 @@ fn capture_arguments(
     Ok(arguments)
 }
 
+/// Resolve the FFmpeg input arguments for the audio source.
+///
+/// Returns an error only when audio was requested but no source is configured.
+/// The caller treats that as "run video only", never as a session failure, so
+/// enabling audio without wiring a capture input can never take the video
+/// stream down with it.
+fn resolve_audio_source_args(
+    explicit_args: Option<String>,
+    test_tone: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match explicit_args {
+        Some(args) => Ok(args),
+        None if test_tone => Ok("-f lavfi -i sine=frequency=440:sample_rate=48000".to_string()),
+        None => Err("audio was requested but no audio source is configured: set OPENSTREAM_AUDIO_FFMPEG_ARGS to an FFmpeg input, or OPENSTREAM_AUDIO_TEST=1 for a test tone"
+            .into()),
+    }
+}
+
 fn spawn_audio_ffmpeg() -> Result<Child, Box<dyn std::error::Error>> {
     let executable = env::var("OPENSTREAM_FFMPEG").unwrap_or_else(|_| DEFAULT_FFMPEG.into());
     // Audio is negotiated with the client before this runs, so a bare
@@ -1623,16 +1843,10 @@ fn spawn_audio_ffmpeg() -> Result<Child, Box<dyn std::error::Error>> {
     // "NotPresent" -- no mention of audio, and no mention of what was
     // missing. Name the setting instead; the operator has to know which
     // one to provide.
-    let args = match env::var("OPENSTREAM_AUDIO_FFMPEG_ARGS") {
-        Ok(args) => args,
-        Err(_) if env::var("OPENSTREAM_AUDIO_TEST").as_deref() == Ok("1") => {
-            "-f lavfi -i sine=frequency=440:sample_rate=48000".to_string()
-        }
-        Err(_) => {
-            return Err("audio was requested but no audio source is configured: set OPENSTREAM_AUDIO_FFMPEG_ARGS to an FFmpeg input, or OPENSTREAM_AUDIO_TEST=1 for a test tone"
-                .into());
-        }
-    };
+    let args = resolve_audio_source_args(
+        env::var("OPENSTREAM_AUDIO_FFMPEG_ARGS").ok(),
+        env::var("OPENSTREAM_AUDIO_TEST").as_deref() == Ok("1"),
+    )?;
     let mut command = Command::new(executable);
     command.args(["-hide_banner", "-loglevel", "error"]);
     // Audio must share the live wall clock with video. Without `-re`, lavfi
@@ -1923,10 +2137,32 @@ mod tests {
     use super::{
         AccessUnitizer, MAX_FFMPEG_ARGS, MAX_VIDEO_FILTER_BYTES, capture_arguments,
         configured_video_filter, contains_idr, display_capture_input, enumerate_host_displays,
-        queue_display_selection, remember_adaptive_decision, resolve_display_index,
-        resolve_encode_profile, split_command_line, topology_with_selected,
+        queue_display_selection, remember_adaptive_decision, resolve_audio_source_args,
+        resolve_display_index, resolve_encode_profile, split_command_line, topology_with_selected,
         validate_custom_ffmpeg_args,
     };
+
+    #[test]
+    fn audio_without_a_source_is_a_recoverable_error_not_a_session_failure() {
+        // No explicit source and no test tone: the resolver reports an error
+        // the caller degrades on (video only), naming the settings to provide.
+        let missing = resolve_audio_source_args(None, false);
+        assert!(missing.is_err());
+        assert!(
+            missing
+                .unwrap_err()
+                .to_string()
+                .contains("no audio source is configured"),
+            "the error must name the missing configuration"
+        );
+        // A test tone is a valid source.
+        assert!(resolve_audio_source_args(None, true).is_ok());
+        // An explicit source is used verbatim, even alongside the test-tone flag.
+        assert_eq!(
+            resolve_audio_source_args(Some("-f pulse -i default".to_string()), true).unwrap(),
+            "-f pulse -i default"
+        );
+    }
 
     #[test]
     fn display_switch_does_not_drop_pending_adaptive_decision() {

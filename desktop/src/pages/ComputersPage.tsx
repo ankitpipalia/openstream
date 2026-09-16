@@ -17,10 +17,12 @@ export function ComputersPage({
 }) {
   const [refreshing, setRefreshing] = useState(false);
   const [action, setAction] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   const controlPlane = snapshot.access.controlPlane;
 
   async function handleConnect(deviceId: string) {
     setAction(deviceId);
+    setActionError(null);
     try {
       onSnapshot(
         await adapter.dispatch({
@@ -40,7 +42,12 @@ export function ComputersPage({
         }),
       );
     } catch {
-      onSnapshot(createRuntimeUnavailableSnapshot("The session runner could not be started."));
+      // A connect failure is usually recoverable (host offline, session could
+      // not start). Surface it inline and keep the current view; wiping the
+      // whole snapshot to a runtime-unavailable placeholder would throw away
+      // settings, the computer list, diagnostics, and access state over a
+      // routine, retryable error.
+      setActionError("The session could not be started. The host may be offline; try again.");
     } finally {
       setAction(null);
     }
@@ -48,10 +55,11 @@ export function ComputersPage({
 
   async function handleDisconnect() {
     setAction("disconnect");
+    setActionError(null);
     try {
       onSnapshot(await adapter.dispatch("Disconnect"));
     } catch {
-      onSnapshot(createRuntimeUnavailableSnapshot("The session runner could not be stopped."));
+      setActionError("The session could not be stopped cleanly. Refresh to see the current state.");
     } finally {
       setAction(null);
     }
@@ -87,6 +95,8 @@ export function ComputersPage({
           </>
         }
       />
+
+      {actionError ? <div className="error-banner" role="alert">{actionError}</div> : null}
 
       <SectionCard title="Your computers" description="Only hosts reported by the configured control plane appear here.">
         {snapshot.computers.length === 0 ? (
