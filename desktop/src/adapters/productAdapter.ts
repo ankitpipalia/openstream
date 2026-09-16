@@ -3,6 +3,7 @@ import type {
   Capability,
   ConnectRequest,
   DiagnosticsSnapshot,
+  PermissionSet,
   ProductSnapshot,
   RuntimeCommand,
   SettingSection,
@@ -22,8 +23,10 @@ export interface ProductAdapter {
   signOut(): Promise<ProductSnapshot>;
   /** Incoming Secure Connect requests awaiting this device's answer. */
   hostConnectRequests(): Promise<ConnectRequest[]>;
-  /** Approve one request and start hosting the session it created. */
-  approveConnectRequest(requestId: string): Promise<void>;
+  /** Approve one request with the permission classes to grant (a subset of
+   * what was requested), and start hosting the session it created. `granted`
+   * omitted leaves the grant to the server-derived default. */
+  approveConnectRequest(requestId: string, granted?: PermissionSet): Promise<void>;
   /** Refuse one request. */
   denyConnectRequest(requestId: string): Promise<void>;
 }

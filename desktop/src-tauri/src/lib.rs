@@ -483,23 +483,28 @@ async fn approve_connect_request(
     session: tauri::State<'_, SharedSession>,
     control_plane: tauri::State<'_, SharedControlPlane>,
     request_id: String,
+    granted: Option<openstream_app_core::PermissionSet>,
 ) -> Result<(), RuntimeError> {
     let credential = {
         let mut client = control_plane.lock().await;
-        // Approve as requested: the host was shown this request from the
-        // pending list, and approving grants what was asked. The granted set is
-        // taken from the broker's own pending record rather than from the
-        // WebView, so this path cannot widen it beyond the request. A request
-        // no longer pending (already approved, or expired) grants the empty
-        // set, which the broker ignores on the idempotent retry.
-        let granted = client
-            .pending_connect_requests()
-            .await
-            .map_err(control_plane_error_runtime)?
-            .into_iter()
-            .find(|request| request.request_id == request_id)
-            .map(|request| request.requested)
-            .unwrap_or_else(openstream_app_core::PermissionSet::none);
+        // The host chooses the granted set in the approval prompt -- a subset
+        // of what was requested. When the UI provides none (an approval with no
+        // request to narrow), fall back to granting what the request asked for,
+        // derived from the broker's own pending record rather than trusted from
+        // the WebView, so no path can widen the grant beyond the request. A
+        // request no longer pending grants the empty set, which the broker
+        // ignores on the idempotent retry.
+        let granted = match granted {
+            Some(granted) => granted,
+            None => client
+                .pending_connect_requests()
+                .await
+                .map_err(control_plane_error_runtime)?
+                .into_iter()
+                .find(|request| request.request_id == request_id)
+                .map(|request| request.requested)
+                .unwrap_or_else(openstream_app_core::PermissionSet::none),
+        };
         client
             .approve_connect(&request_id, granted)
             .await

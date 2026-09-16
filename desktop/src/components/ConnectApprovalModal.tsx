@@ -1,13 +1,38 @@
-import { requestedPermissionLabels } from "../model";
-import type { ConnectRequest } from "../model";
+import { useMemo, useState } from "react";
+import type { ConnectRequest, PermissionSet } from "../model";
+
+/** The permission classes, as [key, label], in a stable display order. */
+const PERMISSION_CLASSES: ReadonlyArray<readonly [keyof PermissionSet, string]> = [
+  ["view", "Screen"],
+  ["keyboard", "Keyboard"],
+  ["mouse", "Mouse"],
+  ["gamepad", "Gamepad"],
+  ["clipboard", "Clipboard"],
+  ["microphone", "Microphone"],
+  ["tablet", "Tablet"],
+  ["virtual_usb", "USB devices"],
+];
+
+const NO_PERMISSIONS: PermissionSet = {
+  view: false,
+  keyboard: false,
+  mouse: false,
+  gamepad: false,
+  clipboard: false,
+  microphone: false,
+  tablet: false,
+  virtual_usb: false,
+};
 
 /**
  * The approval prompt for one incoming Secure Connect request.
  *
- * Rendered app-wide (above every page) so an approval is never missed because
- * of where the operator happened to be. It shows the requesting device, the
- * time left, and -- when the broker carries them -- the permission classes the
- * requester asked for, so the host approves against the actual request.
+ * Rendered app-wide (above every page) so an approval is never missed. It shows
+ * the requesting device, the time left, and -- when the broker carries them --
+ * a checkbox per requested permission class, pre-checked, so the host grants
+ * exactly what it allows (only ever a subset of what was asked). When the broker
+ * carries no request, it falls back to the host's configured policy and grants
+ * `undefined`, leaving the choice to the server-derived default.
  */
 export function ConnectApprovalModal({
   request,
@@ -21,7 +46,7 @@ export function ConnectApprovalModal({
   secondsRemaining: number | null;
   pending: boolean;
   error: string | null;
-  onApprove: () => void;
+  onApprove: (granted: PermissionSet | undefined) => void;
   onDeny: () => void;
 }) {
   const countdown =
@@ -31,9 +56,36 @@ export function ConnectApprovalModal({
         ? `Expires in ${secondsRemaining}s`
         : "Expiring…";
 
-  const requestedLabels = request.requested
-    ? requestedPermissionLabels(request.requested)
-    : [];
+  // The classes the requester asked for, in display order.
+  const requestedClasses = useMemo(
+    () =>
+      request.requested
+        ? PERMISSION_CLASSES.filter(([key]) => request.requested?.[key])
+        : [],
+    [request.requested],
+  );
+
+  // Each requested class starts checked; the host may uncheck to grant less. Any
+  // class not requested is never grantable here, so it is never offered.
+  const [checked, setChecked] = useState<Partial<Record<keyof PermissionSet, boolean>>>(() =>
+    Object.fromEntries(requestedClasses.map(([key]) => [key, true])),
+  );
+
+  const toggle = (key: keyof PermissionSet) =>
+    setChecked((previous) => ({ ...previous, [key]: !previous[key] }));
+
+  const approve = () => {
+    if (requestedClasses.length === 0) {
+      // Nothing was requested; leave the grant to the server-derived default.
+      onApprove(undefined);
+      return;
+    }
+    const granted: PermissionSet = { ...NO_PERMISSIONS };
+    for (const [key] of requestedClasses) {
+      granted[key] = Boolean(checked[key]);
+    }
+    onApprove(granted);
+  };
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -59,16 +111,26 @@ export function ConnectApprovalModal({
           ) : null}
         </dl>
 
-        {requestedLabels.length > 0 ? (
+        {requestedClasses.length > 0 ? (
           <div className="modal-permissions">
-            <p className="modal-note">This device is requesting access to:</p>
+            <p className="modal-note">This device is requesting access. Grant only what you allow:</p>
             <ul className="modal-permission-list" aria-label="Requested access">
-              {requestedLabels.map((label) => (
-                <li key={label}>{label}</li>
+              {requestedClasses.map(([key, label]) => (
+                <li key={key}>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(checked[key])}
+                      onChange={() => toggle(key)}
+                      disabled={pending}
+                    />
+                    {label}
+                  </label>
+                </li>
               ))}
             </ul>
             <p className="modal-note">
-              Approving grants exactly what is listed. Deny if you did not expect this request.
+              Only the checked access is granted. Deny if you did not expect this request.
             </p>
           </div>
         ) : (
@@ -96,7 +158,7 @@ export function ConnectApprovalModal({
           <button
             className="primary-button"
             type="button"
-            onClick={onApprove}
+            onClick={approve}
             disabled={pending}
           >
             {pending ? "Working…" : "Approve"}

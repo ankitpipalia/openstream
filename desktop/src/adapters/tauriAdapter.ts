@@ -905,8 +905,8 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
     },
     // The Rust `request_id` parameter is addressed as camelCase `requestId`,
     // which is how Tauri v2 deserializes command arguments.
-    approveConnectRequest: async (requestId) => {
-      await invokeFn("approve_connect_request", { requestId });
+    approveConnectRequest: async (requestId, granted) => {
+      await invokeFn("approve_connect_request", { requestId, granted });
     },
     denyConnectRequest: async (requestId) => {
       await invokeFn("deny_connect_request", { requestId });
