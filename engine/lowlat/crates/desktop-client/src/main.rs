@@ -2301,6 +2301,17 @@ async fn network_session(
                 reliable_control.retry(&mut session).await?;
                 session.flush_outbound_recoverably().await?;
                 session.maintain_liveness().await?;
+                // Mirror the host's peer-liveness watch. A returned error is
+                // retryable (it is not a TerminalError), so the reconnect
+                // supervisor re-establishes and re-requests a keyframe rather
+                // than the picture sitting frozen indefinitely.
+                let peer_silence = session.last_peer_activity_age();
+                if peer_liveness_expired(peer_silence, PEER_LIVENESS_TIMEOUT) {
+                    return Err(format!(
+                        "no host traffic for {peer_silence:?}; reconnecting"
+                    )
+                    .into());
+                }
             }
             _ = wait_for_outbound_wake(outbound_wake) => {
                 session.flush_outbound_recoverably().await?;
@@ -3336,6 +3347,23 @@ const STALL_DEADLINE: Duration = Duration::from_secs(2);
 /// sitting quietly. A timeout is reported, never silently retried.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long the client tolerates total silence from the host before it tears
+/// the session down and reconnects. It matches the host's own peer-liveness
+/// window: authenticated traffic in either direction refreshes the clock, and
+/// the host sends a keepalive frame roughly every second even on a static
+/// desktop, so this trips only on a genuinely dead transport -- not on a
+/// decode stall (which [`STALL_DEADLINE`] reports separately). Without it a
+/// client whose link drops mid-session waits forever at "pipeline stalled"
+/// instead of reconnecting.
+const PEER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whether the host has been silent long enough to declare the session dead.
+/// Pure so the boundary is unit-tested; the live check reads the age from the
+/// session each control tick.
+fn peer_liveness_expired(peer_silence: Duration, timeout: Duration) -> bool {
+    peer_silence >= timeout
+}
+
 /// A process-local monotonic microsecond reading.
 ///
 /// Monotonic but not *strictly* increasing: two calls in the same microsecond
@@ -3432,11 +3460,11 @@ mod frame_dump_tests {
 mod tests {
     use super::{
         CRITICAL_UI_QUEUE_CAPACITY, ClientClock, ClientTelemetry, Duration, HEALTHY_SESSION,
-        InputReceiver, InputSender, PROBE_TIMEOUT, PresentedRect, ProbeAction, SessionProgress,
-        TerminalError, UiInput, UiMessage, UiReceiver, UiSender, axis_value, cycled_display,
-        decoder_args, discard_stale_input, gamepad_axis_index, gamepad_button_index, is_retryable,
-        keyboard_usages, offer_decoded_frame, presented_rect, selected_display_index,
-        stream_pointer_position,
+        InputReceiver, InputSender, PEER_LIVENESS_TIMEOUT, PROBE_TIMEOUT, PresentedRect,
+        ProbeAction, SessionProgress, TerminalError, UiInput, UiMessage, UiReceiver, UiSender,
+        axis_value, cycled_display, decoder_args, discard_stale_input, gamepad_axis_index,
+        gamepad_button_index, is_retryable, keyboard_usages, offer_decoded_frame,
+        peer_liveness_expired, presented_rect, selected_display_index, stream_pointer_position,
     };
     use gilrs::{Axis, Button};
     use minifb::Key;
@@ -3446,6 +3474,29 @@ mod tests {
     use openstream_media::latest_frame::latest_frame;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn peer_liveness_trips_only_at_or_past_the_timeout() {
+        // Fresh and merely-slow sessions survive; true silence trips. The
+        // host keepalive (~1 Hz) keeps a healthy client well under this even
+        // on a static desktop, so the boundary is what matters.
+        assert!(!peer_liveness_expired(
+            Duration::from_secs(0),
+            PEER_LIVENESS_TIMEOUT
+        ));
+        assert!(!peer_liveness_expired(
+            PEER_LIVENESS_TIMEOUT - Duration::from_millis(1),
+            PEER_LIVENESS_TIMEOUT
+        ));
+        assert!(peer_liveness_expired(
+            PEER_LIVENESS_TIMEOUT,
+            PEER_LIVENESS_TIMEOUT
+        ));
+        assert!(peer_liveness_expired(
+            PEER_LIVENESS_TIMEOUT + Duration::from_secs(45),
+            PEER_LIVENESS_TIMEOUT
+        ));
+    }
 
     #[test]
     fn gamepad_layout_is_stable_across_platform_backends() {
