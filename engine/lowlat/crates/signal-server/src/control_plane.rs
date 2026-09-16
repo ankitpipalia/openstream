@@ -113,6 +113,15 @@ pub(crate) enum ControlPlaneError {
     AlreadyExists,
     NotFound,
     Unauthorized,
+    /// A login was rejected because the device presented a different public key
+    /// than the enrolled one, which auto-revoked the device. Client-facing this
+    /// is indistinguishable from `Unauthorized` (same status, same body); it
+    /// carries the owner internally so the caller can also end the device's live
+    /// sessions, since a changed device identity signals a takeover.
+    DeviceIdentityRevoked {
+        account_id: String,
+        device_id: String,
+    },
     DevicePending,
     DeviceRevoked,
     InvalidStore,
@@ -126,7 +135,7 @@ impl std::fmt::Display for ControlPlaneError {
             Self::InvalidInput(reason) => reason,
             Self::AlreadyExists => "account or device already exists",
             Self::NotFound => "account or device was not found",
-            Self::Unauthorized => "credentials were rejected",
+            Self::Unauthorized | Self::DeviceIdentityRevoked { .. } => "credentials were rejected",
             Self::DevicePending => "device enrollment is awaiting approval",
             Self::DeviceRevoked => "device has been revoked",
             Self::InvalidStore => "control-plane store is invalid",
@@ -570,7 +579,12 @@ impl AccountStore {
                 .expect("an identity mismatch always has a device id");
             self.invalidate_device_tokens(&account_id, device_id);
             self.save()?;
-            return Err(ControlPlaneError::Unauthorized);
+            // Client-facing this is identical to `Unauthorized`; the owner is
+            // carried so the caller can also end the device's live sessions.
+            return Err(ControlPlaneError::DeviceIdentityRevoked {
+                account_id: account_id.clone(),
+                device_id: device_id.to_string(),
+            });
         }
         self.prune_refresh_tokens(&account_id, now_ms);
         self.save()?;
@@ -1383,6 +1397,53 @@ mod tests {
     }
 
     const PASSWORD: &str = "a-sufficiently-long-password";
+
+    /// A login with the right password but a changed device key auto-revokes the
+    /// device and reports the owner (so the caller can end its sessions), while a
+    /// wrong password never reaches the device check -- so an unauthenticated
+    /// caller cannot trigger the teardown.
+    #[test]
+    fn a_changed_device_key_reports_the_revoked_owner_but_stays_unauthorized_to_the_client() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        registered(&mut store, now);
+
+        let (salt, scheme) = store.password_challenge_scheme("operator");
+
+        // Correct password, different device public key.
+        let correct = derive_password_with(PASSWORD, &salt, scheme);
+        match store.login_derived(
+            "operator",
+            salt,
+            correct,
+            Some(test_device("device-1", 0x22)),
+            now + 1,
+        ) {
+            Err(ControlPlaneError::DeviceIdentityRevoked {
+                account_id,
+                device_id,
+            }) => {
+                assert_eq!(device_id, "device-1");
+                assert!(!account_id.is_empty());
+            }
+            other => panic!("expected an identity-revoked signal, got {other:?}"),
+        }
+
+        // A wrong password is rejected before the device check ever runs.
+        let wrong = derive_password_with("the-wrong-password-entirely", &salt, scheme);
+        assert!(matches!(
+            store.login_derived(
+                "operator",
+                salt,
+                wrong,
+                Some(test_device("device-1", 0x33)),
+                now + 2,
+            ),
+            Err(ControlPlaneError::Unauthorized)
+        ));
+
+        cleanup(&directory);
+    }
 
     /// Replaying a rotated refresh token condemns the whole family.
     ///

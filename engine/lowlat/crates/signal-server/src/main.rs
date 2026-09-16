@@ -1540,7 +1540,9 @@ fn control_error_response(error: ControlPlaneError) -> Response {
         ControlPlaneError::InvalidInput(_) => StatusCode::BAD_REQUEST,
         ControlPlaneError::AlreadyExists => StatusCode::CONFLICT,
         ControlPlaneError::NotFound => StatusCode::NOT_FOUND,
-        ControlPlaneError::Unauthorized => StatusCode::UNAUTHORIZED,
+        ControlPlaneError::Unauthorized | ControlPlaneError::DeviceIdentityRevoked { .. } => {
+            StatusCode::UNAUTHORIZED
+        }
         ControlPlaneError::DevicePending | ControlPlaneError::DeviceRevoked => {
             StatusCode::FORBIDDEN
         }
@@ -1859,6 +1861,20 @@ async fn login_account(
             control_plane::now_ms(),
         ) {
             Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
+            // A changed device key auto-revoked the device: end its live sessions
+            // too, not just its tokens, then answer with the same 401 an ordinary
+            // rejection gives so the mismatch stays indistinguishable to a caller.
+            Err(ControlPlaneError::DeviceIdentityRevoked {
+                account_id,
+                device_id,
+            }) => {
+                drop(accounts);
+                let senders = revoke_owned_sessions(&state, &account_id, Some(&device_id)).await;
+                for sender in senders {
+                    let _ = sender.try_send(Message::Close(None));
+                }
+                return control_error_response(ControlPlaneError::Unauthorized);
+            }
             Err(error) => return control_error_response(error),
         };
         if !accounts.password_is_outdated(&request.username) {
@@ -1961,13 +1977,29 @@ async fn set_account_device_trust(
     if let Err(error) = accounts.can_manage_devices(&principal) {
         return control_error_response(error);
     }
-    match accounts.set_device_trust(
+    let result = accounts.set_device_trust(
         &principal.account_id,
         &device_id,
         request.trust,
         control_plane::now_ms(),
-    ) {
-        Ok(device) => Json(device).into_response(),
+    );
+    // Release the account lock before touching sessions: session teardown takes
+    // the sessions lock, and no other path holds accounts across it.
+    drop(accounts);
+    match result {
+        Ok(device) => {
+            // Revoking a device must end its live sessions, not just its tokens:
+            // otherwise a compromised device keeps its signaling and relay path
+            // alive until the session TTL. Trusting a device changes nothing live.
+            if request.trust == DeviceTrust::Revoked {
+                let senders =
+                    revoke_owned_sessions(&state, &principal.account_id, Some(&device_id)).await;
+                for sender in senders {
+                    let _ = sender.try_send(Message::Close(None));
+                }
+            }
+            Json(device).into_response()
+        }
         Err(error) => control_error_response(error),
     }
 }
@@ -2005,6 +2037,70 @@ async fn reap_expired_sessions(state: &AppState) -> Vec<mpsc::Sender<Message>> {
         .collect::<Vec<_>>();
     let mut senders = Vec::new();
     for id in expired {
+        let Some(mut session) = sessions.remove(&id) else {
+            continue;
+        };
+        if let Some(cancel) = session.host_cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(cancel) = session.client_cancel.take() {
+            let _ = cancel.send(());
+        }
+        senders.extend(session.host.take());
+        senders.extend(session.client.take());
+        senders.extend(
+            session
+                .guests
+                .iter_mut()
+                .filter_map(|guest| guest.sender.take()),
+        );
+    }
+    senders
+}
+
+/// The ids of sessions owned by `account_id`, optionally narrowed to a single
+/// `device_id` (matching either the requester/client device or the target/host
+/// device). Provisioning sessions (no ownership) never match, so an admin
+/// session is never torn down by an account revocation.
+///
+/// Pure over the session map so the ownership selection is unit-testable without
+/// a running service.
+fn sessions_owned_by(
+    sessions: &HashMap<String, Session>,
+    account_id: &str,
+    device_id: Option<&str>,
+) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|(_, session)| {
+            session.ownership.as_ref().is_some_and(|owner| {
+                owner.account_id == account_id
+                    && device_id.is_none_or(|device| {
+                        owner.requester_device_id == device || owner.target_device_id == device
+                    })
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Remove every live session owned by `account_id` (optionally just those
+/// involving `device_id`), cancelling their sockets, and return the live senders
+/// so a close notice can be sent after the map lock is released.
+///
+/// This is what makes revocation effective on the media path: invalidating a
+/// device's tokens stops it minting *new* credentials, but without this an
+/// already-established session keeps its signaling and relay path alive until
+/// its TTL. Revoking a compromised device must end its sessions now.
+async fn revoke_owned_sessions(
+    state: &AppState,
+    account_id: &str,
+    device_id: Option<&str>,
+) -> Vec<mpsc::Sender<Message>> {
+    let mut sessions = state.sessions.lock().await;
+    let owned = sessions_owned_by(&sessions, account_id, device_id);
+    let mut senders = Vec::new();
+    for id in owned {
         let Some(mut session) = sessions.remove(&id) else {
             continue;
         };
@@ -4496,17 +4592,18 @@ mod tests {
         MAX_CONCURRENT_PASSWORD_DERIVATIONS, MAX_GUESTS_CEILING, MAX_REFRESH_ATTEMPTS_PER_MINUTE,
         MAX_SESSION_CREATES_PER_MINUTE, MAX_TRACKED_AUTH_SOURCES, PrimaryRole,
         RELAY_BYTES_PER_SECOND, RELAY_PACKETS_PER_SECOND, RateWindow, ReadinessError,
-        RegistrationAuthorization, RelaySlot, Role, SESSION_CREATE_WINDOW, Session, SourceLimiter,
-        admin_allowed, admit_primary_socket as admit_primary_socket_with_cancel,
-        authorize_registration, authorized, bearer_token, cleanup_primary_socket,
-        close_primary_pair, connect_approve, connect_deny, connect_observe, connect_offline,
-        connect_pending, connect_presence, connect_request, consume_dual_budget, create_session,
-        direct_message_route, dispatch_generic_message, enroll_account_device,
-        is_private_lan_address, list_account_devices, login_account, max_guests_for_new_session,
+        RegistrationAuthorization, RelaySlot, Role, SESSION_CREATE_WINDOW, Session,
+        SessionOwnership, SourceLimiter, admin_allowed,
+        admit_primary_socket as admit_primary_socket_with_cancel, authorize_registration,
+        authorized, bearer_token, cleanup_primary_socket, close_primary_pair, connect_approve,
+        connect_deny, connect_observe, connect_offline, connect_pending, connect_presence,
+        connect_request, consume_dual_budget, create_session, direct_message_route,
+        dispatch_generic_message, enroll_account_device, is_private_lan_address,
+        list_account_devices, login_account, max_guests_for_new_session,
         prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
         register_account, relay_owner_for_ticket, relay_ticket, request_source,
-        set_account_device_trust, signal_socket, supplied_token_is_host, validate_signal_message,
-        validate_startup_auth,
+        revoke_owned_sessions, sessions_owned_by, set_account_device_trust, signal_socket,
+        supplied_token_is_host, validate_signal_message, validate_startup_auth,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -6104,6 +6201,87 @@ mod tests {
             .try_send(Message::Close(None))
             .expect("close fits in the bounded queue");
         assert!(matches!(receiver.recv().await, Some(Message::Close(None))));
+    }
+
+    fn owned_session(account: &str, requester: &str, target: &str) -> Session {
+        let mut session = test_session();
+        session.ownership = Some(SessionOwnership {
+            account_id: account.into(),
+            requester_device_id: requester.into(),
+            target_device_id: target.into(),
+            request_id: "req".into(),
+        });
+        session
+    }
+
+    #[test]
+    fn sessions_owned_by_selects_by_account_then_device() {
+        let mut sessions = HashMap::new();
+        sessions.insert(
+            "a-req-d1".to_string(),
+            owned_session("acct-a", "dev-1", "dev-2"),
+        );
+        sessions.insert(
+            "a-tgt-d1".to_string(),
+            owned_session("acct-a", "dev-3", "dev-1"),
+        );
+        sessions.insert(
+            "b-other".to_string(),
+            owned_session("acct-b", "dev-1", "dev-9"),
+        );
+        // A provisioning session has no ownership and must never be selected.
+        sessions.insert("provisioning".to_string(), test_session());
+
+        let mut all_a = sessions_owned_by(&sessions, "acct-a", None);
+        all_a.sort();
+        assert_eq!(all_a, vec!["a-req-d1".to_string(), "a-tgt-d1".to_string()]);
+
+        // dev-1 matches whether it is the requester or the target device.
+        let mut by_d1 = sessions_owned_by(&sessions, "acct-a", Some("dev-1"));
+        by_d1.sort();
+        assert_eq!(by_d1, vec!["a-req-d1".to_string(), "a-tgt-d1".to_string()]);
+
+        assert_eq!(
+            sessions_owned_by(&sessions, "acct-a", Some("dev-3")),
+            vec!["a-tgt-d1".to_string()]
+        );
+        // A different account, and provisioning (unowned) sessions, never match.
+        assert!(sessions_owned_by(&sessions, "acct-a", Some("dev-9")).is_empty());
+        assert!(sessions_owned_by(&sessions, "acct-x", None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_tears_down_its_live_sessions_only() {
+        let state = connect_test_state();
+        let (doomed_tx, mut doomed_rx) = mpsc::channel(2);
+        let (survivor_tx, mut survivor_rx) = mpsc::channel(2);
+        {
+            let mut sessions = state.sessions.lock().await;
+            let mut doomed = owned_session("acct-a", "dev-1", "dev-2");
+            doomed.host = Some(doomed_tx);
+            sessions.insert("doomed".to_string(), doomed);
+            // Same account but not involving dev-1: it must survive.
+            let mut survivor = owned_session("acct-a", "dev-7", "dev-8");
+            survivor.client = Some(survivor_tx);
+            sessions.insert("survivor".to_string(), survivor);
+        }
+
+        let senders = revoke_owned_sessions(&state, "acct-a", Some("dev-1")).await;
+        assert_eq!(
+            senders.len(),
+            1,
+            "only the dev-1 session's sender comes back"
+        );
+
+        let remaining: Vec<String> = state.sessions.lock().await.keys().cloned().collect();
+        assert_eq!(remaining, vec!["survivor".to_string()]);
+
+        // The torn-down session's socket receives a close; the survivor's does not.
+        senders[0]
+            .try_send(Message::Close(None))
+            .expect("close fits the bounded queue");
+        assert!(matches!(doomed_rx.recv().await, Some(Message::Close(None))));
+        assert!(survivor_rx.try_recv().is_err());
     }
 
     #[tokio::test]
