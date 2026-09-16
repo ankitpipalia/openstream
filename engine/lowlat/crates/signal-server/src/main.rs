@@ -7722,6 +7722,102 @@ mod tests {
         server.abort();
     }
 
+    /// A signalling socket that drops can reconnect with the same credential.
+    ///
+    /// A transport drop must not force the whole Connect flow to run again: the
+    /// session and its role token outlive one socket, so a reconnecting peer
+    /// presents the same credential and goes live again. This is the signalling
+    /// half of reconnect resilience (signalling outage -> reconnect); the media
+    /// path re-establishes separately.
+    #[tokio::test]
+    async fn a_signalling_socket_reconnects_with_the_same_credential_after_a_drop() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) =
+            register_with_device(&app, "operator", "device-client", 0x45).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x46).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x46).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (_, grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        let ws_path = grant["websocket_path"]
+            .as_str()
+            .expect("websocket path")
+            .to_string();
+        let host_capability = grant["token"].as_str().expect("host capability").to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let ws_url = format!("ws://{address}{ws_path}");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+        let bearer = format!("Bearer {host_capability}");
+
+        // Connect, take the first frame, then drop the socket -- a signalling
+        // outage from the peer's side.
+        {
+            let mut request = ws_url.clone().into_client_request().expect("request");
+            request
+                .headers_mut()
+                .insert("authorization", bearer.parse().expect("header"));
+            let (mut socket, response) = connect_async(request).await.expect("first connect");
+            assert_eq!(response.status().as_u16(), 101);
+            let _first = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("a first frame arrives")
+                .expect("socket yields a frame")
+                .expect("valid frame");
+            // The socket drops at the end of this scope.
+        }
+
+        // Let the server observe the drop before the reconnect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Reconnect with the same credential: the session survived the drop.
+        let mut request = ws_url.into_client_request().expect("request");
+        request
+            .headers_mut()
+            .insert("authorization", bearer.parse().expect("header"));
+        let (mut socket, response) = connect_async(request)
+            .await
+            .expect("the same credential reconnects the signalling socket after a drop");
+        assert_eq!(
+            response.status().as_u16(),
+            101,
+            "the reconnect switches protocols",
+        );
+        let first = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("a first frame arrives on reconnect")
+            .expect("socket yields a frame")
+            .expect("valid frame");
+        assert!(
+            matches!(first, ClientMessage::Text(_) | ClientMessage::Binary(_)),
+            "the reconnected socket is live",
+        );
+
+        server.abort();
+    }
+
     /// The product flow, end to end, and the boundary it exists to draw.
     ///
     /// Each end receives exactly one role capability and neither can obtain
