@@ -10,5 +10,6 @@
 //! logic unit-tested). Physical Windows runtime verification is pending the
 //! hardware, and none of these are production defaults until then.
 
+pub mod audio;
 pub mod capture;
 pub mod input;
