@@ -7562,8 +7562,7 @@ mod tests {
         let state = connect_test_state();
         let app = connect_router(state.clone());
 
-        let (client_token, _) =
-            register_with_device(&app, "operator", "device-client", 0x41).await;
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x41).await;
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x42).await;
         enroll_trusted_device(&app, &client_token, "device-host", 0x42).await;
         let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
@@ -7593,7 +7592,10 @@ mod tests {
             .as_str()
             .expect("websocket path")
             .to_string();
-        let host_capability = grant["token"].as_str().expect("host capability").to_string();
+        let host_capability = grant["token"]
+            .as_str()
+            .expect("host capability")
+            .to_string();
 
         // Serve the same router (so the same in-memory session) over TCP for
         // the WebSocket half.
@@ -7652,8 +7654,7 @@ mod tests {
         let state = connect_test_state();
         let app = connect_router(state.clone());
 
-        let (client_token, _) =
-            register_with_device(&app, "operator", "device-client", 0x43).await;
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x43).await;
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x44).await;
         enroll_trusted_device(&app, &client_token, "device-host", 0x44).await;
         call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
@@ -7734,8 +7735,7 @@ mod tests {
         let state = connect_test_state();
         let app = connect_router(state.clone());
 
-        let (client_token, _) =
-            register_with_device(&app, "operator", "device-client", 0x45).await;
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x45).await;
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x46).await;
         enroll_trusted_device(&app, &client_token, "device-host", 0x46).await;
         call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
@@ -7760,7 +7760,10 @@ mod tests {
             .as_str()
             .expect("websocket path")
             .to_string();
-        let host_capability = grant["token"].as_str().expect("host capability").to_string();
+        let host_capability = grant["token"]
+            .as_str()
+            .expect("host capability")
+            .to_string();
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -7834,8 +7837,7 @@ mod tests {
         let state = connect_test_state();
         let app = connect_router(state.clone());
 
-        let (client_token, _) =
-            register_with_device(&app, "operator", "device-client", 0x51).await;
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x51).await;
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x52).await;
         enroll_trusted_device(&app, &client_token, "device-host", 0x52).await;
         call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
@@ -7875,7 +7877,10 @@ mod tests {
             .as_str()
             .expect("host websocket path")
             .to_string();
-        let host_capability = host_grant["token"].as_str().expect("host capability").to_string();
+        let host_capability = host_grant["token"]
+            .as_str()
+            .expect("host capability")
+            .to_string();
         let client_path = client_grant["websocket_path"]
             .as_str()
             .expect("client websocket path")
@@ -7940,7 +7945,10 @@ mod tests {
                 }
             }
         };
-        assert!(generation >= 1, "the readiness epoch is published to the client");
+        assert!(
+            generation >= 1,
+            "the readiness epoch is published to the client"
+        );
 
         // The client emits one real direct candidate stamped with that epoch.
         let candidate = serde_json::json!({
@@ -7968,7 +7976,8 @@ mod tests {
             if let ClientMessage::Text(text) = frame {
                 let value: serde_json::Value =
                     serde_json::from_str(text.as_str()).expect("a signalling frame is JSON");
-                if value.get("type").and_then(serde_json::Value::as_str) == Some("direct_candidate") {
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("direct_candidate")
+                {
                     break value;
                 }
             }
@@ -7983,7 +7992,11 @@ mod tests {
             Some("192.0.2.20"),
             "the host receives the client's candidate unchanged",
         );
-        assert_eq!(relayed["port"].as_u64(), Some(40002), "the candidate port survives the relay");
+        assert_eq!(
+            relayed["port"].as_u64(),
+            Some(40002),
+            "the candidate port survives the relay"
+        );
 
         server.abort();
     }
