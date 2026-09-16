@@ -250,11 +250,17 @@ fn to_runtime_trusted_device(device: &control_plane::PublicDevice) -> TrustedDev
 }
 
 fn to_directory_device(device: &control_plane::PublicDevice) -> openstream_app_core::DeviceSummary {
-    // The account/device API does not yet expose host presence. Keep the
-    // record visible for trust management but deliberately mark it offline so
-    // the shell cannot offer a connection that has not been discovered.
-    let mut summary =
-        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone());
+    // Presence now reaches the shell through the device listing, so a device
+    // the control plane last saw announcing itself is offered as connectable
+    // and everything else stays visible for trust management only. The online
+    // flag is advisory: the broker re-checks presence when a session is
+    // actually requested, so a stale "online" costs one refused request, never
+    // a session started against a machine that is not there.
+    let mut summary = if device.online {
+        openstream_app_core::DeviceSummary::online(device.device_id.clone(), device.name.clone())
+    } else {
+        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone())
+    };
     summary.platform = device.platform.clone();
     summary
 }
@@ -486,8 +492,22 @@ async fn approve_connect_request(
 ) -> Result<(), RuntimeError> {
     let credential = {
         let mut client = control_plane.lock().await;
+        // Approve as requested: the host was shown this request from the
+        // pending list, and approving grants what was asked. The granted set is
+        // taken from the broker's own pending record rather than from the
+        // WebView, so this path cannot widen it beyond the request. A request
+        // no longer pending (already approved, or expired) grants the empty
+        // set, which the broker ignores on the idempotent retry.
+        let granted = client
+            .pending_connect_requests()
+            .await
+            .map_err(control_plane_error_runtime)?
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .map(|request| request.requested)
+            .unwrap_or_else(openstream_app_core::PermissionSet::none);
         client
-            .approve_connect(&request_id)
+            .approve_connect(&request_id, granted)
             .await
             .map_err(control_plane_error_runtime)?
     };
@@ -556,12 +576,13 @@ async fn run_secure_connect(
     session: &SharedSession,
     control_plane: &SharedControlPlane,
     device_id: &str,
+    requested: openstream_app_core::PermissionSet,
     mut result: RuntimeDispatchResult,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     let request_id = {
         let mut client = control_plane.lock().await;
         client
-            .request_connect(device_id)
+            .request_connect(device_id, requested)
             .await
             .map_err(control_plane_error_runtime)?
             .request_id
@@ -690,7 +711,15 @@ async fn dispatch_command_with_session(
                 // a capability issued -- to each end separately. The runner
                 // is started from that capability rather than from a pairing
                 // file carrying both roles.
-                return run_secure_connect(state, session, control_plane, &device_id, result).await;
+                return run_secure_connect(
+                    state,
+                    session,
+                    control_plane,
+                    &device_id,
+                    requested,
+                    result,
+                )
+                .await;
             }
             let started = start_session_if_connecting(state, session, &device_id).await;
             match started {
@@ -1390,6 +1419,37 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::task::JoinHandle;
+
+    /// Presence from the control plane decides whether the shell offers a
+    /// connection. This is the desktop half of surfacing host presence: an
+    /// online record maps to a connectable summary, an offline one does not,
+    /// and the platform is carried through either way. Before presence was
+    /// surfaced every device mapped to offline and the connect button was
+    /// never live.
+    #[test]
+    fn to_directory_device_reflects_presence() {
+        let base = super::control_plane::PublicDevice {
+            device_id: "device-host".to_string(),
+            name: "Studio".to_string(),
+            platform: "macos".to_string(),
+            trust: super::control_plane::DeviceTrust::Trusted,
+            enrolled_at_ms: 0,
+            last_seen_ms: None,
+            public_key_fingerprint: "abcd1234".to_string(),
+            online: true,
+        };
+
+        let online = super::to_directory_device(&base);
+        assert!(online.online, "an online device is offered as connectable");
+        assert_eq!(online.platform, "macos", "platform is carried through");
+
+        let offline = super::to_directory_device(&super::control_plane::PublicDevice {
+            online: false,
+            ..base
+        });
+        assert!(!offline.online, "an offline device is not offered");
+        assert_eq!(offline.platform, "macos", "platform is carried through");
+    }
 
     #[test]
     fn local_no_auth_private_lan_origin_does_not_abort_startup() {
