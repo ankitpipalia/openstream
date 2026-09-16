@@ -78,6 +78,14 @@ pub struct PublicDevice {
     pub enrolled_at_ms: u64,
     pub last_seen_ms: Option<u64>,
     pub public_key_fingerprint: String,
+    /// Whether the control plane currently sees this device announcing
+    /// presence. Advisory: the shell uses it to decide whether to offer a
+    /// connection, and the broker re-checks authoritatively when a session is
+    /// actually requested. Defaulted so a control plane that predates the
+    /// field simply leaves every device reading offline rather than failing to
+    /// parse.
+    #[serde(default)]
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
