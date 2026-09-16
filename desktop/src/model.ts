@@ -73,8 +73,10 @@ export interface TrustedDevice {
   name: string;
   platform: string;
   addedAt: string;
-  status: "trusted" | "pending" | "revoked";
+  status: DeviceTrustState;
 }
+
+export type DeviceTrustState = "trusted" | "pending" | "revoked";
 
 export interface AccessSnapshot {
   pairing: {
@@ -92,7 +94,14 @@ export interface SettingItem {
   value: string | number | boolean;
   state: CapabilityState;
   options?: string[];
+  scope?: SettingScope;
+  applyMode?: SettingApplyMode;
+  visibility?: SettingVisibility;
 }
+
+export type SettingScope = "global" | "client" | "host" | "device" | "session";
+export type SettingApplyMode = "live" | "reconnect" | "restart_host" | "restart_application";
+export type SettingVisibility = "normal" | "advanced" | "experimental";
 
 export interface SettingSection {
   id: string;

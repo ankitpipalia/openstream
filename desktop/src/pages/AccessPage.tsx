@@ -52,7 +52,10 @@ export function AccessPage({ snapshot }: { snapshot: ProductSnapshot }) {
                 <div className="device-avatar" aria-hidden="true">{device.name.slice(0, 1).toUpperCase()}</div>
                 <div>
                   <h3>{device.name}</h3>
-                  <p>{device.platform} · Added {device.addedAt}</p>
+                  <p>
+                    {device.platform} · Added {device.addedAt}
+                    {device.fingerprint ? ` · Key ${device.fingerprint}` : ""}
+                  </p>
                 </div>
                 <span className={`device-status device-status-${device.status}`}>{device.status}</span>
               </div>

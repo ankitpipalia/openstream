@@ -44,9 +44,9 @@ function Page({
     case "computers":
       return <ComputersPage snapshot={snapshot} adapter={adapter} onSnapshot={onSnapshot} />;
     case "access":
-      return <AccessPage snapshot={snapshot} />;
+      return <AccessPage snapshot={snapshot} adapter={adapter} onSnapshot={onSnapshot} />;
     case "settings":
-      return <SettingsPage snapshot={snapshot} />;
+      return <SettingsPage snapshot={snapshot} adapter={adapter} onSnapshot={onSnapshot} />;
     case "diagnostics":
       return <DiagnosticsPage snapshot={snapshot} />;
     case "about":

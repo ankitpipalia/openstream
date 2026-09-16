@@ -944,9 +944,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(format!("failed to read OPENSTREAM_ADMIN_TOKEN: {error}").into()),
     };
+    let accounts = AccountStore::open(control_plane::default_store_path())
+        .map_err(|error| format!("failed to open durable control-plane store: {error}"))?;
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         session_creates: Arc::new(Mutex::new(CreationLimiter::default())),
+        accounts: Arc::new(Mutex::new(accounts)),
         admin_token,
         allow_no_auth: std::env::var("OPENSTREAM_ALLOW_NO_AUTH").as_deref() == Ok("1"),
         local_no_auth: std::env::var("OPENSTREAM_LOCAL_NO_AUTH").as_deref() == Ok("1"),
@@ -980,6 +983,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/v1/auth/register", post(register_account))
+        .route("/v1/auth/login", post(login_account))
+        .route("/v1/auth/refresh", post(refresh_account))
+        .route("/v1/devices", get(list_account_devices).post(enroll_account_device))
+        .route(
+            "/v1/devices/{device_id}/trust",
+            axum::routing::patch(set_account_device_trust),
+        )
         .route("/v1/session", post(create_session))
         .route(
             "/v1/session/{session_id}",
@@ -1067,6 +1078,220 @@ async fn shutdown_signal() {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountCredentialsRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    device: Option<DeviceRegistrationRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshAccountRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceRegistrationRequest {
+    device_id: String,
+    name: String,
+    platform: String,
+    /// Public Ed25519 key, encoded as exactly 64 lowercase or uppercase hex
+    /// characters. Private keys and bearer credentials are never accepted by
+    /// this API.
+    public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AccountAuthResponse {
+    access_token: String,
+    refresh_token: String,
+    access_expires_in_seconds: u64,
+    refresh_expires_in_seconds: u64,
+    user: PublicUser,
+    device: Option<PublicDevice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTrustRequest {
+    trust: DeviceTrust,
+}
+
+fn device_registration(
+    request: DeviceRegistrationRequest,
+) -> Result<DeviceRegistration, ControlPlaneError> {
+    let public_key = decode_fixed_hex::<32>(&request.public_key)
+        .ok_or(ControlPlaneError::InvalidInput("public_key must be 32-byte hex"))?;
+    Ok(DeviceRegistration {
+        device_id: request.device_id,
+        name: request.name,
+        platform: request.platform,
+        public_key,
+    })
+}
+
+fn auth_response(tokens: IssuedTokens) -> AccountAuthResponse {
+    AccountAuthResponse {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        access_expires_in_seconds: tokens.access_expires_in_seconds,
+        refresh_expires_in_seconds: tokens.refresh_expires_in_seconds,
+        user: tokens.user,
+        device: tokens.device,
+    }
+}
+
+async fn register_account(
+    State(state): State<AppState>,
+    Json(request): Json<AccountCredentialsRequest>,
+) -> Response {
+    let device = match request.device.map(device_registration).transpose() {
+        Ok(device) => device,
+        Err(error) => return control_error_response(error),
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.register(&request.username, &request.password, device, control_plane::now_ms()) {
+        Ok(tokens) => (StatusCode::CREATED, Json(auth_response(tokens))).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn login_account(
+    State(state): State<AppState>,
+    Json(request): Json<AccountCredentialsRequest>,
+) -> Response {
+    let device = match request.device.map(device_registration).transpose() {
+        Ok(device) => device,
+        Err(error) => return control_error_response(error),
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.login(&request.username, &request.password, device, control_plane::now_ms()) {
+        Ok(tokens) => Json(auth_response(tokens)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn refresh_account(
+    State(state): State<AppState>,
+    Json(request): Json<RefreshAccountRequest>,
+) -> Response {
+    let mut accounts = state.accounts.lock().await;
+    match accounts.refresh(&request.refresh_token, control_plane::now_ms()) {
+        Ok(tokens) => Json(auth_response(tokens)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn account_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AccountPrincipal, Response> {
+    let token = bearer_token(headers).ok_or_else(|| {
+        (StatusCode::UNAUTHORIZED, "account authentication required\n").into_response()
+    })?;
+    let mut accounts = state.accounts.lock().await;
+    accounts
+        .authorize_access(token, control_plane::now_ms())
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "account authentication required\n").into_response())
+}
+
+async fn list_account_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let accounts = state.accounts.lock().await;
+    match accounts.list_devices(&principal.account_id) {
+        Ok(devices) => Json(devices).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn enroll_account_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceRegistrationRequest>,
+) -> Response {
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let registration = match device_registration(request) {
+        Ok(registration) => registration,
+        Err(error) => return control_error_response(error),
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.enroll_device(&principal.account_id, registration, control_plane::now_ms()) {
+        Ok(device) => (StatusCode::CREATED, Json(device)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+async fn set_account_device_trust(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+    Json(request): Json<DeviceTrustRequest>,
+) -> Response {
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.set_device_trust(
+        &principal.account_id,
+        &device_id,
+        request.trust,
+        control_plane::now_ms(),
+    ) {
+        Ok(device) => Json(device).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+fn control_error_response(error: ControlPlaneError) -> Response {
+    let status = match error {
+        ControlPlaneError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        ControlPlaneError::AlreadyExists => StatusCode::CONFLICT,
+        ControlPlaneError::NotFound => StatusCode::NOT_FOUND,
+        ControlPlaneError::Unauthorized => StatusCode::UNAUTHORIZED,
+        ControlPlaneError::DevicePending | ControlPlaneError::DeviceRevoked => {
+            StatusCode::FORBIDDEN
+        }
+        ControlPlaneError::InvalidStore | ControlPlaneError::Io(_) | ControlPlaneError::Json(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    // Never return password/hash/store details. The category is enough for a
+    // client to render a safe error and keeps the endpoint from becoming a
+    // durable-state oracle.
+    let message = match status {
+        StatusCode::BAD_REQUEST => "invalid control-plane request\n",
+        StatusCode::CONFLICT => "control-plane record already exists\n",
+        StatusCode::NOT_FOUND => "control-plane record not found\n",
+        StatusCode::FORBIDDEN => "device is not permitted\n",
+        StatusCode::INTERNAL_SERVER_ERROR => "control-plane storage unavailable\n",
+        _ => "authentication failed\n",
+    };
+    (status, message).into_response()
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 {
+        return None;
+    }
+    let mut bytes = [0_u8; N];
+    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (chunk[0] as char).to_digit(16)? as u8;
+        let low = (chunk[1] as char).to_digit(16)? as u8;
+        bytes[index] = (high << 4) | low;
+    }
+    Some(bytes)
 }
 
 /// Remove expired sessions independently of request and relay traffic.

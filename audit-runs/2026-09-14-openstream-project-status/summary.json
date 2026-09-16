@@ -1,0 +1,61 @@
+{
+  "audit_date": "2026-09-14",
+  "repository": "ankitpipalia/openstream",
+  "branch": "main",
+  "head": "cac3b2fd363da00417a79da682bcc1f0299cdb87",
+  "origin_main": "cac3b2fd363da00417a79da682bcc1f0299cdb87",
+  "merge_base": "cac3b2fd363da00417a79da682bcc1f0299cdb87",
+  "initial_worktree_clean": true,
+  "open_pull_requests": 0,
+  "tags": [],
+  "github_ci": {
+    "run_id": 34816872196,
+    "head_sha": "cac3b2fd363da00417a79da682bcc1f0299cdb87",
+    "status": "completed",
+    "conclusion": "success",
+    "jobs_passed": 27,
+    "jobs_total": 27,
+    "required_check": "CI gate"
+  },
+  "local_verification": {
+    "workspace_tests": "pass",
+    "tauri_tests": { "status": "pass", "count": 39 },
+    "frontend_tests": { "status": "pass", "count": 16 },
+    "frontend_build": "pass",
+    "release_gate": { "status": "not_ready", "failures": 11 },
+    "wan_gate": { "status": "not_ready", "unverified_cases": 10 }
+  },
+  "highest_physical_evidence": {
+    "combination": "Linux NVIDIA host to Apple-Silicon macOS client",
+    "network": "LAN direct UDP",
+    "media": "H.264 NVENC to FFmpeg BGRA with software/wgpu Metal presentation",
+    "limitations": [
+      "fallback capture path only",
+      "no release-accepted Wayland/native capture",
+      "no desktop VideoToolbox zero-copy",
+      "no production input acceptance",
+      "no physical audio acceptance",
+      "no WAN or external TURN",
+      "no package or long-soak evidence"
+    ]
+  },
+  "status_counts": {
+    "critical_release_blockers": 3,
+    "high_release_blockers": 9,
+    "medium_release_blockers": 1,
+    "non_blocking_platform_scope_issue": 1
+  },
+  "top_blockers": [
+    "Product shell Connect does not establish or launch a session",
+    "Durable user/device authentication and secure key custody are missing",
+    "Full ICE/TURN startup and reconnect lack establishment epochs",
+    "Linux capture and host readiness do not prove flowing desktop frames",
+    "Desktop macOS VideoToolbox/IOSurface/Metal path is missing",
+    "Raw mouse/input safety and physical audio acceptance are missing",
+    "Public WAN/NAT/TURN/relay behavior is unverified",
+    "Corrected latency instrumentation has no physical baseline",
+    "Host settings are not applied with a proven revision",
+    "Signed packages, SBOM, updater, upgrade and rollback evidence are absent"
+  ],
+  "decision": "NO-GO — specific release blockers remain."
+}

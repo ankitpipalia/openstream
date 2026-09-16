@@ -248,6 +248,17 @@ export interface RuntimeSnapshot {
   host_restart_required: boolean;
   /** Setting keys whose persisted value is not yet reflected in the running application. */
   pending_settings: string[];
+  trusted_devices?: RuntimeTrustedDevice[];
+}
+
+interface RuntimeTrustedDevice {
+  device_id: string;
+  name: string;
+  platform: string;
+  enrolled_at_ms: number;
+  trust: "pending" | "trusted" | "revoked";
+  last_seen_ms: number | null;
+  public_key_fingerprint: string;
 }
 
 export interface RuntimeDispatchResult {
@@ -467,6 +478,9 @@ function mapSettings(settings: AppConfig, descriptors: SettingDescriptor[]): Set
         description: field.description,
         value: field.value(settings),
         state: descriptor ? mapCapabilityState(descriptor.capability) : "unavailable",
+        scope: descriptor?.scope,
+        applyMode: descriptor?.apply_mode,
+        visibility: descriptor?.visibility,
       };
       if (field.options) {
         item.options = field.options;
@@ -536,7 +550,7 @@ function mapComputers(devices: DeviceSummary[]): Computer[] {
   });
 }
 
-function mapAccess(app: AppSnapshot): AccessSnapshot {
+function mapAccess(app: AppSnapshot, devices: RuntimeTrustedDevice[] = []): AccessSnapshot {
   const pairing =
     app.mode === "Local"
       ? { state: "not-configured" as const, detail: "This desktop runs in local mode and does not require pairing." }
@@ -551,7 +565,17 @@ function mapAccess(app: AppSnapshot): AccessSnapshot {
         ? capability("control-plane", "Control plane", "pending", "Waiting for account authentication.")
         : capability("control-plane", "Control plane", "available", "Signed in to the control plane.");
 
-  return { pairing, controlPlane, trustedDevices: [] };
+  return {
+    pairing,
+    controlPlane,
+    trustedDevices: devices.map((device) => ({
+      id: device.device_id,
+      name: device.name,
+      platform: device.platform,
+      addedAt: new Date(device.enrolled_at_ms).toISOString(),
+      status: device.trust,
+    })),
+  };
 }
 
 /// Translate Rust's diagnostic state into the shell's capability state.
@@ -684,7 +708,7 @@ function mapCapabilities(app: AppSnapshot, controlPlane: Capability): Capability
 
 export function mapRuntimeSnapshot(snapshot: RuntimeSnapshot): ProductSnapshot {
   const app = snapshot.app;
-  const access = mapAccess(app);
+  const access = mapAccess(app, snapshot.trusted_devices ?? []);
 
   return {
     product: { name: "OpenStream", version: PRODUCT_VERSION, channel: "Desktop shell" },
@@ -752,6 +776,17 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
     },
     updateSettings: async (settings: unknown) => {
       const raw = (await invokeFn("runtime_update_settings", { settings })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    updateSetting: async (key, value) => {
+      const raw = (await invokeFn("runtime_update_setting", { key, value })) as RuntimeSnapshot;
+      return publish(mapRuntimeSnapshot(raw));
+    },
+    setDeviceTrust: async (deviceId, trust) => {
+      const raw = (await invokeFn("device_store_set_trust", {
+        deviceId,
+        trust,
+      })) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
     },
   };

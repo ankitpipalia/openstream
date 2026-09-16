@@ -5,6 +5,7 @@ import type {
   ProductSnapshot,
   RuntimeCommand,
   SettingSection,
+  DeviceTrustState,
 } from "../model";
 
 export interface ProductAdapter {
@@ -14,6 +15,8 @@ export interface ProductAdapter {
   refresh(): Promise<ProductSnapshot>;
   dispatch(command: RuntimeCommand): Promise<ProductSnapshot>;
   updateSettings(config: unknown): Promise<ProductSnapshot>;
+  updateSetting(key: string, value: string | number | boolean | null): Promise<ProductSnapshot>;
+  setDeviceTrust(deviceId: string, trust: DeviceTrustState): Promise<ProductSnapshot>;
 }
 
 export interface LocalProductAdapter extends ProductAdapter {
@@ -201,6 +204,8 @@ export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmpt
     refresh: async () => currentSnapshot,
     dispatch: async () => currentSnapshot,
     updateSettings: async () => currentSnapshot,
+    updateSetting: async () => currentSnapshot,
+    setDeviceTrust: async () => currentSnapshot,
     setSnapshot: (snapshot) => {
       currentSnapshot = snapshot;
       for (const listener of listeners) {
