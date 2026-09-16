@@ -7818,6 +7818,176 @@ mod tests {
         server.abort();
     }
 
+    /// Two broker-issued peers meet on the signalling plane and a candidate
+    /// relays between them.
+    ///
+    /// The credential tests above each bring up a single socket. A session is
+    /// only useful once both roles are live and can exchange establishment
+    /// traffic, so this brings both up from one approval -- the host credential
+    /// from `/approve`, the client credential from the observing `GET` -- lets
+    /// the server pair them into one establishment epoch, and drives one real
+    /// direct candidate from the client through to the host. It exercises the
+    /// readiness handshake (`peer_ready`) and the post-ready relay together,
+    /// end to end over real WebSockets, which no single-socket test can reach.
+    #[tokio::test]
+    async fn two_peers_relay_a_candidate_after_reaching_readiness() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) =
+            register_with_device(&app, "operator", "device-client", 0x51).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x52).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x52).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+
+        // Client asks; host approves -> the host credential. The client then
+        // observes the approved request -> the client credential. Two roles,
+        // one session, from a single approval.
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (status, host_grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {host_grant}");
+        let (status, client_grant) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "observe: {client_grant}");
+
+        let host_path = host_grant["websocket_path"]
+            .as_str()
+            .expect("host websocket path")
+            .to_string();
+        let host_capability = host_grant["token"].as_str().expect("host capability").to_string();
+        let client_path = client_grant["websocket_path"]
+            .as_str()
+            .expect("client websocket path")
+            .to_string();
+        let client_capability = client_grant["token"]
+            .as_str()
+            .expect("client capability")
+            .to_string();
+
+        // Serve the same router (hence the same in-memory session) over TCP so
+        // both roles can open real WebSockets against it.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let host_url = format!("ws://{address}{host_path}");
+        let client_url = format!("ws://{address}{client_path}");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        // Bring up the host socket first; it is live but not yet paired.
+        let mut host_request = host_url.into_client_request().expect("host request");
+        host_request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {host_capability}")
+                .parse()
+                .expect("host authorization header"),
+        );
+        let (mut host_socket, _) = connect_async(host_request)
+            .await
+            .expect("the host credential authenticates its socket");
+
+        // Bring up the client socket. With both roles present the server
+        // publishes the ready epoch to each.
+        let mut client_request = client_url.into_client_request().expect("client request");
+        client_request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {client_capability}")
+                .parse()
+                .expect("client authorization header"),
+        );
+        let (mut client_socket, _) = connect_async(client_request)
+            .await
+            .expect("the client credential authenticates its socket");
+
+        // The client reads until its readiness announcement and takes the
+        // establishment generation it must stamp on establishment traffic.
+        let generation = loop {
+            let frame = timeout(Duration::from_secs(2), client_socket.next())
+                .await
+                .expect("a client readiness frame arrives before the timeout")
+                .expect("the client socket yields a frame")
+                .expect("the client frame is valid");
+            if let ClientMessage::Text(text) = frame {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("a signalling frame is JSON");
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("peer_ready") {
+                    break value["establishment_generation"]
+                        .as_u64()
+                        .expect("a readiness generation");
+                }
+            }
+        };
+        assert!(generation >= 1, "the readiness epoch is published to the client");
+
+        // The client emits one real direct candidate stamped with that epoch.
+        let candidate = serde_json::json!({
+            "type": "direct_candidate",
+            "establishment_generation": generation,
+            "kind": "host",
+            "ip": "192.0.2.20",
+            "port": 40002,
+        })
+        .to_string();
+        client_socket
+            .send(ClientMessage::Text(candidate))
+            .await
+            .expect("the client sends its candidate");
+
+        // The host reads until the client's candidate arrives, relayed by the
+        // server -- proof the two peers share one live signalling plane rather
+        // than two isolated sockets.
+        let relayed = loop {
+            let frame = timeout(Duration::from_secs(2), host_socket.next())
+                .await
+                .expect("the relayed candidate arrives at the host before the timeout")
+                .expect("the host socket yields a frame")
+                .expect("the host frame is valid");
+            if let ClientMessage::Text(text) = frame {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("a signalling frame is JSON");
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("direct_candidate") {
+                    break value;
+                }
+            }
+        };
+        assert_eq!(
+            relayed["establishment_generation"].as_u64(),
+            Some(generation),
+            "the relayed candidate carries the same establishment epoch",
+        );
+        assert_eq!(
+            relayed["ip"].as_str(),
+            Some("192.0.2.20"),
+            "the host receives the client's candidate unchanged",
+        );
+        assert_eq!(relayed["port"].as_u64(), Some(40002), "the candidate port survives the relay");
+
+        server.abort();
+    }
+
     /// The product flow, end to end, and the boundary it exists to draw.
     ///
     /// Each end receives exactly one role capability and neither can obtain
