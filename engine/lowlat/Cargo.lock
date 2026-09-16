@@ -1904,6 +1904,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-host-broker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "lowlat-core",
+ "lowlat-host",
+ "lowlat-inject",
+ "openstream-host-ipc",
+ "openstream-media",
+ "tokio",
+]
+
+[[package]]
 name = "openstream-host-ipc"
 version = "0.1.0"
 dependencies = [
