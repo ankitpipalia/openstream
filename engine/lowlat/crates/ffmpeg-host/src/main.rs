@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use openstream_client_core::{
-    Capabilities, FlushOutcome, PeerSession, QueueOutcome, ReliableControl, Role, VideoCodec,
-    load_pairing_from_environment, parse_stun_servers,
+    Capabilities, FlushOutcome, PeerSession, Permissions, QueueOutcome, ReliableControl, Role,
+    VideoCodec, load_pairing_from_environment, parse_stun_servers,
 };
 use openstream_media::clipboard::{
     Assembler as ClipboardAssembler, CompletedClipboard, fragment_text,
@@ -159,7 +159,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         && env::var_os("OPENSTREAM_FFMPEG_INPUT").is_none()
         && env::var_os("OPENSTREAM_FFMPEG_ARGS").is_none()
         && host_displays.len() > 1;
-    let host_policy = openstream_platform::policy::HostPolicy::from_env();
+    // The owner's local settings are a ceiling this machine will never exceed
+    // regardless of who connects; the pairing's negotiated permissions are a
+    // second, independent ceiling for what *this session's guest* was
+    // actually granted. Applying the intersection here, before anything reads
+    // `host_policy`, means every downstream consumer -- capability
+    // advertising, the input adapter, the microphone sink -- is correct for
+    // free instead of needing its own copy of this check. See
+    // `HostPolicy::scoped_to_session` for why neither ceiling alone is enough.
+    let session_permissions = pairing.permissions;
+    let host_policy = openstream_platform::policy::HostPolicy::from_env().scoped_to_session(
+        Permissions::allows(session_permissions, |p| p.keyboard),
+        Permissions::allows(session_permissions, |p| p.mouse),
+        Permissions::allows(session_permissions, |p| p.gamepad),
+        Permissions::allows(session_permissions, |p| p.clipboard),
+        Permissions::allows(session_permissions, |p| p.microphone),
+    );
     eprintln!("{}", host_policy.log_line());
     let clipboard_policy = ClipboardPolicy::from_env();
     eprintln!("{}", clipboard_policy.log_line());
@@ -468,7 +483,8 @@ continuing with video only"
                                 // it carries no portable encoder evidence.
                             } else if apply_clipboard_chunk(
                                 &payload,
-                                clipboard_policy.may_apply(negotiated.clipboard),
+                                clipboard_policy.may_apply(negotiated.clipboard)
+                                    && Permissions::allows(session_permissions, |p| p.clipboard),
                                 &mut clipboard_assembler,
                                 &mut clipboard_value,
                             ).map_err(|error| io::Error::other(error.to_string()))? {
@@ -509,7 +525,8 @@ continuing with video only"
                         // Compatibility marker for legacy clients; no metrics.
                     } else if apply_clipboard_chunk(
                         &packet.payload,
-                        clipboard_policy.may_apply(negotiated.clipboard),
+                        clipboard_policy.may_apply(negotiated.clipboard)
+                            && Permissions::allows(session_permissions, |p| p.clipboard),
                         &mut clipboard_assembler,
                         &mut clipboard_value,
                     ).map_err(|error| io::Error::other(error.to_string()))? {
