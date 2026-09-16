@@ -29,6 +29,7 @@ tokio = { workspace = true }
 lowlat-host = { workspace = true }
 lowlat-inject = { workspace = true }
 lowlat-core = { workspace = true }
+lowlat-net = { workspace = true }
 openstream-media = { path = "../media" }
 libc = { workspace = true }
 
