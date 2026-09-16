@@ -7573,8 +7573,7 @@ mod tests {
         let state = connect_test_state();
         let app = connect_router(state.clone());
         // The owner account, with its own (client) device.
-        let (client_token, _) =
-            register_with_device(&app, "operator", "device-client", 0x11).await;
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
         // A host device on the same account, trusted by the owner.
         let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
         enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
@@ -7592,7 +7591,10 @@ mod tests {
         // Before any heartbeat, nothing is online.
         let (status, body) = call(&app, "GET", "/v1/devices", Some(&client_token), None).await;
         assert_eq!(status, StatusCode::OK, "list devices: {body}");
-        assert!(!online_of(&body, "device-host"), "host offline before heartbeat");
+        assert!(
+            !online_of(&body, "device-host"),
+            "host offline before heartbeat"
+        );
         assert!(!online_of(&body, "device-client"), "client never announces");
 
         // The host announces it is available.
@@ -7603,7 +7605,10 @@ mod tests {
         // that never announced stays offline.
         let (status, body) = call(&app, "GET", "/v1/devices", Some(&client_token), None).await;
         assert_eq!(status, StatusCode::OK, "list devices: {body}");
-        assert!(online_of(&body, "device-host"), "the announced host is online");
+        assert!(
+            online_of(&body, "device-host"),
+            "the announced host is online"
+        );
         assert!(
             !online_of(&body, "device-client"),
             "a device that never announced is not online"
