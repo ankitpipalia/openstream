@@ -34,13 +34,33 @@ const SETTLE_BEFORE_CLOCK_JUMP: Duration = Duration::from_millis(250);
 
 struct LoopbackIceEnv {
     previous: Option<String>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl LoopbackIceEnv {
-    fn enable() -> Self {
+    async fn enable() -> Self {
+        // `OPENSTREAM_ICE_INCLUDE_LOOPBACK` is process-global, and establishment
+        // reads it once per peer when it builds the ICE agent. Serialize the
+        // toggle behind a process-wide lock -- exactly as `ForceRelayEnv` does
+        // for its own variable -- so no guard's `Drop` can restore or unset the
+        // variable while another peer is still establishing. Without the lock,
+        // several `connected_test_sessions` running in parallel share this one
+        // variable: the first guard to drop (its `previous` was `None`) removes
+        // it, a concurrently-establishing peer then reads it unset, gathers no
+        // loopback candidate over its `127.0.0.1:0` bind, and times out -- an
+        // intermittent "establish sender/receiver" failure under load.
+        static ENV_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+        let guard = ENV_LOCK
+            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await;
         let previous = std::env::var("OPENSTREAM_ICE_INCLUDE_LOOPBACK").ok();
         unsafe { std::env::set_var("OPENSTREAM_ICE_INCLUDE_LOOPBACK", "1") };
-        Self { previous }
+        Self {
+            previous,
+            _guard: guard,
+        }
     }
 }
 
@@ -267,7 +287,7 @@ fn delivery_snapshot(generation: u64) -> PeerDeliverySnapshot {
 }
 
 async fn connected_test_sessions() -> (PeerSession, PeerSession, JoinHandle<()>, LoopbackIceEnv) {
-    let loopback = LoopbackIceEnv::enable();
+    let loopback = LoopbackIceEnv::enable().await;
     let (origin, bridge) = websocket_bridge().await;
     let pairing = Arc::new(pairing());
     let (sender_result, receiver_result) = tokio::join!(

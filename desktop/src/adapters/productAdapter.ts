@@ -180,7 +180,11 @@ export function createEmptySnapshot(): ProductSnapshot {
     },
     controlPlane,
     trustedDevices: [],
-    localMode: false,
+    // A fresh snapshot with no control plane configured is local mode, so the
+    // preview/fallback shell is usable without an account. The real runtime
+    // reports this from `network.local_no_auth`; Secure mode (with the login
+    // gate) is what a configured control-plane origin produces.
+    localMode: true,
   };
 
   return {
