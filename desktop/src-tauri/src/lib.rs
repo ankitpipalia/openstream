@@ -492,8 +492,22 @@ async fn approve_connect_request(
 ) -> Result<(), RuntimeError> {
     let credential = {
         let mut client = control_plane.lock().await;
+        // Approve as requested: the host was shown this request from the
+        // pending list, and approving grants what was asked. The granted set is
+        // taken from the broker's own pending record rather than from the
+        // WebView, so this path cannot widen it beyond the request. A request
+        // no longer pending (already approved, or expired) grants the empty
+        // set, which the broker ignores on the idempotent retry.
+        let granted = client
+            .pending_connect_requests()
+            .await
+            .map_err(control_plane_error_runtime)?
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .map(|request| request.requested)
+            .unwrap_or_else(openstream_app_core::PermissionSet::none);
         client
-            .approve_connect(&request_id)
+            .approve_connect(&request_id, granted)
             .await
             .map_err(control_plane_error_runtime)?
     };
@@ -562,12 +576,13 @@ async fn run_secure_connect(
     session: &SharedSession,
     control_plane: &SharedControlPlane,
     device_id: &str,
+    requested: openstream_app_core::PermissionSet,
     mut result: RuntimeDispatchResult,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     let request_id = {
         let mut client = control_plane.lock().await;
         client
-            .request_connect(device_id)
+            .request_connect(device_id, requested)
             .await
             .map_err(control_plane_error_runtime)?
             .request_id
@@ -696,7 +711,15 @@ async fn dispatch_command_with_session(
                 // a capability issued -- to each end separately. The runner
                 // is started from that capability rather than from a pairing
                 // file carrying both roles.
-                return run_secure_connect(state, session, control_plane, &device_id, result).await;
+                return run_secure_connect(
+                    state,
+                    session,
+                    control_plane,
+                    &device_id,
+                    requested,
+                    result,
+                )
+                .await;
             }
             let started = start_session_if_connecting(state, session, &device_id).await;
             match started {
