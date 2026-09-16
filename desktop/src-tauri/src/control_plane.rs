@@ -6,6 +6,7 @@
 //! process for now; a platform secret-provider integration is a separate
 //! release gate, so callers must not treat this as durable credential storage.
 
+use openstream_app_core::PermissionSet;
 use openstream_client_core::{local_device_id, local_identity_public_key};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,10 @@ struct RefreshRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ConnectRequestBody<'a> {
     target_device_id: &'a str,
+    /// The permission classes the requester is asking the host to grant. The
+    /// host sees these before approving; the broker records them and returns
+    /// the granted subset in the credential.
+    requested: PermissionSet,
 }
 
 /// What the service says about a request this device just made.
@@ -368,10 +373,12 @@ impl ControlPlaneClient {
         expect_no_content(response)
     }
 
-    /// Ask one of this account's devices for a session.
+    /// Ask one of this account's devices for a session, requesting a set of
+    /// permission classes the host will see and decide on.
     pub async fn request_connect(
         &mut self,
         target_device_id: &str,
+        requested: PermissionSet,
     ) -> Result<ConnectRequested, ControlPlaneError> {
         if target_device_id.is_empty() || target_device_id.len() > 128 {
             return Err(ControlPlaneError::InvalidInput);
@@ -379,7 +386,10 @@ impl ControlPlaneClient {
         self.refresh_if_needed().await?;
         let response = self
             .authenticated_request(self.http.post(self.endpoint("/v1/connect")?))?
-            .json(&ConnectRequestBody { target_device_id })
+            .json(&ConnectRequestBody {
+                target_device_id,
+                requested,
+            })
             .send()
             .await
             .map_err(|_| ControlPlaneError::Transport)?;
@@ -686,6 +696,33 @@ mod tests {
         assert!(!debug.contains("refresh-sentinel"));
         assert!(debug.contains("has_access_token: true"));
         assert!(debug.contains("has_refresh_token: true"));
+    }
+
+    /// The connect request carries the requested permission classes to the
+    /// broker, which shows them to the host and records them for the grant.
+    #[test]
+    fn a_connect_request_carries_the_requested_permissions() {
+        let body = ConnectRequestBody {
+            target_device_id: "device-host",
+            requested: PermissionSet {
+                view: true,
+                keyboard: true,
+                mouse: false,
+                gamepad: false,
+                clipboard: false,
+                microphone: false,
+                tablet: false,
+                virtual_usb: false,
+            },
+        };
+        let value = serde_json::to_value(&body).expect("serialize the connect body");
+        assert_eq!(value["target_device_id"], serde_json::json!("device-host"));
+        // The whole set rides along so the host and broker see exactly what was
+        // asked, including the classes left off.
+        assert_eq!(value["requested"]["view"], serde_json::json!(true));
+        assert_eq!(value["requested"]["keyboard"], serde_json::json!(true));
+        assert_eq!(value["requested"]["mouse"], serde_json::json!(false));
+        assert_eq!(value["requested"]["virtual_usb"], serde_json::json!(false));
     }
 
     #[test]

@@ -556,12 +556,13 @@ async fn run_secure_connect(
     session: &SharedSession,
     control_plane: &SharedControlPlane,
     device_id: &str,
+    requested: openstream_app_core::PermissionSet,
     mut result: RuntimeDispatchResult,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     let request_id = {
         let mut client = control_plane.lock().await;
         client
-            .request_connect(device_id)
+            .request_connect(device_id, requested)
             .await
             .map_err(control_plane_error_runtime)?
             .request_id
@@ -690,7 +691,15 @@ async fn dispatch_command_with_session(
                 // a capability issued -- to each end separately. The runner
                 // is started from that capability rather than from a pairing
                 // file carrying both roles.
-                return run_secure_connect(state, session, control_plane, &device_id, result).await;
+                return run_secure_connect(
+                    state,
+                    session,
+                    control_plane,
+                    &device_id,
+                    requested,
+                    result,
+                )
+                .await;
             }
             let started = start_session_if_connecting(state, session, &device_id).await;
             match started {
