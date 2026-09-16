@@ -34,6 +34,11 @@ pub struct BrokerServer {
     socket_path: PathBuf,
     allowed: AllowedPeers,
     policy: BrokerPolicy,
+    /// If set, the socket's group is set to this gid so the unprivileged
+    /// machine-service account (a member of that group) can reach a root-owned
+    /// socket. `SO_PEERCRED` is still the real gate; this only opens the door to
+    /// the right group instead of leaving it root-only or world-writable.
+    socket_gid: Option<u32>,
 }
 
 impl BrokerServer {
@@ -49,7 +54,16 @@ impl BrokerServer {
             socket_path: socket_path.into(),
             allowed,
             policy,
+            socket_gid: None,
         }
+    }
+
+    /// Give the socket to this group so an unprivileged service in the group can
+    /// connect (the socket stays `0660`, not world-writable).
+    #[must_use]
+    pub fn with_socket_group(mut self, gid: u32) -> Self {
+        self.socket_gid = Some(gid);
+        self
     }
 
     /// Bind the socket and serve connections until an unrecoverable I/O error.
@@ -117,6 +131,12 @@ impl BrokerServer {
         // Not world-accessible; the peer-credential check is the real gate, but
         // there is no reason to leave the door open to every local user.
         std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o660))?;
+        // Optionally hand the socket to the machine-service group, so an
+        // unprivileged service (in that group) can connect to this root-owned
+        // socket without making it world-writable. Owner stays root.
+        if let Some(gid) = self.socket_gid {
+            std::os::unix::fs::chown(&self.socket_path, None, Some(gid))?;
+        }
         Ok(listener)
     }
 }

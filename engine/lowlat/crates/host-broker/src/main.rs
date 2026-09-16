@@ -57,7 +57,18 @@ async fn run() -> std::io::Result<()> {
         // both halves run privileged during bring-up rather than open to all.
         Err(_) => AllowedPeers::only(0),
     };
-    let server = BrokerServer::new(socket, allowed, BrokerPolicy::default());
+    let mut server = BrokerServer::new(socket, allowed, BrokerPolicy::default());
+    // Optionally hand the socket to the machine-service group so it can connect
+    // unprivileged (SO_PEERCRED still gates who is served).
+    if let Ok(value) = std::env::var("OPENSTREAM_BROKER_SOCKET_GID") {
+        let gid = value.trim().parse::<u32>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "OPENSTREAM_BROKER_SOCKET_GID must be a numeric gid",
+            )
+        })?;
+        server = server.with_socket_group(gid);
+    }
     server.run().await
 }
 
