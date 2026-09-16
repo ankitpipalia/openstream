@@ -22,7 +22,10 @@ fn main() {
             }
         }
         Err(error) => {
-            eprintln!("could not open vulkan device on {}: {error:?}", node.display());
+            eprintln!(
+                "could not open vulkan device on {}: {error:?}",
+                node.display()
+            );
             std::process::exit(1);
         }
     }

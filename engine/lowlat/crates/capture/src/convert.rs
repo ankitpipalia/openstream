@@ -901,7 +901,10 @@ impl Device {
         let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
         let mut out = Vec::new();
         for (name, handle) in [
-            ("DMA_BUF_EXT", vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+            (
+                "DMA_BUF_EXT",
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            ),
             ("OPAQUE_FD", vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
         ] {
             for (fmt_name, format) in [
@@ -1039,10 +1042,14 @@ impl Device {
             Ok(fd) => {
                 // SAFETY: a fresh owned descriptor from the driver; owning it
                 // closes it on drop.
-                let _owned = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                let _owned =
+                    unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
                 format!("EXPORTED fd (size={} bytes)", requirements.size)
             }
-            Err(error) => format!("get_memory_fd FAILED ({error:?}), size={}", requirements.size),
+            Err(error) => format!(
+                "get_memory_fd FAILED ({error:?}), size={}",
+                requirements.size
+            ),
         };
         // SAFETY: nothing submitted references either; free after an idle wait.
         unsafe {
