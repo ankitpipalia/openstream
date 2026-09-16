@@ -276,6 +276,67 @@ mod tests {
         assert_eq!(&out[..taken], &samples);
     }
 
+    /// A concrete sequence a fuzz sweep flagged, pinned as a regression.
+    ///
+    /// These 14 bytes are the input a libFuzzer run wrote for the `microphone`
+    /// target (`crash-8454...`), cut into the same run of packets the target
+    /// feeds one decoder. The third packet drives the third-party SILK core to
+    /// panic (`assertion failed: start_idx > 0`), and this crate's containment
+    /// turns it into a refusal: the loop returns rather than unwinding out of
+    /// it, and a good frame afterwards still decodes. Remove the `catch_unwind`
+    /// in `decompress` and this codec panic would unwind out of the loop and
+    /// fail the test -- which is the regression this pins.
+    ///
+    /// The same input *aborts* under libFuzzer, because `libfuzzer-sys`
+    /// installs a panic hook that ends the process the instant a panic starts,
+    /// before this crate's `catch_unwind` can run. So the fuzz harness reports
+    /// a *contained* codec panic as a crash: a codec panic surfacing there is
+    /// expected and is not, on its own, a lost session. This test is the
+    /// evidence that the production path refuses the packet and carries on.
+    #[test]
+    fn the_fuzz_flagged_sequence_is_contained_not_fatal() {
+        let data: [u8; 14] = [1, 128, 3, 104, 179, 255, 132, 8, 37, 37, 131, 90, 37, 216];
+        let mut decoder = decoder();
+        let mut out = [0i16; SAMPLES_MAX];
+        let mut rest = &data[..];
+        while let Some((&head, tail)) = rest.split_first() {
+            let take = usize::from(head).min(tail.len());
+            let (payload, next) = tail.split_at(take);
+            rest = next;
+            if payload.is_empty() {
+                continue;
+            }
+            // A panic escaping `decode` here would unwind out of this loop and
+            // fail the test; that it returns is the property under test.
+            let _ = decoder.decode(
+                &Packet {
+                    payload,
+                    encoding: Encoding::Compressed,
+                },
+                &mut out,
+            );
+        }
+
+        // Reaching here proves nothing escaped. The guest is also not finished:
+        // a good frame after the bad run still decodes, so a contained packet
+        // did not cost the rest of the conversation.
+        let samples: [i16; 3] = [7, 8, 9];
+        let mut good = Vec::new();
+        for sample in samples {
+            good.extend_from_slice(&sample.to_le_bytes());
+        }
+        let taken = decoder
+            .decode(
+                &Packet {
+                    payload: &good,
+                    encoding: Encoding::Raw,
+                },
+                &mut out,
+            )
+            .expect("the decoder recovers after a contained packet");
+        assert_eq!(&out[..taken], &samples);
+    }
+
     /// An empty payload is refused rather than handed to the codec, which
     /// treats it as a lost frame and invents sound for it.
     #[test]

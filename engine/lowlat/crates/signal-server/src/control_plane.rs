@@ -75,6 +75,13 @@ pub(crate) struct PublicDevice {
     pub enrolled_at_ms: u64,
     pub last_seen_ms: Option<u64>,
     pub public_key_fingerprint: String,
+    /// Whether the Connect broker currently sees this device announcing
+    /// presence. The account store does not know this -- presence is soft,
+    /// per-process state with its own TTL -- so `public_device` leaves it
+    /// `false` and the device-listing handler layers the live value on top.
+    /// It is advisory for the owner's shell; the broker still enforces
+    /// presence authoritatively when a session is actually requested.
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1335,6 +1342,9 @@ fn public_device(device: &DeviceRecord) -> PublicDevice {
         enrolled_at_ms: device.enrolled_at_ms,
         last_seen_ms: device.last_seen_ms,
         public_key_fingerprint: fingerprint,
+        // Presence is not a property of the durable record; the listing
+        // handler fills it in from the Connect broker.
+        online: false,
     }
 }
 
