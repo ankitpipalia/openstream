@@ -240,6 +240,14 @@ pub(crate) struct SendPixelBuffer(CvImageBufferRef);
 // retain/release; moving our owned reference between threads is sound.
 unsafe impl Send for SendPixelBuffer {}
 
+// SAFETY: the only `&self` operation is `as_ptr`, which copies out the raw
+// pointer and mutates nothing, and CoreVideo's retain/release is atomic. The
+// buffer itself is never CPU-locked on this path -- Metal reads its IOSurface
+// -- so shared references from several threads observe an immutable handle.
+// `Sync` is what lets the frame carrier (`Arc<dyn Any + Send + Sync>`) hold
+// one on its way from the decode thread to the window.
+unsafe impl Sync for SendPixelBuffer {}
+
 impl SendPixelBuffer {
     /// The raw `CVPixelBufferRef` (borrowed; the `SendPixelBuffer` keeps the
     /// reference alive).
