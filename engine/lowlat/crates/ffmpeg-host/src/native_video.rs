@@ -14,6 +14,20 @@
 
 use std::borrow::Cow;
 
+/// Whether the user asked for the CoreGraphics poll instead of
+/// ScreenCaptureKit (`OPENSTREAM_MACOS_CAPTURE=coregraphics`).
+///
+/// Only an explicit request counts. An unset, empty or unrecognised value
+/// leaves the host on the fast path: a typo in this variable must not quietly
+/// halve the frame rate.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn forces_core_graphics(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "coregraphics" | "core-graphics" | "cg" | "poll"
+    )
+}
+
 /// Backend names that select the in-process pipeline.
 pub(crate) fn selects_native(backend: &str) -> bool {
     matches!(
@@ -488,7 +502,7 @@ mod macos_pipeline {
     use openstream_macos_media::VideoToolboxH264Encoder;
     use tokio::sync::{mpsc, oneshot};
 
-    use super::{frame_access_unit, scale_bgra};
+    use super::{forces_core_graphics, frame_access_unit, scale_bgra};
 
     /// Complete access units queued before capture backs off. Small on purpose:
     /// a deep queue is latency.
@@ -682,7 +696,23 @@ mod macos_pipeline {
         /// A stream that refuses to start is not a reason to have no host: the
         /// poll still works, just slowly, and the reason is printed so the
         /// difference is not silent.
+        ///
+        /// `OPENSTREAM_MACOS_CAPTURE=coregraphics` forces the poll. Without
+        /// that switch the fallback would be unreachable on every machine
+        /// where the stream does start, which is to say untestable everywhere
+        /// it is not already broken -- and a fallback nobody can exercise is
+        /// one nobody finds out has rotted.
         fn open_source(config: &NativeConfig) -> Source {
+            if forces_core_graphics(&std::env::var("OPENSTREAM_MACOS_CAPTURE").unwrap_or_default())
+            {
+                eprintln!(
+                    "OpenStream capture: CoreGraphics polling, forced by OPENSTREAM_MACOS_CAPTURE"
+                );
+                return match config.display_id {
+                    Some(id) => Source::Poll(ScreenCapture::for_display(id)),
+                    None => Source::Poll(ScreenCapture::main()),
+                };
+            }
             match SckCapture::start(SckConfig {
                 width: config.width,
                 height: config.height,
@@ -873,6 +903,26 @@ mod macos_pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fallback switch has to be explicit. An unset or mistyped value
+    /// leaving the host on the poll would halve its frame rate silently.
+    #[test]
+    fn only_an_explicit_request_forces_the_coregraphics_poll() {
+        for value in ["coregraphics", "Core-Graphics", " CG ", "poll"] {
+            assert!(forces_core_graphics(value), "{value:?}");
+        }
+        for value in [
+            "",
+            "   ",
+            "screencapturekit",
+            "sck",
+            "coregraphic",
+            "core graphics",
+            "1",
+        ] {
+            assert!(!forces_core_graphics(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn native_backend_names_are_recognised_case_insensitively() {

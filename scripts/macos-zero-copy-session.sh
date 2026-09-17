@@ -120,6 +120,7 @@ common_env=(
 # host back to the ffmpeg pipeline and this run would prove nothing.
 env "${common_env[@]}" \
     OPENSTREAM_CAPTURE_BACKEND=native \
+    OPENSTREAM_MACOS_CAPTURE="${OPENSTREAM_ZC_HOST_CAPTURE:-}" \
     OPENSTREAM_HOST_SECONDS="$seconds" \
     target/release/openstream-ffmpeg-host >"$host_log" 2>&1 &
 host_pid=$!
@@ -165,6 +166,16 @@ require "$host_log" "OpenStream run capture=native" \
     "host captured in-process, not through an ffmpeg backend"
 require "$host_log" "OpenStream run encoder=videotoolbox-h264" \
     "host reported the in-process encoder for the session"
+# Which capture actually ran. Set OPENSTREAM_ZC_HOST_CAPTURE=coregraphics to
+# exercise the fallback -- a fallback nobody can run is one nobody finds out
+# has rotted.
+if [[ "${OPENSTREAM_ZC_HOST_CAPTURE:-}" == "coregraphics" ]]; then
+    require "$host_log" "CoreGraphics capture (polled, copied)" \
+        "host used the CoreGraphics fallback, as asked"
+else
+    require "$host_log" "ScreenCaptureKit capture (GPU surfaces, no copy)" \
+        "host captured as GPU surfaces with no copy"
+fi
 
 echo "client ($mode):"
 if ((zero_copy == 1)); then
