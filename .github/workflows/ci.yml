@@ -41,6 +41,16 @@ jobs:
       - name: ASCII check
         run: python3 scripts/check-ascii.py
 
+      # The product version lives in eight files. Nothing made them agree until
+      # this ran, and they did not: artifacts were named 1.0.0 while every
+      # binary inside them reported 1.0.0-dev.
+      - name: Product version consistency
+        run: |
+          bash -n scripts/check-version-consistency.sh
+          scripts/check-version-consistency.sh
+        # This job defaults to engine/lowlat, where these paths do not exist.
+        working-directory: .
+
       - name: Shell fixture syntax
         run: |
           bash -n engine/lowlat/scripts/netns-fixtures.sh
