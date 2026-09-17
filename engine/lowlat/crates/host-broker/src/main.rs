@@ -138,13 +138,6 @@ async fn run() -> std::io::Result<()> {
     server.run().await
 }
 
-/// Read the grant key, refusing one anybody else can read.
-///
-/// A secret the machine service can read is not a boundary: it could then tag
-/// a grant naming any session and any permissions, which is exactly what this
-/// key exists to prevent. Permissions are checked rather than assumed, because
-/// the failure is silent -- a world-readable key file works perfectly until
-/// someone looks.
 #[cfg(target_os = "linux")]
 /// Install the grant key this machine was enrolled with.
 ///

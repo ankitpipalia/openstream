@@ -17,7 +17,7 @@ artifacts, statements made by Parsec, and hypotheses from independent projects.
 | Linux payload advertises hosting capability | False | Disassembly at Linux payload offset `0x2b6fe` passes `false` into the `hosting_supported` serializer |
 | Linux payload contains shared hosting scaffolding | Confirmed | `hosting_*`, `host_*`, session, and server configuration strings plus host startup code |
 | Launcher verifies/loads a versioned payload | Confirmed | Supplied `appdata.json` contains `so_name`, `entry_symbol`, and matching hash; launcher strings contain `dlopen`, `dlsym`, and hash/lock handling; Linux dynamic exports are `wx_main` and `console_main` |
-| Linux payload is fully stripped | False/overstated | `file` reports the inspected ELF as “not stripped”; its dynamic ABI still exposes only the two defined entry symbols |
+| Linux payload is fully stripped | False/overstated | `file` reports the inspected ELF as "not stripped"; its dynamic ABI still exposes only the two defined entry symbols |
 | Linux payload contains a production Linux capture/encoder backend | Not shown | No PipeWire, Wayland, VAAPI-encode, NVENC, V4L2, or capture-backend evidence was found; this is negative evidence, not a proof of absence |
 | Android package is client-only | Confirmed | Official Android documentation and the supplied XAPK manifest |
 | Parsec supports iOS clients | False for the inspected/current product | Current Parsec compatibility documentation says iOS/iPad are unsupported |

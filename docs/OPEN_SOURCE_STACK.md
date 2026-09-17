@@ -1,8 +1,8 @@
 # Open-source stack decision
 
 This document reconciles the supplied fact-check with current upstream
-projects. It prevents the project from treating “Parsec-like” and “stock
-Parsec compatible” as the same engineering target.
+projects. It prevents the project from treating "Parsec-like" and "stock
+Parsec compatible" as the same engineering target.
 
 ## Three viable tracks
 
@@ -66,8 +66,8 @@ pretending to certify external codecs or drivers.
 
 ## Verified product implications
 
-Parsec’s current Linux documentation still says Linux is client-only, which is
-the gap this project addresses. Sunshine’s current host matrix demonstrates
+Parsec's current Linux documentation still says Linux is client-only, which is
+the gap this project addresses. Sunshine's current host matrix demonstrates
 that Linux hosting is practical, but it does not prove that every requested
 architecture/GPU combination works. Each target still needs CI and hardware
 acceptance tests.

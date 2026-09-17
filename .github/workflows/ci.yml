@@ -122,6 +122,19 @@ jobs:
           grep -Fq 'This acceptance does not claim native DRM capture' docs/BUILD.md
           grep -Fq 'decoded-frame zero-copy' docs/BUILD.md
 
+      # The ASCII rule was only ever enforced inside engine/lowlat, because that
+      # is where the workflow's default working-directory points. Every document
+      # at the repository root -- including the one that is meant to be read
+      # first -- was unchecked, which is how twenty-one smart quotes and em
+      # dashes accumulated in them.
+      #
+      # Scoped to the documents that are current. `docs/superpowers`,
+      # `docs/research` and `docs/acceptance` are dated archive material that
+      # STATUS.md marks as not to be acted on; rewriting punctuation in a
+      # historical record would edit the record.
+      - name: Root documentation is ASCII
+        run: python3 engine/lowlat/scripts/check-ascii.py README.md docs/*.md
+
   check:
     name: format, lints, tests
     needs: classify

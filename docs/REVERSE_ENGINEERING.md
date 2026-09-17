@@ -36,8 +36,8 @@ loader; strings and launcher behavior indicate that optional curl/OpenSSL,
 FFmpeg, X11, OpenGL/Vulkan, audio, and device libraries are resolved with
 `dlopen`/`dlsym`. This is consistent with a thin launcher plus a mostly
 self-contained versioned payload. The file utility reports the Linux object as
-“not stripped”, so “only two exported symbols” should not be confused with
-“fully stripped”.
+"not stripped", so "only two exported symbols" should not be confused with
+"fully stripped".
 
 ## Connection architecture
 

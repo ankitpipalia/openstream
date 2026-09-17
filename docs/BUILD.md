@@ -162,6 +162,53 @@ best-effort. This verifies the application fallback path on a machine without
 a controlled test IGD; it is not evidence of successful physical-router
 mapping.
 
+## Enrolling a machine for pre-login hosting
+
+Machine-level hosting needs two things this machine does not have out of the
+box: a device record the account owns, and the grant key its privileged broker
+verifies session approvals against. `openstream-enrol` does both in one step,
+because the key is issued exactly once and there is no endpoint that reads it
+back -- splitting the steps would mean the key crossing a terminal, a pipe or an
+installer log on its way between them.
+
+Run it as the broker's own user. The account access token goes on **stdin**, not
+in an argument, because a command line is visible in `ps` to every user on the
+machine.
+
+```sh
+export OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key
+device_id="$(openstream-enrol \
+  --origin https://signal.example.com \
+  --device-id "$(cat /etc/machine-id)" \
+  --name "Studio" \
+  --public-key "$PUBLIC_KEY_HEX" < access-token.txt)"
+```
+
+It prints the device id and nothing else; the key goes straight into the file
+and is never shown. Then set both of these in the broker's unit:
+
+```
+Environment=OPENSTREAM_BROKER_DEVICE_ID=<the id printed above>
+Environment=OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key
+```
+
+The broker refuses to start against a key it cannot trust, and the checks are
+deliberately stricter than "mode 0600": the file must be **owned by the broker's
+own user**, be a regular file, be opened without following symlinks, and sit
+under directories no other user can write. Mode alone is not the boundary -- a
+file owned by the unprivileged machine service with mode 0600 is private *to the
+machine service*, and a privileged reader would happily verify approvals against
+a key that process chose.
+
+A machine that is already enrolled gets no key back, because the key is issued
+once. Remove the device and enrol it again to get a new one.
+
+If no key is configured the broker starts and refuses every session. That is the
+intended posture, not a fault.
+
+`openstream-host-broker provision-grant-key` writes a key you already hold,
+reading hex on stdin, for the case where enrolment happened elsewhere.
+
 ## Physical Linux NVIDIA -> macOS Apple Silicon MVP acceptance
 
 On 2026-09-12, commit `b407d5474f799ca4b5bca4a50c90eca1454b5763` was tested

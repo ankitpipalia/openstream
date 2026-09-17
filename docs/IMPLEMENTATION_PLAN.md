@@ -129,7 +129,7 @@ and no unbounded memory growth.
 
 - [x] Shared generation-aware `PeerPath` lifecycle for the portable session,
   with one cipher/replay state across a two-phase host-authoritative
-  direct↔opaque-relay migration, bounded old-path drain, relay unregister
+  direct<->opaque-relay migration, bounded old-path drain, relay unregister
   cleanup, and frame-ACK continuity. The live three-generation acceptance is
   `scripts/path-migration-smoke.sh`.
 - [x] Truthful ICE migration capability boundary: `webrtc-ice 0.17.2`
@@ -390,7 +390,7 @@ without changing the default OpenStream wire format.
   remain diagnostic and encoder decisions remain grounded in end-to-end
   `FrameAck` evidence. The adapter remains separate from the packet delivery
   estimator and does not turn local packet metrics into encoder evidence.
-- [x] Add the host-authoritative direct↔opaque-relay↔direct path migration
+- [x] Add the host-authoritative direct<->opaque-relay<->direct path migration
   choreography, versioned path-control messages, idempotent commit/ACK
   handling, replay-window/reliable-control recovery tests, and the live
   three-generation acceptance harness. ICE/TURN replacement remains the typed
