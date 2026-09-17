@@ -41,6 +41,11 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
 
 mod input;
+/// The send-and-service lifecycle shared by the two native pipelines. Not
+/// platform-gated, so the deadlock it prevents is tested on every runner rather
+/// than only where each pipeline happens to compile.
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+mod native_send;
 mod native_video;
 mod reconfigure;
 
