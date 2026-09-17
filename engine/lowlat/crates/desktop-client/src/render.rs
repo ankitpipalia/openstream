@@ -152,6 +152,12 @@ pub(crate) struct GpuPresenter {
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     /// The no-swizzle pipeline for the zero-copy path (a native BGRA texture).
+    ///
+    /// Only macOS decodes into importable surfaces today, so on every other
+    /// target nothing reads this yet. It is built unconditionally rather than
+    /// cfg-gated because the shader and the pipeline are platform-neutral --
+    /// the Windows D3D11 import path will use exactly this one.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pipeline_import: wgpu::RenderPipeline,
     texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
@@ -308,7 +314,10 @@ impl GpuPresenter {
     /// a `CVPixelBuffer` imported into a `wgpu::Texture` belongs to the same
     /// device `present_texture` draws it with -- importing on any other device
     /// would produce a texture this presenter cannot bind. The client's window
-    /// loop calls this to build that importer on the first GPU-resident frame.
+    /// loop calls this to build that importer on the first GPU-resident frame
+    /// -- which today only happens on macOS, so on other targets nothing calls
+    /// this yet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -463,7 +472,10 @@ impl GpuPresenter {
     /// proven correct on hardware by `vt_gpu`'s offscreen tests (and the
     /// `no_swizzle_pipeline_renders_bgra_without_a_swizzle` test below). The
     /// client's window loop calls this for every frame the decode worker
-    /// published as a surface, under `OPENSTREAM_ZERO_COPY=1`.
+    /// published as a surface, under `OPENSTREAM_ZERO_COPY=1`. That worker is
+    /// the VideoToolbox one, so on non-macOS targets this has no caller yet;
+    /// the code itself is platform-neutral wgpu.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn present_texture(
         &mut self,
         window: &Window,
