@@ -40,6 +40,10 @@ use openstream_protocol::Kind;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
 
+/// Counting the frames a capture source delivered apart from the ones the host
+/// re-sent itself. Not platform-gated, for the same reason as `native_send`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod capture_freshness;
 mod input;
 /// The send-and-service lifecycle shared by the two native pipelines. Not
 /// platform-gated, so the deadlock it prevents is tested on every runner rather

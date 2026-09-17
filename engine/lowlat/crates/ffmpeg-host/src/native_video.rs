@@ -561,10 +561,14 @@ mod macos_pipeline {
     const QUEUE_DEPTH: usize = 8;
     /// How long to wait for queue capacity before looking at control again.
     const SEND_RETRY: Duration = Duration::from_millis(1);
-    /// How many consecutive keepalive frames pass before saying so. At one a
-    /// second this is a line every thirty seconds of stillness, which is quiet
-    /// enough to leave on and loud enough to notice.
-    const STALL_REPORT_UNITS: u64 = 30;
+    /// How many *consecutive* keepalive submissions pass before saying so. At
+    /// one a second this is a line every thirty seconds of unbroken stillness,
+    /// which is quiet enough to leave on and loud enough to notice.
+    ///
+    /// Consecutive, not cumulative. A lifetime counter crosses each multiple at
+    /// whatever moment a long session happens to reach it, which is unrelated
+    /// to whether the picture is still right now.
+    const REPEAT_REPORT_INTERVAL: u64 = 30;
 
     /// How long a static desktop goes before the last frame is re-sent.
     ///
@@ -741,20 +745,26 @@ mod macos_pipeline {
         /// Deliberately separate from `last_encode`. The keepalive re-encodes
         /// the last surface every second, so encoded output and the frame
         /// counter keep advancing even when capture has wedged and no fresh
-        /// picture has arrived for minutes. Anything that judges capture health
+        /// picture has arrived for minutes. Anything that judged capture health
         /// from "are units still being produced" would call that healthy.
         ///
-        /// So: capture health is judged from this, and transport liveness from
-        /// `last_encode`. They answer different questions and a repeated frame
-        /// is a legitimate answer to only one of them.
+        /// **This does not detect a stall, and nothing here claims to.**
+        /// ScreenCaptureKit delivers on change, so a source that has frozen and
+        /// a desktop nobody is touching produce the identical signal: no new
+        /// surface. Telling them apart needs the stream-level `SCStreamDelegate`
+        /// and its `stream:didStopWithError:`, which `SckCapture` does not
+        /// install -- it passes a null stream delegate and registers only the
+        /// output one. Until that exists this is a diagnostic: it says how the
+        /// frames being sent were produced, which is worth knowing when a
+        /// session looks frozen, and it is not a health signal.
         last_fresh_capture: Option<Instant>,
-        /// Access units produced from a surface the capture source had just
-        /// delivered.
-        fresh_units: u64,
-        /// Access units produced by re-encoding a surface already sent, to keep
-        /// the stream alive on a still screen. Counted apart so a session that
-        /// is all keepalive is visible as one.
-        repeated_units: u64,
+        /// How the surfaces submitted to the encoder were produced.
+        ///
+        /// Submissions, not access units: the encoder is asynchronous and a
+        /// submission may produce no unit, one, or one belonging to an earlier
+        /// frame. Counting output here would attribute units to whichever
+        /// submission happened to drain them.
+        freshness: crate::capture_freshness::FreshnessLog,
         encoded: u64,
         /// The last surface the stream delivered, kept so a still screen can be
         /// re-sent as a keepalive. Only used by [`Source::Stream`].
@@ -781,8 +791,7 @@ mod macos_pipeline {
                 epoch: Instant::now(),
                 last_encode: None,
                 last_fresh_capture: None,
-                fresh_units: 0,
-                repeated_units: 0,
+                freshness: crate::capture_freshness::FreshnessLog::new(REPEAT_REPORT_INTERVAL),
                 encoded: 0,
                 last_surface: None,
             })
@@ -846,9 +855,18 @@ mod macos_pipeline {
 
         fn run(mut self, units: &mpsc::Sender<Vec<u8>>, control: &std_mpsc::Receiver<Control>) {
             self.stream(units, control);
+            // The split matters when reading a complaint about a session: a run
+            // that is nearly all keepalive was showing a picture that barely
+            // changed, which is either a still desktop or a source that stopped
+            // delivering. Knowing which to go looking for is the difference
+            // between a capture bug and nothing at all -- this does not say
+            // which, it says the question is worth asking.
             eprintln!(
-                "OpenStream native video: stopped after {} access units",
-                self.encoded
+                "OpenStream native video: stopped after {} access units ({} submissions from new \
+                 surfaces, {} keepalive)",
+                self.encoded,
+                self.freshness.fresh(),
+                self.freshness.repeated()
             );
         }
 
@@ -996,38 +1014,44 @@ mod macos_pipeline {
             self.emit(encoded, units, control)
         }
 
-        /// Record whether the frame about to be encoded came from a new capture
-        /// or is the keepalive re-sending the last one, and say so once when it
-        /// changes.
+        /// Record how the surface about to be encoded was produced, and report
+        /// a run of keepalives while it lasts.
         ///
-        /// The transition is logged rather than every repeat: a still desktop
-        /// produces one of these a second forever, and a log line per keepalive
-        /// would bury the moment capture actually stopped.
+        /// Reported on the consecutive count, so the line appears while the
+        /// picture is actually still and stops when it moves again. Reporting
+        /// on a lifetime total instead means the line arrives at moments
+        /// unrelated to what the screen is doing.
+        ///
+        /// What it does *not* say is that capture has stalled. A still desktop
+        /// and a wedged source look the same from here; see the note on
+        /// `last_fresh_capture`.
         fn note_capture_freshness(&mut self, repeated: bool) {
-            if repeated {
-                self.repeated_units += 1;
-                if let Some(last) = self.last_fresh_capture
-                    && self.repeated_units % STALL_REPORT_UNITS == 0
-                {
+            use crate::capture_freshness::{Report, Submission};
+
+            let submission = if repeated {
+                Submission::Repeated
+            } else {
+                Submission::Fresh
+            };
+            match self.freshness.note(submission) {
+                Some(Report::StillRepeating { consecutive }) => {
+                    let silent = self
+                        .last_fresh_capture
+                        .map_or(0.0, |last| last.elapsed().as_secs_f32());
                     eprintln!(
-                        "OpenStream capture: no new surface for {:.1}s; the stream is being kept \
-alive by re-encoding the last frame",
-                        last.elapsed().as_secs_f32()
+                        "OpenStream capture: no new surface for {silent:.1}s ({consecutive} \
+                         consecutive keepalive submissions); the stream is being kept alive by \
+                         re-encoding the last frame. A still screen looks exactly like this."
                     );
                 }
-            } else {
-                self.fresh_units += 1;
+                Some(Report::Resumed { after }) => {
+                    eprintln!(
+                        "OpenStream capture: new surfaces again after {after} keepalive \
+                         submissions"
+                    );
+                }
+                None => {}
             }
-        }
-
-        /// How long capture has been silent, or `None` if it has never
-        /// delivered.
-        ///
-        /// This is the number that says whether capture is healthy. The encoded
-        /// frame counter is not: the keepalive keeps it moving regardless.
-        #[allow(dead_code)]
-        fn capture_silence(&self) -> Option<Duration> {
-            self.last_fresh_capture.map(|last| last.elapsed())
         }
 
         /// One turn of the CoreGraphics loop: pace, snapshot, copy, rescale,
