@@ -59,7 +59,7 @@ believing it.
 
 | Gap | Blocker |
 |---|---|
-| Windows hosting and the LocalSystem/WTS service model | No Windows machine. Builds in CI on both MSVC targets; nothing has ever run |
+| Windows hosting and the LocalSystem/WTS service model | No Windows machine. Builds in CI on both MSVC targets; **nothing has ever run**. There is no Windows physical record in this repository -- the GTX 970 evidence in `docs/BUILD.md` is a Linux SteamOS host streaming to a macOS client, not a Windows run, and has been mistaken for one |
 | Android and iOS clients | No devices |
 | Linux reboot-to-login-screen acceptance | Needs the physical rig |
 | WAN, TURN, NAT matrix | No public TURN deployment |
@@ -80,14 +80,30 @@ but they are **an experimental subsystem, not something an installer enables**:
 - **Neither binary is in the Linux tarball or the Debian package**, and neither
   are their systemd units. Only the older per-user host-agent service ships.
 
-The privilege boundary itself was also weaker than it was described as. The
-broker now mints the session grant itself and refuses any id it did not issue,
-and its capability ceiling comes from the root process's own environment
-rather than from the request. That bounds a compromised network-facing service
-to the operator's standing policy. It does **not** yet bind a session to a
-specific Secure Connect approval -- that needs a signed, expiry-bound grant
-from the control plane, verified against a key pinned at enrolment. Until that
-exists, do not describe the split as enforcing approvals.
+### Approval-bound authorisation: implemented, not yet delivered
+
+Do not describe Secure Connect to privileged-broker authorisation as complete.
+Where it actually stands:
+
+| Part | State |
+|---|---|
+| The grant itself -- session, requester, target device, permissions, validity window, nonce; authenticated encoding, constant-time tag comparison | **implemented** |
+| The control plane issues one at approval, per-device key pinned at enrolment | **implemented** |
+| The broker verifies one before opening any device, and fails closed without it | **implemented** |
+| Replay and reconnect semantics | **corrected** -- a grant leases a session, so the holder may restart and reconnect, a concurrent connection is refused, and a nonce cannot move to another session |
+| The host carries it from the credential into the pairing file | **implemented** |
+| **Delivery from the pairing file to the machine service and on to the broker** | **incomplete** |
+| **Provisioning the broker's key without exposing it to the unprivileged service** | **incomplete** |
+
+So the mechanism exists and is tested end to end *in source*, and no real
+session has yet run through it. The broker has no authority configured, which
+means it refuses every session. That is the intended posture while the last two
+rows are open, not a regression -- but it is also why nothing here should be
+called finished.
+
+The remaining work is not desktop work. Only `machine-service` depends on
+`host-broker`; the desktop drives `host-agent` directly and never speaks to the
+privileged broker. Both open rows belong with the machine service's enrolment.
 
 ### The deployed backend is behind `main`
 
