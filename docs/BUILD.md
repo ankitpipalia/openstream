@@ -209,6 +209,22 @@ intended posture, not a fault.
 `openstream-host-broker provision-grant-key` writes a key you already hold,
 reading hex on stdin, for the case where enrolment happened elsewhere.
 
+### Where the desktop app fits, and where it must not
+
+The desktop app is the thing that has an account access token, so it is the
+natural place to *start* enrolment -- by invoking `openstream-enrol` with
+elevation and piping it that token. It is not a place the grant key may go.
+
+So the desktop's control-plane types deliberately do **not** carry `grant_key`,
+and that is not an omission to be fixed. The key is the secret that decides
+whether an approval is genuine; putting it in an unprivileged, network-facing,
+long-running GUI process would give it a second home with none of the
+protections the broker's file has. The enrolment response is read by the
+short-lived root tool, which writes the key and exits.
+
+If a future change makes the desktop read the enrolment response directly, the
+key has to be dropped before it reaches any structure the app keeps.
+
 ## Physical Linux NVIDIA -> macOS Apple Silicon MVP acceptance
 
 On 2026-09-12, commit `b407d5474f799ca4b5bca4a50c90eca1454b5763` was tested
