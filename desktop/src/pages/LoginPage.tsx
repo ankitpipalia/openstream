@@ -44,6 +44,10 @@ export function LoginPage({
   const [password, setPassword] = useState("");
   const [authError, setAuthError] = useState<string | null>(null);
   const [authPending, setAuthPending] = useState(false);
+  /// Whether this control plane will take a new account. Starts closed so a
+  /// slow or unreachable answer never briefly offers signup that cannot work;
+  /// the probe below opens it only on an explicit yes.
+  const [registrationOpen, setRegistrationOpen] = useState(false);
 
   const [showEndpoint, setShowEndpoint] = useState(false);
   const configuredEndpoint = currentSignalOrigin(snapshot);
@@ -71,6 +75,36 @@ export function LoginPage({
       setEndpoint(configuredEndpoint);
     }
   }, [configuredEndpoint, endpointEdited]);
+
+  // Ask the control plane whether signup is available, and ask again when the
+  // endpoint changes -- that is a different server with its own answer. A
+  // closed deployment only accepts the very first account, so without this the
+  // button is offered to every later user and can only ever fail.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const open = await adapter.registrationOpen();
+        if (!cancelled) {
+          setRegistrationOpen(open);
+        }
+      } catch {
+        if (!cancelled) {
+          setRegistrationOpen(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [adapter, configuredEndpoint]);
+
+  // Never leave the form sitting in a mode the server will refuse.
+  useEffect(() => {
+    if (!registrationOpen && authMode === "register") {
+      setAuthMode("sign-in");
+    }
+  }, [registrationOpen, authMode]);
 
   async function authenticate() {
     setAuthPending(true);
@@ -175,17 +209,19 @@ export function LoginPage({
                   ? "Create account"
                   : "Sign in"}
             </button>
-            <button
-              className="secondary-button"
-              type="button"
-              disabled={authPending}
-              onClick={() => {
-                setAuthMode(authMode === "register" ? "sign-in" : "register");
-                setAuthError(null);
-              }}
-            >
-              {authMode === "register" ? "Use an existing account" : "Create an account"}
-            </button>
+            {registrationOpen ? (
+              <button
+                className="secondary-button"
+                type="button"
+                disabled={authPending}
+                onClick={() => {
+                  setAuthMode(authMode === "register" ? "sign-in" : "register");
+                  setAuthError(null);
+                }}
+              >
+                {authMode === "register" ? "Use an existing account" : "Create an account"}
+              </button>
+            ) : null}
           </div>
         </form>
 

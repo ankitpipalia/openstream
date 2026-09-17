@@ -20,6 +20,10 @@ export interface ProductAdapter {
   setDeviceTrust(deviceId: string, trust: "trusted" | "revoked"): Promise<ProductSnapshot>;
   signIn(username: string, password: string): Promise<ProductSnapshot>;
   registerAccount(username: string, password: string): Promise<ProductSnapshot>;
+  /** Whether the control plane would accept a new account right now. A closed
+   * deployment only takes the very first one, so the login screen asks before
+   * offering signup rather than letting every later user watch it fail. */
+  registrationOpen(): Promise<boolean>;
   signOut(): Promise<ProductSnapshot>;
   /** Incoming Secure Connect requests awaiting this device's answer. */
   hostConnectRequests(): Promise<ConnectRequest[]>;
@@ -225,6 +229,7 @@ export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmpt
     setDeviceTrust: async () => currentSnapshot,
     signIn: async () => currentSnapshot,
     registerAccount: async () => currentSnapshot,
+    registrationOpen: async () => true,
     signOut: async () => currentSnapshot,
     // The fixture adapter has no control-plane broker, so it never receives
     // Secure Connect requests and its approve/deny are no-ops.

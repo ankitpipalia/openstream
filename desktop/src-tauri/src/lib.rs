@@ -373,6 +373,21 @@ async fn control_plane_register(
     .await
 }
 
+/// Whether this control plane would accept a new account right now.
+///
+/// The login screen asks before drawing its "Create an account" control, so a
+/// closed deployment stops offering signup that every later user would watch
+/// fail. Answers `false` when the control plane cannot be reached or is too
+/// old to say: hiding a button that would have worked is a smaller failure
+/// than offering one that cannot.
+#[tauri::command]
+async fn control_plane_registration_open(
+    control_plane: tauri::State<'_, SharedControlPlane>,
+) -> Result<bool, ControlPlaneError> {
+    let client = control_plane.lock().await;
+    Ok(client.registration_open().await.unwrap_or(false))
+}
+
 #[tauri::command]
 async fn control_plane_refresh_devices(
     runtime: tauri::State<'_, SharedRuntime>,
@@ -1406,6 +1421,7 @@ pub fn run() {
             runtime_dispatch,
             control_plane_sign_in,
             control_plane_register,
+            control_plane_registration_open,
             control_plane_refresh_devices,
             control_plane_sign_out,
             host_agent_health,

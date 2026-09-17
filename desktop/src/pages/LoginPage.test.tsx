@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { LoginPage } from "./LoginPage";
@@ -41,6 +41,47 @@ function openEndpointEditor(): void {
 function endpointField(): HTMLInputElement {
   return screen.getByLabelText(/control-plane endpoint/i) as HTMLInputElement;
 }
+
+describe("LoginPage signup availability", () => {
+  /// A closed deployment accepts only the very first account, so every later
+  /// user was shown a "Create an account" button that could not succeed,
+  /// followed by a generic failure. The screen asks the server instead of
+  /// assuming.
+  it("hides signup when the control plane will not accept a new account", async () => {
+    const adapter = createLocalAdapter();
+    adapter.registrationOpen = async () => false;
+    render(
+      <LoginPage snapshot={createEmptySnapshot()} adapter={adapter} onSnapshot={() => {}} />,
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /create an account/i })).toBeNull();
+    });
+  });
+
+  it("offers signup when the control plane will accept one", async () => {
+    const adapter = createLocalAdapter();
+    adapter.registrationOpen = async () => true;
+    render(
+      <LoginPage snapshot={createEmptySnapshot()} adapter={adapter} onSnapshot={() => {}} />,
+    );
+    expect(await screen.findByRole("button", { name: /create an account/i })).toBeTruthy();
+  });
+
+  /// An unreachable or too-old control plane must not produce a button that
+  /// cannot work: unknown is treated as closed.
+  it("treats an unanswerable control plane as closed", async () => {
+    const adapter = createLocalAdapter();
+    adapter.registrationOpen = async () => {
+      throw new Error("unreachable");
+    };
+    render(
+      <LoginPage snapshot={createEmptySnapshot()} adapter={adapter} onSnapshot={() => {}} />,
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /create an account/i })).toBeNull();
+    });
+  });
+});
 
 describe("LoginPage control-plane endpoint", () => {
   /// The adapter's first snapshot is an unresolved placeholder with no
