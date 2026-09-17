@@ -48,14 +48,14 @@ fn main() -> std::process::ExitCode {
     let stride = width * 4;
     let source = vec![0u8; stride * height];
 
-    let mut encoder = match VideoToolboxH264Encoder::new(STREAM_WIDTH, STREAM_HEIGHT, 60, 10_000_000)
-    {
-        Ok(encoder) => encoder,
-        Err(error) => {
-            eprintln!("videotoolbox encoder unavailable: {error}");
-            return std::process::ExitCode::from(2);
-        }
-    };
+    let mut encoder =
+        match VideoToolboxH264Encoder::new(STREAM_WIDTH, STREAM_HEIGHT, 60, 10_000_000) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                eprintln!("videotoolbox encoder unavailable: {error}");
+                return std::process::ExitCode::from(2);
+            }
+        };
     let stream_bytes = (STREAM_WIDTH as usize) * (STREAM_HEIGHT as usize) * 4;
 
     let mut capture_us = Vec::with_capacity(FRAMES);
@@ -109,7 +109,10 @@ fn main() -> std::process::ExitCode {
     // `capture()` is the CoreGraphics call plus the pack, in that order.
     let cg_mean = capture_mean.saturating_sub(pack_mean);
 
-    println!("display {width}x{height} ({} MB per frame)", stride * height / (1024 * 1024));
+    println!(
+        "display {width}x{height} ({} MB per frame)",
+        stride * height / (1024 * 1024)
+    );
     println!("samples {FRAMES}");
     println!("  CGDisplayCreateImage + CopyData  {cg_mean:>7} us   (capture minus pack)");
     println!("  pack_bgra_rows                   {pack_mean:>7} us");
