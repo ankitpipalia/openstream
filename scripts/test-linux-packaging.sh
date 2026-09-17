@@ -114,6 +114,96 @@ require "$build_deb" 'if \[ ! -e /etc/openstream/broker\.env \]' \
 whatever capability ceiling the operator configured"
 
 # ---------------------------------------------------------------------------
+# 3b. Run the postinst, rather than reading it.
+#
+# The env files are written by shell heredocs whose delimiters are deliberately
+# unquoted, so that `$service_uid` expands. That also means every other `$` and
+# backtick expands, and a stray one produces a file that is subtly wrong in a
+# way no grep of the generator would notice. `bash -n` does not catch it either:
+# the script is valid, its output is not.
+#
+# So the postinst is extracted and executed against a scratch directory, with
+# the account tools stubbed, and the files it produces are inspected.
+# ---------------------------------------------------------------------------
+scratch="$(mktemp -d)"
+trap 'rm -rf -- "$scratch"' EXIT
+mkdir -p "$scratch/etc" "$scratch/bin"
+
+# getent is what the postinst asks for the account's numeric ids.
+cat >"$scratch/bin/getent" <<'STUB'
+#!/bin/sh
+case "$1" in
+    passwd) echo "openstream:x:995:990::/nonexistent:/usr/sbin/nologin" ;;
+    group)  echo "openstream:x:990:" ;;
+esac
+STUB
+for stub in addgroup adduser systemctl; do
+    printf '#!/bin/sh\nexit 0\n' >"$scratch/bin/$stub"
+done
+chmod 0755 "$scratch/bin/"*
+
+# Extract the postinst exactly as build-deb.sh emits it, and point the one
+# absolute path it writes to at the scratch tree.
+sed -n "/^cat >\"\$stage\/DEBIAN\/postinst\" <<'POSTINST'$/,/^POSTINST$/p" "$build_deb" |
+    sed '1d;$d' |
+    sed "s#/etc/openstream#$scratch/etc/openstream#g" >"$scratch/postinst"
+mkdir -p "$scratch/etc/openstream"
+
+if PATH="$scratch/bin:$PATH" sh "$scratch/postinst" configure >"$scratch/notice" 2>&1; then
+    pass "postinst runs to completion"
+else
+    fail "postinst failed: $(cat "$scratch/notice")"
+fi
+
+env_file="$scratch/etc/openstream/broker.env"
+if [ -f "$env_file" ]; then
+    pass "postinst wrote broker.env"
+    # The ids it resolved, not the names of the variables holding them.
+    grep -q '^OPENSTREAM_BROKER_SERVICE_UID=995$' "$env_file" ||
+        fail "broker.env does not carry the resolved uid:
+$(grep -i uid "$env_file" || echo '  (no uid line at all)')"
+    grep -q '^OPENSTREAM_BROKER_SOCKET_GID=990$' "$env_file" ||
+        fail "broker.env does not carry the resolved gid"
+    # An unexpanded variable, or a heredoc that swallowed one.
+    unexpanded="$(grep -n '\$service_\|\$(' "$env_file" || true)"
+    [ -z "$unexpanded" ] || fail "broker.env contains unexpanded shell:
+$unexpanded"
+    # Optional settings must be commented, never assigned empty -- the whole
+    # class of bug this file exists to prevent.
+    empty_env="$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=[[:space:]]*$' "$env_file" || true)"
+    [ -z "$empty_env" ] || fail "broker.env assigns an empty value:
+$empty_env"
+    mode="$(ls -l "$env_file" | cut -c1-10)"
+    [ "$mode" = "-rw-------" ] || fail "broker.env is $mode, not 0600"
+    [ -n "$unexpanded$empty_env" ] || pass "broker.env is fully expanded, 0600, with no empty assignments"
+else
+    fail "postinst did not write broker.env"
+fi
+
+service_env="$scratch/etc/openstream/machine-service.env"
+if [ -f "$service_env" ]; then
+    empty_env="$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*=[[:space:]]*$' "$service_env" || true)"
+    [ -z "$empty_env" ] || fail "machine-service.env assigns an empty value:
+$empty_env"
+    [ -n "$empty_env" ] || pass "machine-service.env has no empty assignments"
+else
+    fail "postinst did not write machine-service.env"
+fi
+
+# An upgrade must not discard what the operator configured. Nothing else in
+# this file tests that claim; the grep above only proves the guard is written.
+if [ -f "$env_file" ]; then
+    printf 'OPENSTREAM_BROKER_CEILING=capture,keyboard\n' >>"$env_file"
+    PATH="$scratch/bin:$PATH" sh "$scratch/postinst" configure >/dev/null 2>&1 || true
+    if grep -q '^OPENSTREAM_BROKER_CEILING=capture,keyboard$' "$env_file"; then
+        pass "a second configure leaves the operator's settings alone"
+    else
+        fail "re-running postinst discarded the configured ceiling, which on a
+package upgrade would silently stop the machine granting anything"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 4. systemd's own opinion, where systemd exists.
 # ---------------------------------------------------------------------------
 if command -v systemd-analyze >/dev/null 2>&1; then
