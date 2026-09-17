@@ -1879,6 +1879,8 @@ dependencies = [
  "lowlat-core",
  "lowlat-inject",
  "openstream-client-core",
+ "openstream-macos-host",
+ "openstream-macos-media",
  "openstream-media",
  "openstream-platform",
  "openstream-protocol",
