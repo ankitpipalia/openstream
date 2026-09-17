@@ -700,6 +700,16 @@ pub struct Pairing {
     /// runner treats a present set as the ceiling on what it will drive.
     #[serde(default)]
     pub permissions: Option<Permissions>,
+    /// The control plane's signed statement that this session was approved,
+    /// hex-encoded, for a host that runs behind a privileged broker.
+    ///
+    /// Carried to the agent and handed on unread. Nothing in this process can
+    /// produce one or verify one: the broker checks it against a key only its
+    /// own user can read, which is the entire point. `None` for a client
+    /// pairing, for a host that does not use a broker, and for a device
+    /// enrolled before grant keys existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_grant: Option<String>,
 }
 
 /// The input and device classes a session may drive, as the Connect broker
@@ -796,6 +806,11 @@ pub struct RoleCredential {
     /// pairing so the session runner can scope what it drives to the grant.
     #[serde(default)]
     pub permissions: Option<Permissions>,
+    /// The control plane's signed approval for this session, hex-encoded, for
+    /// a host that runs behind a privileged broker. Carried into the pairing
+    /// and handed on unread; only the broker can verify it.
+    #[serde(default)]
+    pub session_grant: Option<String>,
 }
 
 /// Maximum pairing-file size accepted by the process boundary.
@@ -1096,6 +1111,7 @@ impl Pairing {
             relay_ticket,
             turn,
             permissions,
+            session_grant,
         } = credential;
         let (host_token, client_token) = match role {
             Role::Host => (Some(token), None),
@@ -1128,6 +1144,9 @@ impl Pairing {
             // Role-blind: the broker already scoped this grant to the one role
             // the credential carries, so it passes straight through.
             permissions,
+            // Likewise: the control plane issues one only for the host, so a
+            // client credential simply carries `None`.
+            session_grant,
         }
     }
 
@@ -5600,6 +5619,7 @@ mod tests {
     #[test]
     fn a_role_credential_cannot_act_as_the_other_role() {
         let client = Pairing::from_role_credential(RoleCredential {
+            session_grant: None,
             session_id: "session-1".into(),
             role: Role::Client,
             token: "CLIENT-CAPABILITY".into(),
@@ -5624,6 +5644,7 @@ mod tests {
         assert_eq!(client.relay_ticket(Role::Host), None);
 
         let host = Pairing::from_role_credential(RoleCredential {
+            session_grant: None,
             session_id: "session-1".into(),
             role: Role::Host,
             token: "HOST-CAPABILITY".into(),
@@ -5648,6 +5669,7 @@ mod tests {
     #[test]
     fn an_empty_token_is_refused_like_a_missing_one() {
         let pairing = Pairing {
+            session_grant: None,
             session_id: "session-1".into(),
             host_token: Some(String::new()),
             client_token: Some("client".into()),
@@ -5673,6 +5695,7 @@ mod tests {
     #[test]
     fn a_role_scoped_pairing_survives_serialisation() {
         let pairing = Pairing::from_role_credential(RoleCredential {
+            session_grant: None,
             session_id: "session-1".into(),
             role: Role::Client,
             token: "CLIENT-CAPABILITY".into(),
@@ -5764,6 +5787,7 @@ mod tests {
             virtual_usb: false,
         };
         let pairing = Pairing::from_role_credential(RoleCredential {
+            session_grant: None,
             session_id: "session-1".into(),
             role: Role::Client,
             token: "CLIENT-CAPABILITY".into(),
@@ -5847,6 +5871,7 @@ mod tests {
     #[test]
     fn pairing_and_turn_credentials_never_print_their_secrets() {
         let pairing = Pairing {
+            session_grant: None,
             session_id: "session-1".into(),
             host_token: Some("HOST-BEARER-SHOULD-NOT-APPEAR".into()),
             client_token: Some("CLIENT-BEARER-SHOULD-NOT-APPEAR".into()),
@@ -6846,6 +6871,7 @@ mod tests {
 
     fn pairing() -> Pairing {
         Pairing {
+            session_grant: None,
             session_id: "session".into(),
             host_token: Some("host-token".into()),
             client_token: Some("client-token".into()),
