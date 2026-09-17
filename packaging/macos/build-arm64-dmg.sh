@@ -18,7 +18,7 @@ set -euo pipefail
 # packaging/macos/notarize.sh signs the image itself and submits it.
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-version="${OPENSTREAM_VERSION:-1.0.0-dev}"
+version="${OPENSTREAM_VERSION:-1.0.0}"
 output="${1:-$repo_dir/dist/OpenStream-SessionClient-${version}-macOS-arm64.dmg}"
 artifact_dir="${OPENSTREAM_ARTIFACT_DIR:-$repo_dir/engine/lowlat/target/aarch64-apple-darwin/release}"
 
