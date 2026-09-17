@@ -1911,6 +1911,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "lowlat-core",
+ "lowlat-crypto",
  "lowlat-host",
  "lowlat-inject",
  "lowlat-net",
