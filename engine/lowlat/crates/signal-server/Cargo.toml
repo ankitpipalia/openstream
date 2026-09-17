@@ -20,6 +20,8 @@ hex.workspace = true
 hmac.workspace = true
 libc.workspace = true
 openstream-protocol = { path = "../protocol" }
+openstream-host-ipc = { workspace = true }
+lowlat-crypto = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 ring.workspace = true
