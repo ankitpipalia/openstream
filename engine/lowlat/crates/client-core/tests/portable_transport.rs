@@ -246,6 +246,7 @@ async fn websocket_bridge_with_direct_readiness(
 
 fn pairing() -> Pairing {
     Pairing {
+        session_grant: None,
         session_id: "portable-transport-test".into(),
         host_token: Some("host-token".into()),
         client_token: Some("client-token".into()),

@@ -542,25 +542,7 @@ async fn approve_connect_request(
         let runtime = state.lock().map_err(|_| RuntimeError::StateUnavailable)?;
         runtime.settings().clone()
     };
-    let pairing = openstream_client_core::Pairing::from_role_credential(
-        openstream_client_core::RoleCredential {
-            session_id: credential.session_id,
-            role: openstream_client_core::Role::Host,
-            token: credential.token,
-            websocket_path: credential.websocket_path,
-            expires_in_seconds: 0,
-            relay_address: credential.relay_address,
-            relay_ticket: Some(credential.relay_ticket),
-            turn: None,
-            // What the host just granted, carried through to the runner. A
-            // broker that predates permission negotiation sends nothing, and
-            // the runner treats that as unscoped; a present set is its
-            // ceiling.
-            permissions: credential
-                .permissions
-                .map(control_plane::granted_permissions),
-        },
-    );
+    let pairing = control_plane::host_pairing_from(credential);
     // One capability file per session, written and handed to the agent under
     // the lifecycle lock. Both halves matter: a single fixed filename let a
     // second approval overwrite the first, and releasing the lock between the

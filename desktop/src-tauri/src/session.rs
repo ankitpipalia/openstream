@@ -1236,6 +1236,7 @@ mod tests {
 
     fn client_credential(session: &str) -> RoleCredential {
         RoleCredential {
+            session_grant: None,
             session_id: session.to_string(),
             role: Role::Client,
             token: "CLIENT-CAPABILITY".to_string(),
