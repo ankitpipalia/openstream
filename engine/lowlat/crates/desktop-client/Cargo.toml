@@ -29,7 +29,22 @@ tokio.workspace = true
 wgpu.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# In-process Media Foundation H.264 decode lives in the shared codec crate.
+openstream-windows-media = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+# In-process VideoToolbox decode (macOS). Raw FFI to the VideoToolbox/CoreMedia/
+# CoreVideo frameworks is declared in src/vt_decoder.rs; these give the CoreFoundation
+# plumbing (CFDictionary/CFNumber/CFRetain) so the FFI surface stays small.
+# 0.9 to unify with the version wgpu's Metal backend already pulls in, so the
+# graph carries a single core-foundation.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+core-foundation-sys = "0.8"
+# Same version wgpu-hal 0.21 uses, so the `metal::Texture` we build to import a
+# CVPixelBuffer is the type `wgpu::hal::metal` accepts. wgpu re-exports `hal`,
+# so no direct wgpu-hal dependency is needed.
+metal = "0.28"
 
 [lints]
 workspace = true

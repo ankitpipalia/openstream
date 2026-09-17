@@ -250,11 +250,17 @@ fn to_runtime_trusted_device(device: &control_plane::PublicDevice) -> TrustedDev
 }
 
 fn to_directory_device(device: &control_plane::PublicDevice) -> openstream_app_core::DeviceSummary {
-    // The account/device API does not yet expose host presence. Keep the
-    // record visible for trust management but deliberately mark it offline so
-    // the shell cannot offer a connection that has not been discovered.
-    let mut summary =
-        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone());
+    // Presence now reaches the shell through the device listing, so a device
+    // the control plane last saw announcing itself is offered as connectable
+    // and everything else stays visible for trust management only. The online
+    // flag is advisory: the broker re-checks presence when a session is
+    // actually requested, so a stale "online" costs one refused request, never
+    // a session started against a machine that is not there.
+    let mut summary = if device.online {
+        openstream_app_core::DeviceSummary::online(device.device_id.clone(), device.name.clone())
+    } else {
+        openstream_app_core::DeviceSummary::offline(device.device_id.clone(), device.name.clone())
+    };
     summary.platform = device.platform.clone();
     summary
 }
@@ -365,6 +371,21 @@ async fn control_plane_register(
         true,
     )
     .await
+}
+
+/// Whether this control plane would accept a new account right now.
+///
+/// The login screen asks before drawing its "Create an account" control, so a
+/// closed deployment stops offering signup that every later user would watch
+/// fail. Answers `false` when the control plane cannot be reached or is too
+/// old to say: hiding a button that would have worked is a smaller failure
+/// than offering one that cannot.
+#[tauri::command]
+async fn control_plane_registration_open(
+    control_plane: tauri::State<'_, SharedControlPlane>,
+) -> Result<bool, ControlPlaneError> {
+    let client = control_plane.lock().await;
+    Ok(client.registration_open().await.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -482,12 +503,32 @@ async fn approve_connect_request(
     state: tauri::State<'_, SharedRuntime>,
     session: tauri::State<'_, SharedSession>,
     control_plane: tauri::State<'_, SharedControlPlane>,
+    host_lock: tauri::State<'_, SharedHostLock>,
     request_id: String,
+    granted: Option<openstream_app_core::PermissionSet>,
 ) -> Result<(), RuntimeError> {
     let credential = {
         let mut client = control_plane.lock().await;
+        // The host chooses the granted set in the approval prompt -- a subset
+        // of what was requested. When the UI provides none (an approval with no
+        // request to narrow), fall back to granting what the request asked for,
+        // derived from the broker's own pending record rather than trusted from
+        // the WebView, so no path can widen the grant beyond the request. A
+        // request no longer pending grants the empty set, which the broker
+        // ignores on the idempotent retry.
+        let granted = match granted {
+            Some(granted) => granted,
+            None => client
+                .pending_connect_requests()
+                .await
+                .map_err(control_plane_error_runtime)?
+                .into_iter()
+                .find(|request| request.request_id == request_id)
+                .map(|request| request.requested)
+                .unwrap_or_else(openstream_app_core::PermissionSet::none),
+        };
         client
-            .approve_connect(&request_id)
+            .approve_connect(&request_id, granted)
             .await
             .map_err(control_plane_error_runtime)?
     };
@@ -511,11 +552,23 @@ async fn approve_connect_request(
             relay_address: credential.relay_address,
             relay_ticket: Some(credential.relay_ticket),
             turn: None,
+            // What the host just granted, carried through to the runner. A
+            // broker that predates permission negotiation sends nothing, and
+            // the runner treats that as unscoped; a present set is its
+            // ceiling.
+            permissions: credential
+                .permissions
+                .map(control_plane::granted_permissions),
         },
     );
+    // One capability file per session, written and handed to the agent under
+    // the lifecycle lock. Both halves matter: a single fixed filename let a
+    // second approval overwrite the first, and releasing the lock between the
+    // write and the start let the agent open whichever file won that race.
+    let _lifecycle = host_lock.0.lock().await;
     let path = {
         let supervisor = session.lock().await;
-        supervisor.host_credential_path().to_path_buf()
+        supervisor.host_credential_path_for(&pairing.session_id)
     };
     session::write_private_json(&path, &pairing).map_err(session_error_to_runtime)?;
     let started = HostAgentClient::new()
@@ -556,12 +609,13 @@ async fn run_secure_connect(
     session: &SharedSession,
     control_plane: &SharedControlPlane,
     device_id: &str,
+    requested: openstream_app_core::PermissionSet,
     mut result: RuntimeDispatchResult,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     let request_id = {
         let mut client = control_plane.lock().await;
         client
-            .request_connect(device_id)
+            .request_connect(device_id, requested)
             .await
             .map_err(control_plane_error_runtime)?
             .request_id
@@ -690,7 +744,15 @@ async fn dispatch_command_with_session(
                 // a capability issued -- to each end separately. The runner
                 // is started from that capability rather than from a pairing
                 // file carrying both roles.
-                return run_secure_connect(state, session, control_plane, &device_id, result).await;
+                return run_secure_connect(
+                    state,
+                    session,
+                    control_plane,
+                    &device_id,
+                    requested,
+                    result,
+                )
+                .await;
             }
             let started = start_session_if_connecting(state, session, &device_id).await;
             match started {
@@ -1359,6 +1421,7 @@ pub fn run() {
             runtime_dispatch,
             control_plane_sign_in,
             control_plane_register,
+            control_plane_registration_open,
             control_plane_refresh_devices,
             control_plane_sign_out,
             host_agent_health,
@@ -1390,6 +1453,37 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::task::JoinHandle;
+
+    /// Presence from the control plane decides whether the shell offers a
+    /// connection. This is the desktop half of surfacing host presence: an
+    /// online record maps to a connectable summary, an offline one does not,
+    /// and the platform is carried through either way. Before presence was
+    /// surfaced every device mapped to offline and the connect button was
+    /// never live.
+    #[test]
+    fn to_directory_device_reflects_presence() {
+        let base = super::control_plane::PublicDevice {
+            device_id: "device-host".to_string(),
+            name: "Studio".to_string(),
+            platform: "macos".to_string(),
+            trust: super::control_plane::DeviceTrust::Trusted,
+            enrolled_at_ms: 0,
+            last_seen_ms: None,
+            public_key_fingerprint: "abcd1234".to_string(),
+            online: true,
+        };
+
+        let online = super::to_directory_device(&base);
+        assert!(online.online, "an online device is offered as connectable");
+        assert_eq!(online.platform, "macos", "platform is carried through");
+
+        let offline = super::to_directory_device(&super::control_plane::PublicDevice {
+            online: false,
+            ..base
+        });
+        assert!(!offline.online, "an offline device is not offered");
+        assert_eq!(offline.platform, "macos", "platform is carried through");
+    }
 
     #[test]
     fn local_no_auth_private_lan_origin_does_not_abort_startup() {

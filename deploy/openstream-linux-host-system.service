@@ -11,10 +11,24 @@ EnvironmentFile=/etc/openstream/linux-host.env
 ExecStart=/usr/local/bin/openstream-linux-host
 Restart=on-failure
 RestartSec=2s
-# System service: runs outside any login session for unattended hosting.
+# System service: runs outside any login session for unattended hosting -- the
+# host is reachable at the greeter/lock screen before any user logs in, gated by
+# the control-plane auth and connection approval, not left open.
 # Grant only the device groups the capture/encode/input paths need.
 SupplementaryGroups=video render input
 NoNewPrivileges=yes
+# DRM scanout capture (the greeter before login, and the desktop after) needs
+# the kernel's GETFB2 buffer-handle return, which is gated on CAP_SYS_ADMIN --
+# the one capability the drm subsystem hardcodes for it, with no narrower
+# alternative. Without it a non-root service reads the framebuffer metadata but
+# no handles, so the frame "exports a picture in neither way" and nothing is
+# captured. Granted ambiently so the service can run as a dedicated non-root
+# user rather than full root; verified on a GTX 970 / KDE Wayland box that
+# `capturable: yes` holds with exactly this hardened set (User + NoNewPrivileges
+# + these two lines). The security-cleaner PipeWire screencast portal needs a
+# logged-in graphical session, so it is not an option for pre-login hosting.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only

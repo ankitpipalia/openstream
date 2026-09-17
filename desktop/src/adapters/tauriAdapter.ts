@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 /// Advertised product version. This is a prerelease identifier until
 /// every gate in release/openstream-1.0-gates.tsv actually passes.
-const PRODUCT_VERSION = "1.0.0-dev";
+const PRODUCT_VERSION = "1.0.0";
 
 import type {
   AccessSnapshot,
@@ -76,6 +76,9 @@ interface PendingConnectRequestRaw {
   request_id: string;
   requester_device_id: string;
   expires_in_seconds: number;
+  /** The classes the requester asked for. Absent from a control plane that
+   * predates permission negotiation. */
+  requested?: PermissionSet;
 }
 
 /// Runtime truth for one probe, decided in Rust. The state is a closed set
@@ -887,6 +890,16 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
       const raw = (await invokeFn("control_plane_register", { username, password })) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
     },
+    registrationOpen: async () => {
+      try {
+        return (await invokeFn("control_plane_registration_open")) as boolean;
+      } catch {
+        // Unreachable or too old to answer: treat as closed. Hiding a button
+        // that would have worked is a smaller failure than offering one that
+        // cannot succeed.
+        return false;
+      }
+    },
     signOut: async () => {
       const raw = (await invokeFn("control_plane_sign_out")) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
@@ -897,12 +910,13 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
         requestId: request.request_id,
         requesterDeviceId: request.requester_device_id,
         expiresInSeconds: request.expires_in_seconds,
+        requested: request.requested,
       }));
     },
     // The Rust `request_id` parameter is addressed as camelCase `requestId`,
     // which is how Tauri v2 deserializes command arguments.
-    approveConnectRequest: async (requestId) => {
-      await invokeFn("approve_connect_request", { requestId });
+    approveConnectRequest: async (requestId, granted) => {
+      await invokeFn("approve_connect_request", { requestId, granted });
     },
     denyConnectRequest: async (requestId) => {
       await invokeFn("deny_connect_request", { requestId });

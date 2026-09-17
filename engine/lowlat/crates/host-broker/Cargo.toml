@@ -1,0 +1,38 @@
+[package]
+name = "openstream-host-broker"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+# The small privileged device broker: it holds the two privileges that need
+# elevation -- reading the DRM/KMS scanout (capture+encode) and injecting input
+# through uinput -- and nothing that faces the network. The unprivileged machine
+# service drives it over the host-ipc protocol. The protocol-driven core is
+# cross-platform and unit-tested with fakes; the real capture and injection are
+# Linux-only, behind the same traits.
+[[bin]]
+name = "openstream-host-broker"
+path = "src/main.rs"
+
+[lib]
+name = "openstream_host_broker"
+path = "src/lib.rs"
+
+[dependencies]
+openstream-host-ipc = { workspace = true }
+lowlat-crypto = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+lowlat-host = { workspace = true }
+lowlat-inject = { workspace = true }
+lowlat-core = { workspace = true }
+lowlat-net = { workspace = true }
+openstream-media = { path = "../media" }
+libc = { workspace = true }
+
+[lints]
+workspace = true

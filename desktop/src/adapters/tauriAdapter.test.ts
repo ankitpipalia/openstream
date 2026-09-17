@@ -290,6 +290,38 @@ describe("tauri adapter", () => {
     expect(snapshot.pendingSettingKeys).toEqual(["network.local_no_auth", "host.enabled"]);
   });
 
+  it("carries the requested permissions from host_connect_requests to the UI shape", async () => {
+    const adapter = createTauriAdapter(async (command) => {
+      if (command === "host_connect_requests") {
+        return [
+          {
+            request_id: "r1",
+            requester_device_id: "device-abc",
+            expires_in_seconds: 42,
+            requested: {
+              view: true,
+              keyboard: true,
+              mouse: false,
+              gamepad: false,
+              clipboard: false,
+              microphone: false,
+              tablet: false,
+              virtual_usb: false,
+            },
+          },
+        ];
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    const requests = await adapter.hostConnectRequests();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].requestId).toBe("r1");
+    expect(requests[0].requested?.view).toBe(true);
+    expect(requests[0].requested?.keyboard).toBe(true);
+    expect(requests[0].requested?.mouse).toBe(false);
+  });
+
   it("maps an updateSettings result back into the product snapshot", async () => {
     const fixture = runtimeSnapshotFixture();
     const updated: RuntimeSnapshot = {

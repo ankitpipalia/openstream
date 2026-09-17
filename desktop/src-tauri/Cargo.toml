@@ -1,6 +1,6 @@
 [package]
 name = "openstream-desktop"
-version = "1.0.0-dev"
+version = "1.0.0"
 description = "OpenStream desktop shell"
 authors = ["OpenStream contributors"]
 edition = "2021"

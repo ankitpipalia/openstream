@@ -151,6 +151,14 @@ pub(crate) struct GpuPresenter {
     config: wgpu::SurfaceConfiguration,
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
+    /// The no-swizzle pipeline for the zero-copy path (a native BGRA texture).
+    ///
+    /// Only macOS decodes into importable surfaces today, so on every other
+    /// target nothing reads this yet. It is built unconditionally rather than
+    /// cfg-gated because the shader and the pipeline are platform-neutral --
+    /// the Windows D3D11 import path will use exactly this one.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pipeline_import: wgpu::RenderPipeline,
     texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
     frame_size: Option<(u32, u32)>,
@@ -249,30 +257,37 @@ impl GpuPresenter {
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("openstream frame pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-        });
+        // Two pipelines share everything but the fragment entry: `fs_main`
+        // swizzles the CPU BGRA-in-RGBA upload, `fs_import` samples a native BGRA
+        // texture as-is for the zero-copy path.
+        let make_pipeline = |fragment_entry: &str, label: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: fragment_entry,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            })
+        };
+        let pipeline = make_pipeline("fs_main", "openstream frame pipeline");
+        let pipeline_import = make_pipeline("fs_import", "openstream frame import pipeline");
         eprintln!(
             "OpenStream native renderer: {backend:?} via {:?} ({})",
             info.backend, info.name
@@ -285,11 +300,26 @@ impl GpuPresenter {
             config,
             sampler,
             pipeline,
+            pipeline_import,
             texture: None,
             bind_group: None,
             frame_size: None,
             max_texture_dimension_2d,
         })
+    }
+
+    /// The wgpu device this presenter renders on.
+    ///
+    /// The zero-copy path builds its `MetalTextureImporter` from this device, so
+    /// a `CVPixelBuffer` imported into a `wgpu::Texture` belongs to the same
+    /// device `present_texture` draws it with -- importing on any other device
+    /// would produce a texture this presenter cannot bind. The client's window
+    /// loop calls this to build that importer on the first GPU-resident frame
+    /// -- which today only happens on macOS, so on other targets nothing calls
+    /// this yet.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
     }
 
     /// Upload and present one validated BGRA frame. Transient swapchain
@@ -430,6 +460,98 @@ impl GpuPresenter {
         self.instance.poll_all(false);
         Ok(())
     }
+
+    /// Present a GPU-resident frame with no CPU pixel readback. `texture` is a
+    /// native BGRA surface -- a VideoToolbox `CVPixelBuffer` imported through the
+    /// Metal HAL -- bound and drawn to the swapchain directly through the
+    /// no-swizzle pipeline. Nothing is uploaded (`present` uploads CPU pixels via
+    /// `write_texture`; this path does not), so the decoded pixels never touch
+    /// the CPU on the way to the screen.
+    ///
+    /// The presenter side of the zero-copy path. The no-swizzle render it uses is
+    /// proven correct on hardware by `vt_gpu`'s offscreen tests (and the
+    /// `no_swizzle_pipeline_renders_bgra_without_a_swizzle` test below). The
+    /// client's window loop calls this for every frame the decode worker
+    /// published as a surface, under `OPENSTREAM_ZERO_COPY=1`. That worker is
+    /// the VideoToolbox one, so on non-macOS targets this has no caller yet;
+    /// the code itself is platform-neutral wgpu.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn present_texture(
+        &mut self,
+        window: &Window,
+        texture: &wgpu::Texture,
+    ) -> Result<(), String> {
+        let (window_width, window_height) = window.get_size();
+        let surface_width = u32::try_from(window_width.max(1))
+            .map_err(|_| "window width exceeds the GPU surface limit".to_string())?;
+        let surface_height = u32::try_from(window_height.max(1))
+            .map_err(|_| "window height exceeds the GPU surface limit".to_string())?;
+        if self.config.width != surface_width || self.config.height != surface_height {
+            self.config.width = surface_width;
+            self.config.height = surface_height;
+            self.surface.configure(&self.device, &self.config);
+        }
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let layout = self.pipeline_import.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openstream import bind group"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        let output = match self.surface.get_current_texture() {
+            Ok(output) => output,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                return Err("native renderer ran out of GPU memory".to_string());
+            }
+        };
+        let output_view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("openstream import encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("openstream import pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline_import);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        output.present();
+        self.instance.poll_all(false);
+        Ok(())
+    }
 }
 
 const FRAME_SHADER: &str = r#"
@@ -464,6 +586,15 @@ var frame_sampler: sampler;
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(frame_texture, frame_sampler, input.uv).bgra;
+}
+
+// The zero-copy path binds a native BGRA texture (a VideoToolbox CVPixelBuffer
+// imported through the Metal HAL), which wgpu already returns in logical RGBA
+// order when sampled -- so this entry does not swizzle. `fs_main` swizzles only
+// because the CPU path uploads BGRA bytes into an RGBA-typed texture.
+@fragment
+fn fs_import(input: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(frame_texture, frame_sampler, input.uv);
 }
 "#;
 
@@ -506,5 +637,334 @@ mod tests {
         assert_eq!(RenderBackend::parse("OPENGL"), RenderBackend::OpenGl);
         assert!(!RenderBackend::Software.is_native());
         assert!(RenderBackend::Vulkan.is_native());
+    }
+}
+
+/// The frame shaders build into valid pipelines on real GPU hardware, and the
+/// no-swizzle (`fs_import`) pipeline renders a native BGRA texture with correct
+/// colour. Building catches a WGSL error in either entry (`fs_main` swizzle,
+/// `fs_import` no-swizzle) at test time rather than only when a window first
+/// opens; the render test proves `present_texture` picked the colour-correct
+/// pipeline for an imported `Bgra8Unorm` frame (`vt_gpu`'s offscreen tests cover
+/// the import itself, through an equivalent shader).
+#[cfg(test)]
+mod frame_pipeline_tests {
+    use std::borrow::Cow;
+
+    use super::FRAME_SHADER;
+
+    #[test]
+    fn both_frame_shader_entries_build_valid_pipelines() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no GPU adapter available; skipping frame-pipeline test");
+            return;
+        };
+        let Ok((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+        else {
+            eprintln!("no GPU device available; skipping frame-pipeline test");
+            return;
+        };
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FRAME_SHADER)),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        // Building the pipeline validates the fragment entry's WGSL. A bad entry
+        // name or a shader error makes create_render_pipeline fail here.
+        for entry in ["fs_main", "fs_import"] {
+            let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: entry,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            });
+        }
+    }
+
+    /// The zero-copy pipeline renders a native BGRA texture with correct colour.
+    ///
+    /// `present_texture` binds an imported `Bgra8Unorm` texture (a VideoToolbox
+    /// `CVPixelBuffer`) and draws it through `fs_import`, which samples without a
+    /// swizzle -- the GPU already presents a BGRA texture's channels to the
+    /// shader in RGBA order. `fs_main` instead swaps them, to undo the CPU
+    /// path's BGRA-bytes-in-an-RGBA-texture upload. Rendering the *same* native
+    /// BGRA texture through each proves they are not interchangeable and that
+    /// `present_texture` picked the right one: a blue frame stays blue through
+    /// `fs_import`, and would come out red through `fs_main`. This is the colour
+    /// correctness the live present path depends on, on real GPU hardware.
+    #[test]
+    fn no_swizzle_pipeline_renders_bgra_without_a_swizzle() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no GPU adapter available; skipping no-swizzle render test");
+            return;
+        };
+        let Ok((device, queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+        else {
+            eprintln!("no GPU device available; skipping no-swizzle render test");
+            return;
+        };
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FRAME_SHADER)),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let make = |entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: entry,
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+            })
+        };
+        let pipeline_import = make("fs_import");
+        let pipeline_main = make("fs_main");
+
+        // A native BGRA texture holding pure blue. In BGRA byte order blue is
+        // [B=255, G=0, R=0, A=255]; sampled from a `Bgra8Unorm` texture the GPU
+        // hands the shader (r=0, g=0, b=255).
+        let source = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("native bgra blue"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let blue_bgra: [u8; 16] = [
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ];
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &blue_bgra,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(8),
+                rows_per_image: Some(2),
+            },
+            wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+        );
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Render the source fullscreen through `pipeline` into a 64x64 RGBA
+        // target (64*4 = 256-byte rows, so the readback needs no padding) and
+        // return the centre pixel's R,G,B,A.
+        let render_centre = |pipeline: &wgpu::RenderPipeline| -> [u8; 4] {
+            let target = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: 64,
+                    height: 64,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            let bytes_per_row: u32 = 64 * 4;
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(bytes_per_row) * 64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture: &target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer: &buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(64),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 64,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(encoder.finish()));
+            let slice = buffer.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            let data = slice.get_mapped_range();
+            let centre = ((32 * 64) + 32) * 4;
+            let pixel = [
+                data[centre],
+                data[centre + 1],
+                data[centre + 2],
+                data[centre + 3],
+            ];
+            drop(data);
+            buffer.unmap();
+            pixel
+        };
+
+        let import_pixel = render_centre(&pipeline_import);
+        assert!(
+            import_pixel[2] > 200 && import_pixel[0] < 60,
+            "fs_import must keep a native BGRA blue frame blue (R,G,B,A={import_pixel:?})"
+        );
+        let main_pixel = render_centre(&pipeline_main);
+        assert!(
+            main_pixel[0] > 200 && main_pixel[2] < 60,
+            "fs_main swizzles, so the same native BGRA blue comes out red (R,G,B,A={main_pixel:?})"
+        );
     }
 }

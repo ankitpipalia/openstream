@@ -56,9 +56,16 @@ IOSurface
 CGDisplayStream
 ```
 
-Together these describe hardware decode into a `CVPixelBuffer` backed by an
-`IOSurface`, wrapped as a Metal texture — a GPU-resident path in which the CPU
-never touches decoded pixels.
+Together these establish that a GPU-resident decode path *exists* in this
+payload: hardware decode into a `CVPixelBuffer` backed by an `IOSurface`,
+wrapped as a Metal texture through `CVMetalTextureCache`. What the import table
+proves is that this path is present and that Parsec does not require an external
+FFmpeg executable to decode. It does **not** prove that every decode mode or
+fallback is zero-copy, nor that the CPU never reads back decoded pixels — those
+are runtime buffer-path properties an import table cannot settle. The honest
+target derived from this evidence is "a GPU-resident path with no CPU pixel
+readback"; "zero-copy" should be claimed only after the actual buffer path is
+traced and measured.
 
 ## Input pipeline symbols
 

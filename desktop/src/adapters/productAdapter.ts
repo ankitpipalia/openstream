@@ -3,6 +3,7 @@ import type {
   Capability,
   ConnectRequest,
   DiagnosticsSnapshot,
+  PermissionSet,
   ProductSnapshot,
   RuntimeCommand,
   SettingSection,
@@ -19,11 +20,17 @@ export interface ProductAdapter {
   setDeviceTrust(deviceId: string, trust: "trusted" | "revoked"): Promise<ProductSnapshot>;
   signIn(username: string, password: string): Promise<ProductSnapshot>;
   registerAccount(username: string, password: string): Promise<ProductSnapshot>;
+  /** Whether the control plane would accept a new account right now. A closed
+   * deployment only takes the very first one, so the login screen asks before
+   * offering signup rather than letting every later user watch it fail. */
+  registrationOpen(): Promise<boolean>;
   signOut(): Promise<ProductSnapshot>;
   /** Incoming Secure Connect requests awaiting this device's answer. */
   hostConnectRequests(): Promise<ConnectRequest[]>;
-  /** Approve one request and start hosting the session it created. */
-  approveConnectRequest(requestId: string): Promise<void>;
+  /** Approve one request with the permission classes to grant (a subset of
+   * what was requested), and start hosting the session it created. `granted`
+   * omitted leaves the grant to the server-derived default. */
+  approveConnectRequest(requestId: string, granted?: PermissionSet): Promise<void>;
   /** Refuse one request. */
   denyConnectRequest(requestId: string): Promise<void>;
 }
@@ -180,13 +187,17 @@ export function createEmptySnapshot(): ProductSnapshot {
     },
     controlPlane,
     trustedDevices: [],
-    localMode: false,
+    // A fresh snapshot with no control plane configured is local mode, so the
+    // preview/fallback shell is usable without an account. The real runtime
+    // reports this from `network.local_no_auth`; Secure mode (with the login
+    // gate) is what a configured control-plane origin produces.
+    localMode: true,
   };
 
   return {
     product: {
       name: "OpenStream",
-      version: "1.0.0-dev",
+      version: "1.0.0",
       channel: "Desktop shell",
     },
     connection: {
@@ -218,6 +229,7 @@ export function createLocalAdapter(initialSnapshot: ProductSnapshot = createEmpt
     setDeviceTrust: async () => currentSnapshot,
     signIn: async () => currentSnapshot,
     registerAccount: async () => currentSnapshot,
+    registrationOpen: async () => true,
     signOut: async () => currentSnapshot,
     // The fixture adapter has no control-plane broker, so it never receives
     // Secure Connect requests and its approve/deny are no-ops.

@@ -12,13 +12,77 @@ env:
 permissions:
   contents: read
 
+# Cancel a pull request's older runs the moment a new commit supersedes them.
+# Several jobs were waiting ten to sixteen minutes purely for a runner while
+# runs for commits nobody was looking at any more held them.
+#
+# Pushes to a branch are deliberately NOT cancelled: a run on `main` is the
+# exact-head evidence the release gate reads, and cancelling one would destroy
+# the record of the commit that was actually merged.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 defaults:
   run:
     working-directory: engine/lowlat
 
 jobs:
+  # Decides whether this change can skip the native build, sanitizer and target
+  # matrices. Deliberately narrow: only Markdown, and only under `docs/` or at
+  # the repository root. Anything else -- a workflow, a script, a lockfile, a
+  # packaging or deployment file, release evidence, or a Markdown file inside a
+  # crate where the ASCII check reads it -- takes the full run.
+  #
+  # A push is never classified as documentation-only. Those runs are the
+  # exact-head evidence for a release candidate and have to be complete.
+  classify:
+    name: change classification
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: The classifier's own cases
+        working-directory: .
+        run: bash scripts/check-ci-classifier.sh
+      - id: classify
+        working-directory: .
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "not a pull request; running the full suite"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE" "$HEAD")"
+          if [ -z "$changed" ]; then
+            echo "no changed files reported; running the full suite"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed files:"
+          printf '%s\n' "$changed" | sed 's/^/  /'
+          # Allow-list, not a deny-list: a path is documentation only if it
+          # matches, and anything unrecognised takes the full run. A new kind
+          # of file therefore fails safe.
+          if printf '%s\n' "$changed" | grep -qvE '^(docs/.+\.md|[^/]+\.md)$'; then
+            docs_only=false
+          else
+            docs_only=true
+          fi
+          echo "docs_only=$docs_only"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   check:
     name: format, lints, tests
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -40,6 +104,16 @@ jobs:
 
       - name: ASCII check
         run: python3 scripts/check-ascii.py
+
+      # The product version lives in eight files. Nothing made them agree until
+      # this ran, and they did not: artifacts were named 1.0.0 while every
+      # binary inside them reported 1.0.0-dev.
+      - name: Product version consistency
+        run: |
+          bash -n scripts/check-version-consistency.sh
+          scripts/check-version-consistency.sh
+        # This job defaults to engine/lowlat, where these paths do not exist.
+        working-directory: .
 
       - name: Shell fixture syntax
         run: |
@@ -116,6 +190,8 @@ jobs:
 
   openstream-portable:
     name: OpenStream crates (${{ matrix.os }})
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -126,19 +202,38 @@ jobs:
       - name: Install Linux gamepad dependency
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
+      - name: Install ffmpeg for VideoToolbox test fixtures (macOS)
+        # ffmpeg only *generates* the H.264 clips the native VideoToolbox tests
+        # decode; end users never need it. Installing it here lets those tests
+        # run instead of silently skipping, and the require-flag step below turns
+        # a missing/broken fixture generator into a hard failure.
+        if: matrix.os == 'macos-latest'
+        run: brew install ffmpeg
       - name: Install toolchain
         run: rustup component add rustfmt
       - name: Format OpenStream additions
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all --check
       - name: Test portable protocol/service/client crates
-        run: cargo test --locked -p openstream-client-core -p openstream-protocol -p openstream-transport -p openstream-signal-server -p openstream-reference-peer -p openstream-media -p openstream-platform -p openstream-client -p openstream-desktop-client -p openstream-ffmpeg-host -p openstream-mobile-ffi -p openstream-bridge -- --test-threads=1
+        run: cargo test --locked -p openstream-client-core -p openstream-protocol -p openstream-transport -p openstream-signal-server -p openstream-reference-peer -p openstream-media -p openstream-platform -p openstream-windows-media -p openstream-windows-host -p openstream-macos-media -p openstream-client -p openstream-desktop-client -p openstream-ffmpeg-host -p openstream-mobile-ffi -p openstream-bridge -- --test-threads=1
+      - name: VideoToolbox hardware decode tests must run, not skip (macOS)
+        # OPENSTREAM_REQUIRE_VT_TEST makes a missing/failed ffmpeg fixture a hard
+        # error instead of a silent skip, so the native decode coverage cannot
+        # quietly vanish from the gate. Re-runs the desktop client with the flag.
+        if: matrix.os == 'macos-latest'
+        env:
+          OPENSTREAM_REQUIRE_VT_TEST: "1"
+        # --include-ignored also runs the long-duration soak loopback (fast, ~3s)
+        # so that long-session coverage cannot silently rot either.
+        run: cargo test --locked -p openstream-desktop-client -- --include-ignored --test-threads=1
       - name: Test native Linux host adapters (X11/PipeWire/HWACCEL parsing)
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --locked -p openstream-linux-host
 
   openstream-target-matrix:
     name: OpenStream target (${{ matrix.target }})
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -247,18 +342,10 @@ jobs:
           -p openstream-client-core
           -p openstream-mobile-ffi
           -p openstream-host-agent
-      - name: Check cross-platform FFmpeg host adapter
-        if: matrix.host
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo check --locked --target ${{ matrix.target }} -p openstream-ffmpeg-host
-      - name: Check native Linux host adapter
-        if: matrix.linux_host
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo check --locked --target ${{ matrix.target }} -p openstream-linux-host
+      # `openstream-ffmpeg-host` and `openstream-linux-host` are not checked
+      # separately: the two release builds below compile and link both, for the
+      # same target. The portable subset above stays, because those crates are
+      # not in any release build here and would otherwise go unbuilt.
       - name: Build OpenStream desktop release artifacts
         if: matrix.host
         env:
@@ -281,6 +368,8 @@ jobs:
 
   openstream-desktop-target-matrix:
     name: OpenStream desktop client (${{ matrix.target }})
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -303,11 +392,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
       - name: Install target
         run: rustup target add ${{ matrix.target }}
-      - name: Check desktop client
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo check --locked --target ${{ matrix.target }} -p openstream-desktop-client
+      # No `cargo check` first: the release build below compiles the same
+      # crate for the same target and links it, which is strictly stronger.
+      # Running both cost about 141s of the 361s build on the Windows job.
       - name: Build desktop client release artifact
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -316,12 +403,19 @@ jobs:
 
   desktop-shell:
     name: OpenStream desktop product shell
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          # npm's own cache, keyed on the lockfile. Small, bounded, and
+          # unrelated to the Cargo target caches that are already close to the
+          # repository limit.
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
       - name: Validate frontend lockfile
         working-directory: desktop
         run: node -e 'JSON.parse(require("fs").readFileSync("package-lock.json","utf8"))'
@@ -337,6 +431,8 @@ jobs:
 
   loom:
     name: model checking
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -348,6 +444,8 @@ jobs:
 
   deny:
     name: licenses and advisories
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -364,6 +462,8 @@ jobs:
 
   smoke:
     name: protocol and media smoke
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -394,6 +494,8 @@ jobs:
 
   sanitizers:
     name: sanitizers
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -412,6 +514,8 @@ jobs:
 
   alpine-musl:
     name: Alpine/musl validation
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -447,6 +551,8 @@ jobs:
 
   desktop-runtime:
     name: OpenStream desktop runtime shell
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -479,6 +585,7 @@ jobs:
     name: CI gate
     if: ${{ always() }}
     needs:
+      - classify
       - check
       - openstream-portable
       - openstream-target-matrix
@@ -495,6 +602,8 @@ jobs:
     steps:
       - name: Require every CI job to pass
         env:
+          DOCS_ONLY: ${{ needs.classify.outputs.docs_only }}
+          CLASSIFY: ${{ needs.classify.result }}
           CHECK: ${{ needs.check.result }}
           PORTABLE: ${{ needs.openstream-portable.result }}
           TARGETS: ${{ needs.openstream-target-matrix.result }}
@@ -508,10 +617,26 @@ jobs:
           ALPINE_MUSL: ${{ needs.alpine-musl.result }}
           SECRET_SCAN: ${{ needs.secret-scan.result }}
         run: |
+          # The classifier decides whether a skip is allowed at all, so it has
+          # to have succeeded itself. A classifier that failed or was skipped
+          # cannot license anything.
+          if [ "$CLASSIFY" != success ]; then
+            echo "change classification did not succeed ($CLASSIFY)" >&2
+            exit 1
+          fi
+          if [ "$DOCS_ONLY" = true ]; then
+            echo "documentation-only change: the build and test matrices were skipped"
+          fi
           for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
               "$DESKTOP_SHELL" "$DESKTOP_RUNTIME" "$LOOM" "$DENY" "$SMOKE" \
               "$SANITIZERS" "$ALPINE_MUSL" \
               "$SECRET_SCAN"; do
+            # A skipped job passes the gate only on a change the classifier
+            # proved is documentation only. Everywhere else a skip is a
+            # failure, so a job that silently stops running cannot slip past.
+            if [ "$result" = skipped ] && [ "$DOCS_ONLY" = true ]; then
+              continue
+            fi
             if [ "$result" != success ]; then
               echo "CI job result was $result" >&2
               exit 1

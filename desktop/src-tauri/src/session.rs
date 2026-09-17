@@ -159,13 +159,15 @@ pub struct SessionSupervisor {
     /// 0700 and owner-checked, so the capability never sits anywhere another
     /// user could reach it.
     credential_file: PathBuf,
-    /// Where a *host* capability is written for the host agent to read.
+    /// The already-private directory host capabilities are written into.
     ///
     /// A sibling of this supervisor's own client credential, in the same
     /// already-private directory, so there is one place on this machine where
     /// session capabilities live rather than two with different owners and
-    /// different permission checks.
-    host_credential_file: PathBuf,
+    /// different permission checks. The file itself is named per session --
+    /// see [`SessionSupervisor::host_credential_path_for`] -- because a single
+    /// fixed name let two concurrent approvals overwrite each other.
+    host_credential_dir: PathBuf,
     /// Whether this supervisor wrote the pairing file it handed the runner,
     /// and must therefore remove it when the session ends.
     ///
@@ -196,7 +198,7 @@ impl SessionSupervisor {
             generation: None,
             status_file: runtime_dir.join("session-status.json"),
             credential_file: runtime_dir.join("session-credential.json"),
-            host_credential_file: runtime_dir.join("host-credential.json"),
+            host_credential_dir: runtime_dir.clone(),
             owns_pairing_file: false,
             state: SessionProcessState::Idle,
             exit_state: SessionProcessState::Idle,
@@ -469,10 +471,38 @@ impl SessionSupervisor {
         Ok(self.health())
     }
 
-    /// Where a host capability should be written for the agent.
+    /// Where this session's host capability should be written for the agent.
+    ///
+    /// Per session, not one fixed name: two approvals racing each other used
+    /// to write the same `host-credential.json`, so the second write could
+    /// replace the first before the first agent had opened it and the wrong
+    /// session would start.
+    ///
+    /// `session_id` comes from the broker, so it is reduced to
+    /// `[A-Za-z0-9_-]` here before it is ever joined onto a path. A session id
+    /// is already in that alphabet; anything else is either a bug or an
+    /// attempt at traversal, and neither should be able to choose a filename
+    /// on this machine.
     #[must_use]
-    pub fn host_credential_path(&self) -> &Path {
-        &self.host_credential_file
+    pub fn host_credential_path_for(&self, session_id: &str) -> PathBuf {
+        let safe: String = session_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .take(64)
+            .collect();
+        let stem = if safe.is_empty() {
+            "unnamed".to_string()
+        } else {
+            safe
+        };
+        self.host_credential_dir
+            .join(format!("host-credential-{stem}.json"))
     }
 
     pub async fn disconnect(&mut self) -> Result<SessionHealth, SessionError> {
@@ -1214,6 +1244,7 @@ mod tests {
             relay_address: None,
             relay_ticket: Some("ticket".to_string()),
             turn: None,
+            permissions: None,
         }
     }
 
@@ -1288,6 +1319,64 @@ mod tests {
             !path.exists(),
             "a capability nobody is watching must not survive its session"
         );
+    }
+
+    /// Two approvals arriving together get two capability files.
+    ///
+    /// Every approved host session used to be written to one fixed
+    /// `host-credential.json`. Two approvals racing each other could then
+    /// interleave as: A writes, B overwrites, A tells the agent to open the
+    /// path -- and the agent reads B's capability, starting the wrong session
+    /// and stranding the other requester. Naming the file after the session is
+    /// what makes that interleaving impossible; the lifecycle lock around the
+    /// write-then-start in `approve_connect_request` is what keeps the two
+    /// steps from being split apart again.
+    #[test]
+    fn concurrent_approvals_do_not_share_one_credential_path() {
+        let (supervisor, _directory) = supervisor();
+        let first = supervisor.host_credential_path_for("session-a");
+        let second = supervisor.host_credential_path_for("session-b");
+        assert_ne!(
+            first, second,
+            "two sessions must not be handed the same capability file"
+        );
+
+        // Both still land in the supervisor's own private runtime directory.
+        assert_eq!(first.parent(), second.parent());
+
+        // The same session asked twice is the same file: this is a name, not
+        // a fresh temporary each call, so a retried approval overwrites its
+        // own capability rather than littering.
+        assert_eq!(first, supervisor.host_credential_path_for("session-a"));
+    }
+
+    /// A broker-supplied session id cannot choose a path on this machine.
+    #[test]
+    fn a_hostile_session_id_cannot_escape_the_runtime_directory() {
+        let (supervisor, _directory) = supervisor();
+        let escaped = supervisor.host_credential_path_for("../../../etc/openstream");
+        assert_eq!(
+            escaped.parent(),
+            Some(supervisor.host_credential_dir.as_path()),
+            "a traversal attempt stays inside the private runtime directory"
+        );
+        let name = escaped
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a file name");
+        assert!(
+            !name.contains('/') && !name.contains(".."),
+            "separators and parent references are reduced away: {name}"
+        );
+
+        // An empty id still yields a usable, contained name rather than a
+        // path that ends at the directory itself.
+        let empty = supervisor.host_credential_path_for("");
+        assert_eq!(
+            empty.parent(),
+            Some(supervisor.host_credential_dir.as_path())
+        );
+        assert!(empty.file_name().is_some());
     }
 
     /// A pairing file the supervisor did not write is left alone.

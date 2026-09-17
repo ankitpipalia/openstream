@@ -6,6 +6,8 @@
 //! headless host adapter, not a settings UI.
 
 #[cfg(target_os = "linux")]
+mod logind;
+#[cfg(target_os = "linux")]
 mod pipewire;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -49,8 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use lowlat_inject::event::{Extents, Injector, Permissions};
     use lowlat_inject::uinput::Devices;
     use openstream_client_core::{
-        Capabilities, PeerSession, ReliableControl, Role, VideoCodec,
-        load_pairing_from_environment, parse_stun_servers,
+        Capabilities, PeerSession, Permissions as SessionPermissions, ReliableControl, Role,
+        VideoCodec, load_pairing_from_environment, parse_stun_servers,
     };
     use openstream_media::clipboard::{Assembler as ClipboardAssembler, fragment_text};
     use openstream_media::input::{InputLease, RumbleEvent};
@@ -93,7 +95,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "OpenStream selected data path: {:?}",
         session.connection_path()
     );
-    let host_policy = openstream_platform::policy::HostPolicy::from_env();
+    // See `HostPolicy::scoped_to_session` for why the owner's local settings
+    // and the pairing's negotiated permissions are two independent ceilings,
+    // and only their intersection is what this session may drive.
+    let session_permissions = pairing.permissions;
+    let host_policy = openstream_platform::policy::HostPolicy::from_env().scoped_to_session(
+        SessionPermissions::allows(session_permissions, |p| p.keyboard),
+        SessionPermissions::allows(session_permissions, |p| p.mouse),
+        SessionPermissions::allows(session_permissions, |p| p.gamepad),
+        SessionPermissions::allows(session_permissions, |p| p.clipboard),
+        SessionPermissions::allows(session_permissions, |p| p.microphone),
+    );
     eprintln!("{}", host_policy.log_line());
     let clipboard_policy = ClipboardPolicy::from_env();
     eprintln!("{}", clipboard_policy.log_line());
@@ -317,7 +329,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 return Ok(());
                             } else if apply_clipboard_chunk(
                                 &payload,
-                                clipboard_policy.may_apply(negotiated.clipboard),
+                                clipboard_policy.may_apply(negotiated.clipboard)
+                                    && SessionPermissions::allows(session_permissions, |p| {
+                                        p.clipboard
+                                    }),
                                 &mut clipboard_assembler,
                                 &mut clipboard_value,
                             )? {
@@ -385,7 +400,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if apply_clipboard_chunk(
                         &packet.payload,
-                        clipboard_policy.may_apply(negotiated.clipboard),
+                        clipboard_policy.may_apply(negotiated.clipboard)
+                            && SessionPermissions::allows(session_permissions, |p| p.clipboard),
                         &mut clipboard_assembler,
                         &mut clipboard_value,
                     )? {
@@ -758,8 +774,26 @@ fn preflight() -> Result<(), Box<dyn std::error::Error>> {
         }),
     };
 
+    // What is on the seat right now -- the greeter before login, or a user's
+    // session after -- so a machine-level host knows which it would capture and
+    // when a login handoff is due. A seat with no logind session (or no logind)
+    // reports `active: false` rather than guessing.
+    let logind = match logind::Seat::default().active() {
+        Some(session) => serde_json::json!({
+            "active": true,
+            "session_id": session.id,
+            "class": format!("{:?}", session.kind),
+            "type": session.session_type,
+            "seat_active": session.active,
+            "remote": session.remote,
+            "capturable_local": session.is_capturable_local(),
+        }),
+        None => serde_json::json!({ "active": false }),
+    };
+
     let report = serde_json::json!({
         "schema": 1,
+        "logind": logind,
         "platform": {
             "os": env::consts::OS,
             "arch": env::consts::ARCH,

@@ -59,7 +59,11 @@ pub enum HostStatus {
     Failed { message: String, retryable: bool },
 }
 
+/// Absent fields deserialize to "not granted", so a broker that omits a class
+/// this build knows about can only ever narrow the set, never silently widen
+/// it, and a partial object is a smaller grant rather than a parse failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PermissionSet {
     pub view: bool,
     pub keyboard: bool,

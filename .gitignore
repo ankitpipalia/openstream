@@ -39,6 +39,9 @@ openstream-*.env
 *.pcap
 *.pcapng
 *.log
+# Exception: small committed H.264 test fixtures the Windows codec tests read
+# via include_bytes! (the CI runner has no ffmpeg to generate them).
+!engine/lowlat/crates/windows-media/src/fixtures/*.h264
 
 # Authorized local reverse-engineering evidence. These files are not part of
 # the public source tree and must never be committed or redistributed.
