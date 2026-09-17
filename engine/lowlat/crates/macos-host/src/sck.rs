@@ -28,7 +28,8 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::{CString, c_void};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
 use crate::objc_runtime::{
     self as objc, BlockDescriptor, CmTime, FOREVER, Id, OneArgBlock, TwoArgBlock,
@@ -169,39 +170,59 @@ impl Drop for CapturedSurface {
 /// A slot, not a queue: the newest frame replaces an untaken one. A capture
 /// that outruns the encoder should hand it the freshest picture when it catches
 /// up, not a backlog -- a queued frame is latency that can never be recovered.
+///
+/// The condvar is what lets a consumer wait for the next frame instead of
+/// polling for it. ScreenCaptureKit delivers on change, so a consumer with no
+/// way to block would spin through every quiet moment on a still desktop.
 #[derive(Debug, Default)]
 struct Sink {
-    latest: Mutex<Option<CapturedSurface>>,
+    state: Mutex<SinkState>,
+    arrived: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SinkState {
+    latest: Option<CapturedSurface>,
     /// Frames the delegate accepted, including ones later replaced. The count
     /// is what distinguishes "the stream is running and the screen is static"
     /// from "the stream is delivering nothing".
-    delivered: Mutex<u64>,
+    delivered: u64,
 }
 
 impl Sink {
     fn offer(&self, frame: CapturedSurface) {
-        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
-        *latest = Some(frame);
-        drop(latest);
-        let mut delivered = self
-            .delivered
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        *delivered = delivered.saturating_add(1);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.latest = Some(frame);
+        state.delivered = state.delivered.saturating_add(1);
+        drop(state);
+        self.arrived.notify_all();
     }
 
     fn take(&self) -> Option<CapturedSurface> {
-        self.latest
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .latest
             .take()
     }
 
+    fn wait(&self, timeout: Duration) -> Option<CapturedSurface> {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // `wait_timeout_while` re-checks on spurious wakeups and on a frame
+        // that another taker got to first, and returns when the deadline has
+        // genuinely passed rather than restarting the clock each time.
+        let (mut state, _) = self
+            .arrived
+            .wait_timeout_while(state, timeout, |state| state.latest.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
+        state.latest.take()
+    }
+
     fn delivered(&self) -> u64 {
-        *self
-            .delivered
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .delivered
     }
 }
 
@@ -448,6 +469,17 @@ impl SckCapture {
     #[must_use]
     pub fn take_frame(&self) -> Option<CapturedSurface> {
         self.sink.take()
+    }
+
+    /// Wait up to `timeout` for the next frame.
+    ///
+    /// The form a streaming consumer wants: it blocks rather than spinning
+    /// through the quiet stretches a change-driven capture is full of, and the
+    /// timeout is what lets the caller do something else -- send a keepalive,
+    /// check for a stop -- when the screen has simply not moved.
+    #[must_use]
+    pub fn wait_frame(&self, timeout: Duration) -> Option<CapturedSurface> {
+        self.sink.wait(timeout)
     }
 
     /// How many frames the stream has delivered since it started.
@@ -761,13 +793,31 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// The sink keeps the newest frame, not a backlog. Checked with the
-    /// counter, since building a real `CapturedSurface` needs a display.
+    /// An empty sink reports nothing rather than blocking forever or
+    /// inventing a frame. Building a real `CapturedSurface` needs a display,
+    /// so the empty case is what can be checked here.
     #[test]
-    fn the_sink_counts_every_frame_even_when_it_replaces_one() {
+    fn an_empty_sink_has_nothing_to_take() {
         let sink = Sink::default();
         assert_eq!(sink.delivered(), 0);
         assert!(sink.take().is_none());
+    }
+
+    /// A wait on a screen that never moves has to return, or the pipeline
+    /// that calls it can never send a keepalive or notice a stop request.
+    #[test]
+    fn a_wait_on_a_still_screen_times_out_instead_of_blocking() {
+        let sink = Sink::default();
+        let started = std::time::Instant::now();
+        assert!(sink.wait(Duration::from_millis(50)).is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "returned too early to have actually waited"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait did not honour its timeout"
+        );
     }
 
     /// Each failure carries what a reader needs to act: which permission,
