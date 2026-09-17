@@ -1,17 +1,36 @@
 //! Per-session capability grants.
 //!
 //! Being the trusted service user (proven by [`crate::peercred`]) lets a process
-//! talk to the broker at all; it does not decide what a given *remote peer* may
-//! do. Each peer session carries a [`SessionToken`]: the set of device
-//! capabilities the machine service's approval policy granted that peer. The
-//! broker clamps every request to its own policy ceiling and then enforces the
-//! grant on every input event, so a compromised or buggy service can never
-//! drive a device the operator did not allow, and a session-agent handed a
-//! token can prove exactly what it may do and nothing more.
+//! talk to the broker at all; it does not decide what that process may do.
+//! Each session carries a [`SessionToken`]: an unguessable id the **broker**
+//! mints from the OS CSPRNG, plus the capabilities it granted after clamping to
+//! its own operator-configured ceiling and the seat.
+//!
+//! The direction matters. The service asks; the broker decides and issues. A
+//! service cannot mint a token, and the broker refuses any id it did not hand
+//! out, so a compromised network-facing service cannot name a session it was
+//! never granted or drive a device the operator did not allow.
+//!
+//! # What this does not yet prove
+//!
+//! The grant is *broker-issued*, which bounds a compromised service to the
+//! operator's configured ceiling. It is not yet bound to a specific Secure
+//! Connect approval: that needs a signed, expiry-bound grant from the control
+//! plane, carrying the session id and the approved permissions, which the
+//! broker verifies against a key pinned at enrolment. Until that exists, the
+//! ceiling is the operator's standing policy for the machine, not a statement
+//! about who was approved.
 //!
 //! Pure and side-effect-free: the random token id is supplied by the caller
 //! (the broker generates it from the OS CSPRNG), so issuance and clamping are
 //! fully unit-tested.
+
+/// The reserved grant id meaning "no grant".
+///
+/// A service sends this to ask the broker to issue one. It is never a valid
+/// grant, so a caller that stores it, or a failed entropy draw that returns it,
+/// authorises nothing.
+pub const NO_GRANT: u128 = 0;
 
 /// A set of device capabilities, as an opaque bitset. Constructed from the
 /// named capabilities rather than raw bits so an unknown wire bit cannot smuggle

@@ -22,7 +22,7 @@ use crate::wire::{DecodeError, Reader, Writer};
 
 /// The protocol version. Both sides announce it in their `Hello`; a mismatch is
 /// a clean refusal rather than a misread message.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 // Service -> broker tags occupy the low half, broker -> service the high half,
 // so a message decoded against the wrong direction fails on the tag rather than
@@ -103,13 +103,20 @@ pub enum ServiceRequest {
         /// The service's [`PROTOCOL_VERSION`].
         protocol: u16,
     },
-    /// Begin capturing and encoding for an approved peer session. `token_id`
-    /// identifies the session's grant; `requested` is the capability set the
-    /// service's approval policy wants (the broker clamps it to its own policy).
+    /// Begin capturing and encoding for an approved peer session.
+    ///
+    /// `token_id` is zero to ask the broker to issue a grant, or the id of the
+    /// grant it already issued on this connection. It is never a value the
+    /// service invented: the broker rejects any id it did not mint itself.
+    ///
+    /// `requested` can only *narrow* what the broker's policy already allows.
+    /// A service asking for more than its ceiling does not get more; the extra
+    /// bits are dropped, as they always were, but the ceiling no longer
+    /// defaults to everything.
     OpenCapture {
-        /// The session token id this capture belongs to.
+        /// Zero to be issued a grant, or the id of this connection's grant.
         token_id: u128,
-        /// Capabilities the service is requesting for the session.
+        /// Capabilities the service is requesting, as a reduction only.
         requested: Capabilities,
         /// Geometry and pacing to encode at.
         params: CaptureParams,
@@ -117,6 +124,8 @@ pub enum ServiceRequest {
     /// Re-point the live capture (greeter <-> user, scanout <-> PipeWire)
     /// without ending the session, driven by the lifecycle state machine.
     SwitchCapture {
+        /// The grant this capture belongs to.
+        token_id: u128,
         /// The seat to capture now.
         seat: Seat,
         /// The source kind to capture with now.
@@ -135,6 +144,8 @@ pub enum ServiceRequest {
     /// granted capabilities. The bytes are opaque here; the broker decodes and
     /// validates them.
     Input {
+        /// The grant authorising this injection.
+        token_id: u128,
         /// The encoded input-event bytes.
         payload: Vec<u8>,
     },
@@ -168,8 +179,13 @@ impl ServiceRequest {
                 writer.u32(params.bitrate_kbps);
                 writer.finish()
             }
-            ServiceRequest::SwitchCapture { seat, kind } => {
+            ServiceRequest::SwitchCapture {
+                token_id,
+                seat,
+                kind,
+            } => {
                 let mut writer = Writer::tagged(tag::SWITCH_CAPTURE);
+                writer.u128(*token_id);
                 writer.u8(seat_to_wire(*seat));
                 writer.u8(kind_to_wire(*kind));
                 writer.finish()
@@ -181,8 +197,9 @@ impl ServiceRequest {
             }
             ServiceRequest::RequestKeyframe => Writer::tagged(tag::REQUEST_KEYFRAME).finish(),
             ServiceRequest::CloseCapture => Writer::tagged(tag::CLOSE_CAPTURE).finish(),
-            ServiceRequest::Input { payload } => {
+            ServiceRequest::Input { token_id, payload } => {
                 let mut writer = Writer::tagged(tag::INPUT);
+                writer.u128(*token_id);
                 writer.bytes(payload);
                 writer.finish()
             }
@@ -220,6 +237,7 @@ impl ServiceRequest {
                 }
             }
             tag::SWITCH_CAPTURE => ServiceRequest::SwitchCapture {
+                token_id: reader.u128()?,
                 seat: seat_from_wire(reader.u8()?)?,
                 kind: kind_from_wire(reader.u8()?)?,
             },
@@ -229,6 +247,7 @@ impl ServiceRequest {
             tag::REQUEST_KEYFRAME => ServiceRequest::RequestKeyframe,
             tag::CLOSE_CAPTURE => ServiceRequest::CloseCapture,
             tag::INPUT => ServiceRequest::Input {
+                token_id: reader.u128()?,
                 payload: reader.bytes()?.to_vec(),
             },
             tag::SHUTDOWN => ServiceRequest::Shutdown,
@@ -252,6 +271,9 @@ pub enum BrokerEvent {
     /// Capture has begun; carries the geometry actually in use and the
     /// capabilities the broker granted after clamping the request.
     CaptureStarted {
+        /// The grant the broker issued for this session. The service presents
+        /// this id on every later request; it cannot mint one of its own.
+        token_id: u128,
         /// The seat now being captured.
         seat: Seat,
         /// The source kind now in use.
@@ -313,6 +335,7 @@ impl BrokerEvent {
                 writer.finish()
             }
             BrokerEvent::CaptureStarted {
+                token_id,
                 seat,
                 kind,
                 width,
@@ -320,6 +343,7 @@ impl BrokerEvent {
                 granted,
             } => {
                 let mut writer = Writer::tagged(tag::EV_CAPTURE_STARTED);
+                writer.u128(*token_id);
                 writer.u8(seat_to_wire(*seat));
                 writer.u8(kind_to_wire(*kind));
                 writer.u16(*width);
@@ -374,6 +398,7 @@ impl BrokerEvent {
                 capabilities: Capabilities::from_bits_truncate(reader.u32()?),
             },
             tag::EV_CAPTURE_STARTED => BrokerEvent::CaptureStarted {
+                token_id: reader.u128()?,
                 seat: seat_from_wire(reader.u8()?)?,
                 kind: kind_from_wire(reader.u8()?)?,
                 width: reader.u16()?,
@@ -440,6 +465,7 @@ mod tests {
             },
         });
         service_round_trip(ServiceRequest::SwitchCapture {
+            token_id: 0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00,
             seat: Seat::User,
             kind: CaptureKind::PipeWire,
         });
@@ -447,6 +473,7 @@ mod tests {
         service_round_trip(ServiceRequest::RequestKeyframe);
         service_round_trip(ServiceRequest::CloseCapture);
         service_round_trip(ServiceRequest::Input {
+            token_id: u128::MAX,
             payload: vec![1, 2, 3, 4, 5],
         });
         service_round_trip(ServiceRequest::Shutdown);
@@ -459,6 +486,7 @@ mod tests {
             capabilities: Capabilities::all(),
         });
         broker_round_trip(BrokerEvent::CaptureStarted {
+            token_id: 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100,
             seat: Seat::User,
             kind: CaptureKind::Scanout,
             width: 2560,
