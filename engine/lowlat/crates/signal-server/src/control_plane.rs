@@ -9,6 +9,7 @@
 use getrandom::getrandom;
 use openstream_host_ipc::grant::SessionGrant;
 use openstream_host_ipc::token::Capabilities;
+use openstream_protocol::IdentityKey;
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +37,22 @@ const PASSWORD_MAX_BYTES: usize = 256;
 const USERNAME_MIN_BYTES: usize = 3;
 const USERNAME_MAX_BYTES: usize = 128;
 const DEVICE_ID_MAX_BYTES: usize = 128;
+/// How far a device-authentication proof may be from the service's clock, in
+/// either direction.
+///
+/// Both directions, because the machine and the service keep their own time and
+/// neither is authoritative. Thirty seconds is comfortably more than any clock
+/// skew a machine running NTP will show, and short enough that a proof captured
+/// off the wire is useless long before anyone could act on it.
+const DEVICE_AUTH_WINDOW_MS: u64 = 30_000;
+/// Cap on remembered device-authentication nonces.
+///
+/// The map is pruned by age on every attempt, so reaching this needs a genuine
+/// flood. At that point new proofs are still verified and still work -- what
+/// stops is recording their nonces, which is a bounded loss of replay
+/// protection inside a thirty-second window rather than an outage, and it does
+/// not let anything unauthenticated through.
+const MAX_DEVICE_AUTH_NONCES: usize = 100_000;
 const DEVICE_NAME_MAX_BYTES: usize = 128;
 const PLATFORM_MAX_BYTES: usize = 64;
 const ACCESS_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
@@ -361,6 +378,15 @@ pub(crate) struct AccountStore {
     /// invalidates all active access tokens; refresh tokens are rotated and
     /// stored as hashes, never as bearer values.
     access_tokens: HashMap<[u8; 32], AccessTokenRecord>,
+    /// Device-authentication nonces seen inside the freshness window, with the
+    /// time each was accepted.
+    ///
+    /// A signature is valid forever, so possession of one lets anyone who saw
+    /// it replay the proof. The freshness window bounds how long a captured
+    /// proof stays useful and this bounds it to *once*. Memory-only for the
+    /// same reason the access tokens are: a restart invalidates every token
+    /// those proofs bought, so an old nonce buys nothing either.
+    device_auth_nonces: HashMap<[u8; 16], u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +439,7 @@ impl AccountStore {
             path,
             accounts,
             access_tokens: HashMap::new(),
+            device_auth_nonces: HashMap::new(),
         })
     }
 
@@ -969,6 +996,97 @@ impl AccountStore {
         }
         self.save()?;
         Ok(public)
+    }
+
+    /// Authenticate a device by the identity key it enrolled with.
+    ///
+    /// **Why this exists.** Every other way to obtain a device-bound token goes
+    /// through the account password, and a headless host must not hold one: the
+    /// machine service faces the network, and a password there is an account
+    /// compromise waiting for a bug. What it does hold is the private half of
+    /// the identity key registered at enrolment, in the operating system's own
+    /// custody. Proving possession of that is enough to say "I am this device",
+    /// which is all presence and connect need.
+    ///
+    /// **What it deliberately does not check: trust.** A pending device
+    /// authenticates successfully and then finds every useful endpoint refuses
+    /// it, exactly as a password sign-in from a pending device does. Refusing
+    /// the token instead would leave an unapproved machine unable to say
+    /// anything at all, including that it is waiting.
+    ///
+    /// Three things bound the proof, because a signature on its own is valid
+    /// forever:
+    ///
+    /// - the transcript binds the device id, so a proof for one machine is not
+    ///   a proof for another;
+    /// - `issued_at_ms` must be within [`DEVICE_AUTH_WINDOW_MS`] of now, in
+    ///   either direction, so a captured proof expires;
+    /// - the nonce must be one this service has not already accepted, so the
+    ///   proof works once even inside that window.
+    pub(crate) fn authenticate_device(
+        &mut self,
+        device_id: &str,
+        issued_at_ms: u64,
+        nonce: [u8; 16],
+        signature: [u8; 64],
+        now_ms: u64,
+    ) -> Result<IssuedTokens, ControlPlaneError> {
+        if device_id.is_empty() || device_id.len() > DEVICE_ID_MAX_BYTES {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+        // Freshness first: it is the cheapest check and rejects the bulk of
+        // anything replayed from a capture.
+        if now_ms.abs_diff(issued_at_ms) > DEVICE_AUTH_WINDOW_MS {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+        self.forget_stale_device_nonces(now_ms);
+        if self.device_auth_nonces.contains_key(&nonce) {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+
+        // Device ids are unique within an account, not across the service, so
+        // several accounts may hold one with this id. The signature is what
+        // picks between them: only the account whose enrolled public key
+        // verifies owns this device.
+        let matched = self
+            .accounts
+            .values()
+            .filter_map(|account| {
+                account
+                    .devices
+                    .get(device_id)
+                    .map(|device| (account.account_id.clone(), device.registration.public_key))
+            })
+            .find(|(_, public_key)| {
+                IdentityKey::verify_device_auth(
+                    *public_key,
+                    signature,
+                    device_id,
+                    issued_at_ms,
+                    nonce,
+                )
+            });
+        let Some((account_id, _)) = matched else {
+            return Err(ControlPlaneError::Unauthorized);
+        };
+
+        // Recorded only once the proof is known good. Burning a nonce on a
+        // failed attempt would let anyone who can guess one deny the real
+        // device its next authentication.
+        if self.device_auth_nonces.len() < MAX_DEVICE_AUTH_NONCES {
+            self.device_auth_nonces.insert(nonce, now_ms);
+        }
+        self.issue_tokens(&account_id, Some(device_id.to_string()), now_ms)
+    }
+
+    /// Drop nonces that can no longer be replayed anyway.
+    ///
+    /// A proof outside the freshness window is refused before the nonce is ever
+    /// consulted, so remembering it past that point protects nothing and only
+    /// grows the map.
+    fn forget_stale_device_nonces(&mut self, now_ms: u64) {
+        self.device_auth_nonces
+            .retain(|_, seen_at| now_ms.saturating_sub(*seen_at) <= DEVICE_AUTH_WINDOW_MS);
     }
 
     /// Remove a device from the account entirely.

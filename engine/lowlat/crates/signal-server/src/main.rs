@@ -1323,6 +1323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/auth/register", post(register_account))
         .route("/v1/auth/login", post(login_account))
         .route("/v1/auth/refresh", post(refresh_account))
+        .route("/v1/auth/device", post(authenticate_device))
         .merge(device_routes())
         .route(
             "/v1/presence",
@@ -2045,6 +2046,73 @@ struct EnrolledDevice {
     /// Hex, and present only on the enrolment that created the device.
     #[serde(skip_serializing_if = "Option::is_none")]
     grant_key: Option<String>,
+}
+
+/// What a device sends to prove it is itself.
+///
+/// Hex for the two binary fields, matching how every other key and grant
+/// crosses this API.
+#[derive(Deserialize)]
+struct DeviceAuthRequest {
+    device_id: String,
+    issued_at_ms: u64,
+    nonce: String,
+    signature: String,
+}
+
+/// Exchange a device-identity proof for a device-bound access token.
+///
+/// The endpoint that makes headless hosting possible. Presence, and everything
+/// that follows it, needs a token bound to a device (`connect_principal`
+/// refuses a principal without one), and the only other way to get one is a
+/// password sign-in. A machine service that faces the network must not hold an
+/// account password, so it proves possession of the identity key it enrolled
+/// with instead -- the private half of which stays in the operating system's
+/// custody and never crosses this API in any direction.
+///
+/// Every failure answers the same way. Which device ids exist, which keys are
+/// enrolled and whether a nonce has been used are all things this must not
+/// disclose to an unauthenticated caller.
+async fn authenticate_device(
+    State(state): State<AppState>,
+    Json(request): Json<DeviceAuthRequest>,
+) -> Response {
+    let Some(nonce) = hex_array::<16>(&request.nonce) else {
+        return control_error_response(ControlPlaneError::Unauthorized);
+    };
+    let Some(signature) = hex_array::<64>(&request.signature) else {
+        return control_error_response(ControlPlaneError::Unauthorized);
+    };
+    let mut accounts = state.accounts.lock().await;
+    match accounts.authenticate_device(
+        &request.device_id,
+        request.issued_at_ms,
+        nonce,
+        signature,
+        control_plane::now_ms(),
+    ) {
+        // The same body a password sign-in returns, so a caller holds one kind
+        // of credential however it obtained it.
+        Ok(issued) => Json(AccountAuthResponse::from(issued)).into_response(),
+        Err(error) => control_error_response(error),
+    }
+}
+
+/// Decode exactly `N` bytes of hex, or nothing.
+///
+/// Length is part of the check: a short signature is not a signature, and
+/// accepting one would hand a malformed proof to the verifier to reason about.
+fn hex_array<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let text = text.trim();
+    if text.len() != N * 2 {
+        return None;
+    }
+    let mut bytes = [0_u8; N];
+    for (index, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(pair).ok()?;
+        bytes[index] = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(bytes)
 }
 
 /// The device-management routes, in one place.
@@ -4868,16 +4936,16 @@ mod tests {
         RELAY_BYTES_PER_SECOND, RELAY_PACKETS_PER_SECOND, RateWindow, ReadinessError,
         RegistrationAuthorization, RelaySlot, Role, SESSION_CREATE_WINDOW, Session,
         SessionOwnership, SourceLimiter, admin_allowed,
-        admit_primary_socket as admit_primary_socket_with_cancel, authorize_registration,
-        authorized, bearer_token, cleanup_primary_socket, close_primary_pair, connect_approve,
-        connect_deny, connect_observe, connect_offline, connect_pending, connect_presence,
-        connect_request, consume_dual_budget, create_session, device_routes, direct_message_route,
-        dispatch_generic_message, healthz, is_private_lan_address, login_account,
-        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
-        queue_pending, reap_expired_sessions, register_account, registration_capability,
-        relay_owner_for_ticket, relay_ticket, request_source, revoke_owned_sessions,
-        sessions_owned_by, signal_socket, supplied_token_is_host, validate_signal_message,
-        validate_startup_auth, version_info,
+        admit_primary_socket as admit_primary_socket_with_cancel, authenticate_device,
+        authorize_registration, authorized, bearer_token, cleanup_primary_socket,
+        close_primary_pair, connect_approve, connect_deny, connect_observe, connect_offline,
+        connect_pending, connect_presence, connect_request, consume_dual_budget, create_session,
+        device_routes, direct_message_route, dispatch_generic_message, healthz,
+        is_private_lan_address, login_account, max_guests_for_new_session,
+        prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
+        register_account, registration_capability, relay_owner_for_ticket, relay_ticket,
+        request_source, revoke_owned_sessions, sessions_owned_by, signal_socket,
+        supplied_token_is_host, validate_signal_message, validate_startup_auth, version_info,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -7652,6 +7720,7 @@ mod tests {
             .route("/v1/auth/registration", get(registration_capability))
             .route("/v1/auth/register", post(register_account))
             .route("/v1/auth/login", post(login_account))
+            .route("/v1/auth/device", post(authenticate_device))
             // The real device routes, not a copy of them.
             .merge(device_routes())
             .route(
@@ -8387,6 +8456,167 @@ mod tests {
     /// class that never reached the host to be granted, or never reached each
     /// end to be enforced, is a permission the product cannot honour -- so this
     /// round trip is the foundation enforcement sits on.
+    /// A headless machine authenticates with the key it enrolled with, and
+    /// then can announce presence.
+    ///
+    /// This is the gap that kept machine-level hosting out of the product.
+    /// `/v1/presence` needs a device-bound token, the only other way to get one
+    /// is a password sign-in, and a service facing the network must not hold an
+    /// account password. The test goes the whole way -- enrol, authenticate,
+    /// trust, announce -- because each step alone proves nothing about the one
+    /// after it.
+    #[tokio::test]
+    async fn a_device_authenticates_with_its_identity_key_and_can_announce_presence() {
+        use openstream_protocol::IdentityKey;
+
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (owner_token, _) = register_with_device(&app, "operator", "device-owner", 0x81).await;
+
+        // The machine generates its own key and enrols the public half. The
+        // private half never leaves it, and never appears in this test's
+        // requests.
+        let machine = IdentityKey::generate().expect("identity");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&owner_token),
+            Some(serde_json::json!({
+                "device_id": "machine-headless",
+                "name": "Studio",
+                "platform": "linux",
+                "public_key": hex::encode(machine.public_key()),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "enrol: {body}");
+
+        let proof = |issued_at_ms: u64, nonce: [u8; 16]| {
+            let signature = machine
+                .sign_device_auth("machine-headless", issued_at_ms, nonce)
+                .expect("sign");
+            serde_json::json!({
+                "device_id": "machine-headless",
+                "issued_at_ms": issued_at_ms,
+                "nonce": hex::encode(nonce),
+                "signature": hex::encode(signature),
+            })
+        };
+
+        let now = super::control_plane::now_ms();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(proof(now, [1; 16])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "device authentication: {body}");
+        let machine_token = body["access_token"]
+            .as_str()
+            .expect("an access token")
+            .to_string();
+        assert_eq!(
+            body["device"]["device_id"], "machine-headless",
+            "the token must be bound to the device that proved itself: {body}"
+        );
+
+        // Replaying the exact proof is refused even though it is still fresh.
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(proof(now, [1; 16])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a captured proof must work once, not until it expires"
+        );
+
+        // A proof from a different key for the same device id is refused.
+        let impostor = IdentityKey::generate().expect("identity");
+        let forged = impostor
+            .sign_device_auth("machine-headless", now, [2; 16])
+            .expect("sign");
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(serde_json::json!({
+                "device_id": "machine-headless",
+                "issued_at_ms": now,
+                "nonce": hex::encode([2_u8; 16]),
+                "signature": hex::encode(forged),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "any key must not do");
+
+        // A proof from outside the freshness window is refused.
+        let stale = now.saturating_sub(10 * 60 * 1000);
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(proof(stale, [3; 16])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a stale proof must expire"
+        );
+
+        // The token authenticates, but a pending device may not host: it can
+        // say who it is and nothing more until its owner trusts it.
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&machine_token), None).await;
+        assert_ne!(
+            status,
+            StatusCode::NO_CONTENT,
+            "an untrusted device announced itself as connectable"
+        );
+
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            "/v1/devices/machine-headless/trust",
+            Some(&owner_token),
+            Some(serde_json::json!({ "trust": "trusted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "trust: {body}");
+
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&machine_token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "a trusted device that proved its identity must be able to host"
+        );
+
+        // And the owner sees it as online, which is the point of the whole
+        // chain: a machine nobody can see is a machine nobody can connect to.
+        let (status, body) = call(&app, "GET", "/v1/devices", Some(&owner_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let listed = body
+            .as_array()
+            .expect("device list")
+            .iter()
+            .find(|device| device["device_id"] == "machine-headless")
+            .expect("the enrolled machine is listed");
+        assert_eq!(
+            listed["online"],
+            serde_json::json!(true),
+            "presence did not reach the owner's device list: {body}"
+        );
+    }
+
     /// Removing a device is what makes a lost grant key recoverable.
     ///
     /// The key is returned by exactly one request -- the enrolment that creates
