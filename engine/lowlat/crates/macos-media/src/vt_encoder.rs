@@ -35,7 +35,9 @@ type VtCompressionSessionRef = *mut c_void;
 type CmSampleBufferRef = *mut c_void;
 type CmBlockBufferRef = *mut c_void;
 type CmFormatDescriptionRef = *mut c_void;
-type CvImageBufferRef = *mut c_void;
+/// A `CVPixelBufferRef`. Public because [`VideoToolboxH264Encoder::encode_surface`]
+/// takes one: a caller with a capture surface has to be able to name the type.
+pub type CvImageBufferRef = *mut c_void;
 type CfAllocatorRef = *const c_void;
 type CfArrayRef = *const c_void;
 
@@ -403,6 +405,51 @@ impl VideoToolboxH264Encoder {
             });
         }
         let pixel_buffer = self.make_pixel_buffer(bgra)?;
+        let result = self.submit(pixel_buffer, presentation_time_us);
+        // SAFETY: created by CVPixelBufferCreate just above; released once,
+        // here, whether or not the submit succeeded.
+        unsafe { CFRelease(pixel_buffer.cast()) };
+        result
+    }
+
+    /// Encode a frame the caller already holds as a `CVPixelBuffer`, without
+    /// copying its pixels.
+    ///
+    /// This is the path a capture source that hands back IOSurface-backed
+    /// buffers -- ScreenCaptureKit, or a GPU decoder -- should take.
+    /// [`encode`](Self::encode) has to allocate a pixel buffer and copy several
+    /// megabytes into it row by row before VideoToolbox sees anything; here the
+    /// buffer the capture produced goes straight to the hardware.
+    ///
+    /// # Safety
+    ///
+    /// `pixel_buffer` must be a valid `CVPixelBufferRef` that stays alive for
+    /// the duration of the call. Ownership is *not* taken: the caller releases
+    /// it as before. Its pixel format and dimensions must match what the
+    /// session was created with; VideoToolbox rejects a mismatch with a status
+    /// rather than misreading memory, so a wrong buffer is an error, not
+    /// undefined behaviour -- but a dangling one is.
+    pub unsafe fn encode_surface(
+        &mut self,
+        pixel_buffer: CvImageBufferRef,
+        presentation_time_us: i64,
+    ) -> Result<Vec<EncodedAccessUnit>, VtEncError> {
+        if pixel_buffer.is_null() {
+            return Err(VtEncError::Status("encode_surface: null pixel buffer", -1));
+        }
+        self.submit(pixel_buffer, presentation_time_us)
+    }
+
+    /// Hand one pixel buffer to the session. Shared by both entry points so a
+    /// keyframe forced before either one is honoured identically, and so the
+    /// two paths cannot drift on timestamps or property handling.
+    ///
+    /// Does not release `pixel_buffer`: whoever created it decides that.
+    fn submit(
+        &mut self,
+        pixel_buffer: CvImageBufferRef,
+        presentation_time_us: i64,
+    ) -> Result<Vec<EncodedAccessUnit>, VtEncError> {
         let force = std::mem::take(&mut self.force_keyframe);
         let frame_properties = force.then(force_keyframe_dictionary);
         let frame_properties_ref = frame_properties
@@ -422,8 +469,6 @@ impl VideoToolboxH264Encoder {
                 std::ptr::null_mut(),
             )
         };
-        // SAFETY: created by CVPixelBufferCreate; released once, here.
-        unsafe { CFRelease(pixel_buffer.cast()) };
         if status != 0 {
             return Err(VtEncError::Status(
                 "VTCompressionSessionEncodeFrame",
@@ -677,6 +722,33 @@ mod tests {
         pixels
     }
 
+    /// Split an Annex-B stream into NALs, dropping SEI (type 6).
+    ///
+    /// Only 4-byte start codes appear here: the encoder's AVCC-to-Annex-B
+    /// conversion writes those exclusively.
+    fn without_sei(stream: &[u8]) -> Vec<Vec<u8>> {
+        let mut starts = Vec::new();
+        let mut index = 0;
+        while index + 4 <= stream.len() {
+            if stream[index..index + 4] == [0, 0, 0, 1] {
+                starts.push(index + 4);
+                index += 4;
+            } else {
+                index += 1;
+            }
+        }
+        let mut nals = Vec::new();
+        for (position, &start) in starts.iter().enumerate() {
+            let end = starts
+                .get(position + 1)
+                .map_or(stream.len(), |next| next - 4);
+            if start < end && stream[start] & 0x1f != 6 {
+                nals.push(stream[start..end].to_vec());
+            }
+        }
+        nals
+    }
+
     fn has_nal(stream: &[u8], types: &[u8]) -> bool {
         let mut i = 0;
         while i + 4 < stream.len() {
@@ -704,6 +776,94 @@ mod tests {
     #[test]
     fn avcc_conversion_rejects_a_truncated_length() {
         assert!(avcc_to_annexb(&[0, 0, 0, 9, 0x67]).is_none());
+    }
+
+    /// A caller-owned surface must encode to exactly what the copying path
+    /// produces, and must still be the caller's to release afterwards.
+    ///
+    /// Byte equality is the strong form of the claim on purpose: the host is
+    /// about to stop copying capture buffers and hand VideoToolbox the
+    /// IOSurface it was given, and "the stream looks similar" would not rule
+    /// out a subtly different picture reaching the wire. Two fresh sessions
+    /// with identical settings, fed identical frames, differ only in how the
+    /// pixels arrived.
+    ///
+    /// The release at the end is part of the test: `encode_surface` documents
+    /// that it does not take ownership, and if it did release the buffer this
+    /// would be a double free.
+    #[test]
+    fn encoding_from_a_caller_owned_surface_matches_the_copying_path() {
+        let make = || VideoToolboxH264Encoder::new(WIDTH, HEIGHT, 30, 4_000_000);
+        let (mut copying, mut from_surface) = match (make(), make()) {
+            (Ok(first), Ok(second)) => (first, second),
+            (first, second) => {
+                let error = first.err().or(second.err()).expect("one of them failed");
+                if std::env::var_os("OPENSTREAM_REQUIRE_VT_TEST").is_some() {
+                    panic!("VideoToolbox encoder required but unavailable: {error}");
+                }
+                eprintln!("skipping VideoToolbox surface-encode test: unavailable ({error})");
+                return;
+            }
+        };
+
+        let mut copied_stream = Vec::new();
+        let mut surface_stream = Vec::new();
+        for n in 0..10u8 {
+            let pts = i64::from(n) * 33_333;
+            let pixels = frame(n);
+
+            for unit in copying.encode(&pixels, pts).expect("encode by copy") {
+                copied_stream.extend_from_slice(&unit.data);
+            }
+
+            let buffer = from_surface
+                .make_pixel_buffer(&pixels)
+                .expect("build a pixel buffer");
+            // SAFETY: `buffer` was just created, is the session's format and
+            // size, and is alive across the call.
+            let units = unsafe { from_surface.encode_surface(buffer, pts) };
+            let units = units.expect("encode from surface");
+            for unit in units {
+                surface_stream.extend_from_slice(&unit.data);
+            }
+            // SAFETY: we still own it -- `encode_surface` takes no ownership.
+            unsafe { CFRelease(buffer.cast()) };
+        }
+        for unit in copying.flush().expect("flush") {
+            copied_stream.extend_from_slice(&unit.data);
+        }
+        for unit in from_surface.flush().expect("flush") {
+            surface_stream.extend_from_slice(&unit.data);
+        }
+
+        assert!(
+            !surface_stream.is_empty(),
+            "the surface path produced no output"
+        );
+        // SEI NALs are excluded: VideoToolbox stamps each session's SEI with
+        // per-session identifiers, so two sessions never agree on them, and
+        // they carry no picture. Everything that does -- the parameter sets
+        // and every coded slice -- must match byte for byte.
+        assert_eq!(
+            without_sei(&surface_stream),
+            without_sei(&copied_stream),
+            "the surface path must encode the same picture as the copying path"
+        );
+    }
+
+    /// A null surface is rejected, not dereferenced. The capture source is
+    /// about to hand these in from an Objective-C callback, where a missing
+    /// image buffer is an ordinary runtime outcome rather than a bug.
+    #[test]
+    fn a_null_surface_is_an_error_not_a_crash() {
+        let Ok(mut encoder) = VideoToolboxH264Encoder::new(WIDTH, HEIGHT, 30, 4_000_000) else {
+            eprintln!("skipping: VideoToolbox encoder unavailable");
+            return;
+        };
+        // SAFETY: null is the case under test; the function must check it
+        // before any dereference.
+        let result = unsafe { encoder.encode_surface(std::ptr::null_mut(), 0) };
+        assert!(result.is_err(), "a null surface must not be submitted");
     }
 
     #[test]
