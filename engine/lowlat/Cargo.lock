@@ -1924,7 +1924,9 @@ dependencies = [
 name = "openstream-host-ipc"
 version = "0.1.0"
 dependencies = [
+ "hmac",
  "libc",
+ "sha2",
  "tokio",
 ]
 
