@@ -743,10 +743,18 @@ mod tests {
 /// closed it would close a descriptor the driver still holds.
 pub struct External {
     handle: crate::ffi::cuda::CUexternalMemory,
-    // Debug is by hand: the two function pointers have no useful rendering and
-    // the handle is an address that means nothing outside the runtime.
+    // Debug is by hand: the function pointers have no useful rendering and the
+    // handle is an address that means nothing outside the runtime.
     destroy: DestroyExternalMemory,
     map: ExternalMemoryGetMappedBuffer,
+    /// Frees the buffers mapped out of this import. A mapping outlives neither
+    /// the import nor the free below.
+    free: MemFree,
+    /// Every buffer [`External::plane`] mapped, freed before the import is
+    /// destroyed. `cuExternalMemoryGetMappedBuffer` hands back a device
+    /// allocation that `cuDestroyExternalMemory` does not release, so leaving
+    /// it unfreed leaks one device buffer per session.
+    mapped: Vec<CUdeviceptr>,
 }
 
 impl core::fmt::Debug for External {
@@ -766,7 +774,7 @@ impl External {
     /// A frame laid out for this encoder puts its colour plane exactly one luma
     /// plane in, and the pitch is the same for both, which is the single figure
     /// registration is given.
-    pub fn plane(&self, offset: u64, size: u64, pitch: usize) -> Result<Plane> {
+    pub fn plane(&mut self, offset: u64, size: u64, pitch: usize) -> Result<Plane> {
         let mut descriptor =
             unsafe { core::mem::zeroed::<crate::ffi::cuda::CUDA_EXTERNAL_MEMORY_BUFFER_DESC>() };
         descriptor.offset = offset;
@@ -776,6 +784,8 @@ impl External {
         // SAFETY: the descriptor is live for the call and the import is this
         // runtime's.
         check(unsafe { (self.map)(&raw mut ptr, self.handle, &raw const descriptor) })?;
+        // Owned by the import so it is freed before the import is destroyed.
+        self.mapped.push(ptr);
         Ok(Plane { ptr, pitch })
     }
 }
@@ -784,8 +794,13 @@ impl Drop for External {
     fn drop(&mut self) {
         // SAFETY: imported by this runtime and not released twice. Any address
         // taken from it is invalid afterwards, which is why a plane borrows the
-        // import rather than outliving it.
+        // import rather than outliving it. The mapped buffers are freed first:
+        // `cuDestroyExternalMemory` does not release them, and destroying the
+        // import while a mapping is live is the wrong order.
         unsafe {
+            for ptr in self.mapped.drain(..) {
+                let _ = (self.free)(ptr);
+            }
             let _ = (self.destroy)(self.handle);
         }
     }
@@ -839,6 +854,8 @@ impl Cuda {
             handle,
             destroy: self.destroy_external_memory,
             map: self.external_memory_get_mapped_buffer,
+            free: self.mem_free,
+            mapped: Vec::new(),
         })
     }
 }
