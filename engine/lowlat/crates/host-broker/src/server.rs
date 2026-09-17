@@ -23,7 +23,7 @@ use tokio::net::UnixListener;
 
 use crate::capture::NativeFrameSource;
 use crate::inject::NativeInputSink;
-use crate::session::{BrokerPolicy, serve_connection};
+use crate::session::{BrokerPolicy, GrantAuthority, serve_connection};
 
 /// The default socket path for the broker under the system runtime directory.
 pub const DEFAULT_SOCKET: &str = "/run/openstream/broker.sock";
@@ -34,6 +34,9 @@ pub struct BrokerServer {
     socket_path: PathBuf,
     allowed: AllowedPeers,
     policy: BrokerPolicy,
+    /// Who may say a session was approved. Cloned into each connection, so a
+    /// long-lived server serves every connection against the same pinned key.
+    authority: GrantAuthority,
     /// If set, the socket's group is set to this gid so the unprivileged
     /// machine-service account (a member of that group) can reach a root-owned
     /// socket. `SO_PEERCRED` is still the real gate; this only opens the door to
@@ -49,11 +52,13 @@ impl BrokerServer {
         socket_path: impl Into<PathBuf>,
         allowed: AllowedPeers,
         policy: BrokerPolicy,
+        authority: GrantAuthority,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
             allowed,
             policy,
+            authority,
             socket_gid: None,
         }
     }
@@ -108,6 +113,7 @@ impl BrokerServer {
                 &mut writer,
                 peer,
                 self.policy,
+                self.authority.clone(),
                 &mut frames,
                 &mut input,
             )
