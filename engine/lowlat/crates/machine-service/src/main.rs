@@ -86,6 +86,38 @@ mod linux {
         }
     }
 
+    /// The session approval to relay to the broker.
+    ///
+    /// `OPENSTREAM_SESSION_APPROVAL` carries it as hex until the control plane
+    /// delivers one with the Secure Connect approval. Absent or malformed
+    /// means no approval, and the broker then refuses the session -- there is
+    /// deliberately no path here that produces a grant, because a service that
+    /// could produce one would defeat the point of having it.
+    fn load_approval() -> Vec<u8> {
+        let Ok(hex) = std::env::var("OPENSTREAM_SESSION_APPROVAL") else {
+            return Vec::new();
+        };
+        let hex = hex.trim();
+        if hex.is_empty() || hex.len() % 2 != 0 {
+            eprintln!("machine-service: OPENSTREAM_SESSION_APPROVAL is not valid hex; ignoring");
+            return Vec::new();
+        }
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks_exact(2) {
+            let Ok(text) = std::str::from_utf8(pair) else {
+                return Vec::new();
+            };
+            let Ok(byte) = u8::from_str_radix(text, 16) else {
+                eprintln!(
+                    "machine-service: OPENSTREAM_SESSION_APPROVAL is not valid hex; ignoring"
+                );
+                return Vec::new();
+            };
+            bytes.push(byte);
+        }
+        bytes
+    }
+
     pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         use std::net::SocketAddr;
 
@@ -145,8 +177,13 @@ mod linux {
         let mbps = configured_mbps();
         let mut capture = CaptureContext {
             requested,
-            // Zero asks the broker to issue a grant. It is replaced by the one
-            // the broker mints, on the first CaptureStarted.
+            // The approval this session was opened under. Read from the
+            // environment for now; the control plane will deliver it with the
+            // Secure Connect approval, and until then the broker refuses the
+            // session, which is correct rather than convenient.
+            approval: load_approval(),
+            // Zero asks the broker to issue a capability. It is replaced by
+            // the one the broker mints, on the first CaptureStarted.
             grant: openstream_host_ipc::token::NO_GRANT,
             width: negotiated.width,
             height: negotiated.height,
@@ -272,7 +309,16 @@ mod linux {
         height: u16,
         fps: u8,
         bitrate_kbps: u32,
-        /// The grant the broker issued, echoed back on every later request.
+        /// The control plane's approval for this session, relayed verbatim.
+        ///
+        /// This service cannot produce one: the tag is keyed by a secret only
+        /// the broker's user can read. It carries what it was given, and the
+        /// broker decides. Empty until the control-plane issuance exists, and
+        /// an empty approval is refused -- which is the intended posture, and
+        /// is why the pre-login path is not packaged yet.
+        approval: Vec<u8>,
+        /// The capability id the broker issued, echoed back on every later
+        /// request.
         ///
         /// This service does not and cannot mint one: it used to build an id
         /// from the clock and its own pid, which the broker then ignored, so
@@ -295,6 +341,7 @@ mod linux {
             let request = match action {
                 Action::StartCapture(seat, kind) => ServiceRequest::OpenCapture {
                     token_id: capture.grant,
+                    grant: capture.approval.clone(),
                     requested: capture.requested,
                     params: CaptureParams {
                         seat,

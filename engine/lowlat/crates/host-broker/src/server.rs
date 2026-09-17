@@ -23,7 +23,7 @@ use tokio::net::UnixListener;
 
 use crate::capture::NativeFrameSource;
 use crate::inject::NativeInputSink;
-use crate::session::{BrokerPolicy, serve_connection};
+use crate::session::{BrokerPolicy, GrantAuthority, serve_connection};
 
 /// The default socket path for the broker under the system runtime directory.
 pub const DEFAULT_SOCKET: &str = "/run/openstream/broker.sock";
@@ -49,11 +49,13 @@ impl BrokerServer {
         socket_path: impl Into<PathBuf>,
         allowed: AllowedPeers,
         policy: BrokerPolicy,
+        authority: GrantAuthority,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
             allowed,
             policy,
+            authority,
             socket_gid: None,
         }
     }
@@ -108,6 +110,7 @@ impl BrokerServer {
                 &mut writer,
                 peer,
                 self.policy,
+                self.authority.clone(),
                 &mut frames,
                 &mut input,
             )

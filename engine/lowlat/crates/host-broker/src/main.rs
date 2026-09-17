@@ -38,7 +38,7 @@ async fn main() -> std::process::ExitCode {
 #[cfg(target_os = "linux")]
 async fn run() -> std::io::Result<()> {
     use openstream_host_broker::server::{BrokerServer, DEFAULT_SOCKET};
-    use openstream_host_broker::session::BrokerPolicy;
+    use openstream_host_broker::session::{BrokerPolicy, GrantAuthority};
     use openstream_host_ipc::peercred::AllowedPeers;
 
     let socket =
@@ -78,7 +78,35 @@ async fn run() -> std::io::Result<()> {
         ceiling,
         ..BrokerPolicy::default()
     };
-    let mut server = BrokerServer::new(socket, allowed, policy);
+    // Who may say a session was approved.
+    //
+    // The key is read from a file, not from the environment: an environment
+    // variable is visible in /proc to anyone who can read the process's
+    // environ, and the whole point of this secret is that the unprivileged
+    // machine service cannot obtain it. The file should be mode 0600 and owned
+    // by the broker's user; the broker refuses to use one that anybody else
+    // can read, because a secret the service can read is not a boundary.
+    let authority = match std::env::var("OPENSTREAM_BROKER_GRANT_KEY_FILE") {
+        Ok(path) => {
+            let key = read_grant_key(&path)?;
+            let device_id = std::env::var("OPENSTREAM_BROKER_DEVICE_ID").map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "OPENSTREAM_BROKER_GRANT_KEY_FILE is set but OPENSTREAM_BROKER_DEVICE_ID is not; \
+                     a grant names the device it was issued for and the broker has to know which it is",
+                )
+            })?;
+            eprintln!("openstream-host-broker: verifying approvals for device {device_id}");
+            GrantAuthority::new(key, device_id)
+        }
+        Err(_) => {
+            eprintln!(
+                "openstream-host-broker: no grant key configured; every session will be refused"
+            );
+            GrantAuthority::unconfigured()
+        }
+    };
+    let mut server = BrokerServer::new(socket, allowed, policy, authority);
     // Optionally hand the socket to the machine-service group so it can connect
     // unprivileged (SO_PEERCRED still gates who is served).
     if let Ok(value) = std::env::var("OPENSTREAM_BROKER_SOCKET_GID") {
@@ -91,6 +119,46 @@ async fn run() -> std::io::Result<()> {
         server = server.with_socket_group(gid);
     }
     server.run().await
+}
+
+/// Read the grant key, refusing one anybody else can read.
+///
+/// A secret the machine service can read is not a boundary: it could then tag
+/// a grant naming any session and any permissions, which is exactly what this
+/// key exists to prevent. Permissions are checked rather than assumed, because
+/// the failure is silent -- a world-readable key file works perfectly until
+/// someone looks.
+#[cfg(target_os = "linux")]
+fn read_grant_key(path: &str) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path)?;
+    let mode = metadata.permissions().mode() & 0o077;
+    if mode != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{path} is readable or writable beyond its owner (mode {:o}); \
+                 a grant key the machine service can read is not a boundary",
+                metadata.permissions().mode() & 0o777
+            ),
+        ));
+    }
+    let key = std::fs::read(path)?;
+    // Trailing newlines are what an editor or `echo` leaves behind, and a key
+    // that differs from the control plane's by one byte fails every grant with
+    // no clue why.
+    let trimmed = key
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(&key[..0], |last| &key[..=last]);
+    if trimmed.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{path} is empty"),
+        ));
+    }
+    Ok(trimmed.to_vec())
 }
 
 #[cfg(not(target_os = "linux"))]
