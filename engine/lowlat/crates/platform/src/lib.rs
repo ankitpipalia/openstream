@@ -1,11 +1,21 @@
 //! Compile-time platform boundary shared by desktop and mobile front ends.
 //!
-//! This crate reports capability policy; it does not grant any OS privilege.
+//! This crate reports capability *policy*; it does not grant any OS privilege.
 //! The host daemon still has to open the display, capture, encoder, audio, and
 //! input devices explicitly. Keeping this report independent of those SDKs
 //! lets the protocol/client crates build for Windows, macOS, Linux, Android,
 //! and iOS before each native adapter is linked.
+//!
+//! "Policy" means *which platforms have an implementation*, decided at compile
+//! time -- not whether a given machine's hardware is present and working. The
+//! runtime, per-device truth (does this box actually have a usable capture and
+//! encoder right now?) lives in the `openstream-capability` crate, whose
+//! [`host_capable`](../openstream_capability/fn.host_capable.html) inspects
+//! probed device records. `host_capable()` here answering `true` means only
+//! that this build *could* host; the capability registry decides whether it
+//! *does*.
 
+pub mod capability_bridge;
 pub mod clipboard;
 pub mod clipboard_policy;
 pub mod host_heartbeat;
@@ -84,11 +94,19 @@ const fn architecture() -> &'static str {
 }
 
 const fn host_capable() -> bool {
-    cfg!(any(
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "macos"
-    ))
+    // Whether a *host implementation exists* for this platform -- compile-time
+    // policy, not a promise that a given machine's capture/encode hardware is
+    // present and working. That runtime question is answered by
+    // `openstream_capability::host_capable` against probed per-device records.
+    //
+    // A host session is driven by the host agent, which refuses to start off
+    // Unix (`#[cfg(not(unix))] fn main` exits in host-agent and ffmpeg-host).
+    // Windows therefore has no host path yet and must not claim host
+    // capability even though it is a desktop OS -- reporting Windows as
+    // host-capable was the pre-1.1 lie this corrects. Linux and macOS both run
+    // the Unix host agent and have a real ffmpeg-host capture backend, so they
+    // keep host policy; Android and iOS are excluded as before.
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }
 
 const fn client_capable() -> bool {
@@ -142,11 +160,23 @@ mod tests {
     }
 
     #[test]
-    fn desktop_targets_have_host_policy_and_mobile_targets_do_not() {
+    fn only_platforms_with_a_host_implementation_have_host_policy() {
         let capabilities = current();
-        if matches!(capabilities.operating_system, "linux" | "windows" | "macos") {
+        // Linux and macOS run the Unix host agent and have an ffmpeg-host
+        // capture backend, so they carry host policy.
+        if matches!(capabilities.operating_system, "linux" | "macos") {
             assert!(capabilities.host_capable);
         }
+        // Windows is a desktop OS but has no host path yet: the host agent
+        // refuses to start off Unix. It must report client-only, not host.
+        if capabilities.operating_system == "windows" {
+            assert!(
+                !capabilities.host_capable,
+                "Windows has no host backend and must not claim host capability"
+            );
+            assert!(capabilities.client_capable);
+        }
+        // Mobile targets are client-only as before.
         if matches!(capabilities.operating_system, "android" | "ios") {
             assert!(!capabilities.host_capable);
             assert!(capabilities.client_capable);

@@ -2812,6 +2812,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-capability"
+version = "0.1.0"
+
+[[package]]
 name = "openstream-client-core"
 version = "0.1.0"
 dependencies = [
@@ -2889,6 +2893,7 @@ name = "openstream-platform"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "openstream-capability",
  "windows-sys 0.59.0",
 ]
 

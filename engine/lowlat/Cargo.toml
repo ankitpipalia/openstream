@@ -20,6 +20,7 @@ members = [
     "crates/reference-peer",
     "crates/ffmpeg-host",
     "crates/platform",
+    "crates/capability",
     "crates/media",
     "crates/windows-media",
     "crates/windows-host",
@@ -63,6 +64,7 @@ lowlat-inject = { path = "crates/inject" }
 lowlat-host = { path = "crates/host" }
 lowlat-kessel = { path = "crates/kessel" }
 openstream-transport-policy = { path = "crates/transport-policy" }
+openstream-capability = { path = "crates/capability" }
 openstream-windows-media = { path = "crates/windows-media" }
 openstream-windows-host = { path = "crates/windows-host" }
 openstream-host-ipc = { path = "crates/host-ipc" }
