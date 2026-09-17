@@ -302,7 +302,10 @@ mod linux {
 
     /// The fixed capture parameters negotiated with the peer, used to fill in an
     /// `OpenCapture` whenever the lifecycle asks to (re)start capture.
-    #[derive(Debug, Clone, Copy)]
+    // Not `Copy`: the approval is a `Vec<u8>` now, and a context that copied
+    // itself implicitly would duplicate it at every call site that takes one
+    // by value.
+    #[derive(Debug, Clone)]
     struct CaptureContext {
         requested: BrokerCaps,
         width: u16,
