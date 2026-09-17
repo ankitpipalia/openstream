@@ -389,12 +389,19 @@ jobs:
       # once. Nothing is skipped relative to the per-target jobs this replaces:
       # the same commands run for the same targets, sharing one checkout, one
       # toolchain and one `target/` directory.
+      #
+      # Each loop records failures and continues, then fails the step with the
+      # list. Without that, `bash -e` ends the step on the first bad target and
+      # the rest of the OS's targets never run -- which is the fail-fast the
+      # matrix sets `fail-fast: false` to avoid, reintroduced one level down.
+      # The point of a red run is to learn everything that is broken.
       - name: Check portable target subset
         shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: |
+          failed=""
           for target in ${{ matrix.targets }}; do
             echo "::group::portable subset for $target"
             cargo check --locked --target "$target" \
@@ -404,9 +411,13 @@ jobs:
               -p openstream-platform \
               -p openstream-client-core \
               -p openstream-mobile-ffi \
-              -p openstream-host-agent
+              -p openstream-host-agent || failed="$failed $target"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::portable subset failed for:$failed"
+            exit 1
+          fi
       # `openstream-ffmpeg-host` and `openstream-linux-host` are not checked
       # separately: the release builds below compile and link both, for the
       # same target. The portable subset above stays, because those crates are
@@ -418,14 +429,19 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: |
+          failed=""
           for target in ${{ matrix.host_targets }}; do
             echo "::group::desktop release for $target"
             cargo build --locked --release --target "$target" \
               -p openstream-ffmpeg-host \
               -p openstream-client \
-              -p openstream-signal-server
+              -p openstream-signal-server || failed="$failed $target"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::desktop release failed for:$failed"
+            exit 1
+          fi
       - name: Build OpenStream Linux host release artifact
         if: matrix.linux_host
         shell: bash
@@ -437,11 +453,17 @@ jobs:
         if: matrix.mobile_targets != ''
         shell: bash
         run: |
+          failed=""
           for target in ${{ matrix.mobile_targets }}; do
             echo "::group::mobile bridge for $target"
-            cargo build --locked --release --target "$target" -p openstream-mobile-ffi
+            cargo build --locked --release --target "$target" -p openstream-mobile-ffi \
+              || failed="$failed $target"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::mobile bridge failed for:$failed"
+            exit 1
+          fi
 
   openstream-desktop-target-matrix:
     name: OpenStream desktop client (${{ matrix.label }})
@@ -484,11 +506,17 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: |
+          failed=""
           for target in ${{ matrix.targets }}; do
             echo "::group::desktop client for $target"
-            cargo build --locked --release --target "$target" -p openstream-desktop-client
+            cargo build --locked --release --target "$target" -p openstream-desktop-client \
+              || failed="$failed $target"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::desktop client failed for:$failed"
+            exit 1
+          fi
 
   desktop-shell:
     name: OpenStream desktop product shell

@@ -11,6 +11,13 @@ So the expected coverage is written down here and checked on every pull request,
 docs-only ones included. Adding or dropping a target is then a deliberate edit to
 this file rather than something that can happen by accident.
 
+**What this does not check.** It reads the target *lists* the matrix declares --
+`targets`, `host_targets`, `mobile_targets` -- and not whether the build steps
+still loop over them. Deleting the `cargo build` that consumes `mobile_targets`
+leaves this passing. It catches a target disappearing from the matrix, which is
+the likely accident when consolidating jobs; it is not proof that every target
+is still compiled. Only a green run is that.
+
 Parsed with a small hand-rolled scanner rather than PyYAML, because CI should not
 need a Python package installed to check its own configuration.
 """
