@@ -36,6 +36,8 @@ members = [
     "crates/app-core",
     "crates/local-ipc",
     "crates/host-agent",
+    "crates/host-ipc",
+    "crates/host-broker",
     "crates/diagnostics",
     "crates/probe-helper",
 ]
@@ -62,6 +64,8 @@ lowlat-kessel = { path = "crates/kessel" }
 openstream-transport-policy = { path = "crates/transport-policy" }
 openstream-windows-media = { path = "crates/windows-media" }
 openstream-windows-host = { path = "crates/windows-host" }
+openstream-host-ipc = { path = "crates/host-ipc" }
+openstream-host-broker = { path = "crates/host-broker" }
 openstream-macos-media = { path = "crates/macos-media" }
 openstream-macos-host = { path = "crates/macos-host" }
 
