@@ -240,6 +240,12 @@ pub fn write(path: impl AsRef<Path>, key: &[u8]) -> Result<()> {
     // mode is what actually protects the key.
     let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
 
+    // Refuse to install into a directory `read` will later reject. Without
+    // this, a key written somewhere others can write succeeds here and fails
+    // at the far end of the chain, where the only symptom is the broker
+    // refusing every session with nothing pointing at the directory.
+    check_directory_chain(path)?;
+
     let staging = parent.join(format!(".grant-key.{}.new", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -498,6 +504,39 @@ mod tests {
         write(&path, &oversized).expect("write");
         let error = read(&path).expect_err("an oversized key must be refused");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn writing_tightens_a_loose_directory_it_owns_and_the_key_reads_back() {
+        // Installing has to leave a state `read` will accept, or the key lands
+        // cleanly and then makes the broker refuse every session with nothing
+        // naming the directory that caused it.
+        //
+        // A directory this process owns is repaired: 0777 becomes 0700. The
+        // other case -- a directory owned by *someone else*, where the repair
+        // fails and `check_directory_chain` refuses -- cannot be built in a
+        // unit test without root, so what is pinned here is that install and
+        // read agree. The refusing path is the same function the symlink and
+        // world-writable read tests exercise.
+        let dir = TempDir::new("write-loose-dir");
+        let inner = dir.join("keys");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let path = inner.join("grant.key");
+        write(&path, b"secret").expect("write");
+        assert_eq!(
+            std::fs::metadata(&inner)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "the directory must be tightened, or the key is replaceable"
+        );
+        assert_eq!(
+            read(&path).expect("a freshly installed key must read back"),
+            b"secret"
+        );
     }
 
     #[test]
