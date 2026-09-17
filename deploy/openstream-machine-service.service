@@ -1,0 +1,38 @@
+[Unit]
+Description=OpenStream machine service (network-facing peer session, unprivileged)
+Documentation=https://github.com/ankitpipalia/openstream
+After=network-online.target openstream-host-broker.service
+Wants=network-online.target
+Requires=openstream-host-broker.service
+
+[Service]
+Type=simple
+# Unprivileged on purpose: this is the process an attacker can reach over the
+# network, so it holds no device privileges and does not run as root. It reaches
+# capture and input only by asking the root broker over the local socket, which
+# authorises it by SO_PEERCRED. This is the split the design requires -- the
+# whole network-facing host must not run as root.
+User=openstream
+Group=openstream
+ExecStart=/usr/local/bin/openstream-machine-service
+# Pairing/signaling settings (OPENSTREAM_SIGNAL_ORIGIN, the host pairing, STUN)
+# live here, never in this unit.
+EnvironmentFile=/etc/openstream/machine-service.env
+Environment=OPENSTREAM_BROKER_SOCKET=/run/openstream/broker.sock
+Restart=on-failure
+RestartSec=2s
+# Hardening for a network-facing process.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Reaching the broker socket: the broker (running as root) gives the socket to
+# this account's group via OPENSTREAM_BROKER_SOCKET_GID and admits this account's
+# uid via OPENSTREAM_BROKER_SERVICE_UID, so this User=openstream unit connects to
+# the root-owned socket with no elevation. Verified 2026-09-16: a non-root
+# (uid 1000) consumer connected and captured the live session end to end.
+# The installer sets both ids to this account (see the broker unit's env file).
+
+[Install]
+WantedBy=multi-user.target

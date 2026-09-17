@@ -38,6 +38,7 @@ members = [
     "crates/host-agent",
     "crates/host-ipc",
     "crates/host-broker",
+    "crates/machine-service",
     "crates/diagnostics",
     "crates/probe-helper",
 ]

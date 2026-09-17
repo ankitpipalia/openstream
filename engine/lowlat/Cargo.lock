@@ -1957,6 +1957,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-machine-service"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "openstream-client-core",
+ "openstream-host-ipc",
+ "openstream-media",
+ "openstream-platform",
+ "openstream-protocol",
+ "tokio",
+]
+
+[[package]]
 name = "openstream-macos-host"
 version = "0.1.0"
 dependencies = [
