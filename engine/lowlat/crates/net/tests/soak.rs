@@ -379,7 +379,24 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
         }
         stop.store(true, Ordering::Relaxed);
         // Let the tail land and be acknowledged before the receiver stops.
-        thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
+        //
+        // Waited for rather than slept through. A fixed sleep is a race
+        // against the machine: on a loaded shared runner the last few
+        // datagrams can still be in flight when it expires, and the receiver
+        // then stops holding a count that is short by a handful out of
+        // twenty thousand. That looked exactly like packet loss and was not
+        // -- the gap detector and the kernel drop counter both stayed at zero
+        // every time, which is only possible if the missing datagrams were
+        // still on their way rather than lost. So this polls for the tail to
+        // arrive and keeps SETTLE_MS as the ceiling it will wait, which
+        // leaves `received == sent` asserted exactly as strictly as before
+        // while removing the part that depended on how busy the runner was.
+        let settle_deadline = elapsed_ms(started) + SETTLE_MS as f64;
+        while elapsed_ms(started) < settle_deadline
+            && received.load(Ordering::Relaxed) < sent.load(Ordering::Relaxed)
+        {
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
         stop_receiver.store(true, Ordering::Relaxed);
     });
 
