@@ -99,6 +99,12 @@ jobs:
   docs-policy:
     name: documentation policy
     runs-on: ubuntu-latest
+    # The workflow defaults every `run` to engine/lowlat, where none of these
+    # paths exist. Set once for the job rather than per step, so a step added
+    # later cannot silently check nothing.
+    defaults:
+      run:
+        working-directory: .
     steps:
       - uses: actions/checkout@v7
       - name: The classifier's own cases
