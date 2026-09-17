@@ -6,6 +6,11 @@ encrypted UDP transport, bounded video/audio framing, a Linux host adapter,
 cross-platform FFmpeg host/client adapters, desktop input, and client-only
 Android/iOS integration seams.
 
+**Current state: see [`docs/STATUS.md`](docs/STATUS.md).** It records what is
+verified on hardware, what is not and why, and why the release checker
+deliberately reports NOT READY. The source version is `1.0.0` as a packaging
+candidate; 1.0 has not been released.
+
 This project is experimental. It is not a drop-in replacement for Parsec and
 does not claim compatibility with Parsec's proprietary BUD/Kessel protocols or
 services. The OpenStream runtime uses its own versioned protocol and can be

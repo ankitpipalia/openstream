@@ -3,21 +3,21 @@
 This is the execution plan, not a claim that every phase is complete. Each
 phase has a concrete gate and must remain honest about what it verifies.
 
-## Current handoff state — 2026-09-14
+## Current state
 
-The broader production-completion implementation lives in the isolated
-`codex/production-completion` worktree. Its continuation note is
-[`handoff.md`](../handoff.md). What it establishes is a source-verified
-runtime and control-plane foundation, not a complete product: secure remote
-Connect, native VideoToolbox decode, raw mouse capture, WAN/TURN validation,
-packaging and signing all remain incomplete. The tree builds, is clean under
-Clippy `-D warnings`, and passes the workspace, Tauri, frontend and
-local-acceptance suites. Hardware, WAN/TURN, package and signing
-evidence has not been produced, so the release checker correctly still reports
-`NOT READY`. The edits are uncommitted; `origin/main` remains the clean
-baseline, and the worktree is neither merged nor release-ready.
+**See [`STATUS.md`](STATUS.md).** It is the authoritative current-state
+document; this file is the execution plan and its gates.
 
-## Engineering hardening P0 — correctness, security, and liveness
+The section that used to be here described an uncommitted worktree and listed
+Secure Connect, native VideoToolbox decode and raw mouse capture as
+incomplete. All of that has since landed on `main`. Treat the per-item
+checkboxes below as lagging rather than current: several are done and not yet
+ticked, and `STATUS.md` is the record that is kept up to date.
+
+What has not changed is the release posture: the checker still reports NOT
+READY, and the missing evidence is hardware, signing and packaging, not code.
+
+## Engineering hardening P0 -- correctness, security, and liveness
 
 - [x] Replace guest bearer-token management URLs with stable non-secret guest
   identifiers; retain the bearer only in the create response and WebSocket
@@ -39,7 +39,7 @@ suite, clippy with warnings denied, and both local FFmpeg and full-ICE smoke
 paths pass. External coturn, physical NAT, hardware, and stock Parsec
 interoperability remain separate acceptance gates.
 
-## Phase 0 — workspace and evidence
+## Phase 0 -- workspace and evidence
 
 - [x] Preserve the supplied Parsec artifacts as analysis inputs.
 - [x] Record a fact-check separating local evidence, official claims, and
@@ -58,11 +58,11 @@ interoperability remain separate acceptance gates.
 - [x] Add a read-only, repeatable artifact inventory script and analysis index;
   vendor binaries remain evidence inputs and are not runtime dependencies.
 
-Gate: a clean build of the project’s protocol and signaling tests on macOS,
+Gate: a clean build of the project's protocol and signaling tests on macOS,
 Linux, and Windows CI targets. The project-owned portable crates have a
 three-OS CI matrix; the full lowlat engine remains Linux/macOS-runner work.
 
-## Phase 1 — protocol core
+## Phase 1 -- protocol core
 
 - [x] Versioned capability message types and codec/input-limit negotiation.
 - [x] Explicit capability gates for 10-bit, 4:4:4, clipboard, microphone,
@@ -97,7 +97,7 @@ three-OS CI matrix; the full lowlat engine remains Linux/macOS-runner work.
 Gate: deterministic loopback with loss, reordering, duplication, MTU limits,
 and no unbounded memory growth.
 
-## Phase 2 — service and connectivity
+## Phase 2 -- service and connectivity
 
 - [x] REST session/pairing service.
 - [x] WebSocket signaling server with bounded pre-connect and post-connect
@@ -173,7 +173,7 @@ network profile should be evaluated at approximately 30 Mbps host upload,
 30 Mbps client download, and 2 Mbps client upload for 1080p60, while treating
 those figures as acceptance guidance rather than a protocol requirement.
 
-## Phase 3 — Linux host
+## Phase 3 -- Linux host
 
 - [x] Native Linux DRM/KMS scanout capture: output/framebuffer discovery,
   device-buffer export, pointer-plane support, device-side conversion, and
@@ -236,7 +236,7 @@ remain open.
 Gate: Ubuntu 22.04+ host streams a real desktop at 1080p60 for ten minutes
 with bounded latency, audio, pointer, and keyboard input.
 
-## Phase 4 — desktop client
+## Phase 4 -- desktop client
 
 - [x] Shared client core and reusable peer-session establishment.
 - [x] Cross-platform desktop window using FFmpeg decode and shared
@@ -265,7 +265,7 @@ with bounded latency, audio, pointer, and keyboard input.
 Gate: Windows, macOS, and Linux clients connect to the Linux host and to their
 own desktop hosts using the same test service.
 
-## Phase 5 — mobile clients
+## Phase 5 -- mobile clients
 
 - [x] Client-only Rust C ABI bridge with bounded video callback and input queue.
 - [x] Android Gradle client shell with H.264 `MediaCodec`, PCM `AudioTrack`,
@@ -300,7 +300,7 @@ own desktop hosts using the same test service.
 Gate: signed development builds on Android and iOS render a live H.264 stream
 and send pointer/gamepad input without host capability exposure.
 
-## Phase 6 — feature parity
+## Phase 6 -- feature parity
 
 - [x] H.265 capability negotiation and external-FFmpeg host path; hardware
   decoder acceptance rides the FFmpeg BGRA path on desktop clients.
@@ -335,7 +335,7 @@ and send pointer/gamepad input without host capability exposure.
 
 Gate: feature matrix tests plus platform-specific manual acceptance runs.
 
-## Performance phase — transport/media hot path
+## Performance phase -- transport/media hot path
 
 The architecture and feature work above are now ahead of the latency-critical
 implementation. This phase targets the remaining Parsec-class performance gap
@@ -403,8 +403,10 @@ without changing the default OpenStream wire format.
   behavior, generation-isolated late ACKs, bounded queue/backpressure, and
   end-to-end `FrameAck` continuity over a real loopback opaque relay. The
   suite is synthetic/loopback evidence, not external WAN or TURN acceptance.
-- [ ] Add native macOS ScreenCaptureKit → IOSurface/CVPixelBuffer →
+- [x] Add native macOS ScreenCaptureKit -> IOSurface/CVPixelBuffer ->
   VideoToolbox capture/encode, with live VideoToolbox bitrate updates.
+  Physically verified on an M1 Max; see `STATUS.md`. The CoreGraphics poll
+  remains as the fallback and is exercised by the same rig.
 - [ ] Add native Windows capture/encode and decoder-surface presentation;
   prioritize zero-copy surfaces over API-name parity with D3D11.
 - [ ] Add capability-detected Android HEVC decode and benchmark NDK
