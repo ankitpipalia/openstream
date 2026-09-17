@@ -95,6 +95,7 @@ Where it actually stands:
 | Delivery from the pairing file to the machine service and on to the broker | **implemented** -- the service takes the pairing's grant; `OPENSTREAM_SESSION_APPROVAL` is a development override that cannot displace a real one |
 | Provisioning the broker's key without exposing it to the unprivileged service | **implemented** -- written 0600 through a rename; on read the broker requires the file be owned by its own user, be a regular file opened `O_NOFOLLOW`, and sit under directories no one else can write |
 | The enrolment call that obtains the key | **implemented** -- `openstream-enrol` posts to `POST /v1/devices` and writes the key straight to the broker's file, so it never crosses a terminal or a log |
+| Enrolment that cannot strand a machine | **implemented** -- the destination is created and checked before the request that mints the key, and if storing it still fails the device is removed again through `DELETE /v1/devices/{device_id}`. Both are necessary: the key is issued once, and enrolling the same id twice is a conflict, so a key lost between being issued and being written used to leave a machine that could neither be provisioned nor re-enrolled |
 | **A machine actually enrolled, and a session run through the chain** | **not done** -- no machine has a grant key, so every broker refuses every session |
 
 So the chain is joined in source from approval to broker, and tested at every
