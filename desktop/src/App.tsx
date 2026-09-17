@@ -11,6 +11,7 @@ import { AboutPage } from "./pages/AboutPage";
 import { AccessPage } from "./pages/AccessPage";
 import { ComputersPage } from "./pages/ComputersPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
+import { LoginPage } from "./pages/LoginPage";
 import { SettingsPage } from "./pages/SettingsPage";
 
 const defaultAdapter = createDefaultAdapter();
@@ -115,6 +116,16 @@ export function App({ adapter = defaultAdapter, initialPage = "computers" }: App
         .catch(() => {});
     },
   });
+
+  // Login first, like Parsec: when this desktop is configured against a control
+  // plane and is not signed in, the front door is the only thing shown, so a
+  // new user cannot land on an empty Computers list with no way in. Local
+  // development mode needs no account and skips the gate. This branch is after
+  // every hook above, so the hook order never changes with auth state.
+  const localMode = snapshot.access.localMode;
+  if (!localMode && !authenticated) {
+    return <LoginPage snapshot={snapshot} adapter={adapter} onSnapshot={setSnapshot} />;
+  }
 
   return (
     <>

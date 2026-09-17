@@ -6,6 +6,8 @@
 //! headless host adapter, not a settings UI.
 
 #[cfg(target_os = "linux")]
+mod logind;
+#[cfg(target_os = "linux")]
 mod pipewire;
 #[cfg(target_os = "linux")]
 mod x11;
@@ -758,8 +760,26 @@ fn preflight() -> Result<(), Box<dyn std::error::Error>> {
         }),
     };
 
+    // What is on the seat right now -- the greeter before login, or a user's
+    // session after -- so a machine-level host knows which it would capture and
+    // when a login handoff is due. A seat with no logind session (or no logind)
+    // reports `active: false` rather than guessing.
+    let logind = match logind::Seat::default().active() {
+        Some(session) => serde_json::json!({
+            "active": true,
+            "session_id": session.id,
+            "class": format!("{:?}", session.kind),
+            "type": session.session_type,
+            "seat_active": session.active,
+            "remote": session.remote,
+            "capturable_local": session.is_capturable_local(),
+        }),
+        None => serde_json::json!({ "active": false }),
+    };
+
     let report = serde_json::json!({
         "schema": 1,
+        "logind": logind,
         "platform": {
             "os": env::consts::OS,
             "arch": env::consts::ARCH,

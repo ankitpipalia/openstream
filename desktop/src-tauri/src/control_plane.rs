@@ -6,6 +6,7 @@
 //! process for now; a platform secret-provider integration is a separate
 //! release gate, so callers must not treat this as durable credential storage.
 
+use openstream_app_core::PermissionSet;
 use openstream_client_core::{local_device_id, local_identity_public_key};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -78,6 +79,14 @@ pub struct PublicDevice {
     pub enrolled_at_ms: u64,
     pub last_seen_ms: Option<u64>,
     pub public_key_fingerprint: String,
+    /// Whether the control plane currently sees this device announcing
+    /// presence. Advisory: the shell uses it to decide whether to offer a
+    /// connection, and the broker re-checks authoritatively when a session is
+    /// actually requested. Defaulted so a control plane that predates the
+    /// field simply leaves every device reading offline rather than failing to
+    /// parse.
+    #[serde(default)]
+    pub online: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,6 +134,16 @@ struct RefreshRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ConnectRequestBody<'a> {
     target_device_id: &'a str,
+    /// The permission classes the requester is asking the host to grant. The
+    /// host sees these before approving; the broker records them and returns
+    /// the granted subset in the credential.
+    requested: PermissionSet,
+}
+
+/// The body of an approval: the permission classes the host is granting.
+#[derive(Debug, Serialize)]
+struct ConnectApproveBody {
+    granted: PermissionSet,
 }
 
 /// What the service says about a request this device just made.
@@ -141,6 +160,11 @@ pub struct PendingConnectRequest {
     pub request_id: String,
     pub requester_device_id: String,
     pub expires_in_seconds: u64,
+    /// What the requester asked for, so the host can approve against the actual
+    /// request. Defaulted so a control plane that predates permission
+    /// negotiation still parses (the request then carries the empty set).
+    #[serde(default)]
+    pub requested: PermissionSet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -368,10 +392,12 @@ impl ControlPlaneClient {
         expect_no_content(response)
     }
 
-    /// Ask one of this account's devices for a session.
+    /// Ask one of this account's devices for a session, requesting a set of
+    /// permission classes the host will see and decide on.
     pub async fn request_connect(
         &mut self,
         target_device_id: &str,
+        requested: PermissionSet,
     ) -> Result<ConnectRequested, ControlPlaneError> {
         if target_device_id.is_empty() || target_device_id.len() > 128 {
             return Err(ControlPlaneError::InvalidInput);
@@ -379,7 +405,10 @@ impl ControlPlaneClient {
         self.refresh_if_needed().await?;
         let response = self
             .authenticated_request(self.http.post(self.endpoint("/v1/connect")?))?
-            .json(&ConnectRequestBody { target_device_id })
+            .json(&ConnectRequestBody {
+                target_device_id,
+                requested,
+            })
             .send()
             .await
             .map_err(|_| ControlPlaneError::Transport)?;
@@ -408,6 +437,7 @@ impl ControlPlaneClient {
     pub async fn approve_connect(
         &mut self,
         request_id: &str,
+        granted: PermissionSet,
     ) -> Result<ConnectCredential, ControlPlaneError> {
         self.refresh_if_needed().await?;
         let response = self
@@ -415,6 +445,7 @@ impl ControlPlaneClient {
                 self.http
                     .post(self.connect_endpoint(request_id, "approve")?),
             )?
+            .json(&ConnectApproveBody { granted })
             .send()
             .await
             .map_err(|_| ControlPlaneError::Transport)?;
@@ -686,6 +717,75 @@ mod tests {
         assert!(!debug.contains("refresh-sentinel"));
         assert!(debug.contains("has_access_token: true"));
         assert!(debug.contains("has_refresh_token: true"));
+    }
+
+    /// The connect request carries the requested permission classes to the
+    /// broker, which shows them to the host and records them for the grant.
+    #[test]
+    fn a_connect_request_carries_the_requested_permissions() {
+        let body = ConnectRequestBody {
+            target_device_id: "device-host",
+            requested: PermissionSet {
+                view: true,
+                keyboard: true,
+                mouse: false,
+                gamepad: false,
+                clipboard: false,
+                microphone: false,
+                tablet: false,
+                virtual_usb: false,
+            },
+        };
+        let value = serde_json::to_value(&body).expect("serialize the connect body");
+        assert_eq!(value["target_device_id"], serde_json::json!("device-host"));
+        // The whole set rides along so the host and broker see exactly what was
+        // asked, including the classes left off.
+        assert_eq!(value["requested"]["view"], serde_json::json!(true));
+        assert_eq!(value["requested"]["keyboard"], serde_json::json!(true));
+        assert_eq!(value["requested"]["mouse"], serde_json::json!(false));
+        assert_eq!(value["requested"]["virtual_usb"], serde_json::json!(false));
+    }
+
+    /// The approval carries the granted permission classes to the broker, which
+    /// records them and delivers them in both role credentials.
+    #[test]
+    fn an_approval_carries_the_granted_permissions() {
+        let body = ConnectApproveBody {
+            granted: PermissionSet::view_only(),
+        };
+        let value = serde_json::to_value(&body).expect("serialize the approve body");
+        assert_eq!(value["granted"]["view"], serde_json::json!(true));
+        assert_eq!(value["granted"]["mouse"], serde_json::json!(false));
+    }
+
+    /// A pending request carries what the requester asked for so the host can
+    /// approve against it, and a control plane that predates the field still
+    /// parses (to the empty set).
+    #[test]
+    fn a_pending_request_parses_its_requested_permissions() {
+        let with_requested = serde_json::json!({
+            "request_id": "r1",
+            "requester_device_id": "device-client",
+            "expires_in_seconds": 100,
+            "requested": {
+                "view": true, "keyboard": true, "mouse": false, "gamepad": false,
+                "clipboard": false, "microphone": false, "tablet": false, "virtual_usb": false,
+            },
+        });
+        let pending: PendingConnectRequest =
+            serde_json::from_value(with_requested).expect("parse a pending request");
+        assert!(pending.requested.view);
+        assert!(pending.requested.keyboard);
+        assert!(!pending.requested.mouse);
+
+        let without_requested = serde_json::json!({
+            "request_id": "r2",
+            "requester_device_id": "device-client",
+            "expires_in_seconds": 5,
+        });
+        let pending: PendingConnectRequest =
+            serde_json::from_value(without_requested).expect("parse a pre-field pending request");
+        assert!(pending.requested.is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ProductAdapter } from "../adapters/productAdapter";
-import type { ConnectRequest } from "../model";
+import type { ConnectRequest, PermissionSet } from "../model";
 
 /** Base polling cadence for incoming Secure Connect requests. */
 const POLL_BASE_MS = 2000;
@@ -23,7 +23,7 @@ export interface ConnectApprovals {
   pending: boolean;
   /** A recoverable failure message to show while keeping the request visible. */
   error: string | null;
-  approve: () => void;
+  approve: (granted?: PermissionSet) => void;
   deny: () => void;
 }
 
@@ -160,7 +160,7 @@ export function useConnectApprovals(
   }, [headId]);
 
   const resolve = useCallback(
-    (action: "approve" | "deny") => {
+    (action: "approve" | "deny", granted?: PermissionSet) => {
       if (!head || pending) {
         return;
       }
@@ -169,7 +169,7 @@ export function useConnectApprovals(
       setError(null);
       const call =
         action === "approve"
-          ? adapter.approveConnectRequest(requestId)
+          ? adapter.approveConnectRequest(requestId, granted)
           : adapter.denyConnectRequest(requestId);
       call
         .then(() => {
@@ -195,7 +195,7 @@ export function useConnectApprovals(
     secondsRemaining: head ? Math.max(0, Math.ceil((head.deadline - now) / 1000)) : null,
     pending,
     error,
-    approve: () => resolve("approve"),
+    approve: (granted?: PermissionSet) => resolve("approve", granted),
     deny: () => resolve("deny"),
   };
 }

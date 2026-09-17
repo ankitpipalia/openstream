@@ -23,6 +23,8 @@ members = [
     "crates/media",
     "crates/windows-media",
     "crates/windows-host",
+    "crates/macos-media",
+    "crates/macos-host",
     "crates/linux-host",
     "crates/client",
     "crates/desktop-client",
@@ -34,6 +36,7 @@ members = [
     "crates/app-core",
     "crates/local-ipc",
     "crates/host-agent",
+    "crates/host-ipc",
     "crates/diagnostics",
     "crates/probe-helper",
 ]
@@ -60,6 +63,9 @@ lowlat-kessel = { path = "crates/kessel" }
 openstream-transport-policy = { path = "crates/transport-policy" }
 openstream-windows-media = { path = "crates/windows-media" }
 openstream-windows-host = { path = "crates/windows-host" }
+openstream-host-ipc = { path = "crates/host-ipc" }
+openstream-macos-media = { path = "crates/macos-media" }
+openstream-macos-host = { path = "crates/macos-host" }
 
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 base64 = "0.22"
