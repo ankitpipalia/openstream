@@ -2031,7 +2031,12 @@ async fn enroll_account_device(
                 .ok()
                 .filter(|key| !key.is_empty())
                 .map(|key| lowlat_crypto::hex(key.as_slice()));
-            Json(EnrolledDevice { device, grant_key }).into_response()
+            Json(EnrolledDevice {
+                device,
+                account_id: principal.account_id.clone(),
+                grant_key,
+            })
+            .into_response()
         }
         Err(error) => control_error_response(error),
     }
@@ -2043,6 +2048,13 @@ async fn enroll_account_device(
 struct EnrolledDevice {
     #[serde(flatten)]
     device: control_plane::PublicDevice,
+    /// The account this device now belongs to.
+    ///
+    /// The machine needs it to authenticate later: a device proof names the
+    /// (account, device) pair it is good for, and enrolment is the only moment
+    /// the machine is told which account that is. Not a secret -- an identifier,
+    /// the way a username is.
+    account_id: String,
     /// Hex, and present only on the enrolment that created the device.
     #[serde(skip_serializing_if = "Option::is_none")]
     grant_key: Option<String>,
@@ -2051,13 +2063,35 @@ struct EnrolledDevice {
 /// What a device sends to prove it is itself.
 ///
 /// Hex for the two binary fields, matching how every other key and grant
-/// crosses this API.
+/// crosses this API. The account is named because the proof is bound to it:
+/// device ids are unique inside an account and nowhere else.
 #[derive(Deserialize)]
 struct DeviceAuthRequest {
+    account_id: String,
     device_id: String,
     issued_at_ms: u64,
     nonce: String,
     signature: String,
+}
+
+/// A device credential: an access token, and no refresh token.
+#[derive(Serialize)]
+struct DeviceAuthResponse {
+    access_token: String,
+    access_expires_in_seconds: u64,
+    user: PublicUser,
+    device: PublicDevice,
+}
+
+impl From<control_plane::DeviceCredential> for DeviceAuthResponse {
+    fn from(credential: control_plane::DeviceCredential) -> Self {
+        Self {
+            access_token: credential.access_token,
+            access_expires_in_seconds: credential.access_expires_in_seconds,
+            user: credential.user,
+            device: credential.device,
+        }
+    }
 }
 
 /// Exchange a device-identity proof for a device-bound access token.
@@ -2070,30 +2104,71 @@ struct DeviceAuthRequest {
 /// with instead -- the private half of which stays in the operating system's
 /// custody and never crosses this API in any direction.
 ///
-/// Every failure answers the same way. Which device ids exist, which keys are
-/// enrolled and whether a nonce has been used are all things this must not
-/// disclose to an unauthenticated caller.
+/// **This is an unauthenticated endpoint, so what it costs matters.**
+///
+/// It is on the *renewal* budget rather than the password one, for the reason
+/// `/v1/auth/refresh` has its own: this is a machine renewing a credential it
+/// already holds, cheap and routine, and it must neither starve nor be starved
+/// by password attempts. The password allowance is six per source per minute --
+/// a handful of hosts behind one address would exhaust it in seconds and lock
+/// each other out of hosting.
+///
+/// The shape below keeps the expensive part off the store lock: read one public
+/// key under it, verify outside it, then take it again to consume the nonce and
+/// issue. Verifying while holding the lock would let anyone put Ed25519 work in
+/// front of every login, device listing and token check in the service. Nothing
+/// here is persisted, so the second acquisition does no file I/O either.
+///
+/// Every failure answers the same way. Which accounts and device ids exist,
+/// which keys are enrolled and whether a nonce has been used are all things
+/// this must not disclose to an unauthenticated caller.
 async fn authenticate_device(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<DeviceAuthRequest>,
 ) -> Response {
+    let source = request_source(peer.ip(), &headers, &state.trusted_proxies);
+    if let Err(response) = allow_refresh_attempt(&state, source).await {
+        return response;
+    }
     let Some(nonce) = hex_array::<16>(&request.nonce) else {
         return control_error_response(ControlPlaneError::Unauthorized);
     };
     let Some(signature) = hex_array::<64>(&request.signature) else {
         return control_error_response(ControlPlaneError::Unauthorized);
     };
-    let mut accounts = state.accounts.lock().await;
-    match accounts.authenticate_device(
+
+    let stored_key = {
+        let accounts = state.accounts.lock().await;
+        accounts.device_identity_key(&request.account_id, &request.device_id)
+    };
+    // An unknown account or device takes the same path as a bad signature:
+    // answering differently would turn this into an enumeration oracle.
+    let Some(stored_key) = stored_key else {
+        return control_error_response(ControlPlaneError::Unauthorized);
+    };
+    if !openstream_protocol::IdentityKey::verify_device_auth(
+        stored_key,
+        signature,
+        &request.account_id,
         &request.device_id,
         request.issued_at_ms,
         nonce,
-        signature,
+    ) {
+        return control_error_response(ControlPlaneError::Unauthorized);
+    }
+
+    let mut accounts = state.accounts.lock().await;
+    match accounts.commit_device_auth(
+        &request.account_id,
+        &request.device_id,
+        stored_key,
+        request.issued_at_ms,
+        nonce,
         control_plane::now_ms(),
     ) {
-        // The same body a password sign-in returns, so a caller holds one kind
-        // of credential however it obtained it.
-        Ok(issued) => Json(AccountAuthResponse::from(issued)).into_response(),
+        Ok(credential) => Json(DeviceAuthResponse::from(credential)).into_response(),
         Err(error) => control_error_response(error),
     }
 }
@@ -4943,8 +5018,8 @@ mod tests {
         device_routes, direct_message_route, dispatch_generic_message, healthz,
         is_private_lan_address, login_account, max_guests_for_new_session,
         prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
-        register_account, registration_capability, relay_owner_for_ticket, relay_ticket,
-        request_source, revoke_owned_sessions, sessions_owned_by, signal_socket,
+        refresh_account, register_account, registration_capability, relay_owner_for_ticket,
+        relay_ticket, request_source, revoke_owned_sessions, sessions_owned_by, signal_socket,
         supplied_token_is_host, validate_signal_message, validate_startup_auth, version_info,
     };
     use axum::Router;
@@ -7721,6 +7796,7 @@ mod tests {
             .route("/v1/auth/register", post(register_account))
             .route("/v1/auth/login", post(login_account))
             .route("/v1/auth/device", post(authenticate_device))
+            .route("/v1/auth/refresh", post(refresh_account))
             // The real device routes, not a copy of them.
             .merge(device_routes())
             .route(
@@ -8456,6 +8532,219 @@ mod tests {
     /// class that never reached the host to be granted, or never reached each
     /// end to be enforced, is a permission the product cannot honour -- so this
     /// round trip is the foundation enforcement sits on.
+    /// A device proof is good for the account it names, and no other.
+    ///
+    /// Device ids are unique inside an account and nowhere else, and one
+    /// machine has a single identity key across every account it signs in to --
+    /// the key belongs to the operating-system user, not to the account. So two
+    /// accounts can hold a device with the same id *and* the same key, entirely
+    /// legitimately.
+    ///
+    /// Before the account was part of the signed transcript, one proof verified
+    /// against both records and whichever the store iterated to first received
+    /// the token. A machine could authenticate into an account that is not its
+    /// owner's -- announcing presence there, and never appearing where it
+    /// belongs.
+    #[tokio::test]
+    async fn a_device_proof_authenticates_only_the_account_it_names() {
+        use openstream_protocol::IdentityKey;
+
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let machine = IdentityKey::generate().expect("identity");
+
+        // Two accounts, each enrolling the same device id with the same key.
+        let mut accounts = Vec::new();
+        for (index, username) in ["owner-one", "owner-two"].iter().enumerate() {
+            let (token, _) = register_with_device(
+                &app,
+                username,
+                &format!("device-{index}"),
+                0x91 + u8::try_from(index).expect("small"),
+            )
+            .await;
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/v1/devices",
+                Some(&token),
+                Some(serde_json::json!({
+                    "device_id": "shared-name",
+                    "name": "Studio",
+                    "platform": "linux",
+                    "public_key": hex::encode(machine.public_key()),
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "enrol under {username}: {body}");
+            accounts.push(
+                body["account_id"]
+                    .as_str()
+                    .expect("enrolment names the account")
+                    .to_string(),
+            );
+        }
+        assert_ne!(accounts[0], accounts[1], "two distinct accounts");
+
+        // Each proof must come back bound to the account it was signed for.
+        // With no account in the transcript both proofs are identical, so one
+        // of these two assertions fails whichever account the store picks.
+        for (index, account_id) in accounts.iter().enumerate() {
+            let nonce = [u8::try_from(index).expect("small"); 16];
+            let now = super::control_plane::now_ms();
+            let signature = machine
+                .sign_device_auth(account_id, "shared-name", now, nonce)
+                .expect("sign");
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/v1/auth/device",
+                None,
+                Some(serde_json::json!({
+                    "account_id": account_id,
+                    "device_id": "shared-name",
+                    "issued_at_ms": now,
+                    "nonce": hex::encode(nonce),
+                    "signature": hex::encode(signature),
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "authenticate: {body}");
+            assert_eq!(
+                body["user"]["account_id"].as_str(),
+                Some(account_id.as_str()),
+                "a proof for one account authenticated into another: {body}"
+            );
+        }
+
+        // And a proof signed for one account, presented as the other, fails --
+        // the account is inside what was signed.
+        let nonce = [0x7f_u8; 16];
+        let now = super::control_plane::now_ms();
+        let signature = machine
+            .sign_device_auth(&accounts[0], "shared-name", now, nonce)
+            .expect("sign");
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(serde_json::json!({
+                "account_id": accounts[1],
+                "device_id": "shared-name",
+                "issued_at_ms": now,
+                "nonce": hex::encode(nonce),
+                "signature": hex::encode(signature),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A host re-authenticating must not log its owner out.
+    ///
+    /// Device authentication used to go through the ordinary issuance path,
+    /// which mints a refresh token beside the access token. The machine client
+    /// discards it and re-authenticates from its key instead -- so each one was
+    /// created only to be thrown away. Refresh tokens are capped per account
+    /// and pruned oldest-first, and they live thirty days, so they do not age
+    /// out: a host re-authenticating every few minutes worked through the whole
+    /// allowance in hours and started evicting the owner's real sign-ins.
+    ///
+    /// The assertion is the consequence, not the count: the owner's session
+    /// still works afterwards.
+    #[tokio::test]
+    async fn a_host_re_authenticating_does_not_evict_its_owners_sessions() {
+        use openstream_protocol::IdentityKey;
+
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (owner_token, _) = register_with_device(&app, "operator", "device-owner", 0xa1).await;
+
+        // The owner's own long-lived credential, taken the ordinary way.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(serde_json::json!({
+                "username": "operator",
+                "password": "a-sufficiently-long-password",
+                "device": {
+                    "device_id": "device-owner",
+                    "name": "device-owner",
+                    "platform": "test",
+                    "public_key": hex::encode([0xa1_u8; 32]),
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "login: {body}");
+        let owner_refresh = body["refresh_token"]
+            .as_str()
+            .expect("a password sign-in carries a refresh token")
+            .to_string();
+
+        let machine = IdentityKey::generate().expect("identity");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&owner_token),
+            Some(serde_json::json!({
+                "device_id": "machine-busy",
+                "name": "Studio",
+                "platform": "linux",
+                "public_key": hex::encode(machine.public_key()),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "enrol: {body}");
+        let account_id = body["account_id"].as_str().expect("account").to_string();
+
+        // Comfortably more than MAX_REFRESH_TOKENS_PER_ACCOUNT, which is what
+        // a host reaches in a couple of hours.
+        for attempt in 0..24_u8 {
+            let now = super::control_plane::now_ms();
+            let nonce = [attempt; 16];
+            let signature = machine
+                .sign_device_auth(&account_id, "machine-busy", now, nonce)
+                .expect("sign");
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/v1/auth/device",
+                None,
+                Some(serde_json::json!({
+                    "account_id": account_id,
+                    "device_id": "machine-busy",
+                    "issued_at_ms": now,
+                    "nonce": hex::encode(nonce),
+                    "signature": hex::encode(signature),
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "authenticate {attempt}: {body}");
+            assert!(
+                body.get("refresh_token").is_none(),
+                "a device credential must not carry a refresh token: {body}"
+            );
+        }
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/auth/refresh",
+            None,
+            Some(serde_json::json!({ "refresh_token": owner_refresh })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the host's re-authentications evicted the owner's session: {body}"
+        );
+    }
     /// A headless machine authenticates with the key it enrolled with, and
     /// then can announce presence.
     ///
@@ -8492,11 +8781,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "enrol: {body}");
 
-        let proof = |issued_at_ms: u64, nonce: [u8; 16]| {
+        let account_id = body["account_id"]
+            .as_str()
+            .expect("enrolment tells the machine which account it joined")
+            .to_string();
+
+        let proof = |account: &str, issued_at_ms: u64, nonce: [u8; 16]| {
             let signature = machine
-                .sign_device_auth("machine-headless", issued_at_ms, nonce)
+                .sign_device_auth(account, "machine-headless", issued_at_ms, nonce)
                 .expect("sign");
             serde_json::json!({
+                "account_id": account,
                 "device_id": "machine-headless",
                 "issued_at_ms": issued_at_ms,
                 "nonce": hex::encode(nonce),
@@ -8510,7 +8805,7 @@ mod tests {
             "POST",
             "/v1/auth/device",
             None,
-            Some(proof(now, [1; 16])),
+            Some(proof(&account_id, now, [1; 16])),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "device authentication: {body}");
@@ -8529,7 +8824,7 @@ mod tests {
             "POST",
             "/v1/auth/device",
             None,
-            Some(proof(now, [1; 16])),
+            Some(proof(&account_id, now, [1; 16])),
         )
         .await;
         assert_eq!(
@@ -8541,7 +8836,7 @@ mod tests {
         // A proof from a different key for the same device id is refused.
         let impostor = IdentityKey::generate().expect("identity");
         let forged = impostor
-            .sign_device_auth("machine-headless", now, [2; 16])
+            .sign_device_auth(&account_id, "machine-headless", now, [2; 16])
             .expect("sign");
         let (status, _) = call(
             &app,
@@ -8549,6 +8844,7 @@ mod tests {
             "/v1/auth/device",
             None,
             Some(serde_json::json!({
+                "account_id": account_id,
                 "device_id": "machine-headless",
                 "issued_at_ms": now,
                 "nonce": hex::encode([2_u8; 16]),
@@ -8565,7 +8861,7 @@ mod tests {
             "POST",
             "/v1/auth/device",
             None,
-            Some(proof(stale, [3; 16])),
+            Some(proof(&account_id, stale, [3; 16])),
         )
         .await;
         assert_eq!(

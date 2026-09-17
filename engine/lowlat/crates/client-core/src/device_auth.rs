@@ -120,15 +120,17 @@ impl std::fmt::Debug for DeviceSession {
 /// because the interesting property -- that the signature verifies against the
 /// transcript the control plane rebuilds -- can then be checked directly.
 pub fn proof_body(
+    account_id: &str,
     device_id: &str,
     identity: &IdentityKey,
     issued_at_ms: u64,
     nonce: [u8; 16],
 ) -> Result<Vec<u8>, DeviceAuthError> {
     let signature = identity
-        .sign_device_auth(device_id, issued_at_ms, nonce)
+        .sign_device_auth(account_id, device_id, issued_at_ms, nonce)
         .map_err(DeviceAuthError::Identity)?;
     let body = serde_json::json!({
+        "account_id": account_id,
         "device_id": device_id,
         "issued_at_ms": issued_at_ms,
         "nonce": hex::encode(nonce),
@@ -157,7 +159,11 @@ pub fn parse_session(body: &[u8]) -> Result<DeviceSession, DeviceAuthError> {
     })
 }
 
-/// Prove this machine is `device_id` and take a device-bound access token.
+/// Prove this machine is `device_id` in `account_id`, and take a device-bound
+/// access token.
+///
+/// Both identifiers come from the enrolment response and are signed together:
+/// a device id means nothing without the account it belongs to.
 ///
 /// Call it again when [`DeviceSession::refresh_after`] has elapsed. There is no
 /// refresh-token dance here on purpose: the machine can always mint a fresh
@@ -165,6 +171,7 @@ pub fn parse_session(body: &[u8]) -> Result<DeviceSession, DeviceAuthError> {
 /// would add a thing to lose and nothing to gain.
 pub async fn authenticate(
     origin: &str,
+    account_id: &str,
     device_id: &str,
     identity: &IdentityKey,
 ) -> Result<DeviceSession, DeviceAuthError> {
@@ -179,7 +186,7 @@ pub async fn authenticate(
     getrandom::getrandom(&mut nonce)
         .map_err(|_| DeviceAuthError::Local("the system random source failed"))?;
 
-    let body = proof_body(device_id, identity, issued_at_ms, nonce)?;
+    let body = proof_body(account_id, device_id, identity, issued_at_ms, nonce)?;
     // No bearer: this request is how the caller obtains one.
     let response = http::post_json(origin, DEVICE_AUTH_PATH, None, &body).await?;
     if !response.is_success() {
@@ -210,9 +217,11 @@ mod tests {
         // only symptom would be a 401.
         let identity = IdentityKey::generate().expect("identity");
         let nonce = [0x5a_u8; 16];
-        let body = proof_body("machine-one", &identity, 1_700_000_000_000, nonce).expect("body");
+        let body =
+            proof_body("acct-1", "machine-one", &identity, 1_700_000_000_000, nonce).expect("body");
         let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
 
+        assert_eq!(parsed["account_id"], "acct-1");
         assert_eq!(parsed["device_id"], "machine-one");
         assert_eq!(parsed["issued_at_ms"], 1_700_000_000_000_u64);
         assert_eq!(parsed["nonce"], hex::encode(nonce));
@@ -228,6 +237,7 @@ mod tests {
             IdentityKey::verify_device_auth(
                 identity.public_key(),
                 signature,
+                "acct-1",
                 "machine-one",
                 1_700_000_000_000,
                 nonce
@@ -240,7 +250,7 @@ mod tests {
     fn the_private_key_never_appears_in_the_proof() {
         // The whole point of using an identity key rather than a shared secret.
         let identity = IdentityKey::generate().expect("identity");
-        let body = proof_body("machine-one", &identity, 1, [0; 16]).expect("body");
+        let body = proof_body("acct-1", "machine-one", &identity, 1, [0; 16]).expect("body");
         let text = String::from_utf8_lossy(&body);
         assert!(
             !text.contains(&hex::encode(identity.pkcs8())),

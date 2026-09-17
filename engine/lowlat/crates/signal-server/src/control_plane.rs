@@ -9,7 +9,6 @@
 use getrandom::getrandom;
 use openstream_host_ipc::grant::SessionGrant;
 use openstream_host_ipc::token::Capabilities;
-use openstream_protocol::IdentityKey;
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -131,6 +130,20 @@ pub(crate) struct IssuedTokens {
     pub refresh_expires_in_seconds: u64,
     pub user: PublicUser,
     pub device: Option<PublicDevice>,
+}
+
+/// What a device gets for proving it holds its enrolled identity key.
+///
+/// Deliberately not [`IssuedTokens`]: there is no refresh token here, and a
+/// type that carried an unused one would invite the ordinary issuance path to
+/// be reused -- which is exactly the bug this replaced, where every
+/// re-authentication consumed one of the account's sixteen refresh slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceCredential {
+    pub access_token: String,
+    pub access_expires_in_seconds: u64,
+    pub user: PublicUser,
+    pub device: PublicDevice,
 }
 
 #[derive(Debug)]
@@ -998,7 +1011,28 @@ impl AccountStore {
         Ok(public)
     }
 
-    /// Authenticate a device by the identity key it enrolled with.
+    /// The identity key `device_id` enrolled under `account_id`.
+    ///
+    /// Split out so the Ed25519 verification can happen *outside* the store
+    /// lock. `/v1/auth/device` is unauthenticated by construction -- it is how
+    /// a caller becomes authenticated -- so anything it does while holding the
+    /// global account mutex is something an unauthenticated flood can put in
+    /// front of every login, device listing and token check in the service.
+    /// Verification is the expensive part and needs no lock: one public key and
+    /// one signature.
+    pub(crate) fn device_identity_key(
+        &self,
+        account_id: &str,
+        device_id: &str,
+    ) -> Option<[u8; 32]> {
+        self.accounts
+            .get(account_id)?
+            .devices
+            .get(device_id)
+            .map(|device| device.registration.public_key)
+    }
+
+    /// Finish a device authentication whose signature has already verified.
     ///
     /// **Why this exists.** Every other way to obtain a device-bound token goes
     /// through the account password, and a headless host must not hold one: the
@@ -1017,66 +1051,108 @@ impl AccountStore {
     /// Three things bound the proof, because a signature on its own is valid
     /// forever:
     ///
-    /// - the transcript binds the device id, so a proof for one machine is not
-    ///   a proof for another;
+    /// - the transcript binds the account *and* the device, so a proof is good
+    ///   for exactly one pair and the lookup is a direct one rather than a
+    ///   search through every account for a device of that name;
     /// - `issued_at_ms` must be within [`DEVICE_AUTH_WINDOW_MS`] of now, in
     ///   either direction, so a captured proof expires;
     /// - the nonce must be one this service has not already accepted, so the
     ///   proof works once even inside that window.
-    pub(crate) fn authenticate_device(
+    ///
+    /// `verified_against` is the key the caller actually checked the signature
+    /// with. The device can be removed or re-enrolled between that read and
+    /// this call, so the key is read again and has to be the same one --
+    /// otherwise this would mint a credential from a verification against a key
+    /// the account no longer holds.
+    pub(crate) fn commit_device_auth(
         &mut self,
+        account_id: &str,
         device_id: &str,
+        verified_against: [u8; 32],
         issued_at_ms: u64,
         nonce: [u8; 16],
-        signature: [u8; 64],
         now_ms: u64,
-    ) -> Result<IssuedTokens, ControlPlaneError> {
-        if device_id.is_empty() || device_id.len() > DEVICE_ID_MAX_BYTES {
-            return Err(ControlPlaneError::Unauthorized);
-        }
-        // Freshness first: it is the cheapest check and rejects the bulk of
-        // anything replayed from a capture.
+    ) -> Result<DeviceCredential, ControlPlaneError> {
         if now_ms.abs_diff(issued_at_ms) > DEVICE_AUTH_WINDOW_MS {
             return Err(ControlPlaneError::Unauthorized);
         }
+        if self.device_identity_key(account_id, device_id) != Some(verified_against) {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+        // Checked and consumed under one lock, or two proofs racing with the
+        // same nonce would both find it absent and both be accepted.
         self.forget_stale_device_nonces(now_ms);
         if self.device_auth_nonces.contains_key(&nonce) {
             return Err(ControlPlaneError::Unauthorized);
         }
-
-        // Device ids are unique within an account, not across the service, so
-        // several accounts may hold one with this id. The signature is what
-        // picks between them: only the account whose enrolled public key
-        // verifies owns this device.
-        let matched = self
-            .accounts
-            .values()
-            .filter_map(|account| {
-                account
-                    .devices
-                    .get(device_id)
-                    .map(|device| (account.account_id.clone(), device.registration.public_key))
-            })
-            .find(|(_, public_key)| {
-                IdentityKey::verify_device_auth(
-                    *public_key,
-                    signature,
-                    device_id,
-                    issued_at_ms,
-                    nonce,
-                )
-            });
-        let Some((account_id, _)) = matched else {
-            return Err(ControlPlaneError::Unauthorized);
-        };
-
         // Recorded only once the proof is known good. Burning a nonce on a
         // failed attempt would let anyone who can guess one deny the real
         // device its next authentication.
         if self.device_auth_nonces.len() < MAX_DEVICE_AUTH_NONCES {
             self.device_auth_nonces.insert(nonce, now_ms);
         }
-        self.issue_tokens(&account_id, Some(device_id.to_string()), now_ms)
+        self.issue_device_access(account_id, device_id, now_ms)
+    }
+
+    /// Mint an access token for a device, and nothing else.
+    ///
+    /// **No refresh token, deliberately.** A device re-authenticates by signing
+    /// a fresh proof with a key it already holds, so a refresh token would be a
+    /// second long-lived secret to store and lose for no gain -- and the client
+    /// discarded it anyway. Issuing one through the ordinary path was actively
+    /// harmful: refresh tokens are capped at [`MAX_REFRESH_TOKENS_PER_ACCOUNT`]
+    /// per account and pruned oldest-first, they live thirty days so they never
+    /// age out, and a host re-authenticating every few minutes filled the whole
+    /// allowance within hours -- evicting its owner's real sign-ins.
+    ///
+    /// Nothing here is persisted, so unlike the password paths this does not
+    /// write the store while holding the lock.
+    fn issue_device_access(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<DeviceCredential, ControlPlaneError> {
+        let (user, device) = {
+            let account = self
+                .accounts
+                .get(account_id)
+                .ok_or(ControlPlaneError::NotFound)?;
+            let device = account
+                .devices
+                .get(device_id)
+                .ok_or(ControlPlaneError::NotFound)?;
+            (
+                PublicUser {
+                    account_id: account.account_id.clone(),
+                    username: account.username.clone(),
+                    created_at_ms: account.created_at_ms,
+                },
+                public_device(device),
+            )
+        };
+        let access_token = Uuid::new_v4().simple().to_string();
+        self.access_tokens.insert(
+            token_digest(&access_token),
+            AccessTokenRecord {
+                principal: AccountPrincipal {
+                    account_id: account_id.to_string(),
+                    device_id: Some(device_id.to_string()),
+                },
+                // Its own family of one. Families exist so a compromised
+                // sign-in can be condemned whole; this credential descends from
+                // no sign-in and shares its fate with nothing. Revoking or
+                // removing the device still reaches it, by device id.
+                family_id: Uuid::new_v4().simple().to_string(),
+                expires_at_ms: now_ms.saturating_add(ACCESS_TOKEN_TTL_MS),
+            },
+        );
+        Ok(DeviceCredential {
+            access_token,
+            access_expires_in_seconds: ACCESS_TOKEN_TTL_MS / 1000,
+            user,
+            device,
+        })
     }
 
     /// Drop nonces that can no longer be replayed anyway.
