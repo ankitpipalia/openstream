@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { ProductAdapter } from "../adapters/productAdapter";
 import type { ProductSnapshot } from "../model";
@@ -46,10 +46,31 @@ export function LoginPage({
   const [authPending, setAuthPending] = useState(false);
 
   const [showEndpoint, setShowEndpoint] = useState(false);
-  const [endpoint, setEndpoint] = useState(() => currentSignalOrigin(snapshot));
+  const configuredEndpoint = currentSignalOrigin(snapshot);
+  const [endpoint, setEndpoint] = useState(configuredEndpoint);
   const [endpointPending, setEndpointPending] = useState(false);
   const [endpointSaved, setEndpointSaved] = useState(false);
   const [endpointError, setEndpointError] = useState<string | null>(null);
+  /// Whether the operator has typed in the field since it was last filled in
+  /// from the runtime. Their text always wins over a later snapshot.
+  const [endpointEdited, setEndpointEdited] = useState(false);
+  const lastConfiguredEndpoint = useRef(configuredEndpoint);
+
+  // The first snapshot this page renders against is the adapter's unresolved
+  // placeholder, which carries no settings -- so the initial value here can be
+  // empty even when a perfectly good endpoint is configured. The real snapshot
+  // arrives a moment later, and without this the field kept the empty string:
+  // opening "Edit control-plane endpoint" then showed nothing, and saving it
+  // wrote that nothing over the working endpoint.
+  useEffect(() => {
+    if (configuredEndpoint === lastConfiguredEndpoint.current) {
+      return;
+    }
+    lastConfiguredEndpoint.current = configuredEndpoint;
+    if (!endpointEdited) {
+      setEndpoint(configuredEndpoint);
+    }
+  }, [configuredEndpoint, endpointEdited]);
 
   async function authenticate() {
     setAuthPending(true);
@@ -81,6 +102,9 @@ export function LoginPage({
       const next = await adapter.updateSetting(SIGNAL_ORIGIN_SETTING, endpoint.trim());
       onSnapshot(next);
       setEndpointSaved(true);
+      // Their edit is now the configured value, so later snapshots may drive
+      // the field again.
+      setEndpointEdited(false);
     } catch {
       setEndpointError("Could not update the control-plane endpoint.");
     } finally {
@@ -185,6 +209,7 @@ export function LoginPage({
                   value={endpoint}
                   onChange={(event) => {
                     setEndpoint(event.currentTarget.value);
+                    setEndpointEdited(true);
                     setEndpointSaved(false);
                   }}
                 />

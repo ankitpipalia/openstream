@@ -389,6 +389,43 @@ impl HostPolicy {
             self.approval,
         )
     }
+
+    /// Narrow this machine-wide policy to what one specific session was
+    /// granted.
+    ///
+    /// This policy is the owner's ceiling for the machine; a session's
+    /// granted permissions are a second, independent ceiling for what *that
+    /// session's guest* may drive. Neither alone is enough -- an owner who
+    /// enables input globally must not thereby grant it to a guest the
+    /// broker scoped to view-only, and a broker grant must not re-enable a
+    /// class the owner turned off here -- so the result can only be as
+    /// permissive as the stricter of the two. Each `session_allows_*`
+    /// parameter is the caller's already-resolved verdict for that class
+    /// (true both when the session's ceiling permits it and when there is no
+    /// ceiling to apply); this method only ever narrows, never widens, this
+    /// policy in response.
+    ///
+    /// `input`, `approval`, and every other field this type may grow are
+    /// deliberately left untouched: they describe the adapter and the
+    /// approval flow, not a per-class grant a session can be scoped by.
+    #[must_use]
+    pub fn scoped_to_session(
+        self,
+        session_allows_keyboard: bool,
+        session_allows_mouse: bool,
+        session_allows_gamepad: bool,
+        session_allows_clipboard: bool,
+        session_allows_microphone: bool,
+    ) -> Self {
+        Self {
+            keyboard: self.keyboard && session_allows_keyboard,
+            mouse: self.mouse && session_allows_mouse,
+            gamepad: self.gamepad && session_allows_gamepad,
+            clipboard: self.clipboard && session_allows_clipboard,
+            microphone: self.microphone && session_allows_microphone,
+            ..self
+        }
+    }
 }
 
 fn as_on_off(granted: bool) -> &'static str {
@@ -626,6 +663,66 @@ mod tests {
         let policy = HostPolicy::from_env();
         assert!(!policy.input && !policy.clipboard);
         restore(saved);
+    }
+
+    fn wide_open_policy() -> HostPolicy {
+        HostPolicy {
+            input: true,
+            keyboard: true,
+            mouse: true,
+            clipboard: true,
+            gamepad: true,
+            microphone: true,
+            approval: Approval::Auto,
+        }
+    }
+
+    /// A session granted every class changes nothing: the owner's policy is
+    /// still the only ceiling in effect.
+    #[test]
+    fn a_session_granted_everything_leaves_the_policy_unchanged() {
+        let policy = wide_open_policy();
+        assert_eq!(
+            policy.scoped_to_session(true, true, true, true, true),
+            policy
+        );
+    }
+
+    /// A session denied one class loses exactly that class, regardless of
+    /// what the owner's own policy allows.
+    #[test]
+    fn a_session_denied_one_class_loses_only_that_class() {
+        let scoped = wide_open_policy().scoped_to_session(false, true, true, true, true);
+        assert!(!scoped.keyboard);
+        assert!(scoped.mouse && scoped.gamepad && scoped.clipboard && scoped.microphone);
+    }
+
+    /// The session's grant can only narrow, never widen: a class the owner's
+    /// own policy already denies stays denied even if the session says yes.
+    #[test]
+    fn the_session_cannot_re_enable_a_class_the_owner_denied() {
+        let owner_denies_clipboard = HostPolicy {
+            clipboard: false,
+            ..wide_open_policy()
+        };
+        let scoped = owner_denies_clipboard.scoped_to_session(true, true, true, true, true);
+        assert!(!scoped.clipboard, "the session must not override the owner");
+    }
+
+    /// `input` and `approval` describe the adapter and the approval flow,
+    /// not a per-class grant, so scoping to a session must not touch them.
+    #[test]
+    fn scoping_never_touches_input_or_approval() {
+        let policy = HostPolicy {
+            approval: Approval::OwnerOnly,
+            ..wide_open_policy()
+        };
+        let scoped = policy.scoped_to_session(false, false, false, false, false);
+        assert!(
+            scoped.input,
+            "input describes the adapter, not a session grant"
+        );
+        assert_eq!(scoped.approval, Approval::OwnerOnly);
     }
 
     fn available_probes() -> HostCapabilityProbes {

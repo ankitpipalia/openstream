@@ -757,6 +757,20 @@ impl Permissions {
     pub fn is_empty(&self) -> bool {
         *self == Self::none()
     }
+
+    /// Whether `class` is allowed under this ceiling, when the ceiling itself
+    /// may be absent.
+    ///
+    /// A missing ceiling means unscoped, not denied: a pairing file written
+    /// before permission negotiation existed, or a provisioning pairing that
+    /// never went through Connect, must not suddenly lose every class the
+    /// moment a caller starts consulting one. A *present* ceiling is
+    /// authoritative -- whatever `class` reports for it is final, regardless
+    /// of what any other local policy would otherwise allow.
+    #[must_use]
+    pub fn allows(ceiling: Option<Self>, class: impl FnOnce(Self) -> bool) -> bool {
+        ceiling.is_none_or(class)
+    }
 }
 
 /// One end of an approved session, as the Connect broker delivers it.
@@ -5782,6 +5796,32 @@ mod tests {
                 && all.tablet
                 && all.virtual_usb
         );
+    }
+
+    /// No ceiling means unscoped: an older pairing or one from a path that
+    /// never negotiated permissions must not lose every class the moment
+    /// something starts consulting a ceiling that was never there.
+    #[test]
+    fn a_missing_ceiling_allows_every_class() {
+        assert!(Permissions::allows(None, |permissions| permissions.keyboard));
+        assert!(Permissions::allows(None, |permissions| permissions.microphone));
+    }
+
+    /// A present ceiling is authoritative in both directions: it grants
+    /// exactly what it says, not more and not less.
+    #[test]
+    fn a_present_ceiling_grants_exactly_what_it_says() {
+        let granted = Permissions {
+            keyboard: true,
+            clipboard: false,
+            ..Permissions::none()
+        };
+        assert!(Permissions::allows(Some(granted), |permissions| {
+            permissions.keyboard
+        }));
+        assert!(!Permissions::allows(Some(granted), |permissions| {
+            permissions.clipboard
+        }));
     }
 
     /// Provisioning pairings, which carry both roles, still work.

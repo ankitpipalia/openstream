@@ -71,9 +71,13 @@ pub fn interpret(observation: ConnectObservation, expired: bool) -> ConnectStep 
                 relay_address: credential.relay_address,
                 relay_ticket: Some(credential.relay_ticket),
                 turn: None,
-                // The observed broker credential carries no permission grant on
-                // this path yet; the runner treats that as unscoped for now.
-                permissions: None,
+                // What the host granted when it approved this request. The
+                // broker returns it with the client credential too, so the
+                // client scopes itself to the same ceiling the host enforces
+                // rather than discovering the limit by being refused.
+                permissions: credential
+                    .permissions
+                    .map(crate::control_plane::granted_permissions),
             }))
         }
         ConnectObservation::Waiting { state } => match state {
@@ -97,8 +101,13 @@ pub fn interpret(observation: ConnectObservation, expired: bool) -> ConnectStep 
 mod tests {
     use super::{interpret, ConnectStep, CONNECT_POLL_INTERVAL, CONNECT_WAIT};
     use crate::control_plane::{ConnectCredential, ConnectObservation, ConnectState};
+    use openstream_app_core::PermissionSet;
 
     fn granted(role: &str) -> ConnectObservation {
+        granted_with(role, None)
+    }
+
+    fn granted_with(role: &str, permissions: Option<PermissionSet>) -> ConnectObservation {
         ConnectObservation::Granted(Box::new(ConnectCredential {
             session_id: "session-1".into(),
             role: role.into(),
@@ -106,6 +115,7 @@ mod tests {
             websocket_path: "/v1/signal/session-1/client".into(),
             relay_address: None,
             relay_ticket: "ticket".into(),
+            permissions,
         }))
     }
 
@@ -118,6 +128,74 @@ mod tests {
         assert_eq!(credential.session_id, "session-1");
         assert_eq!(credential.token, "CLIENT-CAPABILITY");
         assert_eq!(credential.relay_ticket.as_deref(), Some("ticket"));
+    }
+
+    /// A narrowed grant survives every layer between the broker and the
+    /// runner's own policy.
+    ///
+    /// This is the test the feature was missing. Permissions were negotiated
+    /// by the broker, rendered by the approval modal and enforced by the host
+    /// policy, but the desktop credential in the middle had no field for them:
+    /// the decision parsed and was dropped, every conversion wrote `None`, and
+    /// `None` means unscoped, so a host that granted keyboard-only still ran a
+    /// session with the mouse live. Each layer passed its own test; only the
+    /// seam was broken, so only a test that crosses the seam can catch it.
+    #[test]
+    fn a_narrowed_grant_reaches_the_runner_policy_with_mouse_denied() {
+        // The request asked for keyboard + mouse; the host approved keyboard.
+        let approved = PermissionSet {
+            view: true,
+            keyboard: true,
+            mouse: false,
+            ..PermissionSet::none()
+        };
+
+        // Broker response -> desktop credential -> role credential.
+        let ConnectStep::Start(credential) =
+            interpret(granted_with("client", Some(approved)), false)
+        else {
+            panic!("an approved request must start a session");
+        };
+        let carried = credential
+            .permissions
+            .expect("the granted set survives the credential conversion");
+        assert!(carried.keyboard, "keyboard was granted");
+        assert!(!carried.mouse, "mouse was not granted");
+
+        // Role credential -> pairing file, including a real serde round trip,
+        // because the pairing is handed to the runner as JSON on disk.
+        let pairing = openstream_client_core::Pairing::from_role_credential(*credential);
+        let encoded = serde_json::to_string(&pairing).expect("serialise the pairing");
+        let decoded: openstream_client_core::Pairing =
+            serde_json::from_str(&encoded).expect("read the pairing back");
+        let from_disk = decoded
+            .permissions
+            .expect("the granted set survives the pairing file");
+
+        // Pairing -> host policy. The owner's own machine policy allows both
+        // classes here, so anything still enabled after scoping came from the
+        // grant and not from the local default.
+        let owner_allows_everything = openstream_platform::policy::HostPolicy {
+            input: true,
+            keyboard: true,
+            mouse: true,
+            clipboard: true,
+            gamepad: true,
+            microphone: true,
+            approval: openstream_platform::policy::Approval::Auto,
+        };
+        let scoped = owner_allows_everything.scoped_to_session(
+            openstream_client_core::Permissions::allows(Some(from_disk), |p| p.keyboard),
+            openstream_client_core::Permissions::allows(Some(from_disk), |p| p.mouse),
+            openstream_client_core::Permissions::allows(Some(from_disk), |p| p.gamepad),
+            openstream_client_core::Permissions::allows(Some(from_disk), |p| p.clipboard),
+            openstream_client_core::Permissions::allows(Some(from_disk), |p| p.microphone),
+        );
+        assert!(scoped.keyboard, "the granted class stays enabled");
+        assert!(
+            !scoped.mouse,
+            "the class the host withheld must be denied at the runner, not merely hidden in the UI"
+        );
     }
 
     /// A host capability arriving on the requester's endpoint is not acted on.

@@ -488,6 +488,7 @@ async fn approve_connect_request(
     state: tauri::State<'_, SharedRuntime>,
     session: tauri::State<'_, SharedSession>,
     control_plane: tauri::State<'_, SharedControlPlane>,
+    host_lock: tauri::State<'_, SharedHostLock>,
     request_id: String,
     granted: Option<openstream_app_core::PermissionSet>,
 ) -> Result<(), RuntimeError> {
@@ -536,12 +537,23 @@ async fn approve_connect_request(
             relay_address: credential.relay_address,
             relay_ticket: Some(credential.relay_ticket),
             turn: None,
-            permissions: None,
+            // What the host just granted, carried through to the runner. A
+            // broker that predates permission negotiation sends nothing, and
+            // the runner treats that as unscoped; a present set is its
+            // ceiling.
+            permissions: credential
+                .permissions
+                .map(control_plane::granted_permissions),
         },
     );
+    // One capability file per session, written and handed to the agent under
+    // the lifecycle lock. Both halves matter: a single fixed filename let a
+    // second approval overwrite the first, and releasing the lock between the
+    // write and the start let the agent open whichever file won that race.
+    let _lifecycle = host_lock.0.lock().await;
     let path = {
         let supervisor = session.lock().await;
-        supervisor.host_credential_path().to_path_buf()
+        supervisor.host_credential_path_for(&pairing.session_id)
     };
     session::write_private_json(&path, &pairing).map_err(session_error_to_runtime)?;
     let started = HostAgentClient::new()

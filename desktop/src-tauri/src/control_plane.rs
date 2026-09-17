@@ -190,6 +190,38 @@ pub struct ConnectCredential {
     #[serde(default)]
     pub relay_address: Option<String>,
     pub relay_ticket: String,
+    /// What the host actually granted this session.
+    ///
+    /// The broker decides this during approval and returns it with *both*
+    /// role credentials. Without this field the decision was parsed and
+    /// dropped on the floor here, so the approval prompt could offer
+    /// keyboard/mouse/clipboard choices that never reached the runner and
+    /// every session ran with whatever the machine-wide host policy allowed.
+    ///
+    /// `None` only for a broker that predates permission negotiation; a
+    /// present set is the ceiling the session runner enforces.
+    #[serde(default)]
+    pub permissions: Option<PermissionSet>,
+}
+
+/// Carry a granted set across the layer boundary.
+///
+/// `app-core` owns the shell's `PermissionSet` and `client-core` owns the
+/// runner's `Permissions`; the two are field-for-field identical but neither
+/// crate depends on the other, so the conversion cannot be a `From` impl in
+/// either of them and lives here, in the one crate that links both.
+#[must_use]
+pub fn granted_permissions(granted: PermissionSet) -> openstream_client_core::Permissions {
+    openstream_client_core::Permissions {
+        view: granted.view,
+        keyboard: granted.keyboard,
+        mouse: granted.mouse,
+        gamepad: granted.gamepad,
+        clipboard: granted.clipboard,
+        microphone: granted.microphone,
+        tablet: granted.tablet,
+        virtual_usb: granted.virtual_usb,
+    }
 }
 
 /// Either a request that is still waiting, or the capability it produced.
