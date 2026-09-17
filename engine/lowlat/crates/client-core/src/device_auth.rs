@@ -102,14 +102,16 @@ impl DeviceSession {
     /// Renewing too often wastes a request; renewing too late means every
     /// request in between carries a credential the control plane has stopped
     /// accepting. The second is worse, so the floor is gone and the result is
-    /// always strictly inside the lifetime. [`parse_session`] refuses a
-    /// response with no usable lifetime, so this never divides zero.
+    /// always strictly inside the lifetime, for every lifetime -- including a
+    /// one-second one, which is why this is not measured in whole seconds.
+    /// [`parse_session`] refuses a response with no usable lifetime, so the
+    /// result is never zero.
     #[must_use]
     pub fn refresh_after(&self) -> std::time::Duration {
-        // For any lifetime of two seconds or more this is at most `L - 1`. The
-        // `max` matters only for a one-second token, where nothing is early
-        // enough and renewing at once is the closest thing to right.
-        std::time::Duration::from_secs((self.access_expires_in_seconds / 2).max(1))
+        // Milliseconds, so half of a one-second lifetime is 500 ms rather than
+        // a second rounded up to the moment it expires. Computed as `L * 500`
+        // rather than `L * 1000 / 2` so it cannot overflow on the way.
+        std::time::Duration::from_millis(self.access_expires_in_seconds.saturating_mul(500))
     }
 }
 
@@ -288,16 +290,21 @@ mod tests {
     fn renewal_is_always_scheduled_inside_the_lifetime() {
         // The property that matters: a credential is replaced before it stops
         // being accepted, whatever lifetime the control plane chose. The old
-        // thirty-second floor broke this for every short one.
+        // thirty-second floor broke this for every short one, and measuring in
+        // whole seconds still broke it for a one-second token -- so no lifetime
+        // is exempted here.
         for lifetime in [1_u64, 2, 5, 29, 30, 31, 59, 60, 120, 900, 86_400] {
             let body =
                 format!(r#"{{"access_token":"abc","access_expires_in_seconds":{lifetime}}}"#);
             let session = parse_session(body.as_bytes()).expect("parse");
-            let after = session.refresh_after().as_secs();
-            assert!(after >= 1, "lifetime {lifetime} scheduled a busy loop");
+            let after = session.refresh_after();
             assert!(
-                after < lifetime || lifetime == 1,
-                "lifetime {lifetime} renews at {after}s, at or after it expires"
+                after >= std::time::Duration::from_millis(500),
+                "lifetime {lifetime}s scheduled a busy loop at {after:?}"
+            );
+            assert!(
+                after < std::time::Duration::from_secs(lifetime),
+                "lifetime {lifetime}s renews at {after:?}, at or after it expires"
             );
         }
     }

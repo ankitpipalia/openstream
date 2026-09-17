@@ -1772,6 +1772,13 @@ mod tests {
     /// without pruning at issuance the map grows for the life of the process --
     /// entries for credentials that stopped working fifteen minutes after they
     /// were minted.
+    ///
+    /// This drives `commit_device_auth` directly, which is the half that owns
+    /// the map. It does not verify a signature, so it is not evidence about the
+    /// endpoint: `a_device_authenticates_with_its_identity_key_and_can_announce_presence`
+    /// and `an_unknown_device_and_a_bad_signature_answer_alike` cover that, over
+    /// HTTP. What this needs is a clock it can move, and two thousand requests
+    /// through the router would take the wall-clock time it is simulating.
     #[test]
     fn renewing_a_device_credential_does_not_grow_the_token_map_without_bound() {
         use openstream_protocol::IdentityKey;
@@ -1802,9 +1809,6 @@ mod tests {
                 bytes[..8].copy_from_slice(&round.to_be_bytes());
                 bytes
             };
-            let signature = machine
-                .sign_device_auth(&account_id, "machine-busy", now, nonce)
-                .expect("sign");
             store
                 .commit_device_auth(
                     &account_id,
@@ -1815,7 +1819,6 @@ mod tests {
                     now,
                 )
                 .expect("authenticate");
-            let _ = signature;
         }
 
         // Only tokens still inside one lifetime may remain. At a renewal every

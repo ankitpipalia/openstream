@@ -1316,6 +1316,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Before the first request, not during it: see `decoy_device_key`.
+    let _ = decoy_device_key();
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version_info))
@@ -2190,15 +2193,25 @@ async fn authenticate_device(
 /// Generated once per process rather than written down as a constant, because
 /// it has to be a *valid* curve point. `ring` rejects a malformed encoding
 /// before doing any real work, which would reintroduce exactly the difference
-/// this exists to remove -- and a hand-written 32 bytes is not obviously on the
-/// curve. If key generation fails, the service has no usable randomness and is
-/// about to fail at something more important.
+/// this exists to remove, and a hand-written 32 bytes is not obviously on the
+/// curve.
+///
+/// **Primed at startup**, by the call in `run`. Generating it lazily inside the
+/// first unknown-device request would make that one request pay for a keypair
+/// on top of the verification -- a smaller version of the same oracle, once per
+/// process. Priming also means the panic below can only happen at boot: by the
+/// time requests are served the cell is filled and the closure never runs.
+///
+/// It panics rather than falling back, because there is no second-best answer.
+/// A service that cannot generate a keypair has no usable randomness, and every
+/// token, nonce and grant it is about to issue depends on the same source; an
+/// invalid fallback key would quietly restore the timing difference instead.
 fn decoy_device_key() -> [u8; 32] {
     static DECOY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     *DECOY.get_or_init(|| {
         openstream_protocol::IdentityKey::generate()
-            .map(|key| key.public_key())
-            .unwrap_or([0x5a; 32])
+            .expect("the decoy device key needs the system RNG, and so does everything else")
+            .public_key()
     })
 }
 
