@@ -21,7 +21,7 @@ use std::time::Duration;
 use openstream_host_ipc::lifecycle::Seat;
 use openstream_host_ipc::peercred::PeerIdentity;
 use openstream_host_ipc::protocol::{BrokerEvent, PROTOCOL_VERSION, ServiceRequest};
-use openstream_host_ipc::token::Capabilities;
+use openstream_host_ipc::token::{Capabilities, NO_GRANT, SessionToken};
 use openstream_host_ipc::transport::{recv_request, send_event};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -34,6 +34,10 @@ pub mod code {
     pub const PROTOCOL_VERSION: u16 = 10;
     /// `CaptureError`: the service sent a request before the handshake.
     pub const PROTOCOL_VIOLATION: u16 = 11;
+    /// `CaptureError`: the request named a session grant the broker did not
+    /// issue, or none at all. Distinct from a protocol violation: the message
+    /// was well formed, the authority behind it was not.
+    pub const UNAUTHORISED: u16 = 12;
     /// `Closed`: the service asked to close the capture.
     pub const CLOSED_ON_REQUEST: u16 = 0;
     /// `Closed`: the service is shutting the broker connection down.
@@ -55,10 +59,86 @@ pub struct BrokerPolicy {
 impl Default for BrokerPolicy {
     fn default() -> Self {
         Self {
-            ceiling: Capabilities::all(),
+            // Nothing, on purpose. This is the root broker's standing answer to
+            // a process that has not been configured to be trusted with
+            // anything, and the machine service is network-facing: if its
+            // configuration is missing or unreadable, the safe reading is that
+            // the operator has not granted it capture or input, not that they
+            // granted it everything. The previous default was
+            // `Capabilities::all()`, which meant a service compromise reached
+            // straight through to the devices.
+            ceiling: Capabilities::none(),
             frame_poll: Duration::from_millis(1),
         }
     }
+}
+
+/// Where the broker's unguessable grant ids come from.
+///
+/// A trait rather than a direct call to the CSPRNG so the state machine stays
+/// deterministic under test: production draws from the OS, tests hand it a
+/// known value and can then check that a *different* value is refused.
+pub trait TokenSource {
+    /// A fresh, unguessable grant id.
+    fn next_id(&mut self) -> u128;
+}
+
+/// The production source: platform entropy.
+#[derive(Debug, Default)]
+pub struct SystemEntropy;
+
+impl TokenSource for SystemEntropy {
+    fn next_id(&mut self) -> u128 {
+        let mut bytes = [0u8; 16];
+        // A grant id that is not random is not a capability. If the platform
+        // cannot produce entropy the broker must not fall back to a counter or
+        // a clock -- both are what the machine service used to construct
+        // itself -- so this returns the one id that is never valid and the
+        // grant is refused.
+        match lowlat_crypto::fill(&mut bytes) {
+            Ok(()) => u128::from_be_bytes(bytes),
+            Err(_) => NO_GRANT,
+        }
+    }
+}
+
+/// Parse an operator-configured capability ceiling.
+///
+/// Comma-separated names: `capture,keyboard,mouse,gamepad,clipboard`, or
+/// `all`, or `none`. An unrecognised name is refused rather than ignored --
+/// silently dropping a misspelled capability would hand the operator a ceiling
+/// they did not write, and the failure they would notice is the one where it is
+/// *narrower* than intended, not wider.
+///
+/// This is read from the root broker's own environment, which is set by its
+/// systemd unit. The machine service runs as a different, unprivileged user and
+/// cannot write it -- which is the whole point: the ceiling has to come from
+/// somewhere the network-facing process cannot reach.
+pub fn parse_ceiling(spec: &str) -> Result<Capabilities, String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
+        return Ok(Capabilities::none());
+    }
+    if spec.eq_ignore_ascii_case("all") {
+        return Ok(Capabilities::all());
+    }
+    let mut ceiling = Capabilities::none();
+    for name in spec.split(',') {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let capability = match name.to_ascii_lowercase().as_str() {
+            "capture" => Capabilities::CAPTURE,
+            "keyboard" => Capabilities::KEYBOARD,
+            "mouse" => Capabilities::MOUSE,
+            "gamepad" => Capabilities::GAMEPAD,
+            "clipboard" => Capabilities::CLIPBOARD,
+            other => return Err(format!("unknown capability {other:?}")),
+        };
+        ceiling = ceiling.with(capability);
+    }
+    Ok(ceiling)
 }
 
 /// The capabilities a seat can ever expose, regardless of what was requested.
@@ -86,7 +166,6 @@ fn effective_grant(requested: Capabilities, ceiling: Capabilities, seat: Seat) -
 }
 
 /// The synchronous broker state machine for one service connection.
-#[derive(Debug)]
 pub struct BrokerSession {
     policy: BrokerPolicy,
     handshaken: bool,
@@ -99,12 +178,48 @@ pub struct BrokerSession {
     granted: Capabilities,
     /// The seat currently being captured.
     seat: Seat,
+    /// The grant this connection is operating under, once one has been issued.
+    ///
+    /// The broker mints it; the service presents it back. An id the broker did
+    /// not mint is refused, which is what stops a compromised service from
+    /// naming a session it was never approved for.
+    grant: Option<SessionToken>,
+    /// Where grant ids come from.
+    tokens: Box<dyn TokenSource + Send>,
+}
+
+impl std::fmt::Debug for BrokerSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The grant id is deliberately not printed: it is a bearer capability,
+        // and a debug line is a log line. Whether one exists is enough.
+        formatter
+            .debug_struct("BrokerSession")
+            .field("policy", &self.policy)
+            .field("handshaken", &self.handshaken)
+            .field("done", &self.done)
+            .field("capturing", &self.capturing)
+            .field("requested", &self.requested)
+            .field("granted", &self.granted)
+            .field("seat", &self.seat)
+            .field("granted_session", &self.grant.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl BrokerSession {
     /// A fresh session that has not yet completed the handshake.
     #[must_use]
     pub fn new(policy: BrokerPolicy) -> Self {
+        Self::with_token_source(policy, Box::new(SystemEntropy))
+    }
+
+    /// A fresh session drawing grant ids from `tokens`.
+    ///
+    /// Production uses [`SystemEntropy`]; a test supplies a known id so it can
+    /// check both that the issued grant is accepted and that any other id is
+    /// not.
+    #[must_use]
+    pub fn with_token_source(policy: BrokerPolicy, tokens: Box<dyn TokenSource + Send>) -> Self {
         Self {
             policy,
             handshaken: false,
@@ -113,7 +228,18 @@ impl BrokerSession {
             requested: Capabilities::none(),
             granted: Capabilities::none(),
             seat: Seat::Empty,
+            grant: None,
+            tokens,
         }
+    }
+
+    /// Whether `token_id` is the grant this broker issued to this connection.
+    ///
+    /// Fails closed in both directions: before a grant exists nothing is
+    /// authorised, and [`NO_GRANT`] never matches even if a caller managed to
+    /// store it.
+    fn authorised(&self, token_id: u128) -> bool {
+        token_id != NO_GRANT && self.grant.is_some_and(|grant| grant.id() == token_id)
     }
 
     /// Whether the connection should be closed (shutdown, or a fatal protocol
@@ -147,10 +273,39 @@ impl BrokerSession {
             // A second Hello after the handshake is a no-op, not a restart.
             ServiceRequest::Hello { .. } => Vec::new(),
             ServiceRequest::OpenCapture {
-                token_id: _,
+                token_id,
                 requested,
                 params,
             } => {
+                // Either "issue me a grant" or "here is the one you issued".
+                // Anything else is a service naming a grant it was not given,
+                // which is exactly the case this check exists for.
+                if token_id != NO_GRANT && !self.authorised(token_id) {
+                    return vec![BrokerEvent::CaptureError {
+                        code: code::UNAUTHORISED,
+                        message: "unknown session grant".into(),
+                    }];
+                }
+                let grant = match self.grant {
+                    Some(existing) => existing,
+                    None => {
+                        let id = self.tokens.next_id();
+                        if id == NO_GRANT {
+                            return vec![BrokerEvent::CaptureError {
+                                code: code::UNAUTHORISED,
+                                message: "could not issue a session grant".into(),
+                            }];
+                        }
+                        // The broker decides the capabilities from its own
+                        // policy and the seat. The service's request can only
+                        // narrow that, never widen it.
+                        let ceiling =
+                            effective_grant(Capabilities::all(), self.policy.ceiling, params.seat);
+                        let issued = SessionToken::grant(id, requested, ceiling);
+                        self.grant = Some(issued);
+                        issued
+                    }
+                };
                 self.requested = requested;
                 self.seat = params.seat;
                 self.granted = effective_grant(requested, self.policy.ceiling, params.seat);
@@ -158,6 +313,7 @@ impl BrokerSession {
                     Ok(opened) => {
                         self.capturing = true;
                         vec![BrokerEvent::CaptureStarted {
+                            token_id: grant.id(),
                             seat: params.seat,
                             kind: params.kind,
                             width: opened.width,
@@ -174,13 +330,24 @@ impl BrokerSession {
                     }
                 }
             }
-            ServiceRequest::SwitchCapture { seat, kind } => {
+            ServiceRequest::SwitchCapture {
+                token_id,
+                seat,
+                kind,
+            } => {
+                if !self.authorised(token_id) {
+                    return vec![BrokerEvent::CaptureError {
+                        code: code::UNAUTHORISED,
+                        message: "unknown session grant".into(),
+                    }];
+                }
                 self.seat = seat;
                 // Re-derive the grant for the new seat: logging in can widen it,
                 // logging out narrows it (dropping clipboard, say) at once.
                 self.granted = effective_grant(self.requested, self.policy.ceiling, seat);
                 match frames.switch(seat, kind) {
                     Ok(opened) => vec![BrokerEvent::CaptureStarted {
+                        token_id,
                         seat,
                         kind,
                         width: opened.width,
@@ -208,7 +375,14 @@ impl BrokerSession {
                     reason: code::CLOSED_ON_REQUEST,
                 }]
             }
-            ServiceRequest::Input { payload } => {
+            ServiceRequest::Input { token_id, payload } => {
+                // Injection is the request that actually moves the operator's
+                // devices, so it is checked first and silently drops rather
+                // than reporting: a caller probing ids should learn nothing
+                // from the difference between a wrong id and an empty grant.
+                if !self.authorised(token_id) {
+                    return Vec::new();
+                }
                 // The sink re-checks each event against the grant; an empty
                 // grant injects nothing.
                 input.inject(&payload, self.granted);
@@ -352,8 +526,55 @@ mod tests {
         }
     }
 
+    /// The id the test token source hands out, so a test can tell the grant
+    /// the broker issued apart from one a caller invented.
+    const TEST_GRANT: u128 = 0x5ec0_0de5_ec00_de5e_c00d_e5ec_00de;
+
+    /// A token source with a known id.
+    struct FixedToken(u128);
+
+    impl TokenSource for FixedToken {
+        fn next_id(&mut self) -> u128 {
+            self.0
+        }
+    }
+
+    /// A policy that allows everything, so seat clamping is what the tests
+    /// observe. The *default* policy allows nothing; that is covered on its
+    /// own in `a_default_policy_grants_nothing`.
+    fn permissive() -> BrokerPolicy {
+        BrokerPolicy {
+            ceiling: Capabilities::all(),
+            ..BrokerPolicy::default()
+        }
+    }
+
+    /// Open a capture and return the grant the broker issued.
+    fn open_and_take_grant(
+        session: &mut BrokerSession,
+        frames: &mut FakeFrameSource,
+        input: &mut FakeInputSink,
+        requested: Capabilities,
+        seat: Seat,
+    ) -> u128 {
+        let events = session.handle_request(
+            ServiceRequest::OpenCapture {
+                token_id: NO_GRANT,
+                requested,
+                params: params(seat),
+            },
+            frames,
+            input,
+        );
+        match events.as_slice() {
+            [BrokerEvent::CaptureStarted { token_id, .. }] => *token_id,
+            other => panic!("expected CaptureStarted, got {other:?}"),
+        }
+    }
+
     fn handshaken() -> (BrokerSession, FakeFrameSource, FakeInputSink) {
-        let mut session = BrokerSession::new(BrokerPolicy::default());
+        let mut session =
+            BrokerSession::with_token_source(permissive(), Box::new(FixedToken(TEST_GRANT)));
         let mut frames = FakeFrameSource::default();
         let mut input = FakeInputSink::default();
         let events = session.handle_request(
@@ -409,7 +630,7 @@ mod tests {
         let (mut session, mut frames, mut input) = handshaken();
         let events = session.handle_request(
             ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 // Ask for everything.
                 requested: Capabilities::all(),
                 params: params(Seat::Greeter),
@@ -430,6 +651,195 @@ mod tests {
         assert!(!granted.contains(Capabilities::GAMEPAD));
     }
 
+    /// The finding this whole change exists for: a service that names a grant
+    /// the broker never issued gets nothing.
+    ///
+    /// Before this, `token_id` was discarded and the capability set came
+    /// straight from the request, so a compromised network-facing service
+    /// could ask the root broker for capture and input and be given them.
+    #[test]
+    fn a_grant_the_broker_did_not_issue_is_refused() {
+        let (mut session, mut frames, mut input) = handshaken();
+        let events = session.handle_request(
+            ServiceRequest::OpenCapture {
+                // Any value the service picked for itself. The old
+                // machine-service built one from the clock and its pid.
+                token_id: 0x0123_4567_89ab_cdef,
+                requested: Capabilities::all(),
+                params: params(Seat::User),
+            },
+            &mut frames,
+            &mut input,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [BrokerEvent::CaptureError {
+                    code: code::UNAUTHORISED,
+                    ..
+                }]
+            ),
+            "got {events:?}"
+        );
+        assert!(frames.opened.is_empty(), "capture must not have opened");
+    }
+
+    /// Injection is the request that moves real devices, so it is checked
+    /// against the grant and not merely against the capability set.
+    #[test]
+    fn input_under_a_forged_grant_injects_nothing() {
+        let (mut session, mut frames, mut input) = handshaken();
+        let grant = open_and_take_grant(
+            &mut session,
+            &mut frames,
+            &mut input,
+            Capabilities::all(),
+            Seat::User,
+        );
+
+        session.handle_request(
+            ServiceRequest::Input {
+                token_id: grant ^ 1,
+                payload: vec![1, 2, 3],
+            },
+            &mut frames,
+            &mut input,
+        );
+        assert!(
+            input.injected.is_empty(),
+            "a forged grant must inject nothing"
+        );
+
+        // The real grant still works, so the check is discriminating and not
+        // simply breaking injection.
+        session.handle_request(
+            ServiceRequest::Input {
+                token_id: grant,
+                payload: vec![1, 2, 3],
+            },
+            &mut frames,
+            &mut input,
+        );
+        assert_eq!(input.injected.len(), 1);
+    }
+
+    /// Re-pointing the capture is a capability-bearing request too: without
+    /// this a forged switch could move a session onto a seat it was never
+    /// granted.
+    #[test]
+    fn switching_seats_under_a_forged_grant_is_refused() {
+        let (mut session, mut frames, mut input) = handshaken();
+        open_and_take_grant(
+            &mut session,
+            &mut frames,
+            &mut input,
+            Capabilities::all(),
+            Seat::Greeter,
+        );
+        let events = session.handle_request(
+            ServiceRequest::SwitchCapture {
+                token_id: NO_GRANT,
+                seat: Seat::User,
+                kind: CaptureKind::Scanout,
+            },
+            &mut frames,
+            &mut input,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [BrokerEvent::CaptureError {
+                    code: code::UNAUTHORISED,
+                    ..
+                }]
+            ),
+            "got {events:?}"
+        );
+        assert!(frames.switched.is_empty());
+    }
+
+    /// A broker that has not been told what the operator allows has not been
+    /// told it may hand out the keyboard.
+    #[test]
+    fn a_default_policy_grants_nothing() {
+        assert_eq!(BrokerPolicy::default().ceiling, Capabilities::none());
+
+        let mut session =
+            BrokerSession::with_token_source(BrokerPolicy::default(), Box::new(FixedToken(7)));
+        let mut frames = FakeFrameSource::default();
+        let mut input = FakeInputSink::default();
+        session.handle_request(
+            ServiceRequest::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+            &mut frames,
+            &mut input,
+        );
+        let grant = open_and_take_grant(
+            &mut session,
+            &mut frames,
+            &mut input,
+            Capabilities::all(),
+            Seat::User,
+        );
+        assert_eq!(grant, 7);
+        assert_eq!(
+            session.granted(),
+            Capabilities::none(),
+            "an unconfigured broker must grant nothing, even to a User seat"
+        );
+    }
+
+    /// The operator's ceiling is read from the root broker's environment, so a
+    /// mistyped capability must be refused rather than silently dropped: a
+    /// ceiling the operator did not write is the bug, in either direction.
+    #[test]
+    fn the_configured_ceiling_parses_names_and_refuses_unknown_ones() {
+        assert_eq!(parse_ceiling(""), Ok(Capabilities::none()));
+        assert_eq!(parse_ceiling("  none "), Ok(Capabilities::none()));
+        assert_eq!(parse_ceiling("all"), Ok(Capabilities::all()));
+        assert_eq!(
+            parse_ceiling("capture, keyboard ,mouse"),
+            Ok(Capabilities::CAPTURE
+                .with(Capabilities::KEYBOARD)
+                .with(Capabilities::MOUSE))
+        );
+        assert!(parse_ceiling("capture,keybaord").is_err());
+        assert!(parse_ceiling("everything").is_err());
+    }
+
+    /// The service may ask for less than the ceiling, never more.
+    #[test]
+    fn a_request_can_only_narrow_the_operators_ceiling() {
+        let policy = BrokerPolicy {
+            ceiling: Capabilities::CAPTURE.with(Capabilities::KEYBOARD),
+            ..BrokerPolicy::default()
+        };
+        let mut session =
+            BrokerSession::with_token_source(policy, Box::new(FixedToken(TEST_GRANT)));
+        let mut frames = FakeFrameSource::default();
+        let mut input = FakeInputSink::default();
+        session.handle_request(
+            ServiceRequest::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+            &mut frames,
+            &mut input,
+        );
+        open_and_take_grant(
+            &mut session,
+            &mut frames,
+            &mut input,
+            Capabilities::all(),
+            Seat::User,
+        );
+        assert_eq!(
+            session.granted(),
+            Capabilities::CAPTURE.with(Capabilities::KEYBOARD),
+            "asking for everything must not exceed the operator's ceiling"
+        );
+    }
+
     #[test]
     fn a_user_session_grants_what_was_requested() {
         let (mut session, mut frames, mut input) = handshaken();
@@ -438,7 +848,7 @@ mod tests {
             .with(Capabilities::CLIPBOARD);
         let events = session.handle_request(
             ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 requested,
                 params: params(Seat::User),
             },
@@ -457,20 +867,19 @@ mod tests {
     #[test]
     fn logging_out_to_the_greeter_contracts_the_grant() {
         let (mut session, mut frames, mut input) = handshaken();
-        session.handle_request(
-            ServiceRequest::OpenCapture {
-                token_id: 1,
-                requested: Capabilities::all(),
-                params: params(Seat::User),
-            },
+        let grant = open_and_take_grant(
+            &mut session,
             &mut frames,
             &mut input,
+            Capabilities::all(),
+            Seat::User,
         );
         assert!(session.granted().contains(Capabilities::CLIPBOARD));
 
         // The user logs out: the seat switches back to the greeter.
         let events = session.handle_request(
             ServiceRequest::SwitchCapture {
+                token_id: grant,
                 seat: Seat::Greeter,
                 kind: CaptureKind::Scanout,
             },
@@ -491,17 +900,16 @@ mod tests {
     #[test]
     fn input_is_injected_with_the_current_grant() {
         let (mut session, mut frames, mut input) = handshaken();
-        session.handle_request(
-            ServiceRequest::OpenCapture {
-                token_id: 1,
-                requested: Capabilities::all(),
-                params: params(Seat::Greeter),
-            },
+        let grant = open_and_take_grant(
+            &mut session,
             &mut frames,
             &mut input,
+            Capabilities::all(),
+            Seat::Greeter,
         );
         session.handle_request(
             ServiceRequest::Input {
+                token_id: grant,
                 payload: vec![9, 9, 9],
             },
             &mut frames,
@@ -520,7 +928,7 @@ mod tests {
         let (mut session, mut frames, mut input) = handshaken();
         session.handle_request(
             ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 requested: Capabilities::all(),
                 params: params(Seat::User),
             },
@@ -570,7 +978,7 @@ mod tests {
         frames.fail_open = Some(crate::device::CaptureFailure::new(2, "encoder unavailable"));
         let events = session.handle_request(
             ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 requested: Capabilities::all(),
                 params: params(Seat::User),
             },
@@ -590,7 +998,7 @@ mod tests {
         let (mut session, mut frames, mut input) = handshaken();
         session.handle_request(
             ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 requested: Capabilities::all(),
                 params: params(Seat::User),
             },
@@ -606,7 +1014,7 @@ mod tests {
         // Re-open, then shut the whole connection down.
         session.handle_request(
             ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 requested: Capabilities::all(),
                 params: params(Seat::User),
             },
@@ -686,7 +1094,7 @@ mod tests {
         send_request(
             &mut service,
             &ServiceRequest::OpenCapture {
-                token_id: 1,
+                token_id: NO_GRANT,
                 requested: Capabilities::all(),
                 params: params(Seat::User),
             },
