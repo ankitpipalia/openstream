@@ -1,0 +1,19 @@
+[package]
+name = "openstream-macos-host"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[lib]
+name = "openstream_macos_host"
+path = "src/lib.rs"
+
+# Native macOS host subsystems (currently: screen capture via CoreGraphics).
+# Raw framework FFI, target-gated so no other platform's graph is touched.
+[target.'cfg(target_os = "macos")'.dependencies]
+
+[lints]
+workspace = true

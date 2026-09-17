@@ -1318,6 +1318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/version", get(version_info))
         .route("/v1/auth/register", post(register_account))
         .route("/v1/auth/login", post(login_account))
         .route("/v1/auth/refresh", post(refresh_account))
@@ -1434,6 +1435,28 @@ async fn shutdown_signal() {
 
 async fn healthz() -> &'static str {
     "ok\n"
+}
+
+/// What revision is actually running.
+///
+/// `/healthz` proves the process answers; it says nothing about which commit
+/// it was built from, which is exactly what makes a stale or partial deploy
+/// indistinguishable from a good one. `git_sha` is baked in at compile time
+/// (see `build.rs`) rather than read at runtime, so it can't be spoofed by
+/// anything reachable through the network stack this binary serves.
+async fn version_info() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        name: env!("CARGO_PKG_NAME"),
+        version: env!("CARGO_PKG_VERSION"),
+        git_sha: env!("OPENSTREAM_BUILD_SHA"),
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct VersionInfo {
+    name: &'static str,
+    version: &'static str,
+    git_sha: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1925,14 +1948,31 @@ async fn list_account_devices(State(state): State<AppState>, headers: HeaderMap)
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    let accounts = state.accounts.lock().await;
-    if let Err(error) = accounts.can_manage_devices(&principal) {
-        return control_error_response(error);
+    let mut devices = {
+        let accounts = state.accounts.lock().await;
+        if let Err(error) = accounts.can_manage_devices(&principal) {
+            return control_error_response(error);
+        }
+        match accounts.list_devices(&principal.account_id) {
+            Ok(devices) => devices,
+            Err(error) => return control_error_response(error),
+        }
+    };
+    // Layer live presence over the stored records. The account store knows a
+    // device exists and whether it is trusted; only the Connect broker knows
+    // whether it is online right now, and a device the owner cannot see as
+    // online is one the shell will never offer to connect to. The accounts
+    // lock is released above before the broker lock is taken, so this adds no
+    // new lock-ordering edge. `is_online` is scoped to the caller's account,
+    // so one account's listing can never reveal another's presence.
+    {
+        let now = Instant::now();
+        let broker = state.connect.lock().await;
+        for device in &mut devices {
+            device.online = broker.is_online(&principal.account_id, &device.device_id, now);
+        }
     }
-    match accounts.list_devices(&principal.account_id) {
-        Ok(devices) => Json(devices).into_response(),
-        Err(error) => control_error_response(error),
-    }
+    Json(devices).into_response()
 }
 
 async fn enroll_account_device(
@@ -2129,6 +2169,20 @@ async fn revoke_owned_sessions(
 #[derive(Debug, Deserialize)]
 struct ConnectRequestBody {
     target_device_id: String,
+    /// The permission classes the requester is asking for. Defaulted so a
+    /// client that predates permission negotiation asks for nothing rather
+    /// than failing to parse.
+    #[serde(default)]
+    requested: connect::Permissions,
+}
+
+/// The optional body of an approval: the permission classes the target grants.
+/// Absent or partial defaults to the empty set, so an old client that approves
+/// with no body grants nothing rather than everything.
+#[derive(Debug, Default, Deserialize)]
+struct ConnectApproveBody {
+    #[serde(default)]
+    granted: connect::Permissions,
 }
 
 #[derive(Debug, Serialize)]
@@ -2143,6 +2197,9 @@ struct PendingConnectRequest {
     request_id: String,
     requester_device_id: String,
     expires_in_seconds: u64,
+    /// What the requester asked for, so the target approves against the actual
+    /// request rather than granting blind.
+    requested: connect::Permissions,
 }
 
 #[derive(Debug, Serialize)]
@@ -2163,6 +2220,9 @@ struct ConnectCredential {
     websocket_path: String,
     relay_address: Option<String>,
     relay_ticket: String,
+    /// The classes the target granted, delivered to each end so both agree on
+    /// the session's scope. The runner enforces it; the broker only negotiates.
+    permissions: connect::Permissions,
 }
 
 fn connect_error_response(error: connect::ConnectError) -> Response {
@@ -2285,11 +2345,12 @@ async fn connect_request(
     let now = Instant::now();
     let request_id = Uuid::new_v4().simple().to_string();
     let mut broker = state.connect.lock().await;
-    match broker.request(
+    match broker.request_scoped(
         request_id,
         &account_id,
         &device_id,
         &body.target_device_id,
+        body.requested,
         now,
     ) {
         Ok(request) => Json(ConnectRequestCreated {
@@ -2320,6 +2381,7 @@ async fn connect_pending(State(state): State<AppState>, headers: HeaderMap) -> R
             request_id: request.request_id,
             requester_device_id: request.requester_device_id,
             expires_in_seconds: seconds_until(request.expires_at, now),
+            requested: request.requested,
         })
         .collect();
     Json(body).into_response()
@@ -2330,11 +2392,19 @@ async fn connect_approve(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
+    body: axum::body::Bytes,
 ) -> Response {
     let (account_id, device_id) = match connect_principal(&state, &headers).await {
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    // The classes the target is granting. An empty or absent body -- a client
+    // that predates permission negotiation -- parses to the empty set rather
+    // than a blanket grant, and a malformed one is treated the same way rather
+    // than failing an approval the person already made.
+    let granted = serde_json::from_slice::<ConnectApproveBody>(&body)
+        .map(|body| body.granted)
+        .unwrap_or_default();
     let now = Instant::now();
     let party = connect::Party {
         account_id: &account_id,
@@ -2353,7 +2423,7 @@ async fn connect_approve(
     // a creation slot for a session that already exists.
     let fresh = {
         let mut broker = state.connect.lock().await;
-        match broker.approve(
+        match broker.approve_scoped(
             &request_id,
             party,
             connect::SessionGrant {
@@ -2361,6 +2431,7 @@ async fn connect_approve(
                 host_credential: Uuid::new_v4().simple().to_string(),
                 client_credential: Uuid::new_v4().simple().to_string(),
             },
+            granted,
             now,
         ) {
             Ok(request) => Some(request),
@@ -2421,6 +2492,7 @@ async fn connect_approve(
             websocket_path: format!("/v1/signal/{session_id}/host"),
             relay_ticket: relay_ticket::mint(&state.relay_secret, &session_id, "host", "host", 1),
             relay_address: state.relay_address.map(|address| address.to_string()),
+            permissions: broker.granted_permissions(&request_id),
             session_id,
             role: "host",
             token,
@@ -2488,6 +2560,7 @@ async fn connect_observe(
                 1,
             ),
             relay_address: state.relay_address.map(|address| address.to_string()),
+            permissions: broker.granted_permissions(&request_id),
             session_id,
             role: "client",
             token,
@@ -4598,12 +4671,12 @@ mod tests {
         authorized, bearer_token, cleanup_primary_socket, close_primary_pair, connect_approve,
         connect_deny, connect_observe, connect_offline, connect_pending, connect_presence,
         connect_request, consume_dual_budget, create_session, direct_message_route,
-        dispatch_generic_message, enroll_account_device, is_private_lan_address,
+        dispatch_generic_message, enroll_account_device, healthz, is_private_lan_address,
         list_account_devices, login_account, max_guests_for_new_session,
         prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
         register_account, relay_owner_for_ticket, relay_ticket, request_source,
         revoke_owned_sessions, sessions_owned_by, set_account_device_trust, signal_socket,
-        supplied_token_is_host, validate_signal_message, validate_startup_auth,
+        supplied_token_is_host, validate_signal_message, validate_startup_auth, version_info,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -7373,6 +7446,8 @@ mod tests {
 
     fn connect_router(state: AppState) -> Router {
         Router::new()
+            .route("/healthz", get(healthz))
+            .route("/version", get(version_info))
             .route("/v1/auth/register", post(register_account))
             .route("/v1/auth/login", post(login_account))
             .route(
@@ -7393,6 +7468,10 @@ mod tests {
             .route("/v1/connect/{request_id}/approve", post(connect_approve))
             .route("/v1/connect/{request_id}/deny", post(connect_deny))
             .route("/v1/session", post(create_session))
+            // The signalling socket, so a test can present a broker-issued
+            // credential to it and prove the connect flow and the relay are one
+            // product rather than two subsystems that only work in isolation.
+            .route("/v1/signal/{session_id}/{role}", get(signal_socket))
             .with_state(state)
     }
 
@@ -7435,6 +7514,35 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
         };
         (status, value)
+    }
+
+    /// `/version` reports a build identity, not just that the process answers.
+    ///
+    /// `/healthz` alone cannot distinguish a good deploy from a stale or
+    /// partial one; this is the endpoint an operator checks to prove which
+    /// commit is actually serving traffic.
+    #[tokio::test]
+    async fn version_reports_a_non_empty_build_identity() {
+        let app = connect_router(connect_test_state());
+        let (status, body) = call(&app, "GET", "/version", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["name"].as_str(),
+            Some("openstream-signal-server"),
+            "unexpected package name in {body}"
+        );
+        assert!(
+            body["version"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "version must be present: {body}"
+        );
+        assert!(
+            body["git_sha"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "git_sha must be present even when it falls back to \"unknown\": {body}"
+        );
     }
 
     /// Register an account with one enrolled device and return its access
@@ -7542,6 +7650,590 @@ mod tests {
             .to_string()
     }
 
+    /// credential the broker mints from an approval authenticates the
+    /// signalling socket, and the socket then delivers its first frame.
+    ///
+    /// Every other test drives the two in isolation -- the connect flow over
+    /// HTTP with `oneshot`, the socket with a hand-built session. This one runs
+    /// the whole path against a single real served router: register, approve,
+    /// then present the issued host credential to `/v1/signal` over a real
+    /// WebSocket. If the token the broker mints did not match the token the
+    /// socket checks, each half would pass its own test and they would fail
+    /// only here.
+    #[tokio::test]
+    async fn a_broker_issued_credential_authenticates_the_signalling_socket() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x41).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x42).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x42).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Client asks, host approves -> the host credential (session, token, ws
+        // path). This is the value the socket must accept.
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (status, grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {grant}");
+        let ws_path = grant["websocket_path"]
+            .as_str()
+            .expect("websocket path")
+            .to_string();
+        let host_capability = grant["token"]
+            .as_str()
+            .expect("host capability")
+            .to_string();
+
+        // Serve the same router (so the same in-memory session) over TCP for
+        // the WebSocket half.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        // Present the broker-issued credential to the signalling socket. A
+        // token the socket does not recognise fails the handshake here.
+        let mut request = format!("ws://{address}{ws_path}")
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {host_capability}")
+                .parse()
+                .expect("authorization header"),
+        );
+        let (mut socket, response) = connect_async(request)
+            .await
+            .expect("the broker-issued credential authenticates the signalling socket");
+        assert_eq!(
+            response.status().as_u16(),
+            101,
+            "the socket switches protocols for a credential it recognises",
+        );
+
+        // The host side receives a first frame on connect, proving the socket
+        // is live for this session rather than merely accepting the upgrade.
+        let first = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("a first frame arrives before the timeout")
+            .expect("the socket yields a frame")
+            .expect("the frame is a valid websocket message");
+        assert!(
+            matches!(first, ClientMessage::Text(_) | ClientMessage::Binary(_)),
+            "the signalling socket delivers its first frame to the host",
+        );
+
+        server.abort();
+    }
+
+    /// The signalling socket refuses a credential it never minted.
+    ///
+    /// The positive path proves a broker-issued token is accepted; this proves
+    /// that acceptance is a check, not a formality. A real session exists, but a
+    /// token the socket never issued for it does not open a live socket: either
+    /// the handshake is refused, or the upgrade completes and the socket closes
+    /// without ever delivering the session's first frame.
+    #[tokio::test]
+    async fn the_signalling_socket_refuses_a_credential_it_did_not_mint() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x43).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x44).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x44).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (_, grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        let ws_path = grant["websocket_path"]
+            .as_str()
+            .expect("websocket path")
+            .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        let mut request = format!("ws://{address}{ws_path}")
+            .into_client_request()
+            .expect("websocket request");
+        request.headers_mut().insert(
+            "authorization",
+            "Bearer not-a-credential-this-socket-issued"
+                .parse()
+                .expect("authorization header"),
+        );
+
+        match connect_async(request).await {
+            // The handshake itself was refused: an unambiguous rejection.
+            Err(_) => {}
+            // The upgrade completed; the socket must not then act as a live
+            // session socket. It closes, errors, or yields nothing -- never a
+            // usable first frame.
+            Ok((mut socket, _)) => {
+                match timeout(Duration::from_secs(2), socket.next()).await {
+                    Ok(Some(Ok(ClientMessage::Text(text)))) => {
+                        panic!("a credential the socket did not mint received a text frame: {text}")
+                    }
+                    Ok(Some(Ok(ClientMessage::Binary(bytes)))) => panic!(
+                        "a credential the socket did not mint received a binary frame ({} bytes)",
+                        bytes.len()
+                    ),
+                    // Close, transport error, end of stream, or timeout: all are
+                    // a rejection, none is authentication.
+                    _ => {}
+                }
+            }
+        }
+
+        server.abort();
+    }
+
+    /// A signalling socket that drops can reconnect with the same credential.
+    ///
+    /// A transport drop must not force the whole Connect flow to run again: the
+    /// session and its role token outlive one socket, so a reconnecting peer
+    /// presents the same credential and goes live again. This is the signalling
+    /// half of reconnect resilience (signalling outage -> reconnect); the media
+    /// path re-establishes separately.
+    #[tokio::test]
+    async fn a_signalling_socket_reconnects_with_the_same_credential_after_a_drop() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x45).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x46).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x46).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (_, grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        let ws_path = grant["websocket_path"]
+            .as_str()
+            .expect("websocket path")
+            .to_string();
+        let host_capability = grant["token"]
+            .as_str()
+            .expect("host capability")
+            .to_string();
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let ws_url = format!("ws://{address}{ws_path}");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+        let bearer = format!("Bearer {host_capability}");
+
+        // Connect, take the first frame, then drop the socket -- a signalling
+        // outage from the peer's side.
+        {
+            let mut request = ws_url.clone().into_client_request().expect("request");
+            request
+                .headers_mut()
+                .insert("authorization", bearer.parse().expect("header"));
+            let (mut socket, response) = connect_async(request).await.expect("first connect");
+            assert_eq!(response.status().as_u16(), 101);
+            let _first = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("a first frame arrives")
+                .expect("socket yields a frame")
+                .expect("valid frame");
+            // The socket drops at the end of this scope.
+        }
+
+        // Let the server observe the drop before the reconnect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Reconnect with the same credential: the session survived the drop.
+        let mut request = ws_url.into_client_request().expect("request");
+        request
+            .headers_mut()
+            .insert("authorization", bearer.parse().expect("header"));
+        let (mut socket, response) = connect_async(request)
+            .await
+            .expect("the same credential reconnects the signalling socket after a drop");
+        assert_eq!(
+            response.status().as_u16(),
+            101,
+            "the reconnect switches protocols",
+        );
+        let first = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("a first frame arrives on reconnect")
+            .expect("socket yields a frame")
+            .expect("valid frame");
+        assert!(
+            matches!(first, ClientMessage::Text(_) | ClientMessage::Binary(_)),
+            "the reconnected socket is live",
+        );
+
+        server.abort();
+    }
+
+    /// Two broker-issued peers meet on the signalling plane and a candidate
+    /// relays between them.
+    ///
+    /// The credential tests above each bring up a single socket. A session is
+    /// only useful once both roles are live and can exchange establishment
+    /// traffic, so this brings both up from one approval -- the host credential
+    /// from `/approve`, the client credential from the observing `GET` -- lets
+    /// the server pair them into one establishment epoch, and drives one real
+    /// direct candidate from the client through to the host. It exercises the
+    /// readiness handshake (`peer_ready`) and the post-ready relay together,
+    /// end to end over real WebSockets, which no single-socket test can reach.
+    #[tokio::test]
+    async fn two_peers_relay_a_candidate_after_reaching_readiness() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x51).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x52).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x52).await;
+        call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+
+        // Client asks; host approves -> the host credential. The client then
+        // observes the approved request -> the client credential. Two roles,
+        // one session, from a single approval.
+        let (_, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+        let (status, host_grant) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {host_grant}");
+        let (status, client_grant) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "observe: {client_grant}");
+
+        let host_path = host_grant["websocket_path"]
+            .as_str()
+            .expect("host websocket path")
+            .to_string();
+        let host_capability = host_grant["token"]
+            .as_str()
+            .expect("host capability")
+            .to_string();
+        let client_path = client_grant["websocket_path"]
+            .as_str()
+            .expect("client websocket path")
+            .to_string();
+        let client_capability = client_grant["token"]
+            .as_str()
+            .expect("client capability")
+            .to_string();
+
+        // Serve the same router (hence the same in-memory session) over TCP so
+        // both roles can open real WebSockets against it.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let host_url = format!("ws://{address}{host_path}");
+        let client_url = format!("ws://{address}{client_path}");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server runs");
+        });
+
+        // Bring up the host socket first; it is live but not yet paired.
+        let mut host_request = host_url.into_client_request().expect("host request");
+        host_request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {host_capability}")
+                .parse()
+                .expect("host authorization header"),
+        );
+        let (mut host_socket, _) = connect_async(host_request)
+            .await
+            .expect("the host credential authenticates its socket");
+
+        // Bring up the client socket. With both roles present the server
+        // publishes the ready epoch to each.
+        let mut client_request = client_url.into_client_request().expect("client request");
+        client_request.headers_mut().insert(
+            "authorization",
+            format!("Bearer {client_capability}")
+                .parse()
+                .expect("client authorization header"),
+        );
+        let (mut client_socket, _) = connect_async(client_request)
+            .await
+            .expect("the client credential authenticates its socket");
+
+        // The client reads until its readiness announcement and takes the
+        // establishment generation it must stamp on establishment traffic.
+        let generation = loop {
+            let frame = timeout(Duration::from_secs(2), client_socket.next())
+                .await
+                .expect("a client readiness frame arrives before the timeout")
+                .expect("the client socket yields a frame")
+                .expect("the client frame is valid");
+            if let ClientMessage::Text(text) = frame {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("a signalling frame is JSON");
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("peer_ready") {
+                    break value["establishment_generation"]
+                        .as_u64()
+                        .expect("a readiness generation");
+                }
+            }
+        };
+        assert!(
+            generation >= 1,
+            "the readiness epoch is published to the client"
+        );
+
+        // The client emits one real direct candidate stamped with that epoch.
+        let candidate = serde_json::json!({
+            "type": "direct_candidate",
+            "establishment_generation": generation,
+            "kind": "host",
+            "ip": "192.0.2.20",
+            "port": 40002,
+        })
+        .to_string();
+        client_socket
+            .send(ClientMessage::Text(candidate))
+            .await
+            .expect("the client sends its candidate");
+
+        // The host reads until the client's candidate arrives, relayed by the
+        // server -- proof the two peers share one live signalling plane rather
+        // than two isolated sockets.
+        let relayed = loop {
+            let frame = timeout(Duration::from_secs(2), host_socket.next())
+                .await
+                .expect("the relayed candidate arrives at the host before the timeout")
+                .expect("the host socket yields a frame")
+                .expect("the host frame is valid");
+            if let ClientMessage::Text(text) = frame {
+                let value: serde_json::Value =
+                    serde_json::from_str(text.as_str()).expect("a signalling frame is JSON");
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("direct_candidate")
+                {
+                    break value;
+                }
+            }
+        };
+        assert_eq!(
+            relayed["establishment_generation"].as_u64(),
+            Some(generation),
+            "the relayed candidate carries the same establishment epoch",
+        );
+        assert_eq!(
+            relayed["ip"].as_str(),
+            Some("192.0.2.20"),
+            "the host receives the client's candidate unchanged",
+        );
+        assert_eq!(
+            relayed["port"].as_u64(),
+            Some(40002),
+            "the candidate port survives the relay"
+        );
+
+        server.abort();
+    }
+
+    /// Permission classes negotiate through the broker: the requester asks, the
+    /// target sees the request and grants a (possibly smaller) set, and both
+    /// ends receive the granted set in their credential.
+    ///
+    /// The broker only carries the decision; nothing here enforces it. But a
+    /// class that never reached the host to be granted, or never reached each
+    /// end to be enforced, is a permission the product cannot honour -- so this
+    /// round trip is the foundation enforcement sits on.
+    #[tokio::test]
+    async fn permissions_negotiate_through_the_connect_flow() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x31).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x32).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x32).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // The client asks for view + keyboard + mouse, and nothing else.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({
+                "target_device_id": "device-host",
+                "requested": { "view": true, "keyboard": true, "mouse": true },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "connect: {body}");
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        // The host sees exactly what was asked, including the classes left off.
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body[0]["requested"]["view"], serde_json::json!(true));
+        assert_eq!(body[0]["requested"]["keyboard"], serde_json::json!(true));
+        assert_eq!(body[0]["requested"]["mouse"], serde_json::json!(true));
+        assert_eq!(body[0]["requested"]["clipboard"], serde_json::json!(false));
+        assert_eq!(body[0]["requested"]["microphone"], serde_json::json!(false));
+
+        // The host grants a subset: view + keyboard, but not mouse.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            Some(serde_json::json!({ "granted": { "view": true, "keyboard": true } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "approve: {body}");
+        // The host's own credential carries the granted set.
+        assert_eq!(body["permissions"]["view"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["keyboard"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["mouse"], serde_json::json!(false));
+
+        // The client polls and receives the same granted set: both ends agree.
+        let (status, body) = call(
+            &app,
+            "GET",
+            &format!("/v1/connect/{request_id}"),
+            Some(&client_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "observe: {body}");
+        assert_eq!(body["role"], serde_json::json!("client"));
+        assert_eq!(body["permissions"]["view"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["keyboard"], serde_json::json!(true));
+        assert_eq!(body["permissions"]["mouse"], serde_json::json!(false));
+    }
+
+    /// The device listing carries live presence, which is what lets the owner's
+    /// shell offer a connection at all.
+    ///
+    /// The broker already tracks and enforces presence, but until it was
+    /// surfaced here the shell had no readable online status and marked every
+    /// device offline -- so discovery could never happen and the connect
+    /// button was never live. Presence must appear in `GET /v1/devices` for
+    /// exactly the device that announced it, and only within the owner's own
+    /// account.
+    #[tokio::test]
+    async fn presence_is_reported_in_the_device_listing() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        // The owner account, with its own (client) device.
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        // A host device on the same account, trusted by the owner.
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+
+        let online_of = |body: &serde_json::Value, id: &str| -> bool {
+            body.as_array()
+                .expect("device array")
+                .iter()
+                .find(|device| device["device_id"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("device {id} present in listing: {body}"))["online"]
+                .as_bool()
+                .expect("online is a bool")
+        };
+
+        // Before any heartbeat, nothing is online.
+        let (status, body) = call(&app, "GET", "/v1/devices", Some(&client_token), None).await;
+        assert_eq!(status, StatusCode::OK, "list devices: {body}");
+        assert!(
+            !online_of(&body, "device-host"),
+            "host offline before heartbeat"
+        );
+        assert!(!online_of(&body, "device-client"), "client never announces");
+
+        // The host announces it is available.
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "host announces presence");
+
+        // Now the owner sees the host as online, and only the host: a device
+        // that never announced stays offline.
+        let (status, body) = call(&app, "GET", "/v1/devices", Some(&client_token), None).await;
+        assert_eq!(status, StatusCode::OK, "list devices: {body}");
+        assert!(
+            online_of(&body, "device-host"),
+            "the announced host is online"
+        );
+        assert!(
+            !online_of(&body, "device-client"),
+            "a device that never announced is not online"
+        );
+    }
+
     /// The product flow, end to end, and the boundary it exists to draw.
     ///
     /// Each end receives exactly one role capability and neither can obtain
@@ -7611,9 +8303,10 @@ mod tests {
         let host_capability = host_grant["token"].as_str().expect("host token");
         assert_eq!(
             host_grant.as_object().expect("object").keys().count(),
-            6,
-            "the approval response carries one capability and nothing that \
-             could be mistaken for a second: {host_grant}"
+            7,
+            "the approval response carries one capability plus the granted \
+             permission set, and nothing that could be mistaken for a second \
+             capability: {host_grant}"
         );
 
         // The client collects the client capability only.

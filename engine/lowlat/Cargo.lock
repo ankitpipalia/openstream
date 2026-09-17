@@ -1911,6 +1911,7 @@ dependencies = [
  "lowlat-core",
  "lowlat-host",
  "lowlat-inject",
+ "lowlat-net",
  "openstream-host-ipc",
  "openstream-media",
  "tokio",
@@ -1951,6 +1952,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "openstream-macos-host"
+version = "0.1.0"
+
+[[package]]
+name = "openstream-macos-media"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
 ]
 
 [[package]]

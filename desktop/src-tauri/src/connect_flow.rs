@@ -71,6 +71,9 @@ pub fn interpret(observation: ConnectObservation, expired: bool) -> ConnectStep 
                 relay_address: credential.relay_address,
                 relay_ticket: Some(credential.relay_ticket),
                 turn: None,
+                // The observed broker credential carries no permission grant on
+                // this path yet; the runner treats that as unscoped for now.
+                permissions: None,
             }))
         }
         ConnectObservation::Waiting { state } => match state {
