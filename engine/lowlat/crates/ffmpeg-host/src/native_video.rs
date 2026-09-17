@@ -14,6 +14,20 @@
 
 use std::borrow::Cow;
 
+/// Whether the user asked for the CoreGraphics poll instead of
+/// ScreenCaptureKit (`OPENSTREAM_MACOS_CAPTURE=coregraphics`).
+///
+/// Only an explicit request counts. An unset, empty or unrecognised value
+/// leaves the host on the fast path: a typo in this variable must not quietly
+/// halve the frame rate.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn forces_core_graphics(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "coregraphics" | "core-graphics" | "cg" | "poll"
+    )
+}
+
 /// Backend names that select the in-process pipeline.
 pub(crate) fn selects_native(backend: &str) -> bool {
     matches!(
@@ -484,14 +498,31 @@ mod macos_pipeline {
     use std::time::{Duration, Instant};
 
     use openstream_macos_host::capture::ScreenCapture;
+    use openstream_macos_host::sck::{CapturedSurface, SckCapture, SckConfig};
     use openstream_macos_media::VideoToolboxH264Encoder;
     use tokio::sync::{mpsc, oneshot};
 
-    use super::{frame_access_unit, scale_bgra};
+    use super::{forces_core_graphics, frame_access_unit, scale_bgra};
 
     /// Complete access units queued before capture backs off. Small on purpose:
     /// a deep queue is latency.
     const QUEUE_DEPTH: usize = 8;
+
+    /// How long a static desktop goes before the last frame is re-sent.
+    ///
+    /// ScreenCaptureKit delivers on change, not on a clock, so a screen nobody
+    /// is touching stops producing frames entirely. Without this the client
+    /// would sit on a frozen picture with no traffic, which its own liveness
+    /// watch reads as a dead host. Re-encoding the last surface costs almost
+    /// nothing -- it compresses to a near-empty inter frame -- and it keeps the
+    /// host's frame counter advancing. The same value the Windows pipeline
+    /// uses, for the same reason.
+    const KEEPALIVE: Duration = Duration::from_millis(1000);
+
+    /// How long to block waiting for a frame before looking at the control
+    /// channel again. Short enough that a stop request is not left sitting,
+    /// long enough that a quiet screen does not spin.
+    const FRAME_WAIT: Duration = Duration::from_millis(100);
 
     /// What the pipeline captures and encodes.
     #[derive(Debug, Clone)]
@@ -604,24 +635,41 @@ mod macos_pipeline {
         }
     }
 
+    /// Where frames come from.
+    ///
+    /// The two differ in more than speed. [`Self::Stream`] is driven by the
+    /// compositor: frames arrive already scaled, as surfaces the encoder takes
+    /// without a copy, and only when something changed. [`Self::Poll`] is
+    /// driven by this loop: every frame costs a full framebuffer copy, a
+    /// stride pack, a CPU rescale and the encoder's own upload, whether or not
+    /// anything moved.
+    enum Source {
+        /// ScreenCaptureKit. Preferred.
+        Stream(SckCapture),
+        /// `CGDisplayCreateImage` polling. The fallback for a system where the
+        /// stream will not start -- kept because "no capture at all" is a much
+        /// worse outcome than a slow one.
+        Poll(ScreenCapture),
+    }
+
     struct Worker {
         config: NativeConfig,
         width_px: usize,
         height_px: usize,
-        capture: ScreenCapture,
+        source: Source,
         encoder: VideoToolboxH264Encoder,
         epoch: Instant,
         interval: Duration,
         last_encode: Option<Instant>,
         encoded: u64,
+        /// The last surface the stream delivered, kept so a still screen can be
+        /// re-sent as a keepalive. Only used by [`Source::Stream`].
+        last_surface: Option<CapturedSurface>,
     }
 
     impl Worker {
         fn open(config: NativeConfig) -> Result<Self, String> {
-            let capture = match config.display_id {
-                Some(id) => ScreenCapture::for_display(id),
-                None => ScreenCapture::main(),
-            };
+            let source = Self::open_source(&config);
             let encoder = VideoToolboxH264Encoder::new(
                 config.width,
                 config.height,
@@ -634,17 +682,64 @@ mod macos_pipeline {
                 height_px: config.height as usize,
                 interval: Duration::from_micros(1_000_000 / u64::from(config.fps.max(1))),
                 config,
-                capture,
+                source,
                 encoder,
                 epoch: Instant::now(),
                 last_encode: None,
                 encoded: 0,
+                last_surface: None,
             })
         }
 
+        /// ScreenCaptureKit if it will start, CoreGraphics if it will not.
+        ///
+        /// A stream that refuses to start is not a reason to have no host: the
+        /// poll still works, just slowly, and the reason is printed so the
+        /// difference is not silent.
+        ///
+        /// `OPENSTREAM_MACOS_CAPTURE=coregraphics` forces the poll. Without
+        /// that switch the fallback would be unreachable on every machine
+        /// where the stream does start, which is to say untestable everywhere
+        /// it is not already broken -- and a fallback nobody can exercise is
+        /// one nobody finds out has rotted.
+        fn open_source(config: &NativeConfig) -> Source {
+            if forces_core_graphics(&std::env::var("OPENSTREAM_MACOS_CAPTURE").unwrap_or_default())
+            {
+                eprintln!(
+                    "OpenStream capture: CoreGraphics polling, forced by OPENSTREAM_MACOS_CAPTURE"
+                );
+                return match config.display_id {
+                    Some(id) => Source::Poll(ScreenCapture::for_display(id)),
+                    None => Source::Poll(ScreenCapture::main()),
+                };
+            }
+            match SckCapture::start(SckConfig {
+                width: config.width,
+                height: config.height,
+                fps: config.fps,
+                display_id: config.display_id,
+                show_cursor: true,
+            }) {
+                Ok(stream) => Source::Stream(stream),
+                Err(error) => {
+                    eprintln!(
+                        "OpenStream ScreenCaptureKit unavailable ({error}); falling back to CoreGraphics polling"
+                    );
+                    match config.display_id {
+                        Some(id) => Source::Poll(ScreenCapture::for_display(id)),
+                        None => Source::Poll(ScreenCapture::main()),
+                    }
+                }
+            }
+        }
+
         fn describe(&self) -> String {
+            let capture = match self.source {
+                Source::Stream(_) => "ScreenCaptureKit capture (GPU surfaces, no copy)",
+                Source::Poll(_) => "CoreGraphics capture (polled, copied)",
+            };
             format!(
-                "CoreGraphics capture -> VideoToolbox H.264 [hardware], {}x{} @ {} fps, {:.2} Mbps",
+                "{capture} -> VideoToolbox H.264 [hardware], {}x{} @ {} fps, {:.2} Mbps",
                 self.config.width,
                 self.config.height,
                 self.config.fps,
@@ -674,40 +769,102 @@ mod macos_pipeline {
                         }
                     }
                 }
-                // Pace to the negotiated rate. CoreGraphics capture is a poll, so
-                // (unlike Desktop Duplication) there is no change signal; a future
-                // ScreenCaptureKit path can skip unchanged frames.
-                if let Some(last) = self.last_encode {
-                    let elapsed = last.elapsed();
-                    if elapsed < self.interval {
-                        thread::sleep(self.interval - elapsed);
-                    }
-                }
-                let frame = match self.capture.capture() {
-                    Ok(frame) => frame,
-                    Err(error) => {
-                        eprintln!("OpenStream native capture failed: {error}");
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
+                let keep_going = match &self.source {
+                    Source::Stream(_) => self.stream_once(units),
+                    Source::Poll(_) => self.poll_once(units),
                 };
-                let scaled = scale_bgra(
-                    &frame.bgra,
-                    frame.width,
-                    frame.height,
-                    self.width_px,
-                    self.height_px,
-                )
-                .into_owned();
-                if !self.encode(&scaled, units) {
+                if !keep_going {
                     return;
                 }
             }
         }
 
-        fn encode(&mut self, bgra: &[u8], units: &mpsc::Sender<Vec<u8>>) -> bool {
-            let pts_us = i64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(i64::MAX);
-            let encoded = match self.encoder.encode(bgra, pts_us) {
+        /// One turn of the ScreenCaptureKit loop.
+        ///
+        /// No pacing of its own: the stream is already capped at the
+        /// negotiated rate and only fires on change, so sleeping to an
+        /// interval here would add latency to frames that are already due.
+        fn stream_once(&mut self, units: &mpsc::Sender<Vec<u8>>) -> bool {
+            let Source::Stream(stream) = &self.source else {
+                return true;
+            };
+            if let Some(surface) = stream.wait_frame(FRAME_WAIT) {
+                self.last_surface = Some(surface);
+            } else if self
+                .last_encode
+                .is_none_or(|last| last.elapsed() < KEEPALIVE)
+            {
+                // Nothing new and the keepalive is not due: go back and look
+                // at the control channel.
+                return true;
+            }
+            // Either a fresh surface, or the last one being re-sent because the
+            // screen has not moved for a second.
+            let Some(surface) = self.last_surface.as_ref() else {
+                return true;
+            };
+            // SAFETY: the surface holds a retain on its pixel buffer for as
+            // long as `self.last_surface` does, which outlives this call, and
+            // the stream was configured with the encoder's size and format.
+            let encoded = unsafe {
+                self.encoder
+                    .encode_surface(surface.as_ptr().cast(), self.pts_now())
+            };
+            self.emit(encoded, units)
+        }
+
+        /// One turn of the CoreGraphics loop: pace, snapshot, copy, rescale,
+        /// and hand the bytes to the encoder to copy again.
+        fn poll_once(&mut self, units: &mpsc::Sender<Vec<u8>>) -> bool {
+            // Paced here because the poll has no change signal of its own:
+            // without this it would capture as fast as the CPU allows.
+            if let Some(last) = self.last_encode {
+                let elapsed = last.elapsed();
+                if elapsed < self.interval {
+                    thread::sleep(self.interval - elapsed);
+                }
+            }
+            let Source::Poll(capture) = &mut self.source else {
+                return true;
+            };
+            let frame = match capture.capture() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    eprintln!("OpenStream native capture failed: {error}");
+                    thread::sleep(Duration::from_millis(100));
+                    return true;
+                }
+            };
+            let scaled = scale_bgra(
+                &frame.bgra,
+                frame.width,
+                frame.height,
+                self.width_px,
+                self.height_px,
+            )
+            .into_owned();
+            let encoded = self.encoder.encode(&scaled, self.pts_now());
+            self.emit(encoded, units)
+        }
+
+        /// Microseconds since the worker started, which is what the encoder
+        /// stamps frames with on both paths.
+        fn pts_now(&self) -> i64 {
+            i64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(i64::MAX)
+        }
+
+        /// Frame and send whatever the encoder produced. Shared by both
+        /// sources so the access-unit framing, the encode clock and the
+        /// back-pressure behaviour cannot differ between them.
+        fn emit(
+            &mut self,
+            encoded: Result<
+                Vec<openstream_macos_media::EncodedAccessUnit>,
+                openstream_macos_media::VtEncError,
+            >,
+            units: &mpsc::Sender<Vec<u8>>,
+        ) -> bool {
+            let encoded = match encoded {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     eprintln!("OpenStream native encode failed: {error}");
@@ -746,6 +903,26 @@ mod macos_pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fallback switch has to be explicit. An unset or mistyped value
+    /// leaving the host on the poll would halve its frame rate silently.
+    #[test]
+    fn only_an_explicit_request_forces_the_coregraphics_poll() {
+        for value in ["coregraphics", "Core-Graphics", " CG ", "poll"] {
+            assert!(forces_core_graphics(value), "{value:?}");
+        }
+        for value in [
+            "",
+            "   ",
+            "screencapturekit",
+            "sck",
+            "coregraphic",
+            "core graphics",
+            "1",
+        ] {
+            assert!(!forces_core_graphics(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn native_backend_names_are_recognised_case_insensitively() {
