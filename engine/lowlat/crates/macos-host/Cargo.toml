@@ -15,5 +15,10 @@ path = "src/lib.rs"
 # Raw framework FFI, target-gated so no other platform's graph is touched.
 [target.'cfg(target_os = "macos")'.dependencies]
 
+# The VideoToolbox encoder, used only by the capture_encode_loopback example that
+# proves capture -> hardware encode works together with no ffmpeg.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+openstream-macos-media = { path = "../macos-media" }
+
 [lints]
 workspace = true
