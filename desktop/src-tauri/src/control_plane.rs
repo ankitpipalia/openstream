@@ -131,6 +131,18 @@ struct RefreshRequest<'a> {
     refresh_token: &'a str,
 }
 
+/// The control plane's answer to "would an anonymous registration succeed?".
+///
+/// Defaulted to closed: a control plane too old to answer, or an answer this
+/// build cannot parse, must not cause the shell to offer signup it cannot
+/// deliver. Hiding a button that would have worked is a smaller failure than
+/// showing one that cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+struct RegistrationCapability {
+    #[serde(default)]
+    open: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ConnectRequestBody<'a> {
     target_device_id: &'a str,
@@ -361,6 +373,22 @@ impl ControlPlaneClient {
             .map_err(|_| ControlPlaneError::Transport)?;
         let response: AuthResponse = parse_response(response).await?;
         Ok(self.accept_auth(response))
+    }
+
+    /// Whether this control plane will accept an anonymous registration.
+    ///
+    /// Unauthenticated on purpose: the login screen asks this *before* anyone
+    /// has an account, precisely so it can stop offering a "Create an account"
+    /// button on a closed deployment where every attempt would fail.
+    pub async fn registration_open(&self) -> Result<bool, ControlPlaneError> {
+        let response = self
+            .http
+            .get(self.endpoint("/v1/auth/registration")?)
+            .send()
+            .await
+            .map_err(|_| ControlPlaneError::Transport)?;
+        let capability: RegistrationCapability = parse_response(response).await?;
+        Ok(capability.open)
     }
 
     pub async fn devices(&mut self) -> Result<Vec<PublicDevice>, ControlPlaneError> {

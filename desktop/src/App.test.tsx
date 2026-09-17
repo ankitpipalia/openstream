@@ -42,6 +42,7 @@ function approvalAdapter(overrides: Partial<ProductAdapter>): ProductAdapter {
   return {
     getSnapshot: () => snapshot,
     subscribe: () => () => {},
+    registrationOpen: async () => true,
     refresh: async () => snapshot,
     dispatch: async () => snapshot,
     updateSettings: async () => snapshot,
@@ -110,6 +111,7 @@ describe("OpenStream desktop shell", () => {
     const adapter: ProductAdapter = {
       getSnapshot: () => createEmptySnapshot(),
       subscribe: () => () => {},
+    registrationOpen: async () => true,
       refresh: async () => {
         throw new Error("bridge down");
       },
@@ -135,6 +137,7 @@ describe("OpenStream desktop shell", () => {
     const adapter: ProductAdapter = {
       getSnapshot: () => createEmptySnapshot(),
       subscribe: () => () => {},
+    registrationOpen: async () => true,
       refresh: async () => {
         refreshCount += 1;
         if (refreshCount === 1) {
@@ -178,6 +181,7 @@ describe("OpenStream desktop shell", () => {
     const adapter: ProductAdapter = {
       getSnapshot: () => seeded,
       subscribe: () => () => {},
+    registrationOpen: async () => true,
       refresh: async () => seeded,
       // A recoverable session-start failure, not a dead runtime bridge.
       dispatch: async () => {

@@ -890,6 +890,16 @@ export function createTauriAdapter(invokeFn: TauriInvoke): ProductAdapter {
       const raw = (await invokeFn("control_plane_register", { username, password })) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));
     },
+    registrationOpen: async () => {
+      try {
+        return (await invokeFn("control_plane_registration_open")) as boolean;
+      } catch {
+        // Unreachable or too old to answer: treat as closed. Hiding a button
+        // that would have worked is a smaller failure than offering one that
+        // cannot succeed.
+        return false;
+      }
+    },
     signOut: async () => {
       const raw = (await invokeFn("control_plane_sign_out")) as RuntimeSnapshot;
       return publish(mapRuntimeSnapshot(raw));

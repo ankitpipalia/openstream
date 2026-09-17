@@ -1319,6 +1319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/version", get(version_info))
+        .route("/v1/auth/registration", get(registration_capability))
         .route("/v1/auth/register", post(register_account))
         .route("/v1/auth/login", post(login_account))
         .route("/v1/auth/refresh", post(refresh_account))
@@ -1450,6 +1451,34 @@ async fn version_info() -> Json<VersionInfo> {
         version: env!("CARGO_PKG_VERSION"),
         git_sha: env!("OPENSTREAM_BUILD_SHA"),
     })
+}
+
+/// Whether this deployment will accept an anonymous `POST /v1/auth/register`
+/// right now.
+///
+/// The shell offered "Create an account" unconditionally, but a closed
+/// deployment only accepts anonymous registration for the very first account
+/// (see [`authorize_registration`]). Every later user therefore saw a button
+/// that could not succeed and a generic failure after pressing it, which reads
+/// as a broken product rather than a closed one.
+///
+/// Advertising it leaks nothing that was not already probeable: anyone can
+/// discover the same fact by attempting the registration this answers for.
+/// The admin-token path is deliberately not reflected here -- that is an
+/// authenticated capability and this endpoint is unauthenticated, so it
+/// answers only the question the login screen actually asks.
+async fn registration_capability(State(state): State<AppState>) -> Json<RegistrationCapability> {
+    let open = if state.open_registration {
+        true
+    } else {
+        state.accounts.lock().await.account_count() == 0
+    };
+    Json(RegistrationCapability { open })
+}
+
+#[derive(Debug, Serialize)]
+struct RegistrationCapability {
+    open: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -4674,9 +4703,10 @@ mod tests {
         dispatch_generic_message, enroll_account_device, healthz, is_private_lan_address,
         list_account_devices, login_account, max_guests_for_new_session,
         prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
-        register_account, relay_owner_for_ticket, relay_ticket, request_source,
-        revoke_owned_sessions, sessions_owned_by, set_account_device_trust, signal_socket,
-        supplied_token_is_host, validate_signal_message, validate_startup_auth, version_info,
+        register_account, registration_capability, relay_owner_for_ticket, relay_ticket,
+        request_source, revoke_owned_sessions, sessions_owned_by, set_account_device_trust,
+        signal_socket, supplied_token_is_host, validate_signal_message, validate_startup_auth,
+        version_info,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -7448,6 +7478,7 @@ mod tests {
         Router::new()
             .route("/healthz", get(healthz))
             .route("/version", get(version_info))
+            .route("/v1/auth/registration", get(registration_capability))
             .route("/v1/auth/register", post(register_account))
             .route("/v1/auth/login", post(login_account))
             .route(
@@ -7542,6 +7573,85 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.is_empty()),
             "git_sha must be present even when it falls back to \"unknown\": {body}"
+        );
+    }
+
+    /// An unclaimed deployment advertises that it will take a first account,
+    /// and stops advertising it once one exists.
+    ///
+    /// This is what lets the login screen stop offering a "Create an account"
+    /// button that cannot succeed. The transition is the whole point: the
+    /// same server answers differently before and after bootstrap, so the
+    /// shell has to ask rather than assume.
+    #[tokio::test]
+    async fn registration_is_advertised_only_while_it_would_succeed() {
+        // Closed deployment: the shared helper opts registration open, which
+        // is the *other* configuration and would never show the transition
+        // this test exists to pin.
+        let state = AppState {
+            open_registration: false,
+            ..connect_test_state()
+        };
+        let app = connect_router(state.clone());
+
+        let (status, body) = call(&app, "GET", "/v1/auth/registration", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["open"],
+            serde_json::json!(true),
+            "an unclaimed deployment accepts the first account: {body}"
+        );
+
+        register_with_device(&app, "operator", "device-one", 0x51).await;
+
+        let (status, body) = call(&app, "GET", "/v1/auth/registration", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["open"],
+            serde_json::json!(false),
+            "a claimed, closed deployment must not advertise open signup: {body}"
+        );
+    }
+
+    /// The advertised answer matches what registration actually does.
+    ///
+    /// A capability endpoint that disagrees with the endpoint it describes is
+    /// worse than none: the shell would hide a button that works, or offer one
+    /// that does not. So this asserts the two agree rather than asserting a
+    /// hardcoded expectation.
+    #[tokio::test]
+    async fn the_advertised_capability_matches_what_registration_does() {
+        let state = AppState {
+            open_registration: false,
+            ..connect_test_state()
+        };
+        let app = connect_router(state.clone());
+        register_with_device(&app, "operator", "device-one", 0x52).await;
+
+        let (_, body) = call(&app, "GET", "/v1/auth/registration", None, None).await;
+        let advertised = body["open"].as_bool().expect("open is a bool");
+
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/auth/register",
+            None,
+            Some(serde_json::json!({
+                "username": "second",
+                "password": "correct horse battery staple",
+                "device": {
+                    "device_id": "device-two",
+                    "name": "device-two",
+                    "platform": "test",
+                    "public_key": hex::encode([0x53_u8; 32]),
+                }
+            })),
+        )
+        .await;
+        let actually_open = status == StatusCode::CREATED;
+        assert_eq!(
+            advertised, actually_open,
+            "the capability endpoint said open={advertised} but registration answered {status}"
         );
     }
 
