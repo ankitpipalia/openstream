@@ -259,6 +259,22 @@ struct Shared {
     sequence_header: Mutex<Option<Vec<u8>>>,
 }
 
+/// The hard per-second byte ceiling for a given bitrate.
+///
+/// The nominal rate plus a ninth. A ceiling set exactly at the target leaves
+/// the rate controller nothing for the frames that genuinely need more, and it
+/// responds by dropping quality across the board; a ninth is enough for a
+/// keyframe to exceed a delta frame without being enough for a burst to queue
+/// anywhere that matters.
+///
+/// One function so session setup and bitrate adaptation cannot drift apart --
+/// a ceiling computed one way at startup and another way on adaptation is a bug
+/// that only shows up after the first rate change.
+#[must_use]
+fn burst_ceiling_bytes(bitrate: u32) -> i64 {
+    i64::from(bitrate) / 8 * 10 / 9
+}
+
 /// The in-process VideoToolbox H.264 encoder.
 pub struct VideoToolboxH264Encoder {
     session: VtCompressionSessionRef,
@@ -477,7 +493,7 @@ impl VideoToolboxH264Encoder {
         // yields a limit of a few bytes per several-billion-second window, which
         // the encoder accepts and then honours, so the mistake shows up as an
         // unaccountably terrible picture rather than as an error.
-        let bytes_per_window = i64::from(bitrate) / 8 * 10 / 9;
+        let bytes_per_window = burst_ceiling_bytes(bitrate);
         self.data_rate_limit = self
             .try_set_data_rate_limit(bytes_per_window, 1.0)
             .is_ok()
@@ -631,11 +647,56 @@ impl VideoToolboxH264Encoder {
     }
 
     /// Change the running encoder's average bitrate (bits per second).
+    ///
+    /// Moves the hard burst ceiling with it. Leaving `DataRateLimits` at the
+    /// value it was configured with breaks adaptation in both directions: after
+    /// an increase the old, lower ceiling clamps the encoder below the bitrate
+    /// it was just told to use, and the picture degrades for no visible reason;
+    /// after a decrease the old, higher ceiling permits exactly the bursts the
+    /// ceiling exists to prevent, on a link that has just been found too slow
+    /// for them.
+    ///
+    /// The order is chosen so the two are never inconsistent in the direction
+    /// that hurts:
+    ///
+    ///   * raising the bitrate raises the ceiling **first**, so the average is
+    ///     never set above a ceiling that would clamp it;
+    ///   * lowering it lowers the average **first**, so the ceiling is never
+    ///     tightened around an average still set high.
+    ///
+    /// The ceiling is only touched if one was accepted at session creation. An
+    /// encoder that refused it keeps refusing it, and a failure to move it is
+    /// not made fatal for the same reason it was not fatal then -- but the
+    /// recorded value is cleared rather than left describing a limit that is no
+    /// longer in force.
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), VtEncError> {
-        self.set_number(
-            unsafe { kVTCompressionPropertyKey_AverageBitRate },
-            i64::from(bitrate),
-        )
+        let average = unsafe { kVTCompressionPropertyKey_AverageBitRate };
+        let target = i64::from(bitrate);
+        let ceiling = burst_ceiling_bytes(bitrate);
+        let raising = self
+            .data_rate_limit
+            .is_some_and(|current| ceiling > current);
+
+        if self.data_rate_limit.is_some() && raising {
+            self.move_burst_ceiling(ceiling);
+        }
+        self.set_number(average, target)?;
+        if self.data_rate_limit.is_some() && !raising {
+            self.move_burst_ceiling(ceiling);
+        }
+        Ok(())
+    }
+
+    /// Set the burst ceiling and record what is actually in force.
+    ///
+    /// On failure the recorded value is cleared: reporting the old number would
+    /// describe a limit the session is no longer honouring, which is worse than
+    /// reporting none.
+    fn move_burst_ceiling(&mut self, bytes_per_window: i64) {
+        self.data_rate_limit = self
+            .try_set_data_rate_limit(bytes_per_window, 1.0)
+            .is_ok()
+            .then_some(bytes_per_window);
     }
 
     /// Encode one BGRA frame (`width * height * 4` bytes, `B, G, R, A` per
@@ -1113,6 +1174,45 @@ mod tests {
     /// A null surface is rejected, not dereferenced. The capture source is
     /// about to hand these in from an Objective-C callback, where a missing
     /// image buffer is an ordinary runtime outcome rather than a bug.
+    #[test]
+    fn the_burst_ceiling_is_the_nominal_rate_plus_a_ninth() {
+        // [bytes, seconds], so bits/8, and 10/9 is the headroom. 10 Mbps ->
+        // 1388888 bytes/s, an 11.11 Mbps ceiling.
+        assert_eq!(super::burst_ceiling_bytes(10_000_000), 1_388_888);
+        assert_eq!(super::burst_ceiling_bytes(0), 0);
+    }
+
+    #[test]
+    fn adapting_the_bitrate_moves_the_burst_ceiling_with_it() {
+        // The bug this pins: `set_bitrate` used to move only AverageBitRate.
+        // After an increase the old lower ceiling clamped the encoder below the
+        // rate it had just been given; after a decrease the old higher ceiling
+        // allowed exactly the bursts the ceiling exists to stop.
+        let Ok(mut encoder) = VideoToolboxH264Encoder::new(640, 480, 30, 4_000_000) else {
+            eprintln!("no VideoToolbox encoder available; skipping");
+            return;
+        };
+        let Some(initial) = encoder.data_rate_limit() else {
+            eprintln!("this encoder refused DataRateLimits; nothing to adapt");
+            return;
+        };
+        assert_eq!(initial, super::burst_ceiling_bytes(4_000_000));
+
+        encoder.set_bitrate(8_000_000).expect("raise the bitrate");
+        assert_eq!(
+            encoder.data_rate_limit(),
+            Some(super::burst_ceiling_bytes(8_000_000)),
+            "raising the bitrate must raise the ceiling, or the encoder stays clamped"
+        );
+
+        encoder.set_bitrate(2_000_000).expect("lower the bitrate");
+        assert_eq!(
+            encoder.data_rate_limit(),
+            Some(super::burst_ceiling_bytes(2_000_000)),
+            "lowering the bitrate must lower the ceiling, or bursts stay permitted"
+        );
+    }
+
     #[test]
     fn a_null_surface_is_an_error_not_a_crash() {
         let Ok(mut encoder) = VideoToolboxH264Encoder::new(WIDTH, HEIGHT, 30, 4_000_000) else {

@@ -102,15 +102,45 @@ impl Response {
 /// An origin split into the parts a request needs.
 struct Target {
     tls: bool,
+    /// The host as written, brackets and all. This is what the `Host` header
+    /// must carry: RFC 7230 requires an IPv6 literal to appear bracketed there.
     host: String,
     port: u16,
+}
+
+impl Target {
+    /// The host as a socket address and a TLS server name expect it: an IPv6
+    /// literal without its brackets.
+    ///
+    /// The brackets are URL syntax, present only to keep the address's colons
+    /// from being read as a port separator. `TcpStream::connect` and
+    /// `ServerName::try_from` both want the bare address, and passing them the
+    /// bracketed text fails to resolve rather than failing loudly.
+    fn connect_host(&self) -> &str {
+        self.host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(&self.host)
+    }
+
+    /// Whether this destination is the local machine.
+    ///
+    /// Only a literal loopback address counts. A *name* that currently resolves
+    /// to loopback is not the same promise: what it resolves to is decided by
+    /// DNS, which is exactly the thing an attacker on the path controls.
+    fn is_loopback(&self) -> bool {
+        let host = self.connect_host();
+        host.parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+    }
 }
 
 /// Parse `http://host[:port]` or `https://host[:port]`.
 ///
 /// Plain HTTP is accepted because the machine service's default origin is
-/// `http://127.0.0.1:8080` for local development. It is the caller's job not to
-/// send a bearer token to a plaintext origin that is not loopback.
+/// `http://127.0.0.1:8080` for local development. Sending a *credential* over
+/// it is refused unless the destination is a loopback literal -- see
+/// [`request`].
 fn parse_origin(origin: &str) -> Result<Target, HttpError> {
     let origin = origin.trim().trim_end_matches('/');
     let (tls, rest) = if let Some(rest) = origin.strip_prefix("https://") {
@@ -315,14 +345,28 @@ pub async fn request(
         return Err(HttpError::Origin("the path must start with /".into()));
     }
     let target = parse_origin(origin)?;
+    // A bearer token on a plaintext connection is readable by anything on the
+    // path, and it is an account credential: whoever reads it can enrol
+    // devices. Loopback is the one exception, because the machine service's
+    // development origin is http://127.0.0.1:8080 and there is no path to be
+    // on. Refusing here rather than documenting it means a caller cannot leak
+    // a token by forgetting; the previous version delegated this to every
+    // caller, which is the same as not enforcing it.
+    if bearer.is_some() && !target.tls && !target.is_loopback() {
+        return Err(HttpError::Origin(format!(
+            "refusing to send a bearer token to {} over plaintext http; use https, or a \
+             loopback address",
+            target.host
+        )));
+    }
     let bytes = request_bytes(method, &target, path, bearer, body);
 
     let work = async {
-        let stream = TcpStream::connect((target.host.as_str(), target.port)).await?;
+        let stream = TcpStream::connect((target.connect_host(), target.port)).await?;
         // Small JSON requests: waiting to coalesce them only adds latency.
         stream.set_nodelay(true)?;
         let raw = if target.tls {
-            let name = rustls::pki_types::ServerName::try_from(target.host.clone())
+            let name = rustls::pki_types::ServerName::try_from(target.connect_host().to_owned())
                 .map_err(|_| HttpError::Origin("the host is not a valid TLS server name".into()))?;
             let connector = tokio_rustls::TlsConnector::from(tls_config());
             let mut stream = connector.connect(name, stream).await?;
@@ -528,13 +572,138 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_path_must_be_absolute() {
-        let error = tokio::runtime::Builder::new_current_thread()
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime")
-            .block_on(request("GET", "https://example.com", "v1/x", None, b""));
+            .block_on(future)
+    }
+
+    #[test]
+    fn brackets_are_stripped_for_the_socket_and_kept_for_the_header() {
+        // "[::1]" is URL syntax: the brackets exist only so the address's own
+        // colons are not read as a port separator. TcpStream::connect and
+        // ServerName::try_from both want the bare address and fail to resolve
+        // the bracketed form, while the Host header requires the brackets.
+        let target = parse_origin("http://[::1]:8080").expect("parse");
+        assert_eq!(target.connect_host(), "::1");
+        assert_eq!(target.host, "[::1]");
+        let text = String::from_utf8(request_bytes("GET", &target, "/x", None, b"")).unwrap();
+        assert!(text.contains("Host: [::1]:8080\r\n"), "{text}");
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_loopback_actually_connects() {
+        // The regression this pins: connecting to ("[::1]", port) does not
+        // resolve, so the bug showed up as a connection error rather than as
+        // anything pointing at the brackets.
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("no IPv6 loopback on this machine; skipping");
+            return;
+        };
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+            }
+        });
+        let response = block_on(get(&format!("http://[::1]:{port}"), "/x", None))
+            .expect("the bracketed IPv6 origin must connect");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hi");
+    }
+
+    #[test]
+    fn a_bearer_token_is_refused_over_plaintext_to_a_remote_host() {
+        // An account bearer token on the wire in clear is an enrolment
+        // credential anyone on the path can take. Leaving this to callers is
+        // the same as not enforcing it.
+        let error = block_on(request(
+            "POST",
+            "http://signal.example.com",
+            "/v1/devices",
+            Some("secret-token"),
+            b"{}",
+        ))
+        .expect_err("a token must not go out over plaintext http");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("refusing to send a bearer token"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("secret-token"),
+            "the refusal must not quote the token back: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_name_that_merely_resolves_to_loopback_is_not_loopback() {
+        // "localhost" is a DNS answer, and DNS is decided by whoever controls
+        // the resolver. Only a literal address is a promise about where the
+        // bytes go.
+        let target = parse_origin("http://localhost:8080").expect("parse");
+        assert!(!target.is_loopback());
+        assert!(
+            parse_origin("http://127.0.0.1:8080")
+                .expect("parse")
+                .is_loopback()
+        );
+        assert!(
+            parse_origin("http://[::1]:8080")
+                .expect("parse")
+                .is_loopback()
+        );
+        assert!(
+            !parse_origin("http://10.0.0.1")
+                .expect("parse")
+                .is_loopback()
+        );
+    }
+
+    #[test]
+    fn a_token_to_loopback_over_plaintext_is_allowed() {
+        // The machine service's development origin is http://127.0.0.1:8080.
+        // There is no path to be on, and refusing would break local work for
+        // no gain. Proven by reaching a real local listener rather than by
+        // asserting the check in isolation.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut scratch = [0u8; 1024];
+                let _ = stream.read(&mut scratch);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let response = block_on(get(&format!("http://127.0.0.1:{port}"), "/x", Some("tok")))
+            .expect("a token to loopback is allowed");
+        assert_eq!(response.status, 204);
+    }
+
+    #[test]
+    fn a_content_length_shorter_than_the_body_does_not_truncate_it() {
+        // This client reads to EOF and ignores Content-Length, so a short
+        // declared length cannot cut a body off. Pinned because switching to a
+        // length-driven read later would silently reintroduce truncation.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{\"a\":1}";
+        assert_eq!(parse_response(raw).expect("parse").body, b"{\"a\":1}");
+    }
+
+    #[test]
+    fn a_header_block_that_is_not_utf8_is_refused() {
+        let raw = b"HTTP/1.1 200 OK\r\nX-Bad: \xff\xfe\r\n\r\nbody";
+        assert!(parse_response(raw).is_err());
+    }
+
+    #[test]
+    fn a_path_must_be_absolute() {
+        let error = block_on(request("GET", "https://example.com", "v1/x", None, b""));
         assert!(error.is_err(), "a relative path must not be sent");
     }
 }

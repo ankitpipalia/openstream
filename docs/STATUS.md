@@ -93,27 +93,61 @@ Where it actually stands:
 | Replay and reconnect semantics | **corrected** -- a grant leases a session, so the holder may restart and reconnect, a concurrent connection is refused, and a nonce cannot move to another session |
 | The host carries it from the credential into the pairing file | **implemented** |
 | Delivery from the pairing file to the machine service and on to the broker | **implemented** -- the service takes the pairing's grant; `OPENSTREAM_SESSION_APPROVAL` is a development override that cannot displace a real one |
-| Provisioning the broker's key without exposing it to the unprivileged service | **implemented** -- `openstream-host-broker provision-grant-key` writes it 0600 from stdin, and the broker refuses a key anybody else can read |
-| **Enrolling the machine to obtain that key in the first place** | **incomplete** -- needs an HTTP client the engine workspace does not have |
+| Provisioning the broker's key without exposing it to the unprivileged service | **implemented** -- written 0600 through a rename; on read the broker requires the file be owned by its own user, be a regular file opened `O_NOFOLLOW`, and sit under directories no one else can write |
+| The enrolment call that obtains the key | **implemented** -- `openstream-enrol` posts to `POST /v1/devices` and writes the key straight to the broker's file, so it never crosses a terminal or a log |
+| **A machine actually enrolled, and a session run through the chain** | **not done** -- no machine has a grant key, so every broker refuses every session |
 
-So the chain is now joined in source from approval to broker, and tested at
-every seam -- but **no real session has run through it**, because the last row
-is open: nothing yet performs machine enrolment, so no machine has a grant key,
-so every broker refuses every session. That is the intended fail-closed posture
-rather than a regression, and it is also why this must not be described as
-finished.
+So the chain is joined in source from approval to broker, and tested at every
+seam -- but **no real session has run through it end to end**, and that is the
+only claim this section makes.
 
-The blocker on that row is concrete and worth stating plainly: enrolment is an
-HTTPS call, and **there is no HTTP client anywhere in the engine workspace** --
-`reqwest` is a desktop-only dependency, and `client-core` carries only
-`tokio-tungstenite`. Adding one to the engine, or hand-rolling the call over the
-`rustls` already present, is a decision that has to be made before that row can
-close. Until it is, the desktop app performs enrolment and pipes the key to
-`provision-grant-key`.
+What has been exercised against the live control plane: `openstream-enrol`
+reaches `POST /v1/devices` over real TLS and is refused with `401 account
+authorization required` for an invalid token. That proves the transport, the
+route and the authentication boundary. It does not prove enrolment, because no
+account token was used, so no device was created, so no grant key exists on any
+machine, so every broker still refuses every session. That is the intended
+fail-closed posture rather than a regression.
 
-The remaining work is not desktop work beyond that. Only `machine-service`
-depends on `host-broker`; the desktop drives `host-agent` directly and never
-speaks to the privileged broker.
+**What would finish it:** enrol one machine with a real account token, start the
+broker with `OPENSTREAM_BROKER_DEVICE_ID` and `OPENSTREAM_BROKER_GRANT_KEY_FILE`
+set, approve a Secure Connect request, and capture a frame. Until that run
+exists, nothing here is verified beyond the unit and integration tests.
+
+The remaining work is not desktop work. Only `machine-service` depends on
+`host-broker`; the desktop drives `host-agent` directly and never speaks to the
+privileged broker.
+
+**On the key file's protection.** Mode bits alone were not the boundary and an
+earlier version of this document overstated what was enforced. A file owned by
+the *machine service* with mode 0600 is private to the machine service, and the
+broker -- being privileged -- can read it perfectly well; the service could then
+choose the key its own approvals are checked against. The broker now requires
+ownership by its own user, a regular file opened `O_NOFOLLOW`, and a directory
+chain no other user can write, because a directory the service can write is one
+in which it can replace the file whatever the file's mode says.
+
+### The capability registry is scaffolding, not runtime behaviour
+
+`crates/capability` and its planner are structured and tested, but **nothing in
+a shipping path calls them**. The desktop still decides host support from
+compile-time OS checks. Before they are wired in, four things in the model are
+known to be wrong or unproven, and each would produce a confident answer that is
+not true:
+
+- `host_capable()` only finds a capture record and an encoder record for the
+  same OS. It does not establish a shared codec, a workable geometry, or that
+  the surface one produces is one the other accepts.
+- An advertised but unprobed capture backend, and a software encoder, both count
+  as usable -- so a machine can be called host-capable without either having
+  been demonstrated.
+- System-memory capture feeding NVENC is classified `ZeroCopy`, when the
+  CPU-to-GPU upload happens inside the backend. The label is simply wrong.
+- The 7680x4320@120 limits are nominal format ceilings, not this device's.
+
+So it is a reasonable 1.1 foundation. It does **not** yet deliver automatic
+AMD/Intel/NVIDIA selection or multi-GPU choice, and should not be described as
+doing so.
 
 ### Native multi-monitor is not implemented
 
