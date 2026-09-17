@@ -92,18 +92,28 @@ Where it actually stands:
 | The broker verifies one before opening any device, and fails closed without it | **implemented** |
 | Replay and reconnect semantics | **corrected** -- a grant leases a session, so the holder may restart and reconnect, a concurrent connection is refused, and a nonce cannot move to another session |
 | The host carries it from the credential into the pairing file | **implemented** |
-| **Delivery from the pairing file to the machine service and on to the broker** | **incomplete** |
-| **Provisioning the broker's key without exposing it to the unprivileged service** | **incomplete** |
+| Delivery from the pairing file to the machine service and on to the broker | **implemented** -- the service takes the pairing's grant; `OPENSTREAM_SESSION_APPROVAL` is a development override that cannot displace a real one |
+| Provisioning the broker's key without exposing it to the unprivileged service | **implemented** -- `openstream-host-broker provision-grant-key` writes it 0600 from stdin, and the broker refuses a key anybody else can read |
+| **Enrolling the machine to obtain that key in the first place** | **incomplete** -- needs an HTTP client the engine workspace does not have |
 
-So the mechanism exists and is tested end to end *in source*, and no real
-session has yet run through it. The broker has no authority configured, which
-means it refuses every session. That is the intended posture while the last two
-rows are open, not a regression -- but it is also why nothing here should be
-called finished.
+So the chain is now joined in source from approval to broker, and tested at
+every seam -- but **no real session has run through it**, because the last row
+is open: nothing yet performs machine enrolment, so no machine has a grant key,
+so every broker refuses every session. That is the intended fail-closed posture
+rather than a regression, and it is also why this must not be described as
+finished.
 
-The remaining work is not desktop work. Only `machine-service` depends on
-`host-broker`; the desktop drives `host-agent` directly and never speaks to the
-privileged broker. Both open rows belong with the machine service's enrolment.
+The blocker on that row is concrete and worth stating plainly: enrolment is an
+HTTPS call, and **there is no HTTP client anywhere in the engine workspace** --
+`reqwest` is a desktop-only dependency, and `client-core` carries only
+`tokio-tungstenite`. Adding one to the engine, or hand-rolling the call over the
+`rustls` already present, is a decision that has to be made before that row can
+close. Until it is, the desktop app performs enrolment and pipes the key to
+`provision-grant-key`.
+
+The remaining work is not desktop work beyond that. Only `machine-service`
+depends on `host-broker`; the desktop drives `host-agent` directly and never
+speaks to the privileged broker.
 
 ### The deployed backend is behind `main`
 
