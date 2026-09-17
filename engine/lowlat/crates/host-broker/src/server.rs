@@ -17,13 +17,17 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use openstream_host_ipc::peercred::{AllowedPeers, read_peer_identity};
 use tokio::net::UnixListener;
 
 use crate::capture::NativeFrameSource;
 use crate::inject::NativeInputSink;
-use crate::session::{BrokerPolicy, GrantAuthority, serve_connection};
+use crate::session::{
+    BrokerPolicy, ConnectionContext, GrantAuthority, SessionLeases, serve_connection,
+};
 
 /// The default socket path for the broker under the system runtime directory.
 pub const DEFAULT_SOCKET: &str = "/run/openstream/broker.sock";
@@ -37,6 +41,13 @@ pub struct BrokerServer {
     /// Who may say a session was approved. Cloned into each connection, so a
     /// long-lived server serves every connection against the same pinned key.
     authority: GrantAuthority,
+    /// Approvals currently leased, shared by every connection this server
+    /// serves. On the server rather than the session because a reconnect has
+    /// to be able to reattach, and a second live connection has to be refused.
+    leases: Arc<Mutex<SessionLeases>>,
+    /// Identifies each connection within the lease registry. Atomic because
+    /// `run` takes `&self`.
+    next_connection: AtomicU64,
     /// If set, the socket's group is set to this gid so the unprivileged
     /// machine-service account (a member of that group) can reach a root-owned
     /// socket. `SO_PEERCRED` is still the real gate; this only opens the door to
@@ -59,6 +70,8 @@ impl BrokerServer {
             allowed,
             policy,
             authority,
+            leases: Arc::new(Mutex::new(SessionLeases::default())),
+            next_connection: AtomicU64::new(0),
             socket_gid: None,
         }
     }
@@ -105,6 +118,10 @@ impl BrokerServer {
                 peer.uid, peer.pid
             );
 
+            // A fresh identity per connection, so a lease taken by one is
+            // never mistaken for the same connection reattaching.
+            let connection = self.next_connection.fetch_add(1, Ordering::Relaxed);
+
             let (mut reader, mut writer) = stream.into_split();
             let mut frames = NativeFrameSource::new();
             let mut input = NativeInputSink::new();
@@ -112,8 +129,12 @@ impl BrokerServer {
                 &mut reader,
                 &mut writer,
                 peer,
-                self.policy,
-                self.authority.clone(),
+                ConnectionContext {
+                    policy: self.policy,
+                    authority: self.authority.clone(),
+                    leases: Arc::clone(&self.leases),
+                    connection,
+                },
                 &mut frames,
                 &mut input,
             )
