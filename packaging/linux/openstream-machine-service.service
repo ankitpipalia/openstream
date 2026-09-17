@@ -19,18 +19,24 @@ Restart=on-failure
 RestartSec=5
 
 # Unprivileged, and its own user so the broker's SO_PEERCRED check has something
-# specific to admit. systemd creates it; it owns nothing but its runtime
-# directory.
+# specific to admit. The broker is told this account's numeric uid at install
+# time; the two have to agree or every connection is refused.
 User=openstream
 Group=openstream
 DynamicUser=false
 
-Environment=OPENSTREAM_SIGNAL_ORIGIN=
+# The origin and the pairing file, in a root-owned file for the same reasons as
+# the broker's: an upgrade replaces this unit, and what belongs here differs per
+# machine. See /etc/openstream/machine-service.env.
+EnvironmentFile=-/etc/openstream/machine-service.env
+
+# Set here because it is the same on every install: it is where the broker's
+# unit puts the socket, and the two are packaged together. Everything that
+# varies is in the environment file, and nothing is assigned an empty value --
+# an empty OPENSTREAM_SIGNAL_ORIGIN overrides the program's own default with an
+# unusable one, and an empty OPENSTREAM_PAIRING_FILE turns "no pairing
+# configured" into "pairing configured, at a path that cannot be opened".
 Environment=OPENSTREAM_BROKER_SOCKET=/run/openstream/broker.sock
-# The pairing the agent writes, carrying the control plane's signed approval for
-# the session. This service cannot produce one or verify one; it relays it to
-# the broker unread, which is what makes the broker's check worth anything.
-Environment=OPENSTREAM_PAIRING_FILE=
 
 NoNewPrivileges=true
 PrivateTmp=true

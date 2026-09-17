@@ -14,31 +14,35 @@ ExecStart=/usr/bin/openstream-host-broker
 Restart=on-failure
 RestartSec=2
 
+# Configuration lives in a root-owned file, not in this unit.
+#
+# Two reasons. A package upgrade replaces the unit, so anything an operator
+# edited here is lost at the worst possible moment -- the machine stops hosting
+# and the reason is a file that reverted. And the values that have to be set are
+# a numeric uid and gid, which only the install knows: writing them here would
+# mean shipping a unit that is wrong on every machine.
+#
+# `-` so a missing file is not a startup failure: the unit ships before postinst
+# has written anything, and an unconfigured broker is meant to start and refuse
+# sessions rather than fail to start.
+EnvironmentFile=-/etc/openstream/broker.env
+
+# Nothing is set here. An `Environment=NAME=` is not an unset variable -- the
+# process sees it set to the empty string, and every one of these is read as a
+# value: an empty uid or gid fails to parse and the broker exits, an empty
+# grant-key path is a file that cannot be opened. Unset has to mean unset, so
+# the defaults in the program are what apply until broker.env says otherwise.
+
 # Creates and owns /run/openstream, where the socket lives. systemd removes it
 # when the service stops, so a stale socket cannot outlive the broker that was
 # listening on it.
+#
+# The group is what makes it reachable: the directory is root-owned 0750, and
+# without a group the unprivileged machine service cannot traverse it to find
+# the socket, whatever the socket's own mode says.
 RuntimeDirectory=openstream
 RuntimeDirectoryMode=0750
-
-# What this machine's operator permits. Unset means nothing is granted: a broker
-# that has not been told what is allowed has not been told it may hand out the
-# keyboard. Set this deliberately -- for example "video,keyboard,mouse".
-Environment=OPENSTREAM_BROKER_CEILING=
-
-# Who may say a session was approved. Written by `openstream-enrol` at install
-# time; the broker refuses a key it does not own, one anybody else can read, one
-# reached through a symlink, or one under a directory others can write.
-#
-# The device id must match the one enrolment printed. A grant addressed to
-# another device is refused, so an approval for one host in a fleet is not an
-# approval for all of them.
-Environment=OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key
-Environment=OPENSTREAM_BROKER_DEVICE_ID=
-
-# The group the machine service runs in, so it can open the socket without being
-# root. SO_PEERCRED still decides who is actually served; this only makes the
-# socket reachable.
-Environment=OPENSTREAM_BROKER_SOCKET_GID=
+RuntimeDirectoryGroup=openstream
 
 # Hardening. This process is root and holds the two privileges that genuinely
 # need elevation, so everything it does not need is taken away.
