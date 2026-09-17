@@ -187,6 +187,12 @@ struct SinkState {
     /// is what distinguishes "the stream is running and the screen is static"
     /// from "the stream is delivering nothing".
     delivered: u64,
+    /// Why the stream ended, once `stream:didStopWithError:` has said so.
+    ///
+    /// Set once and never cleared: a stopped stream does not restart, and a
+    /// reason that could be overwritten by a later callback would report the
+    /// second cause for the first failure.
+    stopped: Option<String>,
 }
 
 impl Sink {
@@ -196,6 +202,28 @@ impl Sink {
         state.delivered = state.delivered.saturating_add(1);
         drop(state);
         self.arrived.notify_all();
+    }
+
+    /// Record that the stream ended, and wake anything waiting for a frame.
+    ///
+    /// The wake matters as much as the flag. A waiter blocked in `wait` would
+    /// otherwise sit out its whole timeout before discovering the stream it is
+    /// waiting on no longer exists.
+    fn stopped(&self, detail: String) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.stopped.is_none() {
+            state.stopped = Some(detail);
+        }
+        drop(state);
+        self.arrived.notify_all();
+    }
+
+    fn stopped_reason(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped
+            .clone()
     }
 
     fn take(&self) -> Option<CapturedSurface> {
@@ -211,9 +239,19 @@ impl Sink {
         // `wait_timeout_while` re-checks on spurious wakeups and on a frame
         // that another taker got to first, and returns when the deadline has
         // genuinely passed rather than restarting the clock each time.
+        //
+        // A stopped stream ends the wait too. Waiting only on `latest` means
+        // the notify from `stopped` is treated as spurious -- the predicate is
+        // still true, so the waiter goes straight back to sleep and sits out
+        // its whole timeout before anything can notice the stream has ended.
+        // The host's loop is built out of these waits, so that is a frame
+        // interval of delay on top of every report, for a stream that is never
+        // going to deliver again.
         let (mut state, _) = self
             .arrived
-            .wait_timeout_while(state, timeout, |state| state.latest.is_none())
+            .wait_timeout_while(state, timeout, |state| {
+                state.latest.is_none() && state.stopped.is_none()
+            })
             .unwrap_or_else(PoisonError::into_inner);
         state.latest.take()
     }
@@ -381,8 +419,12 @@ impl SckCapture {
         };
 
         // SAFETY: standard alloc plus the three-argument designated
-        // initialiser; a null delegate means "no stream-level delegate", which
-        // is separate from the output delegate added below.
+        // initialiser. The same object serves as both the stream-level
+        // delegate and, below, the output delegate: the stream delegate is
+        // what receives `stream:didStopWithError:`, and passing null here --
+        // which this did until the stream-stop signal was wired -- means the
+        // host is never told the capture ended, only that no new surface has
+        // arrived, which a perfectly healthy still desktop also looks like.
         let stream = unsafe {
             let stream = objc::send(objc::class("SCStream"), objc::sel("alloc"));
             objc::send_id3(
@@ -390,7 +432,7 @@ impl SckCapture {
                 objc::sel("initWithFilter:configuration:delegate:"),
                 filter,
                 configuration,
-                std::ptr::null_mut(),
+                delegate,
             )
         };
         // SAFETY: the stream retains what it needs; these are ours to release.
@@ -490,6 +532,22 @@ impl SckCapture {
     #[must_use]
     pub fn delivered(&self) -> u64 {
         self.sink.delivered()
+    }
+
+    /// Why the capture stream ended, if it has.
+    ///
+    /// `None` while the stream is running, including through arbitrarily long
+    /// stretches of a still screen -- ScreenCaptureKit delivers on change, so
+    /// silence is the normal idle state and says nothing about health.
+    ///
+    /// `Some` is the framework itself reporting that the stream is over: the
+    /// display was disconnected, Screen Recording permission was withdrawn, the
+    /// captured window closed. This is the signal a host can act on, and
+    /// nothing on the receiving side can be substituted for it -- a frozen
+    /// source and an untouched desktop produce identical silence.
+    #[must_use]
+    pub fn stopped(&self) -> Option<String> {
+        self.sink.stopped_reason()
     }
 }
 
@@ -663,23 +721,70 @@ unsafe fn pick_display(content: Id, display_id: Option<u32>) -> Result<Id, SckEr
 fn delegate_class() -> Option<objc::Class> {
     static CLASS: OnceLock<Option<usize>> = OnceLock::new();
     let registered = CLASS.get_or_init(|| {
-        // Type encoding: void return, self, _cmd, an object (the stream), a
-        // pointer (the CMSampleBufferRef), and an NSInteger (the output type).
-        // SAFETY: `did_output_sample_buffer` is `extern "C"` with exactly that
-        // signature.
+        // One class implementing both protocols, because both callbacks want
+        // the same sink and a second class would need a second copy of it.
+        //
+        // Type encodings: void return, self, _cmd, then the arguments. For
+        // output that is an object (the stream), a pointer (the
+        // CMSampleBufferRef) and an NSInteger (the output type); for the stop
+        // callback, two objects (the stream and the NSError).
+        //
+        // SAFETY: both functions are `extern "C"` with exactly those
+        // signatures.
         let class = unsafe {
             objc::define_class(
                 DELEGATE_CLASS,
                 DELEGATE_IVAR,
-                objc::sel("stream:didOutputSampleBuffer:ofType:"),
-                did_output_sample_buffer as objc::Imp,
-                "v@:@^vq",
-                "SCStreamOutput",
+                &[
+                    (
+                        objc::sel("stream:didOutputSampleBuffer:ofType:"),
+                        did_output_sample_buffer as objc::Imp,
+                        "v@:@^vq",
+                    ),
+                    (
+                        objc::sel("stream:didStopWithError:"),
+                        stream_did_stop_with_error as objc::Imp,
+                        "v@:@@",
+                    ),
+                ],
+                &["SCStreamOutput", "SCStreamDelegate"],
             )
         };
         class.map(|class| class as usize)
     });
     registered.map(|address| address as objc::Class)
+}
+
+/// `- (void)stream:didStopWithError:`
+///
+/// **The only signal that distinguishes a stalled capture from a still one.**
+/// ScreenCaptureKit delivers on change, so "no new surface" is what a frozen
+/// source and an untouched desktop both look like from the receiving end. This
+/// is the framework saying the stream itself has ended -- the display went
+/// away, the user revoked Screen Recording, the window being captured closed --
+/// and it is the difference between a host that reports a dead capture and one
+/// that serves a still picture forever.
+///
+/// Runs on the stream's dispatch queue, like the output callback, and takes the
+/// same strong reference to the sink for the same reason.
+extern "C" fn stream_did_stop_with_error(this: Id, _cmd: objc::Sel, _stream: Id, error: Id) {
+    // SAFETY: `this` is an instance of the class registered above.
+    let pointer = unsafe { objc::get_ivar(this, DELEGATE_IVAR) };
+    if pointer.is_null() {
+        return;
+    }
+    // SAFETY: the pointer came from `Arc::into_raw` on an `Arc<Sink>`, and the
+    // matching strong count is still held by the `SckCapture`. See the note in
+    // `did_output_sample_buffer` for why taking a count here is what makes a
+    // callback racing teardown safe rather than merely unlikely.
+    let sink = unsafe {
+        Arc::increment_strong_count(pointer.cast::<Sink>());
+        Arc::from_raw(pointer.cast::<Sink>())
+    };
+    // SAFETY: `error` is an NSError or null; `error_message` handles both.
+    let detail = unsafe { objc::error_message(error) }
+        .unwrap_or_else(|| "the capture stream stopped without saying why".to_string());
+    sink.stopped(detail);
 }
 
 /// `- (void)stream:didOutputSampleBuffer:ofType:`
@@ -789,6 +894,81 @@ mod tests {
         // '420v', the format a NV12 stream would arrive in.
         assert!(!is_expected_format(u32::from_be_bytes(*b"420v")));
         assert!(!is_expected_format(0));
+    }
+
+    #[test]
+    fn the_delegate_class_implements_both_callbacks() {
+        // `class_addMethod` does nothing for a type encoding the runtime
+        // dislikes, and a delegate method that was never installed is not an
+        // error at runtime: ScreenCaptureKit asks `respondsToSelector:`, finds
+        // nothing, and silently never calls it. A capture that stops would then
+        // look exactly like a still screen -- which is the whole problem the
+        // stop callback exists to solve, reintroduced by a typo.
+        let class = delegate_class().expect("the delegate class must register");
+        assert!(
+            objc::implements(class, objc::sel("stream:didOutputSampleBuffer:ofType:")),
+            "the output callback is missing, so no frame would ever arrive"
+        );
+        assert!(
+            objc::implements(class, objc::sel("stream:didStopWithError:")),
+            "the stop callback is missing, so a stopped capture would be \
+             indistinguishable from a still screen"
+        );
+        // A selector nobody added, to show the check can fail.
+        assert!(!objc::implements(
+            class,
+            objc::sel("openstreamSelectorThatDoesNotExist")
+        ));
+    }
+
+    #[test]
+    fn a_stopped_stream_reports_its_reason_and_does_not_change_it() {
+        let sink = Sink::default();
+        assert_eq!(
+            sink.stopped_reason(),
+            None,
+            "a running stream has no reason"
+        );
+
+        sink.stopped("the display was disconnected".to_string());
+        assert_eq!(
+            sink.stopped_reason().as_deref(),
+            Some("the display was disconnected")
+        );
+
+        // A stopped stream does not restart. A later callback overwriting this
+        // would report the second cause for the first failure.
+        sink.stopped("something else entirely".to_string());
+        assert_eq!(
+            sink.stopped_reason().as_deref(),
+            Some("the display was disconnected"),
+            "the first reason is the one that explains the failure"
+        );
+    }
+
+    #[test]
+    fn stopping_wakes_a_waiter_instead_of_letting_it_time_out() {
+        // Without the notify, a consumer blocked in `wait` sits out its whole
+        // timeout before discovering the stream it is waiting on has ended --
+        // and the host's loop is built out of exactly those waits, so the
+        // report would arrive a frame interval late every time.
+        let sink = Arc::new(Sink::default());
+        let waiter = Arc::clone(&sink);
+        let started = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            let frame = waiter.wait(Duration::from_secs(5));
+            (frame.is_none(), started.elapsed())
+        });
+        // Give the waiter time to park before the wake, or this proves nothing.
+        std::thread::sleep(Duration::from_millis(50));
+        sink.stopped("the stream ended".to_string());
+
+        let (no_frame, elapsed) = handle.join().expect("waiter thread");
+        assert!(no_frame, "a stop is not a frame");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the waiter was not woken and sat out its timeout: {elapsed:?}"
+        );
     }
 
     #[test]
