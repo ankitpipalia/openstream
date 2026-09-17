@@ -7,6 +7,8 @@
 //! the identity and trust model users expect from a product.
 
 use getrandom::getrandom;
+use openstream_host_ipc::grant::SessionGrant;
+use openstream_host_ipc::token::Capabilities;
 use ring::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -132,6 +134,10 @@ pub(crate) enum ControlPlaneError {
     DevicePending,
     DeviceRevoked,
     InvalidStore,
+    /// Something the server needed from the platform was unavailable -- so far,
+    /// only the CSPRNG. Client-facing this is a 500: it is not the caller's
+    /// fault and there is nothing they can change.
+    Internal(&'static str),
     Io(io::Error),
     Json(serde_json::Error),
 }
@@ -142,6 +148,7 @@ impl std::fmt::Display for ControlPlaneError {
             Self::InvalidInput(reason) => reason,
             Self::AlreadyExists => "account or device already exists",
             Self::NotFound => "account or device was not found",
+            Self::Internal(reason) => reason,
             Self::Unauthorized | Self::DeviceIdentityRevoked { .. } => "credentials were rejected",
             Self::DevicePending => "device enrollment is awaiting approval",
             Self::DeviceRevoked => "device has been revoked",
@@ -257,12 +264,46 @@ struct AccountRecord {
     retired_refresh_tokens: Vec<RetiredRefreshToken>,
 }
 
+/// How many bytes of entropy a device's grant key carries.
+///
+/// A full HMAC-SHA256 block. Shorter would still be far beyond guessing, but
+/// there is no reason to economise on a value generated once per device.
+const GRANT_KEY_LEN: usize = 32;
+
+/// A fresh per-device grant key.
+///
+/// From the OS CSPRNG, and a failure to draw one fails the enrolment. A device
+/// enrolled with a predictable key would let anyone who could guess it forge
+/// approvals for that machine, so there is no fallback here on purpose.
+fn new_grant_key() -> Result<Vec<u8>, ControlPlaneError> {
+    let mut key = vec![0u8; GRANT_KEY_LEN];
+    lowlat_crypto::fill(&mut key)
+        .map_err(|_| ControlPlaneError::Internal("could not draw a device grant key"))?;
+    Ok(key)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeviceRecord {
     registration: DeviceRegistration,
     trust: DeviceTrust,
     enrolled_at_ms: u64,
     last_seen_ms: Option<u64>,
+    /// The secret this account shares with that one machine, for tagging the
+    /// session grants its privileged broker will verify.
+    ///
+    /// Per device, not per account: a grant tagged for one machine must not
+    /// verify on another, or an approval for one host in a fleet is an
+    /// approval for all of them. The grant carries the target device id and
+    /// the broker checks it, but a shared key would make that check the only
+    /// thing standing between them.
+    ///
+    /// `#[serde(default)]` so records written before this field existed still
+    /// load. They come back with an empty key, which signs nothing and
+    /// verifies nothing -- a device enrolled before grants existed has to
+    /// re-enrol to get one, and until it does its sessions are refused rather
+    /// than silently unprotected.
+    #[serde(default)]
+    grant_key: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,6 +375,21 @@ struct AccessTokenRecord {
     /// the credentials descended from the compromised sign-in.
     family_id: String,
     expires_at_ms: u64,
+}
+
+/// What an approval needs to say, for [`AccountStore::issue_session_grant`].
+///
+/// A struct rather than seven positional arguments, three of which are
+/// `&str`: transposing two of those at a call site would compile, and would
+/// mint a grant naming the wrong device.
+pub(crate) struct SessionGrantRequest<'a> {
+    pub account_id: &'a str,
+    pub device_id: &'a str,
+    pub session_id: &'a str,
+    pub requester_device_id: &'a str,
+    pub capabilities: Capabilities,
+    pub now_ms: u64,
+    pub lifetime_ms: u64,
 }
 
 impl AccountStore {
@@ -485,6 +541,7 @@ impl AccountStore {
                     trust: DeviceTrust::Trusted,
                     enrolled_at_ms: now_ms,
                     last_seen_ms: Some(now_ms),
+                    grant_key: new_grant_key()?,
                 },
             );
             Some(device_id)
@@ -569,6 +626,7 @@ impl AccountStore {
                             trust,
                             enrolled_at_ms: now_ms,
                             last_seen_ms: Some(now_ms),
+                            grant_key: new_grant_key()?,
                         },
                     );
                 }
@@ -808,6 +866,7 @@ impl AccountStore {
             trust: DeviceTrust::Pending,
             enrolled_at_ms: now_ms,
             last_seen_ms: None,
+            grant_key: new_grant_key()?,
         };
         let public = public_device(&device);
         account
@@ -815,6 +874,74 @@ impl AccountStore {
             .insert(device.registration.device_id.clone(), device);
         self.save()?;
         Ok(public)
+    }
+
+    /// Mint a session grant for `device_id`, tagged with that device's own key.
+    ///
+    /// This is the statement the privileged broker on that machine verifies
+    /// before it opens a camera, a screen or a keyboard. It is produced here,
+    /// at approval, and nowhere else: the host relays it and cannot make one,
+    /// which is the whole point.
+    ///
+    /// Returns `None` when the device has no key -- one enrolled before grants
+    /// existed. Its sessions are then refused by the broker rather than
+    /// silently unprotected, and it has to re-enrol.
+    pub(crate) fn issue_session_grant(
+        &self,
+        request: &SessionGrantRequest<'_>,
+    ) -> Result<Option<Vec<u8>>, ControlPlaneError> {
+        let &SessionGrantRequest {
+            account_id,
+            device_id,
+            session_id,
+            requester_device_id,
+            capabilities,
+            now_ms,
+            lifetime_ms,
+        } = request;
+        let account = self
+            .accounts
+            .get(account_id)
+            .ok_or(ControlPlaneError::NotFound)?;
+        let device = account
+            .devices
+            .get(device_id)
+            .ok_or(ControlPlaneError::NotFound)?;
+        if device.grant_key.is_empty() {
+            return Ok(None);
+        }
+        let mut nonce = [0u8; 16];
+        lowlat_crypto::fill(&mut nonce)
+            .map_err(|_| ControlPlaneError::Internal("could not draw a grant nonce"))?;
+        let grant = SessionGrant {
+            session_id: session_id.to_string(),
+            requester_device_id: requester_device_id.to_string(),
+            target_device_id: device_id.to_string(),
+            capabilities,
+            issued_at_ms: now_ms,
+            expires_at_ms: now_ms.saturating_add(lifetime_ms),
+            nonce: u128::from_be_bytes(nonce),
+        };
+        Ok(Some(grant.encode(&device.grant_key)))
+    }
+
+    /// The grant key to hand a device at enrolment, so its broker can be
+    /// provisioned with it.
+    ///
+    /// Returned once, to the device that just enrolled. There is deliberately
+    /// no endpoint that reads it back: a key retrievable with an account
+    /// credential would be obtainable by anything that had stolen one, and the
+    /// device already has it.
+    pub(crate) fn device_grant_key(
+        &self,
+        account_id: &str,
+        device_id: &str,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.accounts
+            .get(account_id)
+            .and_then(|account| account.devices.get(device_id))
+            .map(|device| device.grant_key.clone())
+            .ok_or(ControlPlaneError::NotFound)
     }
 
     pub(crate) fn set_device_trust(
@@ -1389,6 +1516,24 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    /// Register an account and return its id, which is not the username.
+    fn registered_account(store: &mut AccountStore, now_ms: u64) -> String {
+        let salt = AccountStore::registration_salt().expect("salt");
+        let derived = derive_password_with(PASSWORD, &salt, PasswordScheme::current());
+        store
+            .register_derived(
+                "operator",
+                salt,
+                derived,
+                Some(test_device("device-1", 0x11)),
+                false,
+                now_ms,
+            )
+            .expect("register")
+            .user
+            .account_id
+    }
+
     /// Register an account and return the store plus its first refresh token.
     fn registered(store: &mut AccountStore, now_ms: u64) -> String {
         let salt = AccountStore::registration_salt().expect("salt");
@@ -1407,6 +1552,152 @@ mod tests {
     }
 
     const PASSWORD: &str = "a-sufficiently-long-password";
+
+    /// The grant a device is issued verifies exactly as its own broker will
+    /// verify it -- same code path, same key -- and names this session, this
+    /// requester and this device.
+    ///
+    /// Anything less and the two halves could drift: a server that tags what
+    /// no broker accepts fails closed, which is safe but silently breaks every
+    /// session, and nothing would notice until someone tried to connect.
+    #[test]
+    fn an_issued_grant_verifies_the_way_the_broker_will() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let account = registered_account(&mut store, now);
+
+        let key = store
+            .device_grant_key(&account, "device-1")
+            .expect("the enrolled device has a key");
+        assert_eq!(key.len(), GRANT_KEY_LEN);
+
+        let encoded = store
+            .issue_session_grant(&SessionGrantRequest {
+                account_id: &account,
+                device_id: "device-1",
+                session_id: "session-7",
+                requester_device_id: "the-requester",
+                capabilities: Capabilities::CAPTURE.with(Capabilities::MOUSE),
+                now_ms: now,
+                lifetime_ms: 60_000,
+            })
+            .expect("issue")
+            .expect("a device with a key gets a grant");
+
+        let verified = SessionGrant::decode_and_verify(&encoded, &key, now + 1_000, "device-1")
+            .expect("the broker's own check must accept it");
+        assert_eq!(verified.session_id, "session-7");
+        assert_eq!(verified.requester_device_id, "the-requester");
+        assert_eq!(verified.target_device_id, "device-1");
+        assert_eq!(
+            verified.capabilities,
+            Capabilities::CAPTURE.with(Capabilities::MOUSE)
+        );
+        assert_eq!(verified.expires_at_ms, now + 60_000);
+
+        cleanup(&directory);
+    }
+
+    /// Each device gets its own key, so a grant for one machine does not
+    /// verify on another. Otherwise an approval for any host in a fleet would
+    /// be an approval for all of them, with the target-device check the only
+    /// thing in the way.
+    #[test]
+    fn one_devices_grant_does_not_verify_with_another_devices_key() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let account = registered_account(&mut store, now);
+        store
+            .enroll_device(&account, test_device("device-2", 0x22), now)
+            .expect("second device");
+
+        let first = store.device_grant_key(&account, "device-1").expect("key");
+        let second = store.device_grant_key(&account, "device-2").expect("key");
+        assert_ne!(first, second, "each device must get its own key");
+
+        let encoded = store
+            .issue_session_grant(&SessionGrantRequest {
+                account_id: &account,
+                device_id: "device-1",
+                session_id: "session-7",
+                requester_device_id: "the-requester",
+                capabilities: Capabilities::all(),
+                now_ms: now,
+                lifetime_ms: 60_000,
+            })
+            .expect("issue")
+            .expect("grant");
+        assert!(
+            SessionGrant::decode_and_verify(&encoded, &second, now + 1, "device-2").is_err(),
+            "a grant for one device must not verify on another"
+        );
+
+        cleanup(&directory);
+    }
+
+    /// Two issuances of the same approval differ, because each carries a fresh
+    /// nonce. A stable grant would be refused by the broker as a replay the
+    /// second time a host presented it.
+    #[test]
+    fn each_issuance_carries_a_fresh_nonce() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let account = registered_account(&mut store, now);
+
+        let issue = || {
+            store
+                .issue_session_grant(&SessionGrantRequest {
+                    account_id: &account,
+                    device_id: "device-1",
+                    session_id: "session-7",
+                    requester_device_id: "the-requester",
+                    capabilities: Capabilities::all(),
+                    now_ms: now,
+                    lifetime_ms: 60_000,
+                })
+                .expect("issue")
+                .expect("grant")
+        };
+        assert_ne!(issue(), issue());
+
+        cleanup(&directory);
+    }
+
+    /// A device enrolled before grant keys existed has an empty key. It gets no
+    /// grant, and its broker then refuses the session -- rather than the server
+    /// tagging with an empty key, which would be a key everybody knows.
+    #[test]
+    fn a_device_without_a_key_is_issued_no_grant() {
+        let (mut store, directory) = test_store();
+        let now = 1_000;
+        let account = registered_account(&mut store, now);
+        store
+            .accounts
+            .get_mut(&account)
+            .expect("account")
+            .devices
+            .get_mut("device-1")
+            .expect("device")
+            .grant_key
+            .clear();
+
+        assert_eq!(
+            store
+                .issue_session_grant(&SessionGrantRequest {
+                    account_id: &account,
+                    device_id: "device-1",
+                    session_id: "session-7",
+                    requester_device_id: "the-requester",
+                    capabilities: Capabilities::all(),
+                    now_ms: now,
+                    lifetime_ms: 60_000,
+                })
+                .expect("issue"),
+            None
+        );
+
+        cleanup(&directory);
+    }
 
     /// A login with the right password but a changed device key auto-revokes the
     /// device and reports the owner (so the caller can end its sessions), while a

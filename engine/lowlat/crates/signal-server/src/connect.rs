@@ -585,6 +585,19 @@ impl ConnectBroker {
             .unwrap_or_default()
     }
 
+    /// The device that asked for this session.
+    ///
+    /// Read alongside [`Self::granted_permissions`], after a collection has
+    /// already authorised the caller, so an unknown request yields nothing
+    /// rather than an error. It names the requester inside the session grant,
+    /// which is what lets a broker refuse a grant replayed for a different
+    /// peer.
+    pub(crate) fn requester_device(&self, request_id: &str) -> Option<String> {
+        self.requests
+            .get(request_id)
+            .map(|request| request.requester_device_id.clone())
+    }
+
     /// The pair of credentials an approval just minted.
     ///
     /// Used once, by the approving request, to build the session the two

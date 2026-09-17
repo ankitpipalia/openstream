@@ -2072,6 +2072,8 @@ dependencies = [
  "hex",
  "hmac",
  "libc",
+ "lowlat-crypto",
+ "openstream-host-ipc",
  "openstream-protocol",
  "ring",
  "serde",

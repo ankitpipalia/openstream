@@ -1598,9 +1598,10 @@ fn control_error_response(error: ControlPlaneError) -> Response {
         ControlPlaneError::DevicePending | ControlPlaneError::DeviceRevoked => {
             StatusCode::FORBIDDEN
         }
-        ControlPlaneError::InvalidStore | ControlPlaneError::Io(_) | ControlPlaneError::Json(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        ControlPlaneError::InvalidStore
+        | ControlPlaneError::Internal(_)
+        | ControlPlaneError::Io(_)
+        | ControlPlaneError::Json(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     // A store fault is the operator's problem to fix and they cannot fix what
     // they cannot see, so the cause goes to the service log. It never goes to
@@ -2022,9 +2023,35 @@ async fn enroll_account_device(
         return control_error_response(error);
     }
     match accounts.enroll_device(&principal.account_id, registration, control_plane::now_ms()) {
-        Ok(device) => Json(device).into_response(),
+        Ok(device) => {
+            // The device's grant key, returned exactly once, to the device
+            // that just enrolled.
+            //
+            // There is deliberately no endpoint that reads it back. A key
+            // retrievable with an account credential would be obtainable by
+            // anything that had stolen one, and the enrolling device already
+            // has it -- it writes it to the file its privileged broker reads
+            // and never asks again.
+            let grant_key = accounts
+                .device_grant_key(&principal.account_id, &device.device_id)
+                .ok()
+                .filter(|key| !key.is_empty())
+                .map(|key| lowlat_crypto::hex(key.as_slice()));
+            Json(EnrolledDevice { device, grant_key }).into_response()
+        }
         Err(error) => control_error_response(error),
     }
+}
+
+/// An enrolment response: the public device record, plus the one-time grant
+/// key the device needs to provision its privileged broker.
+#[derive(Serialize)]
+struct EnrolledDevice {
+    #[serde(flatten)]
+    device: control_plane::PublicDevice,
+    /// Hex, and present only on the enrolment that created the device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_key: Option<String>,
 }
 
 async fn set_account_device_trust(
@@ -2252,6 +2279,15 @@ struct ConnectCredential {
     /// The classes the target granted, delivered to each end so both agree on
     /// the session's scope. The runner enforces it; the broker only negotiates.
     permissions: connect::Permissions,
+    /// The signed statement that this session was approved, for the host to
+    /// relay to its privileged broker. Hex, and only ever sent to the host --
+    /// the client has no broker to present it to.
+    ///
+    /// Absent when the device enrolled before per-device grant keys existed.
+    /// Its broker then refuses the session, which is the safe reading: a host
+    /// that cannot prove an approval should not open a screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_grant: Option<String>,
 }
 
 fn connect_error_response(error: connect::ConnectError) -> Response {
@@ -2516,19 +2552,84 @@ async fn connect_approve(
     }
 
     let mut broker = state.connect.lock().await;
+    let requester_device_id = broker.requester_device(&request_id).unwrap_or_default();
     match broker.collect_host_credential(&request_id, party, now) {
-        Ok((session_id, token)) => Json(ConnectCredential {
-            websocket_path: format!("/v1/signal/{session_id}/host"),
-            relay_ticket: relay_ticket::mint(&state.relay_secret, &session_id, "host", "host", 1),
-            relay_address: state.relay_address.map(|address| address.to_string()),
-            permissions: broker.granted_permissions(&request_id),
-            session_id,
-            role: "host",
-            token,
-        })
-        .into_response(),
+        Ok((session_id, token)) => {
+            let permissions = broker.granted_permissions(&request_id);
+            // Minted here, for this device, from this approval. The host
+            // relays it; it cannot produce one, which is what makes the
+            // broker's check mean anything.
+            let session_grant = state
+                .accounts
+                .lock()
+                .await
+                .issue_session_grant(&control_plane::SessionGrantRequest {
+                    account_id: &account_id,
+                    device_id: &device_id,
+                    session_id: &session_id,
+                    requester_device_id: &requester_device_id,
+                    capabilities: broker_capabilities(permissions),
+                    now_ms: control_plane::now_ms(),
+                    lifetime_ms: SESSION_GRANT_LIFETIME_MS,
+                })
+                .ok()
+                .flatten()
+                .map(|bytes| lowlat_crypto::hex(bytes.as_slice()));
+            Json(ConnectCredential {
+                websocket_path: format!("/v1/signal/{session_id}/host"),
+                relay_ticket: relay_ticket::mint(
+                    &state.relay_secret,
+                    &session_id,
+                    "host",
+                    "host",
+                    1,
+                ),
+                relay_address: state.relay_address.map(|address| address.to_string()),
+                permissions,
+                session_grant,
+                session_id,
+                role: "host",
+                token,
+            })
+            .into_response()
+        }
         Err(error) => connect_error_response(error),
     }
+}
+
+/// How long a session grant is good for.
+///
+/// Long enough to cover a reconnect or two -- a host that drops and comes back
+/// should not need a fresh approval -- and short enough that a captured grant
+/// is worth little. The broker also refuses a repeat of the same nonce, so the
+/// window bounds how long it has to remember one.
+const SESSION_GRANT_LIFETIME_MS: u64 = 10 * 60 * 1000;
+
+/// Translate the negotiated permission classes into the broker's capability
+/// bits.
+///
+/// Two vocabularies for the same decision, on either side of the machine
+/// boundary. Capture is unconditional: a session that may not see the screen
+/// is not a session. Everything else is whatever the person approving actually
+/// ticked.
+fn broker_capabilities(
+    permissions: connect::Permissions,
+) -> openstream_host_ipc::token::Capabilities {
+    use openstream_host_ipc::token::Capabilities;
+    let mut capabilities = Capabilities::CAPTURE;
+    if permissions.keyboard {
+        capabilities = capabilities.with(Capabilities::KEYBOARD);
+    }
+    if permissions.mouse {
+        capabilities = capabilities.with(Capabilities::MOUSE);
+    }
+    if permissions.gamepad {
+        capabilities = capabilities.with(Capabilities::GAMEPAD);
+    }
+    if permissions.clipboard {
+        capabilities = capabilities.with(Capabilities::CLIPBOARD);
+    }
+    capabilities
 }
 
 /// Refuse a request.
@@ -2590,6 +2691,10 @@ async fn connect_observe(
             ),
             relay_address: state.relay_address.map(|address| address.to_string()),
             permissions: broker.granted_permissions(&request_id),
+            // Never to the client: it has no privileged broker to present one
+            // to, and a grant is a bearer statement about what may be done to
+            // the *host's* machine.
+            session_grant: None,
             session_id,
             role: "client",
             token,
@@ -8413,10 +8518,10 @@ mod tests {
         let host_capability = host_grant["token"].as_str().expect("host token");
         assert_eq!(
             host_grant.as_object().expect("object").keys().count(),
-            7,
-            "the approval response carries one capability plus the granted \
-             permission set, and nothing that could be mistaken for a second \
-             capability: {host_grant}"
+            8,
+            "the approval response carries one capability, the granted \
+             permission set and the session grant, and nothing that could be \
+             mistaken for a second capability: {host_grant}"
         );
 
         // The client collects the client capability only.
@@ -8583,9 +8688,37 @@ mod tests {
             StatusCode::OK,
             "a retried approval must not be a conflict: {again}"
         );
-        assert_eq!(
-            first, again,
-            "and must return the same session and host credential"
+        // The session and the capability are the same; the session grant is
+        // not, and must not be.
+        //
+        // A grant carries a nonce and the broker refuses a repeat, so a
+        // retried approval that returned the *same* grant would hand the host
+        // something its own broker would reject the moment it reconnected.
+        // Each delivery mints a fresh one.
+        for field in [
+            "session_id",
+            "token",
+            "role",
+            "websocket_path",
+            "permissions",
+        ] {
+            assert_eq!(
+                first[field], again[field],
+                "{field} must survive a retried approval"
+            );
+        }
+        let (first_grant, again_grant) = (
+            first["session_grant"]
+                .as_str()
+                .expect("a grant the first time"),
+            again["session_grant"]
+                .as_str()
+                .expect("a grant on the retry"),
+        );
+        assert_ne!(
+            first_grant, again_grant,
+            "a retried approval must mint a fresh grant, or the broker would \
+             refuse it as a replay"
         );
 
         // Exactly one session exists: the retry did not mint a second.
