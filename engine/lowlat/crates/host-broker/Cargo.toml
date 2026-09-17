@@ -23,6 +23,7 @@ path = "src/lib.rs"
 
 [dependencies]
 openstream-host-ipc = { workspace = true }
+lowlat-crypto = { workspace = true }
 tokio = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

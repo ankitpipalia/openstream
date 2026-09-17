@@ -57,7 +57,28 @@ async fn run() -> std::io::Result<()> {
         // both halves run privileged during bring-up rather than open to all.
         Err(_) => AllowedPeers::only(0),
     };
-    let mut server = BrokerServer::new(socket, allowed, BrokerPolicy::default());
+    // The ceiling comes from the root broker's own environment, set by its
+    // systemd unit. The machine service runs as a different, unprivileged user
+    // and cannot write it -- which is the point: what the broker will ever
+    // grant must not be decided by the network-facing process asking.
+    //
+    // Unset means nothing is granted. A broker that has not been told what the
+    // operator allows has not been told it may hand out the keyboard.
+    let ceiling = match std::env::var("OPENSTREAM_BROKER_CEILING") {
+        Ok(spec) => openstream_host_broker::session::parse_ceiling(&spec).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("OPENSTREAM_BROKER_CEILING: {error}"),
+            )
+        })?,
+        Err(_) => openstream_host_ipc::token::Capabilities::none(),
+    };
+    eprintln!("openstream-host-broker: capability ceiling {ceiling:?}");
+    let policy = BrokerPolicy {
+        ceiling,
+        ..BrokerPolicy::default()
+    };
+    let mut server = BrokerServer::new(socket, allowed, policy);
     // Optionally hand the socket to the machine-service group so it can connect
     // unprivileged (SO_PEERCRED still gates who is served).
     if let Ok(value) = std::env::var("OPENSTREAM_BROKER_SOCKET_GID") {

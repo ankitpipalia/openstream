@@ -86,18 +86,6 @@ mod linux {
         }
     }
 
-    /// A best-effort unique-enough token id for this session. The broker does not
-    /// treat it as a secret in this version (it enforces the granted capability
-    /// set, not token possession), so a monotonic value from the clock suffices.
-    fn session_token_id() -> u128 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|delta| delta.as_nanos())
-            .unwrap_or(0);
-        nanos ^ (u128::from(std::process::id()) << 96)
-    }
-
     pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         use std::net::SocketAddr;
 
@@ -155,8 +143,11 @@ mod linux {
             requested = requested.with(BrokerCaps::KEYBOARD).with(BrokerCaps::MOUSE);
         }
         let mbps = configured_mbps();
-        let capture = CaptureContext {
+        let mut capture = CaptureContext {
             requested,
+            // Zero asks the broker to issue a grant. It is replaced by the one
+            // the broker mints, on the first CaptureStarted.
+            grant: openstream_host_ipc::token::NO_GRANT,
             width: negotiated.width,
             height: negotiated.height,
             fps: u8::try_from(negotiated.fps.clamp(1, 240)).unwrap_or(60),
@@ -200,7 +191,7 @@ mod linux {
                 event = recv_event(&mut broker.reader) => {
                     match event {
                         Ok(event) => {
-                            if forward_broker_event(event, &mut session, &mut adaptive, started).await? {
+                            if forward_broker_event(event, &mut session, &mut adaptive, started, &mut capture).await? {
                                 // A fatal broker error ended capture.
                                 break;
                             }
@@ -220,6 +211,7 @@ mod linux {
                         &mut reliable_control,
                         &mut adaptive,
                         started,
+                        capture.grant,
                     ).await? {
                         // The peer asked to end the session.
                         break;
@@ -280,6 +272,14 @@ mod linux {
         height: u16,
         fps: u8,
         bitrate_kbps: u32,
+        /// The grant the broker issued, echoed back on every later request.
+        ///
+        /// This service does not and cannot mint one: it used to build an id
+        /// from the clock and its own pid, which the broker then ignored, so
+        /// nothing stopped a compromise of this process from asking the root
+        /// broker for capture and input directly. `NO_GRANT` asks to be issued
+        /// one; the broker refuses any other id it did not itself hand out.
+        grant: u128,
     }
 
     /// Turn lifecycle actions into broker requests. `StartCapture` opens a new
@@ -294,7 +294,7 @@ mod linux {
         for action in actions {
             let request = match action {
                 Action::StartCapture(seat, kind) => ServiceRequest::OpenCapture {
-                    token_id: session_token_id(),
+                    token_id: capture.grant,
                     requested: capture.requested,
                     params: CaptureParams {
                         seat,
@@ -305,7 +305,11 @@ mod linux {
                         bitrate_kbps: capture.bitrate_kbps,
                     },
                 },
-                Action::SwitchCapture(seat, kind) => ServiceRequest::SwitchCapture { seat, kind },
+                Action::SwitchCapture(seat, kind) => ServiceRequest::SwitchCapture {
+                    token_id: capture.grant,
+                    seat,
+                    kind,
+                },
                 Action::StopCapture => ServiceRequest::CloseCapture,
                 Action::RequestKeyframe => ServiceRequest::RequestKeyframe,
             };
@@ -321,6 +325,7 @@ mod linux {
         session: &mut PeerSession,
         adaptive: &mut AdaptiveBitrate,
         started: Instant,
+        capture: &mut CaptureContext,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         match event {
             BrokerEvent::Frame {
@@ -339,12 +344,17 @@ mod linux {
                 Ok(false)
             }
             BrokerEvent::CaptureStarted {
+                token_id,
                 seat,
                 kind,
                 width,
                 height,
                 granted,
             } => {
+                // The grant the broker issued. Recorded, not chosen: every
+                // later request echoes this id back, and the broker refuses
+                // any other.
+                capture.grant = token_id;
                 // A re-point after a login/logout switch: geometry and grant may
                 // have changed. Nothing to send the peer; just note it.
                 eprintln!(
@@ -378,22 +388,33 @@ mod linux {
         reliable_control: &mut ReliableControl,
         adaptive: &mut AdaptiveBitrate,
         started: Instant,
+        grant: u128,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         if packet.kind == Kind::Control {
             if let Some(deliveries) = reliable_control.receive(session, &packet).await? {
                 for payload in deliveries {
-                    if handle_control_payload(&payload, broker_writer, adaptive, started).await? {
+                    if handle_control_payload(&payload, broker_writer, adaptive, started, grant)
+                        .await?
+                    {
                         return Ok(true);
                     }
                 }
                 return Ok(false);
             }
-            return handle_control_payload(&packet.payload, broker_writer, adaptive, started).await;
+            return handle_control_payload(
+                &packet.payload,
+                broker_writer,
+                adaptive,
+                started,
+                grant,
+            )
+            .await;
         }
         if packet.kind == Kind::Input {
             send_request(
                 broker_writer,
                 &ServiceRequest::Input {
+                    token_id: grant,
                     payload: packet.payload,
                 },
             )
@@ -408,6 +429,7 @@ mod linux {
         broker_writer: &mut tokio::net::unix::OwnedWriteHalf,
         adaptive: &mut AdaptiveBitrate,
         started: Instant,
+        grant: u128,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         if payload == b"openstream/end" {
             return Ok(true);
@@ -429,6 +451,7 @@ mod linux {
         send_request(
             broker_writer,
             &ServiceRequest::Input {
+                token_id: grant,
                 payload: payload.to_vec(),
             },
         )
