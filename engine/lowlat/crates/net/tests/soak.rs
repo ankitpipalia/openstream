@@ -51,9 +51,16 @@ const BODY: usize = 1100;
 /// steady state before anything is sampled.
 const WARMUP_MS: f64 = 500.0;
 
-/// How long the receiver keeps running after the sender stops, so the messages
-/// still in flight arrive before the counts are compared.
-const SETTLE_MS: u64 = 1_000;
+/// How long the tail is allowed to take to drain after the sender stops,
+/// before the receiver is stopped regardless.
+///
+/// A bound, not a wait: the drain below ends as soon as the receiver goes
+/// quiet, so this only decides how long a genuinely stuck run takes to fail.
+const SETTLE_MAX_MS: u64 = 10_000;
+
+/// How long the received count must stand still before the tail is considered
+/// drained.
+const SETTLE_QUIET_MS: u64 = 250;
 
 const SLOT: usize = 1400;
 const SLOTS: usize = 256;
@@ -366,6 +373,10 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
                     }
                     count += 1;
                 }
+                // Published every pass, not just at the end: the thread that
+                // decides when to stop this one needs to see the tail arriving
+                // to know when it has stopped arriving.
+                received.store(count, Ordering::Relaxed);
             }
             received.store(count, Ordering::Relaxed);
             gaps.store(seen_gaps, Ordering::Relaxed);
@@ -378,8 +389,35 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
             thread::sleep(std::time::Duration::from_millis(50));
         }
         stop.store(true, Ordering::Relaxed);
-        // Let the tail land and be acknowledged before the receiver stops.
-        thread::sleep(std::time::Duration::from_millis(SETTLE_MS));
+        // Drain the tail, do not sleep through it.
+        //
+        // This was a fixed one-second sleep, which is a stopwatch tuned to one
+        // machine: it passed for months and then failed repeatedly on the musl
+        // and sanitizer runners, which are slower. Both failures reported
+        // `datagrams_out == datagrams_in` exactly, with zero kernel drops and
+        // zero gaps -- so nothing was lost in the network or the socket
+        // buffers. The receiver was simply stopped before it had surfaced the
+        // last few messages, and the test called that loss.
+        //
+        // Waiting for the count to stand still costs nothing when the drain is
+        // quick and cannot truncate it when it is not.
+        let settle_deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(SETTLE_MAX_MS);
+        let quiet = std::time::Duration::from_millis(SETTLE_QUIET_MS);
+        let mut last_seen = u64::MAX;
+        let mut unchanged_since = std::time::Instant::now();
+        while std::time::Instant::now() < settle_deadline {
+            let seen = received.load(Ordering::Relaxed);
+            if seen == last_seen {
+                if unchanged_since.elapsed() >= quiet {
+                    break;
+                }
+            } else {
+                last_seen = seen;
+                unchanged_since = std::time::Instant::now();
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
         stop_receiver.store(true, Ordering::Relaxed);
     });
 
