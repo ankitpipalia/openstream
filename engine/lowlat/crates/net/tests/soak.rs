@@ -51,6 +51,14 @@ const BODY: usize = 1100;
 /// steady state before anything is sampled.
 const WARMUP_MS: f64 = 500.0;
 
+/// How long the sender is allowed to spend flushing what it has already
+/// accepted, before it stops regardless.
+const FLUSH_MAX_MS: u64 = 5_000;
+
+/// How long `datagrams_out` must stand still before the sender is considered
+/// flushed.
+const FLUSH_QUIET_MS: u64 = 100;
+
 /// How long the tail is allowed to take to drain after the sender stops,
 /// before the receiver is stopped regardless.
 ///
@@ -308,6 +316,37 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
                     baseline = Some(alloc_counter::count());
                 }
                 if stop.load(Ordering::Relaxed) {
+                    // Flush before leaving.
+                    //
+                    // `send_message` moves a message into the session's send
+                    // ring; only a `turn` packs that ring into datagrams. This
+                    // loop used to break straight out, so everything accepted
+                    // during the final pass was counted in `sent` and never put
+                    // on the wire -- which is exactly the tail this test kept
+                    // reporting as loss, while every datagram that *was*
+                    // produced arrived intact (`datagrams_out == datagrams_in`
+                    // in all three captured failures, with zero kernel drops
+                    // and zero gaps).
+                    //
+                    // Turning without enqueuing anything drains it. Bounded, so
+                    // a genuinely stuck session still ends the test.
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(FLUSH_MAX_MS);
+                    let quiet = std::time::Duration::from_millis(FLUSH_QUIET_MS);
+                    let mut last_out = u64::MAX;
+                    let mut unchanged_since = std::time::Instant::now();
+                    while std::time::Instant::now() < deadline {
+                        left.turn(elapsed_ms(started), |_| {}).expect("left flush");
+                        let out = left.stats().datagrams_out;
+                        if out == last_out {
+                            if unchanged_since.elapsed() >= quiet {
+                                break;
+                            }
+                        } else {
+                            last_out = out;
+                            unchanged_since = std::time::Instant::now();
+                        }
+                    }
                     break;
                 }
                 // Owed by the clock rather than by a per-pass count, so a slow
