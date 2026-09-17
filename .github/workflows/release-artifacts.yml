@@ -160,6 +160,49 @@ jobs:
             out/macos-codesign.txt
           if-no-files-found: error
 
+  windows-client:
+    # A test build of the streaming client for Windows. Windows is not a 1.0
+    # host platform (the host agent requires Unix local IPC), and Windows is not
+    # a staged 1.0 release row, so this job stands apart from `stage` and only
+    # produces a downloadable client for host/client interoperability testing:
+    # a Windows client against a Linux host. The client shells out to ffmpeg for
+    # decode, so a runner/user must have ffmpeg on PATH (or OPENSTREAM_FFMPEG) to
+    # run it; it is not needed to build.
+    name: Windows x86_64 client (test build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/lowlat/target
+          key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the desktop streaming client
+        working-directory: engine/lowlat
+        run: >
+          cargo build --locked --release
+          --target x86_64-pc-windows-msvc
+          -p openstream-desktop-client
+
+      - name: Stage the Windows client
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp engine/lowlat/target/x86_64-pc-windows-msvc/release/openstream-desktop-client.exe \
+            out/openstream-desktop-client.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-client
+          path: out/openstream-desktop-client.exe
+          if-no-files-found: error
+
   stage:
     name: Stage checksums and SBOM
     runs-on: ubuntu-latest
