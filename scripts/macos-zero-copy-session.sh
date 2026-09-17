@@ -7,11 +7,16 @@ unset OPENSTREAM_PAIRING_JSON OPENSTREAM_DEVELOPER_OVERRIDE
 # desktop client on this machine, run to prove the zero-copy present path on a
 # live window surface.
 #
-# Nothing here is a fixture: the host captures the display with
-# ScreenCaptureKit and encodes with VideoToolbox, the client decodes with
-# VideoToolbox into IOSurface-backed CVPixelBuffers, and the window imports
-# each one into a Metal texture and draws it. No ffmpeg process is involved on
-# either side, and no decoded pixel is ever read back to the CPU.
+# Nothing here is a fixture: the host captures the display in-process and
+# encodes with VideoToolbox, the client decodes with VideoToolbox into
+# IOSurface-backed CVPixelBuffers, and the window imports each one into a Metal
+# texture and draws it. No ffmpeg process is involved on either side, and no
+# decoded pixel is ever read back to the CPU on the client.
+#
+# The host half is not zero-copy: it polls CGDisplayCreateImage and copies the
+# framebuffer several times per frame, which is why the host stage lines in its
+# log show far more time than anything on the client. That is a known finding,
+# not something this rig is asserting away.
 #
 # What the offscreen tests cannot show, and this can:
 #   * the presenter that draws the imported texture is the live window's
@@ -74,13 +79,17 @@ case "$mode" in
 esac
 
 cd "$engine_dir"
-cargo build -q --locked \
+# Release, not debug. The pixel loops on both sides -- the host's stride pack
+# and rescale, the client's readback -- are exactly what a debug build makes
+# unrepresentative, and a latency measurement taken against them describes the
+# compiler rather than the product.
+cargo build -q --locked --release \
     -p openstream-signal-server \
     -p openstream-ffmpeg-host \
     -p openstream-desktop-client
 
 OPENSTREAM_ALLOW_NO_AUTH=1 \
-OPENSTREAM_SIGNAL_BIND="127.0.0.1:$port" target/debug/openstream-signal-server \
+OPENSTREAM_SIGNAL_BIND="127.0.0.1:$port" target/release/openstream-signal-server \
     >"$server_log" 2>&1 &
 server_pid=$!
 
@@ -112,7 +121,7 @@ common_env=(
 env "${common_env[@]}" \
     OPENSTREAM_CAPTURE_BACKEND=native \
     OPENSTREAM_HOST_SECONDS="$seconds" \
-    target/debug/openstream-ffmpeg-host >"$host_log" 2>&1 &
+    target/release/openstream-ffmpeg-host >"$host_log" 2>&1 &
 host_pid=$!
 
 # The client exits when the host stops and no reconnect is left, and prints its
@@ -123,7 +132,7 @@ env "${common_env[@]}" \
     OPENSTREAM_DECODER=native \
     OPENSTREAM_ZERO_COPY="$zero_copy" \
     OPENSTREAM_RECONNECT_ATTEMPTS=0 \
-    target/debug/openstream-desktop-client >"$client_log" 2>&1 || true
+    target/release/openstream-desktop-client >"$client_log" 2>&1 || true
 wait "$host_pid" 2>/dev/null || true
 
 fail=0
@@ -153,7 +162,7 @@ require "$host_log" "OpenStream native encoder: videotoolbox-h264" \
 # (avfoundation on macOS) and an ffmpeg encoder profile, and neither can be
 # printed by a run that went in-process.
 require "$host_log" "OpenStream run capture=native" \
-    "host captured with ScreenCaptureKit, not an ffmpeg backend"
+    "host captured in-process, not through an ffmpeg backend"
 require "$host_log" "OpenStream run encoder=videotoolbox-h264" \
     "host reported the in-process encoder for the session"
 
