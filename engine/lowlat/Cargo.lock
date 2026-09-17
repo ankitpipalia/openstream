@@ -1877,6 +1877,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openstream-enrol"
+version = "0.1.0"
+dependencies = [
+ "openstream-client-core",
+ "openstream-host-broker",
+ "tokio",
+]
+
+[[package]]
 name = "openstream-ffmpeg-host"
 version = "0.1.0"
 dependencies = [
