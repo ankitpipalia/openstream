@@ -100,14 +100,21 @@ but they are **an experimental subsystem, not something an installer enables**:
   once with the account ids it has just resolved.
 - **Nothing has been installed or started on a real machine.** The units are
   written and packaged; no one has booted them.
+- One of those was a directive systemd does not have. `RuntimeDirectoryGroup=`
+  is not a `systemd.exec` setting -- a `RuntimeDirectory`'s ownership comes from
+  the unit's `User=` and `Group=` -- so it was accepted into the file, silently
+  ignored at runtime, and left `/run/openstream` root-owned and unreachable by
+  the service that has to find the socket in it. It is `Group=openstream` now,
+  and the packaging check refuses the non-existent directive by name.
 - `scripts/test-linux-packaging.sh` is the check that stops this recurring, and
   only half of it has been run. Its static half ran locally and, against the
-  units as they were, failed on eight separate counts -- every problem listed
-  above. Its functional half, which starts the real broker with the environment
-  the package writes and requires that it listens (with a negative control that
-  must still fail), is **wired into CI but has never executed**: it needs Linux,
-  and this branch has no pull request, so no run has ever reached it. Do not
-  quote it as evidence until a run does.
+  units as they were, failed on eight separate counts. Its functional half --
+  run `postinst` and inspect what it writes, launch the broker with that
+  environment, connect to its socket, with a negative control that must still
+  fail -- is **wired into CI but has never executed**: it needs Linux, and this
+  branch has no pull request, so no run has ever reached it. It also does not
+  start the systemd units or exercise the machine-service to broker path. Do not
+  quote it as evidence until a run does, and not as an install test even then.
 - The broker's `CapabilityBoundingSet` is deliberately left unnarrowed, because
   guessing it wrong yields a service that will not start and no one here can
   currently test it -- the unit says so and says where to start once someone can.

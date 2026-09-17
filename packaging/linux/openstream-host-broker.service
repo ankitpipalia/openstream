@@ -37,12 +37,21 @@ EnvironmentFile=-/etc/openstream/broker.env
 # when the service stops, so a stale socket cannot outlive the broker that was
 # listening on it.
 #
-# The group is what makes it reachable: the directory is root-owned 0750, and
-# without a group the unprivileged machine service cannot traverse it to find
-# the socket, whatever the socket's own mode says.
+# `Group=` is what makes the directory reachable. systemd gives a
+# RuntimeDirectory= the ownership of this unit's User= and Group=, and there is
+# no separate directive for it -- an earlier version of this file used a
+# `RuntimeDirectoryGroup=` that systemd does not have, so it was ignored and
+# /run/openstream came out root:root 0750, which the unprivileged machine
+# service cannot traverse whatever the socket's own mode says.
+#
+# The process still runs as root: only its primary group changes, and root
+# bypasses the permission checks that group would otherwise decide. What it
+# does mean is that anything this service creates without an explicit mode is
+# group-readable by the machine service, so the grant key is written 0600 and
+# the read path requires that.
 RuntimeDirectory=openstream
 RuntimeDirectoryMode=0750
-RuntimeDirectoryGroup=openstream
+Group=openstream
 
 # Hardening. This process is root and holds the two privileges that genuinely
 # need elevation, so everything it does not need is taken away.

@@ -197,17 +197,23 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 
-      # The shipped Linux configuration, started for real.
+      # The shipped Linux configuration, checked by running it rather than by
+      # reading it.
       #
       # Everything about the pre-login units used to be checked by reading them:
       # the package built, the binaries passed their tests, and the pair could
       # not start on any machine -- five variables were assigned the empty
       # string, which a process reads as a value rather than as unset, and the
-      # broker exited parsing an empty gid. This runs the broker with the
-      # environment the package writes and requires that it listens, with a
-      # negative control so a broker that ignored its configuration would not
-      # pass. Linux-only, which is why it lives in this job rather than
-      # somewhere the maintainer's macOS can reach.
+      # broker exited parsing an empty gid. A sixth was a directive systemd does
+      # not have, silently ignored, leaving the runtime directory unreachable.
+      #
+      # This runs postinst and inspects what it writes, then launches the broker
+      # binary with that environment and connects to its socket, with a negative
+      # control so a broker that ignored its configuration would not pass.
+      #
+      # It does NOT start the systemd units, and does not exercise the
+      # machine-service -> socket -> broker path as the unprivileged user. It is
+      # not an install test and does not stand in for one.
       - name: Linux packaging configuration
         run: |
           cargo build --locked -p openstream-host-broker

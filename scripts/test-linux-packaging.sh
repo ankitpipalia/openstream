@@ -20,6 +20,11 @@
 # functional one that starts the real binary with the real configuration, which
 # needs Linux.
 #
+# What this does NOT do: start either systemd unit, and exercise the
+# machine-service -> Unix socket -> broker path as the unprivileged user. It
+# launches the broker binary directly with the environment the package writes.
+# That is enough to catch every problem listed above and is not an install test.
+#
 # Usage: scripts/test-linux-packaging.sh [path-to-openstream-host-broker]
 set -euo pipefail
 
@@ -67,10 +72,22 @@ require() {
     fi
 }
 
-require "$broker_unit" '^RuntimeDirectoryGroup=openstream$' \
+require "$broker_unit" '^Group=openstream$' \
     "the runtime directory is group-owned by the service account" \
-    "the broker does not set RuntimeDirectoryGroup, so /run/openstream is
-root-owned 0750 and the machine service cannot traverse it to reach the socket"
+    "the broker does not set Group=, so systemd gives its RuntimeDirectory the
+unit's default ownership -- root:root 0750 -- and the unprivileged machine
+service cannot traverse it to reach the socket"
+
+# The directive that does not exist. systemd ignores an unknown key with a log
+# line nobody reads, so this file looked correct and shipped a directory the
+# service could not enter.
+if grep -q '^RuntimeDirectoryGroup=' "$broker_unit"; then
+    fail "the broker uses RuntimeDirectoryGroup=, which systemd has no such
+directive for; it is silently ignored. RuntimeDirectory ownership comes from
+User= and Group=."
+else
+    pass "no RuntimeDirectoryGroup= (systemd has no such directive)"
+fi
 
 require "$broker_unit" '^EnvironmentFile=-/etc/openstream/broker\.env$' \
     "the broker reads its environment file" \
@@ -290,6 +307,22 @@ ENV
 
     if [ "$ready" = 1 ]; then
         pass "the broker starts and listens with the configuration the package writes"
+        # A socket file is not a listener. `RuntimeDirectory` would leave one
+        # behind after a crash, and the bind can succeed on a path nothing is
+        # accepting on -- so connect to it.
+        if python3 - "$work/run/broker.sock" <<'CONNECT'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect(sys.argv[1])
+s.close()
+CONNECT
+        then
+            pass "the socket accepts a connection"
+        else
+            fail "the socket exists but refused a connection, so nothing is
+listening on the path the machine service is configured to use"
+        fi
     else
         fail "the broker did not start with the configuration the package writes:
 $(cat "$work/out")"
