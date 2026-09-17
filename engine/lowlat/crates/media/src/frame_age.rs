@@ -29,10 +29,53 @@
 //! observe, and it is named for the act rather than for the outcome so no
 //! reader mistakes it for the photon leaving the display.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::latency::{Client, Histogram, SpanValue, Stamp};
+
+/// A decoded picture that lives in GPU memory, carried opaquely.
+///
+/// A hardware decoder can hand back a surface the GPU already holds -- a
+/// `CVPixelBuffer` on macOS, a D3D11 texture on Windows -- and reading it
+/// into [`DecodedFrame::pixels`] costs a per-pixel copy of several megabytes
+/// per frame purely to hand the result straight back to the GPU. The frame
+/// carries the surface instead, and the window imports it directly.
+///
+/// The type is opaque on purpose. `lowlat-media` is platform-neutral and must
+/// not grow a CoreVideo or Direct3D dependency to describe a pointer it never
+/// dereferences; the producer and the presenter are in the same crate and
+/// agree on the concrete type, so a downcast at the window is enough. The
+/// `Send + Sync` bound is what lets a frame cross the decoder-to-window
+/// mailboxes, and `Arc` keeps [`DecodedFrame`]'s `Clone` cheap rather than
+/// duplicating a surface.
+#[derive(Clone)]
+pub struct FrameSurface(Arc<dyn Any + Send + Sync>);
+
+impl FrameSurface {
+    /// Wrap a platform surface for carriage to the window.
+    #[must_use]
+    pub fn new<T: Any + Send + Sync>(surface: T) -> Self {
+        Self(Arc::new(surface))
+    }
+
+    /// Borrow the surface as its concrete type, or `None` if it is something
+    /// else -- which is the presenter's signal to use the CPU pixels.
+    #[must_use]
+    pub fn downcast_ref<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+impl fmt::Debug for FrameSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The payload is `dyn Any`, which is not `Debug`; naming the type
+        // would need a bound the carrier deliberately does not impose.
+        formatter.write_str("FrameSurface(..)")
+    }
+}
 
 /// Identity the client assigns to each picture its decoder produces.
 ///
@@ -95,6 +138,7 @@ pub struct DecodedFrame {
     width: usize,
     height: usize,
     pixels: Vec<u32>,
+    surface: Option<FrameSurface>,
 }
 
 impl DecodedFrame {
@@ -125,7 +169,26 @@ impl DecodedFrame {
             width,
             height,
             pixels,
+            surface: None,
         }
+    }
+
+    /// Attach the GPU surface this picture was decoded into.
+    ///
+    /// A frame carrying a surface normally has an empty `pixels` -- that is
+    /// the point: the readback never happened. Presenters must therefore
+    /// check [`surface`](Self::surface) before reading the pixels, and any
+    /// frame without one is an ordinary CPU frame.
+    #[must_use]
+    pub fn with_surface(mut self, surface: FrameSurface) -> Self {
+        self.surface = Some(surface);
+        self
+    }
+
+    /// The GPU surface backing this picture, if it was decoded into one.
+    #[must_use]
+    pub const fn surface(&self) -> Option<&FrameSurface> {
+        self.surface.as_ref()
     }
 
     /// When the decoder's raw bytes were in hand, before conversion.
@@ -590,7 +653,9 @@ impl FrameAgeRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodedFrame, DecodedFrameSeq, FrameAgeRecord, FrameOffer, PENDING_CAPACITY};
+    use super::{
+        DecodedFrame, DecodedFrameSeq, FrameAgeRecord, FrameOffer, FrameSurface, PENDING_CAPACITY,
+    };
     use crate::latency::{Client, SpanValue, Stamp};
     use std::time::{Duration, Instant};
 
@@ -607,6 +672,68 @@ mod tests {
             2,
             vec![0; 8],
         )
+    }
+
+    /// The presenter decides between the GPU and CPU paths on this being
+    /// `None`, so a plain decoded frame must never look like a GPU one.
+    #[test]
+    fn a_frame_without_a_surface_reports_none() {
+        let base = Instant::now();
+        assert!(frame(DecodedFrameSeq::FIRST, base, 0).surface().is_none());
+    }
+
+    #[test]
+    fn an_attached_surface_comes_back_as_its_own_type() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Surface(u32);
+
+        let base = Instant::now();
+        let carried =
+            frame(DecodedFrameSeq::FIRST, base, 0).with_surface(FrameSurface::new(Surface(0xfeed)));
+
+        let surface = carried.surface().expect("the surface was attached");
+        assert_eq!(surface.downcast_ref::<Surface>(), Some(&Surface(0xfeed)));
+    }
+
+    /// A downcast to the wrong type must return `None` rather than
+    /// reinterpreting the pointer: a presenter that is handed a surface it
+    /// does not recognise has to fall back, not guess.
+    #[test]
+    fn a_surface_does_not_downcast_to_another_type() {
+        struct Theirs;
+        struct Ours;
+
+        let base = Instant::now();
+        let carried =
+            frame(DecodedFrameSeq::FIRST, base, 0).with_surface(FrameSurface::new(Theirs));
+
+        let surface = carried.surface().expect("the surface was attached");
+        assert!(surface.downcast_ref::<Ours>().is_none());
+    }
+
+    /// Cloning a frame shares the surface rather than duplicating it -- the
+    /// mailboxes clone frames, and a GPU surface cannot be deep-copied.
+    #[test]
+    fn cloning_a_frame_keeps_the_same_surface() {
+        struct Surface;
+
+        let base = Instant::now();
+        let carried =
+            frame(DecodedFrameSeq::FIRST, base, 0).with_surface(FrameSurface::new(Surface));
+        let copy = carried.clone();
+
+        let original = std::ptr::from_ref(
+            carried
+                .surface()
+                .and_then(FrameSurface::downcast_ref::<Surface>)
+                .expect("the surface was attached"),
+        );
+        let cloned = std::ptr::from_ref(
+            copy.surface()
+                .and_then(FrameSurface::downcast_ref::<Surface>)
+                .expect("the clone kept the surface"),
+        );
+        assert!(std::ptr::eq(original, cloned));
     }
 
     #[test]
