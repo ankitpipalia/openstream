@@ -99,6 +99,29 @@ pub(crate) fn prefer_native_from_env() -> bool {
     )
 }
 
+/// Whether the user opted into zero-copy presentation (`OPENSTREAM_ZERO_COPY=1`).
+///
+/// A separate switch from [`prefer_native_from_env`] because it is a separate
+/// risk. The native decoder changes where decoding happens; zero-copy changes
+/// what reaches the window -- a GPU surface instead of a pixel buffer -- and
+/// that path depends on the native presenter being available and on the
+/// surface importing successfully. Both must be asked for explicitly, and the
+/// decode worker ignores this flag unless it is running natively, since there
+/// is no surface to carry out of ffmpeg.
+pub(crate) fn prefer_zero_copy_from_env() -> bool {
+    zero_copy_requested(&std::env::var("OPENSTREAM_ZERO_COPY").unwrap_or_default())
+}
+
+/// The parsing half of [`prefer_zero_copy_from_env`], split out so it can be
+/// tested without a process-wide environment variable that other tests in the
+/// same process would race against.
+fn zero_copy_requested(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes"
+    )
+}
+
 /// Capability-driven backend selection: when `prefer_in_process` is set, the
 /// first in-process decoder that supports `codec` wins; otherwise, and whenever
 /// no such decoder exists, ffmpeg -- the universal fallback -- is chosen.
@@ -123,6 +146,18 @@ pub(crate) fn select_decoder(
 #[cfg(test)]
 mod selection_tests {
     use super::*;
+
+    /// Zero-copy changes what reaches the window, so an unset or unrecognised
+    /// value must leave the client on the pixel path rather than guessing.
+    #[test]
+    fn zero_copy_is_off_unless_it_is_asked_for() {
+        for value in ["", "  ", "0", "off", "no", "false", "native", "maybe"] {
+            assert!(!zero_copy_requested(value), "{value:?} must not enable it");
+        }
+        for value in ["1", "true", "yes", " TRUE ", "Yes"] {
+            assert!(zero_copy_requested(value), "{value:?} must enable it");
+        }
+    }
 
     #[test]
     fn ffmpeg_is_the_fallback_for_every_codec_when_not_preferring_native() {

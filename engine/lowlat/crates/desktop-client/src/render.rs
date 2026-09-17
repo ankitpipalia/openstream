@@ -307,11 +307,8 @@ impl GpuPresenter {
     /// The zero-copy path builds its `MetalTextureImporter` from this device, so
     /// a `CVPixelBuffer` imported into a `wgpu::Texture` belongs to the same
     /// device `present_texture` draws it with -- importing on any other device
-    /// would produce a texture this presenter cannot bind. Not yet on the live
-    /// hot path: the decode worker that shares this device and calls
-    /// `present_texture` is wired in a follow-up, so like `present_texture` this
-    /// is `dead_code` for now.
-    #[allow(dead_code)]
+    /// would produce a texture this presenter cannot bind. The client's window
+    /// loop calls this to build that importer on the first GPU-resident frame.
     pub(crate) fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -464,11 +461,9 @@ impl GpuPresenter {
     ///
     /// The presenter side of the zero-copy path. The no-swizzle render it uses is
     /// proven correct on hardware by `vt_gpu`'s offscreen tests (and the
-    /// `no_swizzle_pipeline_renders_bgra_without_a_swizzle` test below); the
-    /// client's decode worker is wired to publish `CVPixelBuffer`s and call this
-    /// (sharing this presenter's wgpu device) in a follow-up, so it is not yet on
-    /// the live hot path.
-    #[allow(dead_code)]
+    /// `no_swizzle_pipeline_renders_bgra_without_a_swizzle` test below). The
+    /// client's window loop calls this for every frame the decode worker
+    /// published as a surface, under `OPENSTREAM_ZERO_COPY=1`.
     pub(crate) fn present_texture(
         &mut self,
         window: &Window,
