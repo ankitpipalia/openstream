@@ -2834,8 +2834,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "url",
+ "webpki-roots 0.26.11",
  "webrtc-ice",
  "webrtc-util",
 ]

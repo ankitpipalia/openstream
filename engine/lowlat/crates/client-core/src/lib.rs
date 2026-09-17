@@ -48,6 +48,7 @@ use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
 use webrtc_ice::url::Url as IceUrl;
 use webrtc_util::conn::Conn as IceConn;
 
+pub mod http;
 mod keystore;
 mod path;
 pub mod scheduler;

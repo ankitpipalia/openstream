@@ -22,7 +22,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite.workspace = true
+webpki-roots = "0.26"
 url.workspace = true
 webrtc-ice.workspace = true
 webrtc-util.workspace = true
