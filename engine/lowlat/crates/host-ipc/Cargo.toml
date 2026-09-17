@@ -19,6 +19,8 @@ path = "src/lib.rs"
 # The wire codec is hand-rolled (see src/wire.rs), so there is no serialization
 # dependency. tokio drives the async framed transport (src/transport.rs).
 [dependencies]
+hmac = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 
 # libc is only for the Linux SO_PEERCRED read in src/peercred.rs.

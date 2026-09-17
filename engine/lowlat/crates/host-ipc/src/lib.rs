@@ -29,6 +29,7 @@
 //! runtime dependency is `tokio` for [`transport`]. The DRM reader and the
 //! `uinput` sink live in the broker binary that depends on this crate, not here.
 
+pub mod grant;
 pub mod lifecycle;
 pub mod peercred;
 pub mod protocol;
