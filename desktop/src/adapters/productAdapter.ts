@@ -197,7 +197,7 @@ export function createEmptySnapshot(): ProductSnapshot {
   return {
     product: {
       name: "OpenStream",
-      version: "1.0.0-dev",
+      version: "1.0.0",
       channel: "Desktop shell",
     },
     connection: {

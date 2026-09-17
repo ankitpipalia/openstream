@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 /// Advertised product version. This is a prerelease identifier until
 /// every gate in release/openstream-1.0-gates.tsv actually passes.
-const PRODUCT_VERSION = "1.0.0-dev";
+const PRODUCT_VERSION = "1.0.0";
 
 import type {
   AccessSnapshot,
