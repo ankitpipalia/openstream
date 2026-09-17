@@ -54,14 +54,17 @@ fn main() -> std::process::ExitCode {
         }
     }
 
-    /// The value at `fraction` through a sorted copy of `values`.
-    fn percentile(values: &[u128], fraction: f64) -> u128 {
+    /// The value at `percent` of the way through a sorted copy of `values`.
+    ///
+    /// Integer arithmetic throughout: a float index needs a cast back to
+    /// `usize` that is only ever correct by inspection.
+    fn percentile(values: &[u128], percent: usize) -> u128 {
         if values.is_empty() {
             return 0;
         }
         let mut sorted = values.to_vec();
         sorted.sort_unstable();
-        let index = ((sorted.len() - 1) as f64 * fraction).round() as usize;
+        let index = (sorted.len() - 1) * percent / 100;
         sorted[index]
     }
 
@@ -142,7 +145,7 @@ fn main() -> std::process::ExitCode {
             }
         }
         idle_us.push(idle_started.elapsed().as_micros());
-        let pts = started_at.elapsed().as_micros() as i64;
+        let pts = i64::try_from(started_at.elapsed().as_micros()).unwrap_or(i64::MAX);
 
         let submitted_at = Instant::now();
         // SAFETY: the frame holds a retain on its pixel buffer for as long as
@@ -283,13 +286,13 @@ fn main() -> std::process::ExitCode {
     println!(
         "  submit -> access unit            mean {:>7} us   p95 {:>7} us   max {:>7} us",
         mean(&encode_us),
-        percentile(&encode_us, 0.95),
+        percentile(&encode_us, 95),
         encode_us.iter().copied().max().unwrap_or(0)
     );
     println!(
         "  capture -> access unit           mean {:>7} us   p95 {:>7} us   max {:>7} us",
         mean(&capture_us),
-        percentile(&capture_us, 0.95),
+        percentile(&capture_us, 95),
         capture_us.iter().copied().max().unwrap_or(0)
     );
     println!();
@@ -311,7 +314,7 @@ fn main() -> std::process::ExitCode {
     println!(
         "  access-unit size                 mean {:>7} B   p95 {:>7} B",
         mean(&au_bytes),
-        percentile(&au_bytes, 0.95)
+        percentile(&au_bytes, 95)
     );
     println!();
     println!("  a {FPS} fps frame budget is {} us", 1_000_000 / FPS);
