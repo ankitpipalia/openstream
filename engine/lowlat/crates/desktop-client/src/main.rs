@@ -4741,6 +4741,18 @@ mod native_wiring_tests {
     use crate::test_fixtures::{access_units_by_aud, generate_h264};
     use std::sync::PoisonError;
 
+    /// How long to wait for the first decoded picture.
+    ///
+    /// Generous on purpose. The first decode of a session pays for
+    /// `VTDecompressionSessionCreate`, which is XPC-backed: on an unloaded
+    /// machine it returns in milliseconds, and on a loaded one it has been
+    /// measured here taking several seconds. A one-second budget passed for
+    /// weeks and then failed every run once this machine was busy, which is
+    /// the worst way for a test to be wrong -- it looks like the decoder
+    /// broke. The wait is bounded so a genuine failure still fails, just not
+    /// on a stopwatch tuned to an idle laptop.
+    const FIRST_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// `ZERO_COPY_PRESENT` is process-wide, and these tests run in one process:
     /// a test that flips it would otherwise change the decoder mode under a
     /// test that is between storing the flag and building its decoder.
@@ -4806,9 +4818,10 @@ mod native_wiring_tests {
                 .expect("feed access unit");
         }
 
-        // The decoder runs on its own thread; wait briefly for frames to land.
+        // The decoder runs on its own thread; wait for frames to land.
         let mut frames = 0;
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + FIRST_FRAME_BUDGET;
+        while std::time::Instant::now() < deadline {
             while let Some(frame) = frame_rx.take() {
                 assert_eq!(frame.width(), 160);
                 assert_eq!(frame.height(), 120);
@@ -4821,14 +4834,19 @@ mod native_wiring_tests {
                 assert_eq!(frame.pixels().len(), 160 * 120);
                 frames += 1;
             }
-            if frames >= 3 {
+            // One is the whole claim, and one is all that can be relied on:
+            // the mailbox keeps only the newest picture, so a decoder that
+            // outruns this loop has most of its output replaced before it is
+            // ever taken. Waiting for more would burn the budget above for
+            // frames that are working exactly as designed.
+            if frames >= 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
             frames >= 1,
-            "native SessionDecoder published no frames to the mailbox"
+            "native SessionDecoder published no frames to the mailbox within {FIRST_FRAME_BUDGET:?}"
         );
     }
 
@@ -4885,7 +4903,8 @@ mod native_wiring_tests {
         }
 
         let mut imported = 0;
-        for _ in 0..100 {
+        let deadline = std::time::Instant::now() + FIRST_FRAME_BUDGET;
+        while std::time::Instant::now() < deadline {
             while let Some(frame) = frame_rx.take() {
                 let surface = frame
                     .surface()
@@ -4905,14 +4924,15 @@ mod native_wiring_tests {
                 assert_eq!(texture.height(), 120);
                 imported += 1;
             }
-            if imported >= 3 {
+            // As above: the mailbox is a slot, not a queue.
+            if imported >= 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
             imported >= 1,
-            "the zero-copy path published no importable surfaces"
+            "the zero-copy path published no importable surfaces within {FIRST_FRAME_BUDGET:?}"
         );
     }
 }
