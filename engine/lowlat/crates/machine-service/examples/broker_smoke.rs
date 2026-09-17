@@ -45,7 +45,12 @@ async fn main() -> std::process::ExitCode {
     if let Err(error) = send_request(
         &mut broker.writer,
         &ServiceRequest::OpenCapture {
-            token_id: 1,
+            // Zero asks the broker to issue a capability; an empty approval is
+            // refused. This probe checks that the socket, the peer check and
+            // the handshake work, and a refusal past all three is a successful
+            // probe -- it proves the boundary is live rather than absent.
+            token_id: openstream_host_ipc::token::NO_GRANT,
+            grant: Vec::new(),
             requested: Capabilities::CAPTURE,
             params: CaptureParams {
                 seat,

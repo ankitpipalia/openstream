@@ -124,6 +124,7 @@ mod tests {
     async fn a_service_request_round_trips_over_a_pipe() {
         let (mut client, mut broker) = tokio::io::duplex(64 * 1024);
         let sent = ServiceRequest::OpenCapture {
+            grant: vec![0xA1, 0x02, 0x03],
             token_id: 0xABCD,
             requested: Capabilities::CAPTURE.with(Capabilities::MOUSE),
             params: CaptureParams {

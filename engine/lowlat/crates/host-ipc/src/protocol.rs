@@ -22,7 +22,7 @@ use crate::wire::{DecodeError, Reader, Writer};
 
 /// The protocol version. Both sides announce it in their `Hello`; a mismatch is
 /// a clean refusal rather than a misread message.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 // Service -> broker tags occupy the low half, broker -> service the high half,
 // so a message decoded against the wrong direction fails on the tag rather than
@@ -116,7 +116,17 @@ pub enum ServiceRequest {
     OpenCapture {
         /// Zero to be issued a grant, or the id of this connection's grant.
         token_id: u128,
-        /// Capabilities the service is requesting, as a reduction only.
+        /// The control plane's approval for this session, encoded by
+        /// [`crate::grant::SessionGrant::encode`].
+        ///
+        /// The broker verifies it against the key pinned at enrolment before
+        /// it opens anything, so this is the field that says *someone
+        /// approved this*. The service relays it; it cannot compute a tag for
+        /// one it made up.
+        grant: Vec<u8>,
+        /// Capabilities the service is requesting, as a reduction only. The
+        /// grant is a ceiling above this, and the broker's own policy and the
+        /// seat are ceilings above that.
         requested: Capabilities,
         /// Geometry and pacing to encode at.
         params: CaptureParams,
@@ -165,11 +175,13 @@ impl ServiceRequest {
             }
             ServiceRequest::OpenCapture {
                 token_id,
+                grant,
                 requested,
                 params,
             } => {
                 let mut writer = Writer::tagged(tag::OPEN_CAPTURE);
                 writer.u128(*token_id);
+                writer.bytes(grant);
                 writer.u32(requested.bits());
                 writer.u8(seat_to_wire(params.seat));
                 writer.u8(kind_to_wire(params.kind));
@@ -216,6 +228,7 @@ impl ServiceRequest {
             },
             tag::OPEN_CAPTURE => {
                 let token_id = reader.u128()?;
+                let grant = reader.bytes()?.to_vec();
                 let requested = Capabilities::from_bits_truncate(reader.u32()?);
                 let seat = seat_from_wire(reader.u8()?)?;
                 let kind = kind_from_wire(reader.u8()?)?;
@@ -225,6 +238,7 @@ impl ServiceRequest {
                 let bitrate_kbps = reader.u32()?;
                 ServiceRequest::OpenCapture {
                     token_id,
+                    grant,
                     requested,
                     params: CaptureParams {
                         seat,
@@ -453,6 +467,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
         });
         service_round_trip(ServiceRequest::OpenCapture {
+            grant: vec![0xA1, 0x02, 0x03],
             token_id: 0x0123_4567_89AB_CDEF_0011_2233_4455_6677,
             requested: Capabilities::CAPTURE.with(Capabilities::KEYBOARD),
             params: CaptureParams {
@@ -524,6 +539,7 @@ mod tests {
     #[test]
     fn a_truncated_open_capture_is_rejected() {
         let mut encoded = ServiceRequest::OpenCapture {
+            grant: vec![0xA1, 0x02, 0x03],
             token_id: 7,
             requested: Capabilities::all(),
             params: CaptureParams {
@@ -545,9 +561,11 @@ mod tests {
 
     #[test]
     fn an_unknown_seat_byte_is_rejected() {
-        // Tag OPEN_CAPTURE, token, caps, then an out-of-range seat byte (9).
+        // Tag OPEN_CAPTURE, token, grant, caps, then an out-of-range seat
+        // byte (9).
         let mut writer = Writer::tagged(tag::OPEN_CAPTURE);
         writer.u128(1);
+        writer.bytes(&[]);
         writer.u32(0);
         writer.u8(9);
         writer.u8(0);
