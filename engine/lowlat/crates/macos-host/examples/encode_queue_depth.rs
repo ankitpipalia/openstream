@@ -45,6 +45,10 @@ fn main() -> std::process::ExitCode {
     const FPS: u32 = 60;
     const BITRATE: u32 = 10_000_000;
     const RUN_SECONDS: u64 = 10;
+    /// The same pair the host uses: how long to wait for a frame in total, and
+    /// how long to block on the stream before looking at the encoder again.
+    const FRAME_WAIT: Duration = Duration::from_millis(100);
+    const DRAIN_SLICE: Duration = Duration::from_millis(2);
 
     fn mean(values: &[u128]) -> u128 {
         if values.is_empty() {
@@ -84,6 +88,7 @@ fn main() -> std::process::ExitCode {
     let frame_delay = encoder.max_frame_delay();
     let speed_hint = encoder.prioritises_speed();
     let pending_at_rest = encoder.pending_frames();
+    let rate_limit = encoder.data_rate_limit();
 
     let stream = match SckCapture::start(SckConfig {
         width: STREAM_WIDTH,
@@ -108,7 +113,6 @@ fn main() -> std::process::ExitCode {
     // one arrives, and no amount of draining will help.
     let mut pending_before = Vec::new();
     let mut ready_without_submit = 0usize;
-    let mut idle_us = Vec::new();
     let mut encode_us = Vec::new();
     let mut capture_us = Vec::new();
     let mut au_bytes = Vec::new();
@@ -122,29 +126,43 @@ fn main() -> std::process::ExitCode {
     let started_at = Instant::now();
     let deadline = started_at + Duration::from_secs(RUN_SECONDS);
     while Instant::now() < deadline {
-        let Some(frame) = stream.wait_frame(Duration::from_millis(100)) else {
+        // Wait for the next frame the way the host now does: in short slices,
+        // checking the encoder between them, so a finished access unit is
+        // collected when it exists rather than when the next capture happens
+        // to arrive. Measuring any other way would report the bug instead of
+        // the behaviour.
+        let mut frame = None;
+        let wait_deadline = Instant::now() + FRAME_WAIT;
+        loop {
+            if let Some(depth) = encoder.pending_frames() {
+                pending_before.push(depth);
+            }
+            let early = encoder.take_ready();
+            if !early.is_empty() {
+                ready_without_submit += early.len();
+                let now = Instant::now();
+                for unit in early {
+                    if let Some((submit, capture)) = in_flight.pop_front() {
+                        encode_us.push((now - submit).as_micros());
+                        capture_us.push((now - capture).as_micros());
+                    }
+                    au_bytes.push(unit.data.len() as u128);
+                    emitted += 1;
+                }
+            }
+            if let Some(surface) = stream.wait_frame(DRAIN_SLICE) {
+                frame = Some(surface);
+                break;
+            }
+            if Instant::now() >= wait_deadline {
+                break;
+            }
+        }
+        let Some(frame) = frame else {
             // A still screen delivers nothing. Not an error, and not a stall.
             continue;
         };
         let captured_at = Instant::now();
-        if let Some(depth) = encoder.pending_frames() {
-            pending_before.push(depth);
-        }
-        let idle_started = Instant::now();
-        let early = encoder.take_ready();
-        if !early.is_empty() {
-            ready_without_submit += early.len();
-            let now = Instant::now();
-            for unit in early {
-                if let Some((submit, capture)) = in_flight.pop_front() {
-                    encode_us.push((now - submit).as_micros());
-                    capture_us.push((now - capture).as_micros());
-                }
-                au_bytes.push(unit.data.len() as u128);
-                emitted += 1;
-            }
-        }
-        idle_us.push(idle_started.elapsed().as_micros());
         let pts = i64::try_from(started_at.elapsed().as_micros()).unwrap_or(i64::MAX);
 
         let submitted_at = Instant::now();
@@ -219,6 +237,16 @@ fn main() -> std::process::ExitCode {
         } else {
             "no (property refused)"
         }
+    );
+    println!(
+        "  DataRateLimits (bytes / second)  {}",
+        rate_limit.map_or_else(
+            || "not set (property refused)".to_owned(),
+            |bytes| format!(
+                "{bytes} ({:.2} Mbps ceiling)",
+                bytes as f64 * 8.0 / 1_000_000.0
+            )
+        )
     );
     println!(
         "  NumberOfPendingFrames readable   {}",

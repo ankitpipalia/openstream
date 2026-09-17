@@ -20,6 +20,7 @@ use std::ffi::c_void;
 use std::os::raw::{c_int, c_long};
 use std::sync::Mutex;
 
+use core_foundation::array::CFArray;
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
@@ -151,6 +152,10 @@ unsafe extern "C" {
     /// Hint that latency matters more than compression efficiency. Apple
     /// recommends it for ultra-low-latency work.
     static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: CFStringRef;
+    /// A hard ceiling on bytes emitted per window, as a two-element array of
+    /// [bytes, seconds]. Distinct from AverageBitRate, which is a target the
+    /// encoder may overshoot.
+    static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
     /// Encoder-specification key enabling Apple's low-latency rate control,
     /// which Apple documents for cloud gaming and conferencing.
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
@@ -274,6 +279,8 @@ pub struct VideoToolboxH264Encoder {
     low_latency_rate_control: bool,
     /// Whether the encoder accepted the speed-over-quality hint.
     prioritise_speed: bool,
+    /// The per-second byte ceiling the session accepted, if any.
+    data_rate_limit: Option<i64>,
 }
 
 // SAFETY: the session and shared state are protected for cross-thread use --
@@ -323,6 +330,7 @@ impl VideoToolboxH264Encoder {
             max_frame_delay: None,
             low_latency_rate_control,
             prioritise_speed: false,
+            data_rate_limit: None,
         };
         encoder.configure(fps, bitrate)?;
         // SAFETY: preparing a live session is documented and side-effect free
@@ -448,6 +456,33 @@ impl VideoToolboxH264Encoder {
             }
         }
 
+        // Cap the burst, not just the average.
+        //
+        // AverageBitRate is a target the rate controller converges on over
+        // time; it says nothing about any one second. A keyframe or a scene
+        // change can emit several times the average in a single window, and on
+        // a link provisioned for the average that excess does not vanish -- it
+        // queues, somewhere between here and the client, and arrives as
+        // latency. DataRateLimits is the hard ceiling that stops it.
+        //
+        // The window is one second and the ceiling is the nominal bitrate plus
+        // a ninth. The headroom exists because a limit set exactly at the
+        // target leaves the rate controller nothing to work with on the frames
+        // that genuinely need more, and it responds by dropping quality across
+        // the board. A ninth is enough for a keyframe to be bigger than a delta
+        // frame without being enough for a burst to matter.
+        //
+        // The value is an array of [bytes, seconds], in that order -- not a
+        // bits-per-second number, and not [seconds, bytes]. Getting it backwards
+        // yields a limit of a few bytes per several-billion-second window, which
+        // the encoder accepts and then honours, so the mistake shows up as an
+        // unaccountably terrible picture rather than as an error.
+        let bytes_per_window = i64::from(bitrate) / 8 * 10 / 9;
+        self.data_rate_limit = self
+            .try_set_data_rate_limit(bytes_per_window, 1.0)
+            .is_ok()
+            .then_some(bytes_per_window);
+
         // Ask the encoder to spend less time searching for a smaller frame.
         // Optional in the same way: absent on older systems and on codecs that
         // do not implement it.
@@ -513,6 +548,33 @@ impl VideoToolboxH264Encoder {
     #[must_use]
     pub fn prioritises_speed(&self) -> bool {
         self.prioritise_speed
+    }
+
+    /// The per-second byte ceiling in force, or `None` if the encoder refused
+    /// one. Optional in the same way as the other rate properties.
+    #[must_use]
+    pub fn data_rate_limit(&self) -> Option<i64> {
+        self.data_rate_limit
+    }
+
+    /// Set the hard byte ceiling over a window, returning the raw status.
+    ///
+    /// The property takes a CFArray of exactly two numbers, byte count first
+    /// and window length in seconds second.
+    fn try_set_data_rate_limit(&self, bytes: i64, seconds: f64) -> Result<(), OSStatus> {
+        let limits = CFArray::from_CFTypes(&[
+            CFNumber::from(bytes).as_CFType(),
+            CFNumber::from(seconds).as_CFType(),
+        ]);
+        // SAFETY: the key is a framework constant and the array outlives the call.
+        let status = unsafe {
+            VTSessionSetProperty(
+                self.session,
+                kVTCompressionPropertyKey_DataRateLimits,
+                limits.as_CFTypeRef().cast(),
+            )
+        };
+        if status == 0 { Ok(()) } else { Err(status) }
     }
 
     /// Set a boolean property, returning the raw status instead of failing the
