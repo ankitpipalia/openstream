@@ -110,6 +110,26 @@ account token was used, so no device was created, so no grant key exists on any
 machine, so every broker still refuses every session. That is the intended
 fail-closed posture rather than a regression.
 
+What has been exercised **against a locally run `openstream-signal-server`**,
+with the real binaries over real HTTP -- not the live service, and not a
+session:
+
+- Registering an account, then enrolling a device: the key file lands 0600 and
+  32 bytes, and the key is not printed on success or failure.
+- The broker environment file is updated in place: the shipped
+  commented-out `OPENSTREAM_BROKER_GRANT_KEY_FILE` and
+  `OPENSTREAM_BROKER_DEVICE_ID` lines become real assignments and
+  `OPENSTREAM_BROKER_CEILING` is left alone.
+- Enrolling the same device id again is refused `409`.
+- `DELETE /v1/devices/{device_id}` returns `204`, and re-enrolling then issues a
+  **different** key -- so removal really does destroy the old one.
+- Pointing the key at an unusable path refuses *before* the request, and the
+  device list afterwards confirms no device was created by that attempt.
+
+That is the enrolment half of the chain working for real. It is still not the
+chain: the broker is Linux-only, the Linux rig was unreachable, and nothing has
+verified an approval or a frame.
+
 **What would finish it:** enrol one machine with a real account token, start the
 broker with `OPENSTREAM_BROKER_DEVICE_ID` and `OPENSTREAM_BROKER_GRANT_KEY_FILE`
 set, approve a Secure Connect request, and capture a frame. Until that run

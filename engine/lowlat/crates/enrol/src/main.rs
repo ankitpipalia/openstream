@@ -119,7 +119,7 @@ async fn undo(origin: &str, access_token: &str, device_id: &str, why: &str) -> E
 #[cfg(unix)]
 #[tokio::main]
 async fn main() -> ExitCode {
-    use openstream_client_core::enrolment::{MachineIdentity, enrol};
+    use openstream_client_core::enrolment::{EnrolmentError, MachineIdentity, enrol};
     use std::io::Read;
 
     let args = match parse_args() {
@@ -181,6 +181,25 @@ async fn main() -> ExitCode {
     };
     let enrolment = match enrol(&args.origin, access_token, &identity).await {
         Ok(enrolment) => enrolment,
+        // A conflict is the one refusal an operator can act on, and it is the
+        // one they will actually hit: it means this machine is already enrolled
+        // under this id. The generic message says "the control plane refused
+        // enrolment (409): control-plane request failed", which describes
+        // nothing and suggests nothing.
+        Err(EnrolmentError::Rejected { status: 409, .. }) => {
+            eprintln!(
+                "openstream-enrol: {} is already enrolled on this account. Its grant key was \
+                 issued once, at that enrolment, and cannot be re-read -- so if this machine no \
+                 longer has it, the device has to be removed and enrolled again:\n\
+                 \x20 curl -X DELETE {}/v1/devices/{} -H \"authorization: Bearer $TOKEN\"\n\
+                 openstream-enrol: that invalidates the old key. Any broker still running with it \
+                 will refuse every session until it is re-provisioned.",
+                identity.device_id,
+                args.origin.trim_end_matches('/'),
+                identity.device_id
+            );
+            return ExitCode::FAILURE;
+        }
         Err(error) => {
             eprintln!("openstream-enrol: {error}");
             return ExitCode::FAILURE;
