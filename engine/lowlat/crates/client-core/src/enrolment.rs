@@ -190,9 +190,38 @@ pub async fn enrol(
 /// Built here rather than formatted at each call site so the one place that
 /// has to match the server's route table is the one place [`DEVICES_PATH`]
 /// already covers.
+///
+/// The id is percent-encoded, because it is not a path segment until it has
+/// been. The control plane accepts any device id without control characters,
+/// which leaves `/`, `?`, `#`, spaces and more -- and interpolating one of
+/// those produces a different route, a query string, or a fragment. The id also
+/// comes from `--device-id` on a command line, so `\r\n` in it would split the
+/// request this client is building. Every one of those turns "remove the device
+/// I just enrolled" into a request against something else.
 #[must_use]
 pub fn device_path(device_id: &str) -> String {
-    format!("{DEVICES_PATH}/{device_id}")
+    format!("{DEVICES_PATH}/{}", percent_encode_segment(device_id))
+}
+
+/// Percent-encode one path segment.
+///
+/// Unreserved characters (RFC 3986: ALPHA / DIGIT / `-` / `.` / `_` / `~`) pass
+/// through; everything else becomes `%XX`. Deliberately stricter than the
+/// grammar allows -- sub-delims like `+` and `,` are legal in a segment but
+/// encoding them costs nothing and removes a class of question. Hand-rolled
+/// rather than pulling in a crate for fifteen lines.
+#[must_use]
+fn percent_encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(*byte));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Remove a device, destroying the grant key enrolment issued for it.
@@ -251,6 +280,40 @@ mod tests {
         // during a rollback, which reads like the control plane refusing
         // rather than the client asking the wrong question.
         assert_eq!(device_path("device-abc"), "/v1/devices/device-abc");
+    }
+
+    #[test]
+    fn a_device_id_is_encoded_before_it_becomes_a_path_segment() {
+        // The control plane accepts any device id without control characters,
+        // so every one of these is a real id someone can enrol -- and each one
+        // interpolated raw addresses something other than the device.
+        assert_eq!(
+            device_path("a/b"),
+            "/v1/devices/a%2Fb",
+            "a slash silently becomes a different route"
+        );
+        assert_eq!(
+            device_path("a?b"),
+            "/v1/devices/a%3Fb",
+            "a question mark turns the rest of the id into a query string"
+        );
+        assert_eq!(device_path("a#b"), "/v1/devices/a%23b");
+        assert_eq!(device_path("my laptop"), "/v1/devices/my%20laptop");
+        // The id reaches this from `--device-id` on a command line. A newline
+        // in it would end the request line and let the rest be read as headers.
+        assert_eq!(
+            device_path("a\r\nX-Evil: 1"),
+            "/v1/devices/a%0D%0AX-Evil%3A%201",
+            "a device id must not be able to split the request"
+        );
+        // Unreserved characters are left alone, so the ordinary case stays
+        // readable in a log.
+        assert_eq!(
+            device_path("Studio-01_a.b~c"),
+            "/v1/devices/Studio-01_a.b~c"
+        );
+        // Non-ASCII is encoded per UTF-8 byte, which is what the server decodes.
+        assert_eq!(device_path("caf\u{e9}"), "/v1/devices/caf%C3%A9");
     }
 
     #[test]

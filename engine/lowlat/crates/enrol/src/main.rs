@@ -21,6 +21,15 @@
 //! one. And if storing still fails, it removes the device it just enrolled,
 //! because a device id whose key was lost cannot be enrolled a second time.
 //!
+//! **Two windows remain, and they are the ones it cannot see.** If the server
+//! commits the enrolment and the response is lost, or this process dies between
+//! the server's commit and the local one, the device exists and its key does
+//! not -- and nothing here knows a device was created, so nothing rolls it back.
+//! The next run gets a 409 and the message tells the operator how to remove it.
+//! Closing the windows properly needs an idempotent enrolment keyed by a durable
+//! client-generated request id, so a retry re-reads its own outcome instead of
+//! creating a second device. That is not built.
+//!
 //! ```text
 //! OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key \
 //!   openstream-enrol --origin https://signal.example.com \
