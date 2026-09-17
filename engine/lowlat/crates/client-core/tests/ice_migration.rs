@@ -116,6 +116,7 @@ fn pairing() -> Pairing {
         turn_client: None,
         relay_host_ticket: None,
         relay_client_ticket: None,
+        permissions: None,
     }
 }
 

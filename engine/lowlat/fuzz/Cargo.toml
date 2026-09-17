@@ -17,6 +17,9 @@ lowlat-core = { path = "../crates/core" }
 lowlat-audio = { path = "../crates/audio" }
 openstream-media = { path = "../crates/media" }
 openstream-protocol = { path = "../crates/protocol" }
+# The broker protocol parses untrusted bytes off the local socket in both
+# directions; fuzz both decoders and the low-level reader.
+openstream-host-ipc = { path = "../crates/host-ipc" }
 
 [[bin]]
 name = "envelope"
@@ -77,6 +80,13 @@ bench = false
 [[bin]]
 name = "openstream-media"
 path = "fuzz_targets/openstream-media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_ipc"
+path = "fuzz_targets/host_ipc.rs"
 test = false
 doc = false
 bench = false

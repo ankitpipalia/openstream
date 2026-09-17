@@ -1,0 +1,22 @@
+[package]
+name = "openstream-macos-media"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+[lib]
+name = "openstream_macos_media"
+path = "src/lib.rs"
+
+# In-process H.264 encode on macOS via VideoToolbox (the host counterpart to the
+# client's VideoToolbox decoder). Raw framework FFI through the CoreFoundation
+# bindings, target-gated so no other platform's dependency graph is touched.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+core-foundation-sys = "0.8"
+
+[lints]
+workspace = true
