@@ -55,10 +55,6 @@ const WARMUP_MS: f64 = 500.0;
 /// accepted, before it stops regardless.
 const FLUSH_MAX_MS: u64 = 5_000;
 
-/// How long `datagrams_out` must stand still before the sender is considered
-/// flushed.
-const FLUSH_QUIET_MS: u64 = 100;
-
 /// How long the tail is allowed to take to drain after the sender stops,
 /// before the receiver is stopped regardless.
 ///
@@ -304,6 +300,13 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
     let gaps = AtomicU64::new(0);
     let sender_allocs = AtomicU64::new(u64::MAX);
     let receiver_allocs = AtomicU64::new(u64::MAX);
+    // The sender's timeout-wake count at the moment it stopped, before the
+    // flush below. The flush turns in a tight loop on purpose, which is not
+    // steady-state behaviour and must not be measured as if it were.
+    let flush_timeout_wakes = AtomicU64::new(0);
+    // Whether the sender's ring reached zero in-flight fragments before its
+    // deadline. A flush that timed out is reported rather than passed over.
+    let sender_drained = AtomicBool::new(false);
 
     thread::scope(|scope| {
         scope.spawn(|| {
@@ -316,7 +319,8 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
                     baseline = Some(alloc_counter::count());
                 }
                 if stop.load(Ordering::Relaxed) {
-                    // Flush before leaving.
+                    // Flush before leaving, and know when it is flushed rather
+                    // than guess.
                     //
                     // `send_message` moves a message into the session's send
                     // ring; only a `turn` packs that ring into datagrams. This
@@ -324,27 +328,31 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
                     // during the final pass was counted in `sent` and never put
                     // on the wire -- which is exactly the tail this test kept
                     // reporting as loss, while every datagram that *was*
-                    // produced arrived intact (`datagrams_out == datagrams_in`
-                    // in all three captured failures, with zero kernel drops
-                    // and zero gaps).
+                    // produced arrived intact.
                     //
-                    // Turning without enqueuing anything drains it. Bounded, so
-                    // a genuinely stuck session still ends the test.
+                    // The condition is the ring's own `in_flight`, not a
+                    // counter that has stopped moving: pacing, congestion or a
+                    // retransmission deadline can all produce a quiet interval
+                    // while fragments are still outstanding, so silence is not
+                    // emptiness. Zero in-flight fragments is emptiness.
+                    //
+                    // The wakes this costs are deliberately excluded from the
+                    // steady-state gate below; see `flush_timeout_wakes`.
+                    flush_timeout_wakes.store(
+                        left.stats().timeout_wakes,
+                        Ordering::Relaxed,
+                    );
                     let deadline = std::time::Instant::now()
                         + std::time::Duration::from_millis(FLUSH_MAX_MS);
-                    let quiet = std::time::Duration::from_millis(FLUSH_QUIET_MS);
-                    let mut last_out = u64::MAX;
-                    let mut unchanged_since = std::time::Instant::now();
-                    while std::time::Instant::now() < deadline {
-                        left.turn(elapsed_ms(started), |_| {}).expect("left flush");
-                        let out = left.stats().datagrams_out;
-                        if out == last_out {
-                            if unchanged_since.elapsed() >= quiet {
-                                break;
-                            }
-                        } else {
-                            last_out = out;
-                            unchanged_since = std::time::Instant::now();
+                    loop {
+                        let mut outstanding = 0;
+                        left.turn(elapsed_ms(started), |endpoint| {
+                            outstanding = endpoint.session().transport_stats().in_flight;
+                        })
+                        .expect("left flush");
+                        if outstanding == 0 || std::time::Instant::now() >= deadline {
+                            sender_drained.store(outstanding == 0, Ordering::Relaxed);
+                            break;
                         }
                     }
                     break;
@@ -468,6 +476,12 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
     let receiver_allocs = receiver_allocs.load(Ordering::Relaxed);
     let left_stats = left.stats();
     let right_stats = right.stats();
+    // The sender's steady-state wakes: what it had at the moment it stopped,
+    // before the flush. The flush turns in a tight loop until the ring is
+    // empty, which is exactly the polling the gate below forbids -- and it is
+    // correct there, because it is teardown and not the streaming loop.
+    let sender_steady_timeout_wakes = flush_timeout_wakes.load(Ordering::Relaxed);
+    let sender_drained = sender_drained.load(Ordering::Relaxed);
     let seconds = duration_ms / 1000.0;
 
     println!("soak:   {seconds:.1} s at a {TARGET_PPS} datagram/s target");
@@ -491,6 +505,11 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
         right_stats.send_wakes
     );
 
+    assert!(
+        sender_drained,
+        "the sender's send ring still had fragments in flight after {FLUSH_MAX_MS} ms; \
+         any message shortfall below is a flush that did not finish, not loss"
+    );
     assert_eq!(gaps, 0, "the stream lost or reordered messages");
     assert_eq!(received, sent, "{} messages never arrived", sent - received);
     assert_eq!(
@@ -507,8 +526,11 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
     // an order of magnitude is what separates the two.
     let ticking_per_sec = 1000.0 / lowlat_net::shell::MIN_WAIT_MS;
     let ceiling = ticking_per_sec / 10.0;
-    for (who, stats) in [("sender", left_stats), ("receiver", right_stats)] {
-        let per_sec = stats.timeout_wakes as f64 / seconds;
+    for (who, timeout_wakes) in [
+        ("sender", sender_steady_timeout_wakes),
+        ("receiver", right_stats.timeout_wakes),
+    ] {
+        let per_sec = timeout_wakes as f64 / seconds;
         assert!(
             per_sec <= ceiling,
             "{who} woke on a timeout {per_sec:.0}/s against a {ticking_per_sec:.0}/s tick, \
@@ -518,7 +540,7 @@ fn a_sustained_stream_loses_nothing_allocates_nothing_and_does_not_tick() {
     println!(
         "gate4:  sender {:.0}/s, receiver {:.0}/s timeout wakes, ceiling {ceiling:.0}/s, \
          a polling loop would be {ticking_per_sec:.0}/s",
-        left_stats.timeout_wakes as f64 / seconds,
+        sender_steady_timeout_wakes as f64 / seconds,
         right_stats.timeout_wakes as f64 / seconds
     );
 }
