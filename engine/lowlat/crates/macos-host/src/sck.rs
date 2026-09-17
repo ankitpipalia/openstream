@@ -500,7 +500,11 @@ impl Drop for SckCapture {
         // SAFETY: `self.stream` is live until released just after.
         let _ = unsafe { await_completion(self.stream, "stopCaptureWithCompletionHandler:") };
         // SAFETY: each object was created in `start_with_content` and is
-        // released exactly once here.
+        // released exactly once here. The stream goes first, because it is
+        // what retains the delegate; the ivar is cleared before the delegate
+        // is released so that a callback arriving against Apple's documented
+        // ordering finds nothing rather than a dangling pointer, and the
+        // strong count the delegate was given is returned last.
         unsafe {
             objc::send(self.stream, objc::sel("release"));
             let sink_pointer = objc::get_ivar(self.delegate, DELEGATE_IVAR);
@@ -695,15 +699,27 @@ extern "C" fn did_output_sample_buffer(
     }
     // SAFETY: `this` is an instance of the class registered above, which
     // declares this ivar.
-    let sink = unsafe { objc::get_ivar(this, DELEGATE_IVAR) };
-    if sink.is_null() {
+    let pointer = unsafe { objc::get_ivar(this, DELEGATE_IVAR) };
+    if pointer.is_null() {
         // Torn down between the last frame and this one.
         return;
     }
-    // SAFETY: the pointer came from `Arc::into_raw` and the matching `Arc` is
-    // alive: `Drop` stops the stream and waits before reclaiming it. Borrowed,
-    // never dropped here.
-    let sink = unsafe { &*sink.cast::<Sink>() };
+    // A strong reference of this callback's own, not a borrow.
+    //
+    // What makes reclaiming the sink safe at all is the teardown order:
+    // `Drop` waits for `stopCaptureWithCompletionHandler:` to complete, and
+    // ScreenCaptureKit does not run that handler until the stream has stopped
+    // delivering, so no callback is in flight by the time the pointer is
+    // reclaimed. Taking a count here anyway means a callback that somehow is
+    // in flight keeps the sink alive for its whole body instead of holding a
+    // borrow into memory another thread is free to release.
+    //
+    // SAFETY: the pointer came from `Arc::into_raw` on an `Arc<Sink>` and the
+    // matching strong count is still held by the `SckCapture`.
+    let sink = unsafe {
+        Arc::increment_strong_count(pointer.cast::<Sink>());
+        Arc::from_raw(pointer.cast::<Sink>())
+    };
 
     // SAFETY: a sample buffer handed to a stream output, valid for this call.
     unsafe {
