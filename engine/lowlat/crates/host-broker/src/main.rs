@@ -26,6 +26,18 @@ async fn main() -> std::process::ExitCode {
         print_version();
         return ExitCode::SUCCESS;
     }
+    if std::env::args().nth(1).as_deref() == Some("provision-grant-key") {
+        return match provision_grant_key() {
+            Ok(path) => {
+                eprintln!("openstream-host-broker: grant key written to {path}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("openstream-host-broker: provision-grant-key: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -88,7 +100,7 @@ async fn run() -> std::io::Result<()> {
     // can read, because a secret the service can read is not a boundary.
     let authority = match std::env::var("OPENSTREAM_BROKER_GRANT_KEY_FILE") {
         Ok(path) => {
-            let key = read_grant_key(&path)?;
+            let key = openstream_host_broker::grant_key::read(&path)?;
             let device_id = std::env::var("OPENSTREAM_BROKER_DEVICE_ID").map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -129,36 +141,41 @@ async fn run() -> std::io::Result<()> {
 /// the failure is silent -- a world-readable key file works perfectly until
 /// someone looks.
 #[cfg(target_os = "linux")]
-fn read_grant_key(path: &str) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::PermissionsExt;
+/// Install the grant key this machine was enrolled with.
+///
+/// Run as the broker's own user -- root during bring-up -- because the key must
+/// land in a file the unprivileged machine service cannot read, and only that
+/// user can create one.
+///
+/// The key arrives as hex on **stdin**, not as an argument: a command line is
+/// visible in `ps` to every user on the machine, so passing a secret that way
+/// would leak it to exactly the process this key exists to keep it from. The
+/// caller is whatever performed enrolment and received the key from the control
+/// plane -- the desktop app, or an installer:
+///
+/// ```text
+/// openstream-host-broker provision-grant-key < key.hex
+/// ```
+///
+/// The destination is `OPENSTREAM_BROKER_GRANT_KEY_FILE`, the same variable the
+/// broker reads at startup, so a machine cannot be provisioned to one path and
+/// then run against another.
+#[cfg(target_os = "linux")]
+fn provision_grant_key() -> std::io::Result<String> {
+    use std::io::Read;
 
-    let metadata = std::fs::metadata(path)?;
-    let mode = metadata.permissions().mode() & 0o077;
-    if mode != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "{path} is readable or writable beyond its owner (mode {:o}); \
-                 a grant key the machine service can read is not a boundary",
-                metadata.permissions().mode() & 0o777
-            ),
-        ));
-    }
-    let key = std::fs::read(path)?;
-    // Trailing newlines are what an editor or `echo` leaves behind, and a key
-    // that differs from the control plane's by one byte fails every grant with
-    // no clue why.
-    let trimmed = key
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(&key[..0], |last| &key[..=last]);
-    if trimmed.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("{path} is empty"),
-        ));
-    }
-    Ok(trimmed.to_vec())
+    let path = std::env::var("OPENSTREAM_BROKER_GRANT_KEY_FILE").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OPENSTREAM_BROKER_GRANT_KEY_FILE is not set, so there is nowhere to put the key; \
+             set it to the same path the broker's unit uses",
+        )
+    })?;
+    let mut hex = String::new();
+    std::io::stdin().read_to_string(&mut hex)?;
+    let key = openstream_host_broker::grant_key::from_hex(&hex)?;
+    openstream_host_broker::grant_key::write(&path, &key)?;
+    Ok(path)
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -13,5 +13,9 @@
 //!   - [`session`]: reading the logind seat state to tell the broker whether it
 //!     is capturing the greeter or a logged-in user.
 
+//!   - [`approval`]: which session approval is relayed to the broker, and why
+//!     an environment variable may not displace the pairing file's.
+
+pub mod approval;
 pub mod broker_client;
 pub mod session;

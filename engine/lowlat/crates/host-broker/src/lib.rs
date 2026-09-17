@@ -16,6 +16,11 @@
 pub mod device;
 pub mod session;
 
+/// Reading and writing the grant key. Unix, not Linux-only, so the file
+/// permission rules that protect it are tested on every Unix runner.
+#[cfg(unix)]
+pub mod grant_key;
+
 #[cfg(target_os = "linux")]
 pub mod capture;
 #[cfg(target_os = "linux")]

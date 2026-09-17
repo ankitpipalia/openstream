@@ -41,9 +41,11 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use openstream_client_core::{
-        Capabilities, PeerSession, ReliableControl, Role, VideoCodec,
+        Capabilities, Pairing, PeerSession, ReliableControl, Role, VideoCodec,
         load_pairing_from_environment, parse_stun_servers,
     };
+    use openstream_machine_service::approval::{ApprovalSource, select as select_approval};
+
     use openstream_host_ipc::lifecycle::{Action, Event, Lifecycle};
     use openstream_host_ipc::protocol::{BrokerEvent, CaptureParams, ServiceRequest};
     use openstream_host_ipc::token::Capabilities as BrokerCaps;
@@ -86,20 +88,17 @@ mod linux {
         }
     }
 
-    /// The session approval to relay to the broker.
+    /// Decode a hex-encoded approval, or nothing if it is not hex.
     ///
-    /// `OPENSTREAM_SESSION_APPROVAL` carries it as hex until the control plane
-    /// delivers one with the Secure Connect approval. Absent or malformed
-    /// means no approval, and the broker then refuses the session -- there is
-    /// deliberately no path here that produces a grant, because a service that
-    /// could produce one would defeat the point of having it.
-    fn load_approval() -> Vec<u8> {
-        let Ok(hex) = std::env::var("OPENSTREAM_SESSION_APPROVAL") else {
-            return Vec::new();
-        };
+    /// Returning nothing rather than an error is deliberate: the broker
+    /// refuses a session with no approval, so a malformed one fails closed by
+    /// the same path as a missing one. There is no branch here that produces a
+    /// grant -- a service that could mint its own would defeat the point of
+    /// having one.
+    fn decode_approval(hex: &str, source: &str) -> Vec<u8> {
         let hex = hex.trim();
         if hex.is_empty() || hex.len() % 2 != 0 {
-            eprintln!("machine-service: OPENSTREAM_SESSION_APPROVAL is not valid hex; ignoring");
+            eprintln!("machine-service: the {source} approval is not valid hex; ignoring");
             return Vec::new();
         }
         let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -108,14 +107,57 @@ mod linux {
                 return Vec::new();
             };
             let Ok(byte) = u8::from_str_radix(text, 16) else {
-                eprintln!(
-                    "machine-service: OPENSTREAM_SESSION_APPROVAL is not valid hex; ignoring"
-                );
+                eprintln!("machine-service: the {source} approval is not valid hex; ignoring");
                 return Vec::new();
             };
             bytes.push(byte);
         }
         bytes
+    }
+
+    /// The session approval to relay to the broker.
+    ///
+    /// The pairing file is where this comes from in the product. The control
+    /// plane signs a grant when the owner approves a Secure Connect request,
+    /// the agent writes it into the pairing it hands to this service, and this
+    /// service passes it to the broker without reading it -- nothing here can
+    /// produce one or verify one, which is what makes the broker's check worth
+    /// anything.
+    ///
+    /// `OPENSTREAM_SESSION_APPROVAL` remains as a development override, and
+    /// takes second place: a pairing that carries a grant is the real thing and
+    /// an environment variable must not be able to substitute for it.
+    ///
+    /// No approval from either source means the broker refuses the session.
+    /// That is the intended posture, not a fault.
+    fn load_approval(pairing: &Pairing) -> Vec<u8> {
+        let from_environment = std::env::var("OPENSTREAM_SESSION_APPROVAL").ok();
+        match select_approval(
+            pairing.session_grant.as_deref(),
+            from_environment.as_deref(),
+        ) {
+            ApprovalSource::Pairing => decode_approval(
+                pairing.session_grant.as_deref().unwrap_or_default(),
+                "pairing file",
+            ),
+            ApprovalSource::Environment => {
+                eprintln!(
+                    "machine-service: using OPENSTREAM_SESSION_APPROVAL; the pairing file carried \
+no grant"
+                );
+                decode_approval(
+                    from_environment.as_deref().unwrap_or_default(),
+                    "OPENSTREAM_SESSION_APPROVAL",
+                )
+            }
+            ApprovalSource::None => {
+                eprintln!(
+                    "machine-service: no session approval available; the broker will refuse this \
+session, which is the intended posture"
+                );
+                Vec::new()
+            }
+        }
     }
 
     pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -181,7 +223,7 @@ mod linux {
             // environment for now; the control plane will deliver it with the
             // Secure Connect approval, and until then the broker refuses the
             // session, which is correct rather than convenient.
-            approval: load_approval(),
+            approval: load_approval(&pairing),
             // Zero asks the broker to issue a capability. It is replaced by
             // the one the broker mints, on the first CaptureStarted.
             grant: openstream_host_ipc::token::NO_GRANT,
