@@ -950,6 +950,33 @@ mod macos_pipeline {
             if !matches!(self.source, Source::Stream(_)) {
                 return true;
             }
+            // The one question the keepalive cannot answer.
+            //
+            // Everything else here treats "no new surface" as normal, because
+            // for a change-driven capture it is: a desktop nobody is touching
+            // produces nothing for minutes and is perfectly healthy. This is
+            // ScreenCaptureKit saying the stream itself has ended -- the
+            // display went away, Screen Recording was revoked -- and continuing
+            // to re-encode the last surface after that is a host serving a
+            // frozen picture and reporting itself alive.
+            if let Source::Stream(stream) = &self.source
+                && let Some(reason) = stream.stopped()
+            {
+                eprintln!(
+                    "OpenStream capture: the capture stream stopped ({reason}); ending the \
+                     session rather than re-sending the last frame forever"
+                );
+                // Ending is the honest response, not the best one. A display
+                // that was unplugged could be answered by re-targeting the
+                // remaining display and carrying on, which is what a user
+                // would expect and what this should eventually do. Restarting
+                // capture mid-session touches the encoder's dimensions and the
+                // negotiated stream shape, so it is a feature rather than a
+                // branch here -- and stopping with a reason is already the
+                // difference between a session that ends and one that silently
+                // shows a frozen desktop.
+                return false;
+            }
             // Wait for the next frame, but keep asking the encoder whether it
             // has finished one -- output arrives on a VideoToolbox thread and
             // is otherwise not noticed until the next submit, which costs a

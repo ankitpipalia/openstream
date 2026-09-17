@@ -51,6 +51,9 @@ unsafe extern "C" {
     fn objc_registerClassPair(cls: Class);
     fn class_addMethod(cls: Class, name: Sel, imp: Imp, types: *const c_char) -> bool;
     fn class_addProtocol(cls: Class, protocol: Id) -> bool;
+    /// Only [`implements`] uses this, and only tests use that.
+    #[cfg(test)]
+    fn class_getInstanceMethod(cls: Class, name: Sel) -> *mut c_void;
     fn class_addIvar(
         cls: Class,
         name: *const c_char,
@@ -383,14 +386,11 @@ pub(crate) unsafe fn send_block<B>(receiver: Id, selector: Sel, block: *mut B) {
 pub(crate) unsafe fn define_class(
     name: &str,
     ivar: &str,
-    selector: Sel,
-    imp: Imp,
-    types: &str,
-    protocol_name: &str,
+    methods: &[(Sel, Imp, &str)],
+    protocol_names: &[&str],
 ) -> Option<Class> {
     let class_name = CString::new(name).ok()?;
     let ivar_name = CString::new(ivar).ok()?;
-    let type_encoding = CString::new(types).ok()?;
     let pointer_encoding = CString::new("^v").ok()?;
     let superclass = class("NSObject");
     if superclass.is_null() {
@@ -416,14 +416,45 @@ pub(crate) unsafe fn define_class(
             u8::try_from(std::mem::align_of::<*mut c_void>().trailing_zeros()).ok()?,
             pointer_encoding.as_ptr(),
         );
-        class_addMethod(cls, selector, imp, type_encoding.as_ptr());
-        let proto = protocol(protocol_name);
-        if !proto.is_null() {
-            class_addProtocol(cls, proto);
+        for (selector, imp, types) in methods {
+            let Ok(type_encoding) = CString::new(*types) else {
+                continue;
+            };
+            class_addMethod(cls, *selector, *imp, type_encoding.as_ptr());
+        }
+        // A protocol the runtime does not know about is not an error: it means
+        // this macOS does not declare it, and the methods are still installed
+        // and still called. ScreenCaptureKit dispatches by selector.
+        for protocol_name in protocol_names {
+            let proto = protocol(protocol_name);
+            if !proto.is_null() {
+                class_addProtocol(cls, proto);
+            }
         }
         objc_registerClassPair(cls);
     }
     Some(cls)
+}
+
+/// Whether a class actually implements a selector.
+///
+/// `class_addMethod` returns false for a name already taken and simply does
+/// nothing for a type encoding the runtime dislikes, so "the code that adds the
+/// method ran" is not the same as "the method is there". This is how a test can
+/// tell the difference -- and the difference matters, because a delegate method
+/// that was never installed is not an error at runtime either. The framework
+/// checks `respondsToSelector:`, finds nothing, and silently never calls it.
+///
+/// Test-only: nothing in the running host asks this, and a production build
+/// that carried it would carry a use of the runtime it never makes.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn implements(cls: Class, selector: Sel) -> bool {
+    if cls.is_null() {
+        return false;
+    }
+    // SAFETY: FFI against a registered class; a missing method returns null.
+    !unsafe { class_getInstanceMethod(cls, selector) }.is_null()
 }
 
 /// Store a raw pointer in an object's ivar.

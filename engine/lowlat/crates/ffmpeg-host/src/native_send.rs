@@ -58,6 +58,19 @@ pub(crate) enum SendOutcome {
 /// by a second is a command the host has already given up on.
 const MAX_RETRY: Duration = Duration::from_millis(10);
 
+/// The wait after one attempt that found no room: double it, up to the cap.
+///
+/// Pulled out of the loop so the schedule can be tested as arithmetic. The
+/// first version of that test measured elapsed wall-clock time and asserted an
+/// upper bound on it, which is not a property this code has: `thread::sleep`
+/// guarantees a minimum and nothing else, so twelve of them on a loaded runner
+/// overshot the bound and failed a correct implementation. What is worth
+/// pinning is the sequence this decides, and that is deterministic.
+#[must_use]
+fn next_retry(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_RETRY)
+}
+
 /// Hand `payload` to `units`, running `service_control` whenever the queue is
 /// full.
 ///
@@ -90,7 +103,7 @@ pub(crate) fn send_servicing_control<T>(
                     return SendOutcome::Stopped;
                 }
                 thread::sleep(wait);
-                wait = wait.saturating_mul(2).min(MAX_RETRY);
+                wait = next_retry(wait);
             }
         }
     }
@@ -229,36 +242,43 @@ mod tests {
     }
 
     /// The wait grows, so a consumer that stops draining for a long time is not
-    /// polled a thousand times a second.
+    /// polled a thousand times a second, and stops growing so it never becomes
+    /// a long silence of its own.
+    ///
+    /// Asserted as arithmetic rather than as elapsed time. The first version of
+    /// this measured the wall clock and required it to stay under 600 ms; a
+    /// loaded macOS runner took 610 ms and failed an implementation that was
+    /// perfectly correct, because `thread::sleep` promises a minimum and never
+    /// a maximum. Twelve sleeps give the scheduler twelve chances to overshoot,
+    /// and no amount of slack in the bound makes that a property of this code.
     #[test]
-    fn the_retry_interval_backs_off_and_is_capped() {
-        let (tx, _rx) = mpsc::channel::<u8>(1);
-        tx.try_send(1).expect("fill the queue");
-
-        // Enough attempts to pass the cap several times over; the elapsed time
-        // is what would run away without it.
-        const ATTEMPTS: usize = 12;
-        let serviced = AtomicUsize::new(0);
-        let mut service = || serviced.fetch_add(1, Ordering::Relaxed) < ATTEMPTS - 1;
-
-        let started = std::time::Instant::now();
+    fn the_retry_interval_doubles_up_to_the_cap() {
+        let mut wait = RETRY;
+        let mut schedule = vec![wait];
+        for _ in 0..8 {
+            wait = super::next_retry(wait);
+            schedule.push(wait);
+        }
         assert_eq!(
-            send_servicing_control(2, &tx, RETRY, &mut service),
-            SendOutcome::Stopped
+            schedule,
+            [1, 2, 4, 8, 10, 10, 10, 10, 10]
+                .map(Duration::from_millis)
+                .to_vec(),
+            "the backoff schedule changed"
         );
-        let elapsed = started.elapsed();
 
-        // Doubling from 1 ms capped at 10 ms: 1+2+4+8+10*7 = 85 ms. Ungrown it
-        // would be 11 ms, so the growth is unmistakable; uncapped it would be
-        // 2^11 ms, which is two seconds and is what the cap exists to stop.
+        // The two properties the schedule exists for, stated directly.
         assert!(
-            elapsed >= Duration::from_millis(40),
-            "the interval did not grow: {elapsed:?}"
+            schedule[1] > schedule[0],
+            "a fixed interval polls a wedged consumer a thousand times a second"
         );
         assert!(
-            elapsed < Duration::from_millis(600),
-            "the interval grew past the cap: {elapsed:?}"
+            schedule.iter().all(|wait| *wait <= super::MAX_RETRY),
+            "an uncapped doubling reaches two seconds by the eleventh retry, \
+             which is a control message sitting unread for that long"
         );
+        // And the cap is a fixed point: once reached it stays.
+        assert_eq!(super::next_retry(super::MAX_RETRY), super::MAX_RETRY);
     }
 
     /// Room straight away means no control round trip and no sleep.
