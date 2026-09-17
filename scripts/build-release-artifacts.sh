@@ -87,7 +87,19 @@ linux_package="${OPENSTREAM_LINUX_PACKAGE:-}"
 if [[ -n "$linux_package" ]]; then
     copy_required "$linux_package" "$artifact_root/linux-x86_64/OpenStream-Linux-x86_64.tar.gz"
 else
-    for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
+    # The per-user agent and the machine-level pre-login subsystem. The tarball
+    # and the Debian package must ship the same set, or an operator who
+    # installed from one finds a feature the other one has.
+    linux_binaries=(
+        openstream-host-agent
+        openstream-ffmpeg-host
+        openstream-linux-host
+        openstream-signal-server
+        openstream-host-broker
+        openstream-machine-service
+        openstream-enrol
+    )
+    for binary in "${linux_binaries[@]}"; do
         [[ -x "$engine_dir/target/$linux_target/release/$binary" ]] || {
             echo "missing Linux release binary: $engine_dir/target/$linux_target/release/$binary" >&2
             echo "build the pinned Linux target or set OPENSTREAM_LINUX_PACKAGE" >&2
@@ -102,8 +114,8 @@ else
     linux_stage="$(mktemp -d "${TMPDIR:-/tmp}/openstream-linux-stage.XXXXXX")"
     trap 'rm -rf -- "$linux_stage"' EXIT
     mkdir -p "$linux_stage/usr/bin" "$linux_stage/usr/lib/systemd/user" \
-        "$linux_stage/usr/share/applications"
-    for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
+        "$linux_stage/usr/lib/systemd/system" "$linux_stage/usr/share/applications"
+    for binary in "${linux_binaries[@]}"; do
         install -m 0755 "$engine_dir/target/$linux_target/release/$binary" \
             "$linux_stage/usr/bin/$binary"
     done
@@ -112,6 +124,10 @@ else
         "$linux_stage/usr/lib/systemd/user/openstream-host-agent.service"
     install -m 0644 "$repo_dir/packaging/linux/openstream.desktop" \
         "$linux_stage/usr/share/applications/openstream.desktop"
+    for unit in openstream-host-broker openstream-machine-service; do
+        install -m 0644 "$repo_dir/packaging/linux/$unit.service" \
+            "$linux_stage/usr/lib/systemd/system/$unit.service"
+    done
     tar -czf "$artifact_root/linux-x86_64/OpenStream-Linux-x86_64.tar.gz" \
         -C "$linux_stage" usr
     rm -rf -- "$linux_stage"

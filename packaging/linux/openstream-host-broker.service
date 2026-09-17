@@ -1,0 +1,88 @@
+[Unit]
+# The privileged half of machine-level hosting: it reads the DRM/KMS scanout to
+# capture and hardware-encode the screen, and injects input through uinput. It
+# faces no network at all -- the unprivileged machine service does that and
+# drives this one over a Unix socket.
+Description=OpenStream privileged device broker
+Documentation=file:///usr/share/doc/openstream/BUILD.md
+After=systemd-logind.service
+Wants=systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/openstream-host-broker
+Restart=on-failure
+RestartSec=2
+
+# Creates and owns /run/openstream, where the socket lives. systemd removes it
+# when the service stops, so a stale socket cannot outlive the broker that was
+# listening on it.
+RuntimeDirectory=openstream
+RuntimeDirectoryMode=0750
+
+# What this machine's operator permits. Unset means nothing is granted: a broker
+# that has not been told what is allowed has not been told it may hand out the
+# keyboard. Set this deliberately -- for example "video,keyboard,mouse".
+Environment=OPENSTREAM_BROKER_CEILING=
+
+# Who may say a session was approved. Written by `openstream-enrol` at install
+# time; the broker refuses a key it does not own, one anybody else can read, one
+# reached through a symlink, or one under a directory others can write.
+#
+# The device id must match the one enrolment printed. A grant addressed to
+# another device is refused, so an approval for one host in a fleet is not an
+# approval for all of them.
+Environment=OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key
+Environment=OPENSTREAM_BROKER_DEVICE_ID=
+
+# The group the machine service runs in, so it can open the socket without being
+# root. SO_PEERCRED still decides who is actually served; this only makes the
+# socket reachable.
+Environment=OPENSTREAM_BROKER_SOCKET_GID=
+
+# Hardening. This process is root and holds the two privileges that genuinely
+# need elevation, so everything it does not need is taken away.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# CapabilityBoundingSet is deliberately NOT narrowed here.
+#
+# The obvious set is CAP_SYS_ADMIN plus CAP_DAC_OVERRIDE, and it may well be
+# right -- but DRM master operations and uinput device creation are exactly the
+# kind of thing that needs one more capability than expected, and the symptom of
+# guessing wrong is a service that fails to start on a machine nobody in this
+# project can currently test on. Shipping a restriction that has never been run
+# is worse than shipping none: it turns a working install into a broken one and
+# the reason is invisible.
+#
+# Narrow it once someone has a Linux host to boot: start from
+# `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE`, confirm capture and
+# injection still work, and record the run.
+
+# PrivateNetwork is deliberate and load-bearing: the whole design is that the
+# privileged half cannot be reached over the network. If it ever needs a socket
+# to the outside, that is a design change, not a unit-file tweak.
+
+# It must read the grant key, and the GPU and uinput nodes it exists to use.
+ReadOnlyPaths=/etc/openstream
+DeviceAllow=/dev/uinput rw
+DeviceAllow=char-drm rw
+PrivateDevices=false
+
+[Install]
+WantedBy=multi-user.target

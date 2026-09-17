@@ -85,8 +85,17 @@ but they are **an experimental subsystem, not something an installer enables**:
   the endpoint, the transcript and the client library exist and are tested, and
   nothing announces anything until the service is wired to them.
 - Audio and clipboard are explicitly disabled in it.
-- **Neither binary is in the Linux tarball or the Debian package**, and neither
-  are their systemd units. Only the older per-user host-agent service ships.
+- The three binaries and two systemd units are now **in the tarball and the
+  Debian package**, with `scripts/verify-package-install.sh` asserting each one
+  so the gap cannot reopen quietly. The units ship **disabled**: without a grant
+  key the broker refuses every session by design, so enabling the pair on
+  install would leave a privileged service running and a network-facing one
+  restart-looping for a feature nobody asked for. `postinst` prints what to do.
+- **Nothing has been installed or started on a real machine.** The units are
+  written and packaged; no one has booted them. In particular the broker's
+  `CapabilityBoundingSet` is deliberately left unnarrowed, because guessing it
+  wrong yields a service that will not start and no one here can currently test
+  it -- the unit says so and says where to start once someone can.
 
 ### Approval-bound authorisation: implemented, not yet delivered
 
