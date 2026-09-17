@@ -7,10 +7,23 @@
 //!
 //! That rules out the environment: `/proc/<pid>/environ` is readable by anyone
 //! who can read the process, and a systemd unit's environment is not a secret.
-//! So the key lives in a file owned by the broker's user with mode 0600, and
-//! both halves of that are enforced here rather than documented and hoped for:
-//! [`read`] refuses a file anybody else can read, and [`write`] creates one
-//! that nobody else can.
+//! So the key lives in a file owned by the broker's user with mode 0600.
+//!
+//! **Mode alone is not the boundary.** A file owned by the *machine service*
+//! with mode 0600 is private to the machine service, and the broker -- running
+//! privileged -- can read it perfectly well. A check that looked only at the
+//! permission bits would accept a key the unprivileged process chose, and the
+//! service could then forge its own approvals: exactly the privilege boundary
+//! this key exists to draw. So [`read`] also requires that the file be
+//! **owned by the reading process's own user**, that it be a **regular file**
+//! rather than a symlink or device, and that **no directory on the path to it
+//! be writable by anyone else** -- a directory the service can write is a
+//! directory in which it can replace the file.
+//!
+//! The file is opened with `O_NOFOLLOW` and inspected through `fstat` on the
+//! resulting descriptor, so what is checked and what is read are the same
+//! object. Checking a path and then opening it is a race the service wins by
+//! swapping the file in between.
 //!
 //! Not Linux-gated. The file handling is ordinary Unix and is tested on every
 //! Unix CI runner, which is the point -- the Linux-only half of this crate
@@ -21,8 +34,97 @@
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
-/// Bits that must be clear: any access at all for group or other.
+/// Bits that must be clear on the key file: any access at all for group or
+/// other.
 const OTHERS: u32 = 0o077;
+
+/// Bits that must be clear on every directory leading to it: write for group or
+/// other. A directory someone else can write is one in which they can unlink
+/// the key and put their own in its place, whatever the key's own mode says.
+const DIRECTORY_OTHERS_WRITE: u32 = 0o022;
+
+/// The sticky bit, widened once.
+///
+/// `libc::S_ISVTX` is `u16` on macOS and `u32` on Linux, so the cast is
+/// required on one and redundant on the other. Normalised here rather than at
+/// each use, with the lint silenced for the platform where it is a no-op.
+#[allow(clippy::unnecessary_cast)]
+const STICKY: u32 = libc::S_ISVTX as u32;
+
+/// Largest key file accepted. A grant key is a handful of bytes; this stops a
+/// wrong path from reading something enormous into memory.
+const MAX_KEY_BYTES: u64 = 4096;
+
+/// Refuse a path any other user could have tampered with.
+///
+/// Walks from the file's directory up to the root. Each directory must be owned
+/// by this process's user or by root, and must not be writable by group or
+/// other unless it is sticky -- `/tmp` is world-writable and sticky, and sticky
+/// is what stops one user unlinking another's entries there.
+///
+/// Without this, a key with a perfect mode inside a directory the machine
+/// service can write is still a key the machine service controls: it can
+/// unlink the file and create its own.
+fn check_directory_chain(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let effective = unsafe { libc::geteuid() };
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    // Resolve the directories first. A symlinked directory in the middle of the
+    // path is ordinary -- `/var` is a symlink to `/private/var` on macOS, and
+    // merged-/usr Linux systems link `/lib` and friends -- so what has to be
+    // checked is the real directory each one lands on, which is where an
+    // attacker would need write access to replace the key. The file itself is
+    // still opened `O_NOFOLLOW`: a symlink *as the key* is a different thing
+    // and stays refused.
+    let mut directory = match absolute.parent() {
+        Some(parent) => Some(parent.canonicalize()?),
+        None => None,
+    };
+    while let Some(current) = directory {
+        let metadata = std::fs::symlink_metadata(&current)?;
+        if !metadata.is_dir() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "{} is on the key's path but is not a directory",
+                    current.display()
+                ),
+            ));
+        }
+        let mode = metadata.mode();
+        let sticky = mode & STICKY != 0;
+        if mode & DIRECTORY_OTHERS_WRITE != 0 && !sticky {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} is writable by others (mode {:o}), so the key inside it can be replaced \
+                     no matter what the key's own mode says",
+                    current.display(),
+                    mode & 0o777
+                ),
+            ));
+        }
+        if metadata.uid() != effective && metadata.uid() != 0 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} is owned by uid {}, which is neither root nor this process's uid \
+                     {effective}; its owner can replace the key",
+                    current.display(),
+                    metadata.uid()
+                ),
+            ));
+        }
+        directory = current.parent().map(Path::to_path_buf);
+    }
+    Ok(())
+}
 
 /// Read the grant key, refusing one that is not private.
 ///
@@ -30,11 +132,34 @@ const OTHERS: u32 = 0o077;
 /// editor carries a newline, and a key that differs from the control plane's by
 /// one byte fails every grant with nothing in the logs to say why.
 pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     let path = path.as_ref();
-    let metadata = std::fs::metadata(path)?;
-    let mode = metadata.permissions().mode();
+    check_directory_chain(path)?;
+
+    // O_NOFOLLOW: a symlink here is someone redirecting the broker at a key
+    // they control, and following it would be the whole attack.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!("{}: {error} (a symlink here is refused)", path.display()),
+            )
+        })?;
+    // Everything below is checked on the open descriptor, not on the path, so
+    // the object inspected is the object read.
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mode = metadata.mode();
     if mode & OTHERS != 0 {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
@@ -46,7 +171,28 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
             ),
         ));
     }
-    let key = std::fs::read(path)?;
+    // SAFETY: geteuid cannot fail and touches no memory.
+    let effective = unsafe { libc::geteuid() };
+    if metadata.uid() != effective {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by uid {} but this process runs as uid {effective}; a key owned by \
+                 the unprivileged service is a key the service chose, and a privileged reader \
+                 would happily forge approvals from it",
+                path.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+    let mut key = Vec::new();
+    (&file).take(MAX_KEY_BYTES + 1).read_to_end(&mut key)?;
+    if key.len() as u64 > MAX_KEY_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("{} is larger than a key should ever be", path.display()),
+        ));
+    }
     let trimmed = key
         .iter()
         .rposition(|byte| !byte.is_ascii_whitespace())
@@ -147,7 +293,7 @@ pub fn from_hex(hex: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     /// A directory that cleans itself up, so a failing test does not leave a
     /// key behind.
@@ -268,6 +414,89 @@ mod tests {
         std::fs::write(&path, b"   \n").expect("seed");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         let error = read(&path).expect_err("a whitespace-only key must be refused");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_symlink_to_another_key_is_refused() {
+        // The attack this blocks: leave a private-looking symlink where the
+        // broker expects its key, pointing at a key the attacker wrote. Mode
+        // bits on a symlink say nothing about its target.
+        let dir = TempDir::new("symlink");
+        let real = dir.join("attacker.key");
+        std::fs::write(&real, b"forged").expect("seed");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let link = dir.join("grant.key");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(
+            read(&link).is_err(),
+            "a symlink must not be followed to a key someone else placed"
+        );
+    }
+
+    #[test]
+    fn a_directory_others_can_write_is_refused() {
+        // A key with a perfect 0600 mode inside a directory the machine
+        // service can write is still a key the machine service controls: it
+        // unlinks the file and creates its own. Mode on the file alone was the
+        // gap this closes.
+        let dir = TempDir::new("loose-dir");
+        let inner = dir.join("keys");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let path = inner.join("grant.key");
+        std::fs::write(&path, b"secret").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        let error = read(&path).expect_err("a world-writable parent must be refused");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_directory_that_is_private_is_accepted() {
+        // The counterpart: the check must not refuse a correctly-installed key,
+        // or the broker never starts.
+        let dir = TempDir::new("tight-dir");
+        let inner = dir.join("keys");
+        std::fs::create_dir_all(&inner).expect("mkdir");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let path = inner.join("grant.key");
+        write(&path, b"secret").expect("write");
+        assert_eq!(read(&path).expect("read"), b"secret");
+    }
+
+    #[test]
+    fn a_directory_is_not_a_key() {
+        let dir = TempDir::new("isdir");
+        let path = dir.join("grant.key");
+        std::fs::create_dir_all(&path).expect("mkdir");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(read(&path).is_err(), "a directory must not read as a key");
+    }
+
+    #[test]
+    fn a_key_owned_by_this_process_is_accepted() {
+        // The ownership check compares against the reading process's own uid.
+        // A test cannot create a file owned by somebody else without being
+        // root, so what is asserted here is that the check does not reject the
+        // legitimate case -- the rejecting half is exercised by the directory
+        // and symlink tests above, which share its code path.
+        let dir = TempDir::new("owner");
+        let path = dir.join("grant.key");
+        write(&path, b"secret").expect("write");
+        // SAFETY: geteuid cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        let owner = std::fs::metadata(&path).expect("metadata").uid();
+        assert_eq!(owner, uid, "the test's own file is owned by the test");
+        assert_eq!(read(&path).expect("read"), b"secret");
+    }
+
+    #[test]
+    fn an_enormous_file_is_refused_rather_than_read() {
+        let dir = TempDir::new("huge");
+        let path = dir.join("grant.key");
+        let oversized = vec![b'a'; usize::try_from(MAX_KEY_BYTES).expect("fits") + 10];
+        write(&path, &oversized).expect("write");
+        let error = read(&path).expect_err("an oversized key must be refused");
         assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 
