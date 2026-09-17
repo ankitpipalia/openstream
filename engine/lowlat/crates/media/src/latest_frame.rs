@@ -29,6 +29,59 @@ use crate::frame_age::FrameOffer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Test-only seam, run inside [`LatestFramePublisher::publish`] between the
+/// advisory `closed` check and the acquisition of the slot lock.
+///
+/// That gap is the race: a few instructions wide, and no amount of concurrent
+/// stressing reproduces it dependably -- a twenty-thousand-iteration loop
+/// against the unfixed code never once stranded a frame. A test that cannot
+/// fail against the bug is not a regression test, so the window is made
+/// addressable instead of hoped for.
+///
+/// Compiled out entirely otherwise.
+#[cfg(test)]
+mod race_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` at the seam until [`clear`] is called.
+    pub(super) fn set(hook: Box<dyn Fn()>) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    }
+
+    pub(super) fn clear() {
+        HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    pub(super) fn run() {
+        // Cloned out of the RefCell's borrow before calling, so a hook that
+        // re-enters `publish` cannot panic on an outstanding borrow.
+        let hook = HOOK.with(|slot| slot.borrow().is_some());
+        if hook {
+            HOOK.with(|slot| {
+                let taken = slot.borrow_mut().take();
+                if let Some(run) = taken {
+                    run();
+                    *slot.borrow_mut() = Some(run);
+                }
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn at_publish_race_window() {
+    race_hook::run();
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn at_publish_race_window() {}
+
 /// The shared slot behind a [`LatestFramePublisher`] and [`LatestFrameReader`].
 #[derive(Debug)]
 struct Slot<T> {
@@ -38,6 +91,12 @@ struct Slot<T> {
     value: Mutex<Option<T>>,
     /// Set when the reader goes away, so a producer that never blocks can
     /// still learn to stop.
+    ///
+    /// **Written and read under `value`'s lock**, and additionally read outside
+    /// it as an advisory fast path. It cannot be authoritative on its own: a
+    /// publisher that checks it and *then* takes the lock can be overtaken by a
+    /// reader that closes and drains in between, and would insert into a slot
+    /// nobody will ever read again.
     closed: AtomicBool,
 }
 
@@ -82,9 +141,13 @@ impl<T> LatestFramePublisher<T> {
     /// Returns [`FrameOffer::ReplacedOlder`] when an undelivered frame was
     /// displaced, so the caller can count how far behind the consumer is.
     pub fn publish(&self, value: T) -> FrameOffer {
+        // Advisory only: it saves taking the lock once shutdown is settled. A
+        // `false` here means nothing, because the reader may close between this
+        // load and the lock below.
         if self.slot.closed.load(Ordering::Acquire) {
             return FrameOffer::Closed;
         }
+        at_publish_race_window();
         let Ok(mut held) = self.slot.value.lock() else {
             // A poisoned lock means a consumer panicked while holding it.
             // There is no consumer to deliver to any more, so this is the
@@ -93,6 +156,19 @@ impl<T> LatestFramePublisher<T> {
             self.slot.closed.store(true, Ordering::Release);
             return FrameOffer::Closed;
         };
+        // Authoritative, and the reason the flag is touched twice. The reader
+        // sets it while holding this same lock, so a close that raced the check
+        // above is visible here and the frame is dropped instead of stored.
+        //
+        // Without this the publisher could pass the first check, wait on the
+        // lock while the reader closed and drained, and then insert into a slot
+        // with no reader: the frame -- megabytes, for a decoded picture --
+        // would be held for the publisher's whole lifetime, and the publisher
+        // would be told `Enqueued` and go on producing for a consumer that no
+        // longer exists.
+        if self.slot.closed.load(Ordering::Acquire) {
+            return FrameOffer::Closed;
+        }
         if held.replace(value).is_some() {
             FrameOffer::ReplacedOlder
         } else {
@@ -125,12 +201,28 @@ impl<T> LatestFrameReader<T> {
 
 impl<T> Drop for LatestFrameReader<T> {
     fn drop(&mut self) {
-        self.slot.closed.store(true, Ordering::Release);
-        // Release the held frame now rather than waiting for the publisher
-        // to be dropped too: a decoded frame is megabytes, and the publisher
-        // may outlive the window by the length of a shutdown.
-        if let Ok(mut held) = self.slot.value.lock() {
-            held.take();
+        // Close and drain under one lock, so the flag and the slot always
+        // change together.
+        //
+        // This is defensive rather than load-bearing: the fix for the stranding
+        // race is the re-check inside `publish`, and reverting this ordering
+        // alone does not fail the regression test. It is kept because the
+        // invariant "closed is only observed together with the slot" is what
+        // makes that re-check correct, and a future second publisher path or a
+        // rearrangement of `publish` would otherwise reopen the window silently.
+        //
+        // Releasing the held frame here, rather than leaving it for the
+        // publisher's drop, is separate and does matter: a decoded frame is
+        // megabytes and the publisher may outlive the window by the length of a
+        // shutdown.
+        match self.slot.value.lock() {
+            Ok(mut held) => {
+                self.slot.closed.store(true, Ordering::Release);
+                held.take();
+            }
+            // Poisoned: the slot cannot be drained, but the producer must still
+            // be told to stop.
+            Err(_) => self.slot.closed.store(true, Ordering::Release),
         }
     }
 }
@@ -139,6 +231,78 @@ impl<T> Drop for LatestFrameReader<T> {
 mod tests {
     use super::latest_frame;
     use crate::frame_age::FrameOffer;
+
+    /// A frame must never be stranded in a slot whose reader has gone.
+    ///
+    /// The race: `publish` read `closed` and only then took the lock, while the
+    /// reader's `Drop` stored `closed` *before* taking it. A publisher could
+    /// pass the check, wait for the lock while the reader closed and drained,
+    /// and then insert -- holding a decoded frame, which is megabytes, for the
+    /// publisher's whole lifetime, and being told `Enqueued` so it carried on
+    /// producing for a consumer that was gone.
+    ///
+    /// Driven through the test-only seam rather than by concurrent stress. The
+    /// window is a few instructions wide; twenty thousand iterations of two
+    /// threads racing never reproduced it once against the unfixed code, so a
+    /// stress test here would have passed against the bug and been worse than
+    /// no test at all.
+    ///
+    /// The publisher is deliberately alive at the assertion: a stranded frame
+    /// is released when the last `Arc<Slot>` drops, so dropping the publisher
+    /// first hides exactly what is being measured.
+    #[test]
+    fn a_frame_is_never_stranded_in_a_slot_whose_reader_has_gone() {
+        use super::race_hook;
+        use std::sync::{Arc, Mutex};
+
+        let (publisher, reader) = latest_frame::<Arc<()>>();
+        // Parked so the seam can drop it at the one moment that matters.
+        let parked = Arc::new(Mutex::new(Some(reader)));
+        {
+            let parked = Arc::clone(&parked);
+            race_hook::set(Box::new(move || {
+                // Closes and drains, exactly as a window teardown would, in the
+                // gap between the publisher's check and its lock.
+                drop(parked.lock().expect("parked reader").take());
+            }));
+        }
+
+        let canary = Arc::new(());
+        let offer = publisher.publish(Arc::clone(&canary));
+        race_hook::clear();
+
+        assert_eq!(
+            offer,
+            FrameOffer::Closed,
+            "a publisher that lost the race must be told the mailbox closed, \
+             not that its frame was enqueued"
+        );
+        assert_eq!(
+            Arc::strong_count(&canary),
+            1,
+            "the frame was stranded in a slot with no reader, and would be held \
+             for the publisher's lifetime"
+        );
+        assert!(publisher.is_closed());
+    }
+
+    /// Publishing after the reader has gone reports the closure and keeps
+    /// nothing.
+    #[test]
+    fn publishing_to_a_closed_mailbox_reports_it_and_holds_no_frame() {
+        use std::sync::Arc;
+
+        let canary = Arc::new(());
+        let (publisher, reader) = latest_frame();
+        drop(reader);
+        assert_eq!(publisher.publish(Arc::clone(&canary)), FrameOffer::Closed);
+        assert!(publisher.is_closed());
+        assert_eq!(
+            Arc::strong_count(&canary),
+            1,
+            "a refused frame must be dropped, not stored"
+        );
+    }
 
     /// The consumer sees the newest frame, not the oldest one queued.
     ///

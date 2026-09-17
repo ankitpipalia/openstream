@@ -101,6 +101,19 @@ impl AdaptiveBitrate {
     }
 
     /// Record a frame before its fragments are sent.
+    ///
+    /// # Do not replace the scan with `pop_first`
+    ///
+    /// Evicting the oldest entry looks like a job for `BTreeMap::pop_first`,
+    /// and it is not. The map is keyed by frame id, which is a wrapping `u32`:
+    /// once it wraps, the smallest key is the *newest* frame, and `pop_first`
+    /// would evict the frame that had just been sent while keeping one that is
+    /// four billion ids stale. The scan below reads the timestamp, which is
+    /// what "oldest" actually means here.
+    ///
+    /// The scan is O(n), and n is [`MAX_PENDING_FRAMES`] = 64. If profiling
+    /// ever shows it matters, the answer is a separate insertion-order queue
+    /// beside the map -- not a cheaper way to pick the wrong entry.
     pub fn frame_sent(&mut self, frame_id: u32, now_ms: u64) {
         if self.pending.len() >= MAX_PENDING_FRAMES {
             if let Some(oldest) = self

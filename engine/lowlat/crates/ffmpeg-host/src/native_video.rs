@@ -131,6 +131,8 @@ mod pipeline {
     /// Complete access units queued for the streaming loop before capture
     /// backs off. Small on purpose: a deep queue is latency.
     const QUEUE_DEPTH: usize = 8;
+    /// How long to wait for queue capacity before looking at control again.
+    const SEND_RETRY: Duration = Duration::from_millis(1);
 
     /// What the pipeline captures and encodes.
     #[derive(Debug, Clone)]
@@ -342,23 +344,68 @@ mod pipeline {
             );
         }
 
+        /// Handle every pending control message. `false` means stop.
+        ///
+        /// Called both at the top of the loop and while waiting for room in the
+        /// unit queue -- see [`Self::send_unit`] for why the second one is not
+        /// optional.
+        fn service_control(&mut self, control: &std_mpsc::Receiver<Control>) -> bool {
+            while let Ok(command) = control.try_recv() {
+                match command {
+                    Control::Stop => return false,
+                    Control::Reconfigure {
+                        bitrate_bps,
+                        force_keyframe,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.reconfigure(bitrate_bps, force_keyframe));
+                    }
+                }
+            }
+            true
+        }
+
+        /// Hand one access unit to the consumer, staying responsive to control
+        /// while the queue is full. `false` means stop.
+        ///
+        /// This used to be `blocking_send`, and that deadlocked. The consumer is
+        /// the host's event loop; `reconfigure` makes it await an
+        /// acknowledgement that only *this* thread can send. So when the queue
+        /// fills:
+        ///
+        ///   worker: blocking_send  -- waiting for the consumer to take a unit
+        ///   host:   reconfigure().await -- waiting for the worker to reply
+        ///
+        /// and neither moves, because the host cannot drain the queue while it
+        /// is awaiting, and the worker cannot reach the control channel while
+        /// it is blocked on the send. A full eight-deep queue plus one bitrate
+        /// change was enough.
+        ///
+        /// Servicing control inside the wait breaks the cycle without weakening
+        /// the acknowledgement: the reply is still sent only once the change has
+        /// actually been applied. Answering without applying would be worse than
+        /// the deadlock -- a timed-out command could land later and leave the
+        /// reported profile describing an encoder that never got it.
+        fn send_unit(
+            &mut self,
+            payload: Vec<u8>,
+            units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
+        ) -> bool {
+            crate::native_send::send_servicing_control(payload, units, SEND_RETRY, &mut || {
+                self.service_control(control)
+            }) == crate::native_send::SendOutcome::Sent
+        }
+
         fn stream(&mut self, units: &mpsc::Sender<Vec<u8>>, control: &std_mpsc::Receiver<Control>) {
             let timeout_ms = u32::try_from(self.interval.as_millis())
                 .unwrap_or(16)
                 .max(1);
             loop {
-                while let Ok(command) = control.try_recv() {
-                    match command {
-                        Control::Stop => return,
-                        Control::Reconfigure {
-                            bitrate_bps,
-                            force_keyframe,
-                            reply,
-                        } => {
-                            let _ = reply.send(self.reconfigure(bitrate_bps, force_keyframe));
-                        }
-                    }
+                if !self.service_control(control) {
+                    return;
                 }
+
                 match self.duplication.capture(timeout_ms) {
                     Ok(frame) => {
                         let scaled = scale_bgra(
@@ -402,7 +449,7 @@ mod pipeline {
                     continue;
                 }
                 if let Some(frame) = self.pending.take() {
-                    if !self.encode(&frame, units) {
+                    if !self.encode(&frame, units, control) {
                         return;
                     }
                     self.last_frame = Some(frame);
@@ -410,7 +457,7 @@ mod pipeline {
                     .last_encode
                     .is_some_and(|last| now.duration_since(last) >= KEEPALIVE)
                     && let Some(frame) = self.last_frame.clone()
-                    && !self.encode(&frame, units)
+                    && !self.encode(&frame, units, control)
                 {
                     return;
                 }
@@ -419,7 +466,12 @@ mod pipeline {
 
         /// Convert and encode one frame, handing every access unit to the
         /// loop. Returns `false` once the loop has gone away.
-        fn encode(&mut self, bgra: &[u8], units: &mpsc::Sender<Vec<u8>>) -> bool {
+        fn encode(
+            &mut self,
+            bgra: &[u8],
+            units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
+        ) -> bool {
             let nv12 =
                 bgra_bytes_to_nv12(bgra, self.width_px, self.height_px, self.conversion_threads);
             let pts_us = i64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(i64::MAX);
@@ -443,7 +495,7 @@ mod pipeline {
                 }
                 let payload =
                     frame_access_unit(&unit.data, unit.keyframe, self.sequence_header.as_deref());
-                if units.blocking_send(payload).is_err() {
+                if !self.send_unit(payload, units, control) {
                     return false;
                 }
                 self.encoded += 1;
@@ -507,6 +559,16 @@ mod macos_pipeline {
     /// Complete access units queued before capture backs off. Small on purpose:
     /// a deep queue is latency.
     const QUEUE_DEPTH: usize = 8;
+    /// How long to wait for queue capacity before looking at control again.
+    const SEND_RETRY: Duration = Duration::from_millis(1);
+    /// How many *consecutive* keepalive submissions pass before saying so. At
+    /// one a second this is a line every thirty seconds of unbroken stillness,
+    /// which is quiet enough to leave on and loud enough to notice.
+    ///
+    /// Consecutive, not cumulative. A lifetime counter crosses each multiple at
+    /// whatever moment a long session happens to reach it, which is unrelated
+    /// to whether the picture is still right now.
+    const REPEAT_REPORT_INTERVAL: u64 = 30;
 
     /// How long a static desktop goes before the last frame is re-sent.
     ///
@@ -678,6 +740,31 @@ mod macos_pipeline {
         epoch: Instant,
         interval: Duration,
         last_encode: Option<Instant>,
+        /// When the capture source last handed over a *new* surface.
+        ///
+        /// Deliberately separate from `last_encode`. The keepalive re-encodes
+        /// the last surface every second, so encoded output and the frame
+        /// counter keep advancing even when capture has wedged and no fresh
+        /// picture has arrived for minutes. Anything that judged capture health
+        /// from "are units still being produced" would call that healthy.
+        ///
+        /// **This does not detect a stall, and nothing here claims to.**
+        /// ScreenCaptureKit delivers on change, so a source that has frozen and
+        /// a desktop nobody is touching produce the identical signal: no new
+        /// surface. Telling them apart needs the stream-level `SCStreamDelegate`
+        /// and its `stream:didStopWithError:`, which `SckCapture` does not
+        /// install -- it passes a null stream delegate and registers only the
+        /// output one. Until that exists this is a diagnostic: it says how the
+        /// frames being sent were produced, which is worth knowing when a
+        /// session looks frozen, and it is not a health signal.
+        last_fresh_capture: Option<Instant>,
+        /// How the surfaces submitted to the encoder were produced.
+        ///
+        /// Submissions, not access units: the encoder is asynchronous and a
+        /// submission may produce no unit, one, or one belonging to an earlier
+        /// frame. Counting output here would attribute units to whichever
+        /// submission happened to drain them.
+        freshness: crate::capture_freshness::FreshnessLog,
         encoded: u64,
         /// The last surface the stream delivered, kept so a still screen can be
         /// re-sent as a keepalive. Only used by [`Source::Stream`].
@@ -703,6 +790,8 @@ mod macos_pipeline {
                 encoder,
                 epoch: Instant::now(),
                 last_encode: None,
+                last_fresh_capture: None,
+                freshness: crate::capture_freshness::FreshnessLog::new(REPEAT_REPORT_INTERVAL),
                 encoded: 0,
                 last_surface: None,
             })
@@ -766,29 +855,81 @@ mod macos_pipeline {
 
         fn run(mut self, units: &mpsc::Sender<Vec<u8>>, control: &std_mpsc::Receiver<Control>) {
             self.stream(units, control);
+            // The split matters when reading a complaint about a session: a run
+            // that is nearly all keepalive was showing a picture that barely
+            // changed, which is either a still desktop or a source that stopped
+            // delivering. Knowing which to go looking for is the difference
+            // between a capture bug and nothing at all -- this does not say
+            // which, it says the question is worth asking.
             eprintln!(
-                "OpenStream native video: stopped after {} access units",
-                self.encoded
+                "OpenStream native video: stopped after {} access units ({} submissions from new \
+                 surfaces, {} keepalive)",
+                self.encoded,
+                self.freshness.fresh(),
+                self.freshness.repeated()
             );
+        }
+
+        /// Handle every pending control message. `false` means stop.
+        ///
+        /// Called both at the top of the loop and while waiting for room in the
+        /// unit queue -- see [`Self::send_unit`] for why the second one is not
+        /// optional.
+        fn service_control(&mut self, control: &std_mpsc::Receiver<Control>) -> bool {
+            while let Ok(command) = control.try_recv() {
+                match command {
+                    Control::Stop => return false,
+                    Control::Reconfigure {
+                        bitrate_bps,
+                        force_keyframe,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.reconfigure(bitrate_bps, force_keyframe));
+                    }
+                }
+            }
+            true
+        }
+
+        /// Hand one access unit to the consumer, staying responsive to control
+        /// while the queue is full. `false` means stop.
+        ///
+        /// A plain blocking send deadlocks here. The consumer is the host's
+        /// event loop, and `reconfigure` makes it await an acknowledgement that
+        /// only *this* thread can send. So when the queue fills:
+        ///
+        ///   worker: waiting for the consumer to take a unit
+        ///   host:   waiting, inside reconfigure().await, for the worker to reply
+        ///
+        /// and neither moves, because the host cannot drain the queue while it
+        /// is awaiting and the worker cannot reach the control channel while it
+        /// is parked on the send. A full eight-deep queue plus one bitrate
+        /// change was enough.
+        ///
+        /// Servicing control inside the wait breaks the cycle without weakening
+        /// the acknowledgement: the reply is still sent only once the change has
+        /// actually been applied. Answering without applying would be worse than
+        /// the deadlock -- a timed-out command could land later and leave the
+        /// reported profile describing an encoder that never received it.
+        fn send_unit(
+            &mut self,
+            payload: Vec<u8>,
+            units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
+        ) -> bool {
+            crate::native_send::send_servicing_control(payload, units, SEND_RETRY, &mut || {
+                self.service_control(control)
+            }) == crate::native_send::SendOutcome::Sent
         }
 
         fn stream(&mut self, units: &mpsc::Sender<Vec<u8>>, control: &std_mpsc::Receiver<Control>) {
             loop {
-                while let Ok(command) = control.try_recv() {
-                    match command {
-                        Control::Stop => return,
-                        Control::Reconfigure {
-                            bitrate_bps,
-                            force_keyframe,
-                            reply,
-                        } => {
-                            let _ = reply.send(self.reconfigure(bitrate_bps, force_keyframe));
-                        }
-                    }
+                if !self.service_control(control) {
+                    return;
                 }
                 let keep_going = match &self.source {
-                    Source::Stream(_) => self.stream_once(units),
-                    Source::Poll(_) => self.poll_once(units),
+                    Source::Stream(_) => self.stream_once(units, control),
+                    Source::Poll(_) => self.poll_once(units, control),
                 };
                 if !keep_going {
                     return;
@@ -801,7 +942,11 @@ mod macos_pipeline {
         /// No pacing of its own: the stream is already capped at the
         /// negotiated rate and only fires on change, so sleeping to an
         /// interval here would add latency to frames that are already due.
-        fn stream_once(&mut self, units: &mpsc::Sender<Vec<u8>>) -> bool {
+        fn stream_once(
+            &mut self,
+            units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
+        ) -> bool {
             if !matches!(self.source, Source::Stream(_)) {
                 return true;
             }
@@ -839,10 +984,12 @@ mod macos_pipeline {
                 // Send it now rather than after waiting for the next capture.
                 // Going straight back round also re-checks the control channel
                 // before anything else is submitted.
-                return self.emit_units(ready, units);
+                return self.emit_units(ready, units, control);
             }
+            let repeated = fresh.is_none();
             if let Some(surface) = fresh {
                 self.last_surface = Some(surface);
+                self.last_fresh_capture = Some(Instant::now());
             } else if self
                 .last_encode
                 .is_none_or(|last| last.elapsed() < KEEPALIVE)
@@ -863,12 +1010,57 @@ mod macos_pipeline {
                 self.encoder
                     .encode_surface(surface.as_ptr().cast(), self.pts_now())
             };
-            self.emit(encoded, units)
+            self.note_capture_freshness(repeated);
+            self.emit(encoded, units, control)
+        }
+
+        /// Record how the surface about to be encoded was produced, and report
+        /// a run of keepalives while it lasts.
+        ///
+        /// Reported on the consecutive count, so the line appears while the
+        /// picture is actually still and stops when it moves again. Reporting
+        /// on a lifetime total instead means the line arrives at moments
+        /// unrelated to what the screen is doing.
+        ///
+        /// What it does *not* say is that capture has stalled. A still desktop
+        /// and a wedged source look the same from here; see the note on
+        /// `last_fresh_capture`.
+        fn note_capture_freshness(&mut self, repeated: bool) {
+            use crate::capture_freshness::{Report, Submission};
+
+            let submission = if repeated {
+                Submission::Repeated
+            } else {
+                Submission::Fresh
+            };
+            match self.freshness.note(submission) {
+                Some(Report::StillRepeating { consecutive }) => {
+                    let silent = self
+                        .last_fresh_capture
+                        .map_or(0.0, |last| last.elapsed().as_secs_f32());
+                    eprintln!(
+                        "OpenStream capture: no new surface for {silent:.1}s ({consecutive} \
+                         consecutive keepalive submissions); the stream is being kept alive by \
+                         re-encoding the last frame. A still screen looks exactly like this."
+                    );
+                }
+                Some(Report::Resumed { after }) => {
+                    eprintln!(
+                        "OpenStream capture: new surfaces again after {after} keepalive \
+                         submissions"
+                    );
+                }
+                None => {}
+            }
         }
 
         /// One turn of the CoreGraphics loop: pace, snapshot, copy, rescale,
         /// and hand the bytes to the encoder to copy again.
-        fn poll_once(&mut self, units: &mpsc::Sender<Vec<u8>>) -> bool {
+        fn poll_once(
+            &mut self,
+            units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
+        ) -> bool {
             // Paced here because the poll has no change signal of its own:
             // without this it would capture as fast as the CPU allows.
             if let Some(last) = self.last_encode {
@@ -897,7 +1089,7 @@ mod macos_pipeline {
             )
             .into_owned();
             let encoded = self.encoder.encode(&scaled, self.pts_now());
-            self.emit(encoded, units)
+            self.emit(encoded, units, control)
         }
 
         /// Microseconds since the worker started, which is what the encoder
@@ -916,6 +1108,7 @@ mod macos_pipeline {
                 openstream_macos_media::VtEncError,
             >,
             units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
         ) -> bool {
             let encoded = match encoded {
                 Ok(encoded) => encoded,
@@ -925,7 +1118,7 @@ mod macos_pipeline {
                     return true;
                 }
             };
-            self.emit_units(encoded, units)
+            self.emit_units(encoded, units, control)
         }
 
         /// Frame and send access units the encoder has already produced.
@@ -938,6 +1131,7 @@ mod macos_pipeline {
             &mut self,
             encoded: Vec<openstream_macos_media::EncodedAccessUnit>,
             units: &mpsc::Sender<Vec<u8>>,
+            control: &std_mpsc::Receiver<Control>,
         ) -> bool {
             if encoded.is_empty() {
                 return true;
@@ -947,7 +1141,7 @@ mod macos_pipeline {
                 // The VideoToolbox encoder already prepends SPS/PPS to keyframes,
                 // so only the access-unit delimiter is framed here.
                 let payload = frame_access_unit(&unit.data, false, None);
-                if units.blocking_send(payload).is_err() {
+                if !self.send_unit(payload, units, control) {
                     return false;
                 }
                 self.encoded += 1;
