@@ -814,7 +814,9 @@ mod macos_pipeline {
             {
                 // Split borrows: the encoder and the capture stream are
                 // disjoint fields, and both are needed in this loop.
-                let Self { source, encoder, .. } = self;
+                let Self {
+                    source, encoder, ..
+                } = self;
                 let Source::Stream(stream) = source else {
                     return true;
                 };

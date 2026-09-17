@@ -65,14 +65,14 @@ fn main() -> std::process::ExitCode {
         sorted[index]
     }
 
-    let mut encoder =
-        match VideoToolboxH264Encoder::new(STREAM_WIDTH, STREAM_HEIGHT, FPS, BITRATE) {
-            Ok(encoder) => encoder,
-            Err(error) => {
-                eprintln!("VideoToolbox encoder unavailable: {error}");
-                return std::process::ExitCode::from(2);
-            }
-        };
+    let mut encoder = match VideoToolboxH264Encoder::new(STREAM_WIDTH, STREAM_HEIGHT, FPS, BITRATE)
+    {
+        Ok(encoder) => encoder,
+        Err(error) => {
+            eprintln!("VideoToolbox encoder unavailable: {error}");
+            return std::process::ExitCode::from(2);
+        }
+    };
 
     // Read the settings back before measuring anything, so the report says what
     // was actually in force. Every one of these is optional; a `no` here is a
@@ -196,7 +196,11 @@ fn main() -> std::process::ExitCode {
     println!("session properties actually in force:");
     println!(
         "  low-latency rate control         {}",
-        if low_latency { "yes" } else { "no (encoder specification refused)" }
+        if low_latency {
+            "yes"
+        } else {
+            "no (encoder specification refused)"
+        }
     );
     println!(
         "  MaxFrameDelayCount               {}",
@@ -207,11 +211,19 @@ fn main() -> std::process::ExitCode {
     );
     println!(
         "  speed over quality               {}",
-        if speed_hint { "yes" } else { "no (property refused)" }
+        if speed_hint {
+            "yes"
+        } else {
+            "no (property refused)"
+        }
     );
     println!(
         "  NumberOfPendingFrames readable   {}",
-        if pending_at_rest.is_some() { "yes" } else { "no" }
+        if pending_at_rest.is_some() {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!();
 
@@ -246,7 +258,10 @@ fn main() -> std::process::ExitCode {
         let max_before = pending_before.iter().copied().max().unwrap_or(0);
         let sum_before: i64 = pending_before.iter().sum();
         let zero_before = pending_before.iter().filter(|value| **value == 0).count();
-        println!("queue depth before the next submit ({} samples):", pending_before.len());
+        println!(
+            "queue depth before the next submit ({} samples):",
+            pending_before.len()
+        );
         println!("  max                              {max_before}");
         println!(
             "  mean                             {:.2}",

@@ -350,8 +350,12 @@ impl VideoToolboxH264Encoder {
         let spec = low_latency.then(|| {
             CFDictionary::from_CFType_pairs(&[(
                 // SAFETY: a framework constant, valid for the process lifetime.
-                unsafe { CFString::wrap_under_get_rule(kVTVideoEncoderSpecification_EnableLowLatencyRateControl) }
-                    .as_CFType(),
+                unsafe {
+                    CFString::wrap_under_get_rule(
+                        kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
+                    )
+                }
+                .as_CFType(),
                 CFBoolean::true_value().as_CFType(),
             )])
         });
