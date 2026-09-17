@@ -91,11 +91,23 @@ but they are **an experimental subsystem, not something an installer enables**:
   key the broker refuses every session by design, so enabling the pair on
   install would leave a privileged service running and a network-facing one
   restart-looping for a feature nobody asked for. `postinst` prints what to do.
+- The configuration those units ship with **could not have started either
+  service**, and was fixed only after review: five variables were assigned the
+  empty string, which a process reads as a value rather than as unset, and the
+  uid the broker admits was never set anywhere, so it fell back to admitting
+  root and would have refused the unprivileged service it ships with. Settings
+  now live in root-owned files under `/etc/openstream` that `postinst` writes
+  once with the account ids it has just resolved.
 - **Nothing has been installed or started on a real machine.** The units are
-  written and packaged; no one has booted them. In particular the broker's
-  `CapabilityBoundingSet` is deliberately left unnarrowed, because guessing it
-  wrong yields a service that will not start and no one here can currently test
-  it -- the unit says so and says where to start once someone can.
+  written and packaged; no one has booted them. What does now run is
+  `scripts/test-linux-packaging.sh`, in CI on a Linux runner: it starts the real
+  broker with the environment the package writes and requires that it listens,
+  with a negative control that must still fail. That is more than reading the
+  units and less than an install test, and it is not a substitute for one.
+  In particular the broker's `CapabilityBoundingSet` is deliberately left
+  unnarrowed, because guessing it wrong yields a service that will not start and
+  no one here can currently test it -- the unit says so and says where to start
+  once someone can.
 
 ### Approval-bound authorisation: implemented, not yet delivered
 
