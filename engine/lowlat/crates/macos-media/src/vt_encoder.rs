@@ -130,12 +130,30 @@ unsafe extern "C" {
         property_value: CFTypeRef,
     ) -> OSStatus;
 
+    fn VTSessionCopyProperty(
+        session: VtCompressionSessionRef,
+        property_key: CFStringRef,
+        allocator: CfAllocatorRef,
+        property_value_out: *mut CFTypeRef,
+    ) -> OSStatus;
+
     static kVTCompressionPropertyKey_RealTime: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
     static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
+    /// How many frames the encoder may hold before emitting one. Optional:
+    /// a codec that does not support it returns a non-zero status.
+    static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
+    /// How many frames the session is currently holding. Read-only.
+    static kVTCompressionPropertyKey_NumberOfPendingFrames: CFStringRef;
+    /// Hint that latency matters more than compression efficiency. Apple
+    /// recommends it for ultra-low-latency work.
+    static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: CFStringRef;
+    /// Encoder-specification key enabling Apple's low-latency rate control,
+    /// which Apple documents for cloud gaming and conferencing.
+    static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
     static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
 }
@@ -247,6 +265,15 @@ pub struct VideoToolboxH264Encoder {
     // no callback can run after it goes away.
     shared: Box<Shared>,
     force_keyframe: bool,
+    /// The frame-delay ceiling this session accepted, or `None` if the encoder
+    /// refused every rung of the ladder. Diagnostic: the caller reports it so a
+    /// measurement can be read against the setting that produced it.
+    max_frame_delay: Option<i64>,
+    /// Whether Apple's low-latency rate control was enabled at session
+    /// creation.
+    low_latency_rate_control: bool,
+    /// Whether the encoder accepted the speed-over-quality hint.
+    prioritise_speed: bool,
 }
 
 // SAFETY: the session and shared state are protected for cross-thread use --
@@ -270,34 +297,32 @@ impl VideoToolboxH264Encoder {
         let shared = Box::new(Shared::default());
         let ref_con = std::ptr::from_ref(shared.as_ref()) as *mut c_void;
 
-        let mut session: VtCompressionSessionRef = std::ptr::null_mut();
-        // SAFETY: FFI. A null encoder/source spec lets VideoToolbox pick the
-        // hardware encoder; the callback and its ref-con outlive the session
-        // (invalidated before the box drops).
-        let status = unsafe {
-            VTCompressionSessionCreate(
-                std::ptr::null(),
-                i32::try_from(width).unwrap_or(i32::MAX),
-                i32::try_from(height).unwrap_or(i32::MAX),
-                K_CM_VIDEO_CODEC_TYPE_H264,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null(),
-                compression_output,
-                ref_con,
-                &mut session,
-            )
-        };
-        if status != 0 || session.is_null() {
-            return Err(VtEncError::Status("VTCompressionSessionCreate", status));
-        }
+        // Ask for Apple's low-latency rate control. Unlike the compression
+        // properties below this is an *encoder specification*: it selects how
+        // the encoder is built, so it cannot be turned on afterwards. Apple
+        // documents it for conferencing and cloud gaming -- it caps the
+        // rate controller's lookahead rather than only asking for real-time
+        // pacing.
+        //
+        // It is not available for every codec on every machine, and the
+        // documented failure is that session creation itself fails. So try it,
+        // and on any failure build the session the way this encoder always did.
+        // A session that exists without it beats no session.
+        let (session, low_latency_rate_control) =
+            match Self::create_session(width, height, ref_con, true) {
+                Ok(session) => (session, true),
+                Err(_) => (Self::create_session(width, height, ref_con, false)?, false),
+            };
 
-        let encoder = Self {
+        let mut encoder = Self {
             session,
             width: width as usize,
             height: height as usize,
             shared,
             force_keyframe: false,
+            max_frame_delay: None,
+            low_latency_rate_control,
+            prioritise_speed: false,
         };
         encoder.configure(fps, bitrate)?;
         // SAFETY: preparing a live session is documented and side-effect free
@@ -312,7 +337,53 @@ impl VideoToolboxH264Encoder {
         Ok(encoder)
     }
 
-    fn configure(&self, fps: u32, bitrate: u32) -> Result<(), VtEncError> {
+    /// Build the compression session, optionally requesting low-latency rate
+    /// control through the encoder specification.
+    fn create_session(
+        width: u32,
+        height: u32,
+        ref_con: *mut c_void,
+        low_latency: bool,
+    ) -> Result<VtCompressionSessionRef, VtEncError> {
+        // Held for the duration of the call: VideoToolbox copies what it needs
+        // out of the specification dictionary.
+        let spec = low_latency.then(|| {
+            CFDictionary::from_CFType_pairs(&[(
+                // SAFETY: a framework constant, valid for the process lifetime.
+                unsafe { CFString::wrap_under_get_rule(kVTVideoEncoderSpecification_EnableLowLatencyRateControl) }
+                    .as_CFType(),
+                CFBoolean::true_value().as_CFType(),
+            )])
+        });
+        let spec_ref: CFDictionaryRef = spec
+            .as_ref()
+            .map_or(std::ptr::null(), TCFType::as_concrete_TypeRef);
+
+        let mut session: VtCompressionSessionRef = std::ptr::null_mut();
+        // SAFETY: FFI. A null source spec lets VideoToolbox pick the pixel
+        // format; the callback and its ref-con outlive the session (it is
+        // invalidated before the box drops).
+        let status = unsafe {
+            VTCompressionSessionCreate(
+                std::ptr::null(),
+                i32::try_from(width).unwrap_or(i32::MAX),
+                i32::try_from(height).unwrap_or(i32::MAX),
+                K_CM_VIDEO_CODEC_TYPE_H264,
+                spec_ref,
+                std::ptr::null(),
+                std::ptr::null(),
+                compression_output,
+                ref_con,
+                &mut session,
+            )
+        };
+        if status != 0 || session.is_null() {
+            return Err(VtEncError::Status("VTCompressionSessionCreate", status));
+        }
+        Ok(session)
+    }
+
+    fn configure(&mut self, fps: u32, bitrate: u32) -> Result<(), VtEncError> {
         // Real-time, low-latency: no frame reordering (no B-frames), a bounded
         // keyframe interval, and the target bitrate and frame rate the session
         // paces to.
@@ -346,7 +417,118 @@ impl VideoToolboxH264Encoder {
             unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
             i64::from(fps.max(1)) * 2,
         )?;
+
+        // Bound how many frames the encoder may hold before it emits one.
+        //
+        // VideoToolbox's documented default is an *unlimited* compression
+        // window. That permits buffering; it is not evidence that this encoder
+        // is buffering, which is what [`pending_frames`] is for. The ladder is
+        // here because the property is optional: a codec that does not
+        // implement it, or implements it read-only, refuses the value, and an
+        // encoder that refuses 0 may still accept 1. Take the tightest rung
+        // that sticks and record it, so a later measurement can be read against
+        // the setting that produced it.
+        //
+        // Never fatal. An encoder that refuses the whole ladder encodes
+        // correctly; it just keeps the default window.
+        for candidate in [0_i64, 1, 2] {
+            if self
+                .try_set_number(
+                    unsafe { kVTCompressionPropertyKey_MaxFrameDelayCount },
+                    candidate,
+                )
+                .is_ok()
+            {
+                self.max_frame_delay = Some(candidate);
+                break;
+            }
+        }
+
+        // Ask the encoder to spend less time searching for a smaller frame.
+        // Optional in the same way: absent on older systems and on codecs that
+        // do not implement it.
+        self.prioritise_speed = self
+            .try_set_bool(
+                unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
+                true,
+            )
+            .is_ok();
+
         Ok(())
+    }
+
+    /// Read a numeric session property, or `None` if it is unavailable.
+    ///
+    /// Used for read-only diagnostics, where "the encoder did not answer" is a
+    /// fact about this machine and not a failure worth ending a session over.
+    fn number_property(&self, key: CFStringRef) -> Option<i64> {
+        let mut value: CFTypeRef = std::ptr::null();
+        // SAFETY: the key is a framework constant; on success we own the value
+        // under the Copy rule and release it below.
+        let status =
+            unsafe { VTSessionCopyProperty(self.session, key, std::ptr::null(), &mut value) };
+        if status != 0 || value.is_null() {
+            return None;
+        }
+        // SAFETY: the property is documented as a CFNumber.
+        let number = unsafe { CFNumber::wrap_under_create_rule(value.cast()) };
+        number.to_i64()
+    }
+
+    /// How many frames VideoToolbox is currently holding.
+    ///
+    /// This is the measurement that decides whether any of the queue-limiting
+    /// properties are worth setting. Apple documents the default compression
+    /// window as unlimited, which *permits* buffering -- it is not evidence
+    /// that this encoder, on this machine, with these settings, is actually
+    /// holding frames. Measure before constraining.
+    ///
+    /// `None` when the session does not report it.
+    #[must_use]
+    pub fn pending_frames(&self) -> Option<i64> {
+        self.number_property(unsafe { kVTCompressionPropertyKey_NumberOfPendingFrames })
+    }
+
+    /// The frame-delay ceiling the session accepted, if any.
+    ///
+    /// `None` means the encoder refused every value tried, which is a
+    /// supported outcome rather than an error: the property is optional and a
+    /// codec that does not implement it still encodes correctly.
+    #[must_use]
+    pub fn max_frame_delay(&self) -> Option<i64> {
+        self.max_frame_delay
+    }
+
+    /// Whether the session was created with Apple's low-latency rate control.
+    #[must_use]
+    pub fn low_latency_rate_control(&self) -> bool {
+        self.low_latency_rate_control
+    }
+
+    /// Whether the encoder accepted the speed-over-quality hint.
+    #[must_use]
+    pub fn prioritises_speed(&self) -> bool {
+        self.prioritise_speed
+    }
+
+    /// Set a boolean property, returning the raw status instead of failing the
+    /// session. For optional properties only.
+    fn try_set_bool(&self, key: CFStringRef, value: bool) -> Result<(), OSStatus> {
+        let value = CFBoolean::from(value);
+        // SAFETY: the key is a framework constant and the value outlives the call.
+        let status =
+            unsafe { VTSessionSetProperty(self.session, key, value.as_CFTypeRef().cast()) };
+        if status == 0 { Ok(()) } else { Err(status) }
+    }
+
+    /// Set a numeric property, returning the raw status instead of failing the
+    /// session. For optional properties only.
+    fn try_set_number(&self, key: CFStringRef, value: i64) -> Result<(), OSStatus> {
+        let value = CFNumber::from(value);
+        // SAFETY: the key is a framework constant and the value outlives the call.
+        let status =
+            unsafe { VTSessionSetProperty(self.session, key, value.as_CFTypeRef().cast()) };
+        if status == 0 { Ok(()) } else { Err(status) }
     }
 
     fn set_bool(&self, key: CFStringRef, value: bool) -> Result<(), VtEncError> {
@@ -476,6 +658,17 @@ impl VideoToolboxH264Encoder {
             ));
         }
         Ok(self.drain_ready())
+    }
+
+    /// Take whatever the encoder has finished, without submitting anything.
+    ///
+    /// The compression callback runs on a VideoToolbox thread, so output can
+    /// become available at any time -- not only while a submit is in progress.
+    /// A caller that only drains as a side effect of submitting will not see a
+    /// finished frame until the *next* one arrives, which on a still screen can
+    /// be a long time. This is how such a caller looks.
+    pub fn take_ready(&mut self) -> Vec<EncodedAccessUnit> {
+        self.drain_ready()
     }
 
     /// Force every pending frame out and return them. Call at end of stream.

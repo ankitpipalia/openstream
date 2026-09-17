@@ -523,6 +523,23 @@ mod macos_pipeline {
     /// channel again. Short enough that a stop request is not left sitting,
     /// long enough that a quiet screen does not spin.
     const FRAME_WAIT: Duration = Duration::from_millis(100);
+    /// How long to block on the capture stream in one go while waiting for a
+    /// frame.
+    ///
+    /// The encoder finishes on a VideoToolbox thread, at its own pace, and a
+    /// host that only collects output as a side effect of submitting the next
+    /// frame holds each finished access unit for the whole gap between frames.
+    /// Measured on an M1 Max at 1920x1080: 290 of 291 access units were already
+    /// finished before the next frame arrived, and the mean time from submit to
+    /// the host noticing was 34.8 ms -- almost all of it waiting, none of it
+    /// encoding. (`cargo run --release -p openstream-macos-host --example
+    /// encode_queue_depth`.)
+    ///
+    /// So the wait is sliced, and the encoder is checked between slices. The
+    /// slice bounds how long a finished frame can sit; at 2 ms the extra
+    /// wakeups on a completely still screen are a few hundred a second doing
+    /// nothing, which is far cheaper than the latency they remove.
+    const DRAIN_SLICE: Duration = Duration::from_millis(2);
 
     /// What the pipeline captures and encodes.
     #[derive(Debug, Clone)]
@@ -785,17 +802,51 @@ mod macos_pipeline {
         /// negotiated rate and only fires on change, so sleeping to an
         /// interval here would add latency to frames that are already due.
         fn stream_once(&mut self, units: &mpsc::Sender<Vec<u8>>) -> bool {
-            let Source::Stream(stream) = &self.source else {
+            if !matches!(self.source, Source::Stream(_)) {
                 return true;
-            };
-            if let Some(surface) = stream.wait_frame(FRAME_WAIT) {
+            }
+            // Wait for the next frame, but keep asking the encoder whether it
+            // has finished one -- output arrives on a VideoToolbox thread and
+            // is otherwise not noticed until the next submit, which costs a
+            // whole inter-frame gap on every frame. Whichever comes first wins.
+            let mut ready;
+            let mut fresh = None;
+            {
+                // Split borrows: the encoder and the capture stream are
+                // disjoint fields, and both are needed in this loop.
+                let Self { source, encoder, .. } = self;
+                let Source::Stream(stream) = source else {
+                    return true;
+                };
+                let deadline = Instant::now() + FRAME_WAIT;
+                loop {
+                    ready = encoder.take_ready();
+                    if !ready.is_empty() {
+                        break;
+                    }
+                    if let Some(surface) = stream.wait_frame(DRAIN_SLICE) {
+                        fresh = Some(surface);
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+            }
+            if !ready.is_empty() {
+                // Send it now rather than after waiting for the next capture.
+                // Going straight back round also re-checks the control channel
+                // before anything else is submitted.
+                return self.emit_units(ready, units);
+            }
+            if let Some(surface) = fresh {
                 self.last_surface = Some(surface);
             } else if self
                 .last_encode
                 .is_none_or(|last| last.elapsed() < KEEPALIVE)
             {
-                // Nothing new and the keepalive is not due: go back and look
-                // at the control channel.
+                // Nothing new, nothing finished, and the keepalive is not due:
+                // go back and look at the control channel.
                 return true;
             }
             // Either a fresh surface, or the last one being re-sent because the
@@ -872,6 +923,23 @@ mod macos_pipeline {
                     return true;
                 }
             };
+            self.emit_units(encoded, units)
+        }
+
+        /// Frame and send access units the encoder has already produced.
+        ///
+        /// Separate from [`Self::emit`] because output is collected in two
+        /// places -- as a submit returns, and while waiting for the next frame
+        /// -- and both have to frame it, count it and apply back-pressure
+        /// identically.
+        fn emit_units(
+            &mut self,
+            encoded: Vec<openstream_macos_media::EncodedAccessUnit>,
+            units: &mpsc::Sender<Vec<u8>>,
+        ) -> bool {
+            if encoded.is_empty() {
+                return true;
+            }
             self.last_encode = Some(Instant::now());
             for unit in encoded {
                 // The VideoToolbox encoder already prepends SPS/PPS to keyframes,
