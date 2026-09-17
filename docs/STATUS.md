@@ -74,8 +74,16 @@ believing it.
 but they are **an experimental subsystem, not something an installer enables**:
 
 - The machine service still loads a static pairing from environment variables.
-  It does not enrol the machine, announce durable presence, receive Secure
-  Connect requests, or obtain fresh role credentials.
+  It does not announce durable presence, receive Secure Connect requests, or
+  obtain fresh role credentials. (Enrolment itself is now `openstream-enrol`.)
+- **Why it could not announce presence, and what changed.** `/v1/presence`
+  needs a device-bound token, and the only way to get one was a password
+  sign-in -- which a service facing the network must not hold. So a machine
+  could be enrolled, trusted, and still unable to say it was online.
+  `POST /v1/auth/device` now takes a signature from the identity key the device
+  enrolled with and returns one. **The machine service does not call it yet**:
+  the endpoint, the transcript and the client library exist and are tested, and
+  nothing announces anything until the service is wired to them.
 - Audio and clipboard are explicitly disabled in it.
 - **Neither binary is in the Linux tarball or the Debian package**, and neither
   are their systemd units. Only the older per-user host-agent service ships.
@@ -96,6 +104,7 @@ Where it actually stands:
 | Provisioning the broker's key without exposing it to the unprivileged service | **implemented** -- written 0600 through a rename; on read the broker requires the file be owned by its own user, be a regular file opened `O_NOFOLLOW`, and sit under directories no one else can write |
 | The enrolment call that obtains the key | **implemented** -- `openstream-enrol` posts to `POST /v1/devices` and writes the key straight to the broker's file, so it never crosses a terminal or a log |
 | Enrolment that recovers from a local failure after the response | **implemented, and narrower than it sounds** -- the destination is created and checked before the request that mints the key, and if storing it still fails the device is removed again through `DELETE /v1/devices/{device_id}`. That covers every failure the client *sees*. It does not cover the two where it sees nothing: a response lost in transit after the server committed, and the process or machine dying between the server's commit and the local one. In both the device exists, its one key does not, and the next attempt gets a 409 that needs a manual removal -- which `openstream-enrol` now spells out, but cannot perform for a device it does not know was created. Closing those needs an idempotent enrolment keyed by a durable client-generated request id; it is not built |
+| A headless machine able to authenticate at all | **implemented** -- `POST /v1/auth/device` takes a signature from the identity key the device enrolled with, bound to the device id, a 30-second window and a single-use nonce. Before this, the only device-bound token came from a password sign-in, which a network-facing service must not hold, so an enrolled and trusted machine still could not announce presence. **Not yet called by the machine service.** |
 | **A machine actually enrolled, and a session run through the chain** | **not done** -- no machine has a grant key, so every broker refuses every session |
 
 So the chain is joined in source from approval to broker, and tested at every
