@@ -34,6 +34,9 @@ pub struct BrokerServer {
     socket_path: PathBuf,
     allowed: AllowedPeers,
     policy: BrokerPolicy,
+    /// Who may say a session was approved. Cloned into each connection, so a
+    /// long-lived server serves every connection against the same pinned key.
+    authority: GrantAuthority,
     /// If set, the socket's group is set to this gid so the unprivileged
     /// machine-service account (a member of that group) can reach a root-owned
     /// socket. `SO_PEERCRED` is still the real gate; this only opens the door to
