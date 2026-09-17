@@ -1879,6 +1879,8 @@ dependencies = [
  "lowlat-core",
  "lowlat-inject",
  "openstream-client-core",
+ "openstream-macos-host",
+ "openstream-macos-media",
  "openstream-media",
  "openstream-platform",
  "openstream-protocol",
@@ -1900,6 +1902,28 @@ dependencies = [
  "openstream-settings",
  "serde",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "openstream-host-broker"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "lowlat-core",
+ "lowlat-host",
+ "lowlat-inject",
+ "lowlat-net",
+ "openstream-host-ipc",
+ "openstream-media",
+ "tokio",
+]
+
+[[package]]
+name = "openstream-host-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "tokio",
 ]
 
@@ -1930,6 +1954,26 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "openstream-machine-service"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "openstream-client-core",
+ "openstream-host-ipc",
+ "openstream-media",
+ "openstream-platform",
+ "openstream-protocol",
+ "tokio",
+]
+
+[[package]]
+name = "openstream-macos-host"
+version = "0.1.0"
+dependencies = [
+ "openstream-macos-media",
 ]
 
 [[package]]

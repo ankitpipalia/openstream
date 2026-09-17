@@ -1,0 +1,46 @@
+[Unit]
+Description=OpenStream privileged device broker (DRM capture and uinput injection)
+Documentation=https://github.com/ankitpipalia/openstream
+# The broker must be listening before the network-facing service that drives it.
+Before=openstream-machine-service.service
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+# Runs as root because it needs CAP_SYS_ADMIN for the DRM scanout -- the kernel
+# hardcodes that capability for the GETFB2 buffer-handle return, with no narrower
+# alternative -- and write access to /dev/uinput. This is the ONLY privileged
+# OpenStream process; it is deliberately NOT network-facing (the machine service
+# is), so it is locked to local sockets and handed only the devices it needs.
+ExecStart=/usr/local/bin/openstream-host-broker
+Environment=OPENSTREAM_BROKER_SOCKET=/run/openstream/broker.sock
+# The machine-service account: OPENSTREAM_BROKER_SERVICE_UID is the uid the broker
+# admits over SO_PEERCRED, and OPENSTREAM_BROKER_SOCKET_GID is the group it gives
+# the socket so that account can connect unprivileged (owner stays root, mode
+# 0660). Both are provisioned by the installer in the env file below; 0 (root) is
+# the bring-up default. Verified 2026-09-16 on the GTX 970: with these set to a
+# non-root account, a uid-1000 consumer connected (socket came up root:<gid> 0660)
+# and captured the live session end to end.
+Environment=OPENSTREAM_BROKER_SERVICE_UID=0
+EnvironmentFile=-/etc/openstream/broker.env
+Restart=on-failure
+RestartSec=2s
+# /run/openstream, where the broker socket is created.
+RuntimeDirectory=openstream
+RuntimeDirectoryMode=0755
+# Hardening. The broker never talks to the network, so it is confined to Unix
+# sockets; it touches only the DRM and uinput devices; and it cannot gain new
+# privileges. CAP_SYS_ADMIN is retained as root; everything else is narrowed.
+RestrictAddressFamilies=AF_UNIX
+DeviceAllow=/dev/uinput rw
+DeviceAllow=char-drm rw
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# Start at boot before any user logs in -- the point of a pre-login host.
+
+[Install]
+WantedBy=multi-user.target

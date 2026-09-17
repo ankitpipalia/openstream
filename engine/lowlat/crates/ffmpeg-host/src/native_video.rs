@@ -1,13 +1,16 @@
-//! In-process video source for the Windows host: no FFmpeg.
+//! In-process video source for the native hosts: no FFmpeg.
 //!
-//! Desktop Duplication captures the desktop, the frame is scaled to the
-//! negotiated size and converted to NV12, and the Media Foundation H.264
-//! encoder turns it into access units -- all inside this process on a
-//! dedicated thread, the way Parsec-class hosts work. Selected with
-//! `OPENSTREAM_CAPTURE_BACKEND=native`.
+//! On Windows, Desktop Duplication captures the desktop, the frame is scaled and
+//! converted to NV12, and the Media Foundation H.264 encoder turns it into access
+//! units. On macOS, CoreGraphics captures the display, the frame is scaled, and
+//! the VideoToolbox H.264 encoder turns it into access units. Either way it runs
+//! inside this process on a dedicated thread, the way Parsec-class hosts work,
+//! selected with `OPENSTREAM_CAPTURE_BACKEND=native`.
 //!
-//! The pipeline itself is Windows-only. Backend selection, scaling and
-//! access-unit framing are pure and unit-tested on every target.
+//! The two pipelines are platform-gated; backend selection, scaling and
+//! access-unit framing are pure and unit-tested on every target. Both expose the
+//! same `NativePipeline` interface (`start`/`next_unit`/`reconfigure`/`stop`) so
+//! the host's `VideoSource` drives them identically.
 
 use std::borrow::Cow;
 
@@ -26,7 +29,7 @@ const ACCESS_UNIT_DELIMITER: [u8; 6] = [0, 0, 0, 1, 0x09, 0xF0];
 /// Frame one encoder access unit for the wire: delimiter, then on keyframes
 /// the SPS/PPS (the encoder publishes them out of band, and a client must be
 /// able to start at any keyframe), then the slices.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn frame_access_unit(
     data: &[u8],
     keyframe: bool,
@@ -49,7 +52,7 @@ pub(crate) fn frame_access_unit(
 /// (capture at native resolution, stream at half) averages each 2x2 block;
 /// anything else is nearest-neighbour, which is cheap and never reads out of
 /// bounds.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) fn scale_bgra<'a>(
     src: &'a [u8],
     src_width: usize,
@@ -467,6 +470,279 @@ mod pipeline {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) use macos_pipeline::{NativeConfig, NativePipeline};
+
+/// The macOS in-process pipeline: CoreGraphics capture -> VideoToolbox H.264,
+/// the same interface as the Windows one. The VideoToolbox encoder already
+/// prepends SPS/PPS to each keyframe, so only the access-unit delimiter is
+/// framed here.
+#[cfg(target_os = "macos")]
+mod macos_pipeline {
+    use std::sync::mpsc as std_mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use openstream_macos_host::capture::ScreenCapture;
+    use openstream_macos_media::VideoToolboxH264Encoder;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::{frame_access_unit, scale_bgra};
+
+    /// Complete access units queued before capture backs off. Small on purpose:
+    /// a deep queue is latency.
+    const QUEUE_DEPTH: usize = 8;
+
+    /// What the pipeline captures and encodes.
+    #[derive(Debug, Clone)]
+    pub(crate) struct NativeConfig {
+        pub(crate) width: u32,
+        pub(crate) height: u32,
+        pub(crate) fps: u32,
+        pub(crate) bitrate_bps: u32,
+        /// CoreGraphics display id to capture; `None` is the main display.
+        pub(crate) display_id: Option<u32>,
+    }
+
+    enum Control {
+        Reconfigure {
+            bitrate_bps: u32,
+            force_keyframe: bool,
+            reply: oneshot::Sender<Result<(), String>>,
+        },
+        Stop,
+    }
+
+    /// Handle to the capture/encode thread: access units come out of
+    /// [`NativePipeline::next_unit`]; keyframe and bitrate changes go in through
+    /// [`NativePipeline::reconfigure`].
+    pub(crate) struct NativePipeline {
+        units: mpsc::Receiver<Vec<u8>>,
+        control: std_mpsc::Sender<Control>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl NativePipeline {
+        /// Open capture and the encoder on the worker thread and start
+        /// streaming. An open failure is returned here, synchronously.
+        pub(crate) fn start(config: NativeConfig) -> Result<Self, String> {
+            let (units_tx, units_rx) = mpsc::channel(QUEUE_DEPTH);
+            let (control_tx, control_rx) = std_mpsc::channel();
+            let (ready_tx, ready_rx) = std_mpsc::channel::<Result<String, String>>();
+            let worker = thread::Builder::new()
+                .name("openstream-native-video".into())
+                .spawn(move || {
+                    let worker = match Worker::open(config) {
+                        Ok(worker) => {
+                            let _ = ready_tx.send(Ok(worker.describe()));
+                            worker
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    };
+                    worker.run(&units_tx, &control_rx);
+                })
+                .map_err(|error| format!("could not start the native video thread: {error}"))?;
+            match ready_rx.recv() {
+                Ok(Ok(description)) => {
+                    eprintln!("OpenStream native video: {description}");
+                    Ok(Self {
+                        units: units_rx,
+                        control: control_tx,
+                        worker: Some(worker),
+                    })
+                }
+                Ok(Err(error)) => {
+                    let _ = worker.join();
+                    Err(error)
+                }
+                Err(_) => {
+                    let _ = worker.join();
+                    Err("the native video thread exited before it was ready".into())
+                }
+            }
+        }
+
+        /// The next complete access unit, or `None` once the thread is gone.
+        pub(crate) async fn next_unit(&mut self) -> Option<Vec<u8>> {
+            self.units.recv().await
+        }
+
+        /// Apply a new bitrate and/or force the next frame to be a keyframe.
+        pub(crate) async fn reconfigure(
+            &mut self,
+            bitrate_bps: u32,
+            force_keyframe: bool,
+        ) -> Result<(), String> {
+            let (reply, done) = oneshot::channel();
+            self.control
+                .send(Control::Reconfigure {
+                    bitrate_bps,
+                    force_keyframe,
+                    reply,
+                })
+                .map_err(|_| "the native video thread is gone".to_string())?;
+            done.await
+                .map_err(|_| "the native video thread dropped a reconfigure request".to_string())?
+        }
+
+        /// Stop the thread and wait for it.
+        pub(crate) fn stop(&mut self) {
+            self.units.close();
+            let _ = self.control.send(Control::Stop);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    impl Drop for NativePipeline {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    struct Worker {
+        config: NativeConfig,
+        width_px: usize,
+        height_px: usize,
+        capture: ScreenCapture,
+        encoder: VideoToolboxH264Encoder,
+        epoch: Instant,
+        interval: Duration,
+        last_encode: Option<Instant>,
+        encoded: u64,
+    }
+
+    impl Worker {
+        fn open(config: NativeConfig) -> Result<Self, String> {
+            let capture = match config.display_id {
+                Some(id) => ScreenCapture::for_display(id),
+                None => ScreenCapture::main(),
+            };
+            let encoder = VideoToolboxH264Encoder::new(
+                config.width,
+                config.height,
+                config.fps,
+                config.bitrate_bps,
+            )
+            .map_err(|error| format!("videotoolbox h264 encoder: {error}"))?;
+            Ok(Self {
+                width_px: config.width as usize,
+                height_px: config.height as usize,
+                interval: Duration::from_micros(1_000_000 / u64::from(config.fps.max(1))),
+                config,
+                capture,
+                encoder,
+                epoch: Instant::now(),
+                last_encode: None,
+                encoded: 0,
+            })
+        }
+
+        fn describe(&self) -> String {
+            format!(
+                "CoreGraphics capture -> VideoToolbox H.264 [hardware], {}x{} @ {} fps, {:.2} Mbps",
+                self.config.width,
+                self.config.height,
+                self.config.fps,
+                f64::from(self.config.bitrate_bps) / 1_000_000.0
+            )
+        }
+
+        fn run(mut self, units: &mpsc::Sender<Vec<u8>>, control: &std_mpsc::Receiver<Control>) {
+            self.stream(units, control);
+            eprintln!(
+                "OpenStream native video: stopped after {} access units",
+                self.encoded
+            );
+        }
+
+        fn stream(&mut self, units: &mpsc::Sender<Vec<u8>>, control: &std_mpsc::Receiver<Control>) {
+            loop {
+                while let Ok(command) = control.try_recv() {
+                    match command {
+                        Control::Stop => return,
+                        Control::Reconfigure {
+                            bitrate_bps,
+                            force_keyframe,
+                            reply,
+                        } => {
+                            let _ = reply.send(self.reconfigure(bitrate_bps, force_keyframe));
+                        }
+                    }
+                }
+                // Pace to the negotiated rate. CoreGraphics capture is a poll, so
+                // (unlike Desktop Duplication) there is no change signal; a future
+                // ScreenCaptureKit path can skip unchanged frames.
+                if let Some(last) = self.last_encode {
+                    let elapsed = last.elapsed();
+                    if elapsed < self.interval {
+                        thread::sleep(self.interval - elapsed);
+                    }
+                }
+                let frame = match self.capture.capture() {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        eprintln!("OpenStream native capture failed: {error}");
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                };
+                let scaled = scale_bgra(
+                    &frame.bgra,
+                    frame.width,
+                    frame.height,
+                    self.width_px,
+                    self.height_px,
+                )
+                .into_owned();
+                if !self.encode(&scaled, units) {
+                    return;
+                }
+            }
+        }
+
+        fn encode(&mut self, bgra: &[u8], units: &mpsc::Sender<Vec<u8>>) -> bool {
+            let pts_us = i64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(i64::MAX);
+            let encoded = match self.encoder.encode(bgra, pts_us) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    eprintln!("OpenStream native encode failed: {error}");
+                    thread::sleep(Duration::from_millis(100));
+                    return true;
+                }
+            };
+            self.last_encode = Some(Instant::now());
+            for unit in encoded {
+                // The VideoToolbox encoder already prepends SPS/PPS to keyframes,
+                // so only the access-unit delimiter is framed here.
+                let payload = frame_access_unit(&unit.data, false, None);
+                if units.blocking_send(payload).is_err() {
+                    return false;
+                }
+                self.encoded += 1;
+            }
+            true
+        }
+
+        fn reconfigure(&mut self, bitrate_bps: u32, force_keyframe: bool) -> Result<(), String> {
+            if bitrate_bps != self.config.bitrate_bps {
+                self.encoder
+                    .set_bitrate(bitrate_bps)
+                    .map_err(|error| format!("set bitrate: {error}"))?;
+                self.config.bitrate_bps = bitrate_bps;
+            }
+            if force_keyframe {
+                self.encoder.force_keyframe();
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +840,55 @@ mod tests {
         // Upscaling reads only valid source pixels too.
         let up = scale_bgra(&src, 3, 3, 7, 5).into_owned();
         assert_eq!(up.len(), 7 * 5 * 4);
+    }
+}
+
+/// The macOS in-process pipeline end to end: start it, pull real access units,
+/// and check the wire shape. Needs a live display and Screen Recording, so it is
+/// gated behind `OPENSTREAM_REQUIRE_MACOS_CAPTURE` like the capture smoke.
+#[cfg(all(test, target_os = "macos"))]
+mod macos_native_tests {
+    use std::time::Duration;
+
+    use super::{ACCESS_UNIT_DELIMITER, NativeConfig, NativePipeline};
+
+    #[tokio::test]
+    async fn the_native_pipeline_produces_delimited_access_units() {
+        if std::env::var_os("OPENSTREAM_REQUIRE_MACOS_CAPTURE").is_none() {
+            eprintln!(
+                "skipping macOS native pipeline test (set OPENSTREAM_REQUIRE_MACOS_CAPTURE and grant Screen Recording)"
+            );
+            return;
+        }
+        let mut pipeline = NativePipeline::start(NativeConfig {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_bps: 8_000_000,
+            display_id: None,
+        })
+        .expect("the native pipeline starts");
+
+        let mut units = 0_u32;
+        let mut bytes = 0_usize;
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_secs(3), pipeline.next_unit()).await {
+                Ok(Some(unit)) => {
+                    assert!(
+                        unit.len() > ACCESS_UNIT_DELIMITER.len(),
+                        "empty access unit"
+                    );
+                    // Every unit begins with the access-unit delimiter.
+                    assert_eq!(&unit[..ACCESS_UNIT_DELIMITER.len()], &ACCESS_UNIT_DELIMITER);
+                    units += 1;
+                    bytes += unit.len();
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        pipeline.stop();
+        assert!(units > 0, "the native pipeline produced no access units");
+        eprintln!("macOS native pipeline: {units} access units, {bytes} bytes");
     }
 }
