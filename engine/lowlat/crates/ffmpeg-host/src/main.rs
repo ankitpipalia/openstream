@@ -159,6 +159,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Runtime monitor switching is only honest when this adapter controls the
     // X11 origin. A custom input or custom argument list may describe a
     // PipeWire/window/device source that cannot be selected by an xrandr id.
+    //
+    // Note what this says about the native hosts: **Windows and macOS do not
+    // implement multi-monitor discovery or switching at all.** Both always open
+    // with `output_index: None` and `display_id: None`, so the condition below
+    // is false for them, `host_capabilities.multi_monitor` is advertised as
+    // false, and a selection that arrives anyway is logged and ignored rather
+    // than silently appearing to work. That is the honest posture for a feature
+    // that is missing, but it is missing -- not merely gated.
+    //
+    // Implementing it is not a matter of relaxing this condition. The requested
+    // display has to be carried as a *stable* identifier into `NativeConfig`
+    // (`display_id` on macOS, the DXGI output on Windows), and then verified
+    // against what the capture source actually opened, because an index into a
+    // monitor list is not stable across hotplug and a request that silently
+    // lands on the wrong screen is worse than one that is refused.
     let display_selection_enabled = cfg!(target_os = "linux")
         && capture_backend == "x11grab"
         && env::var_os("OPENSTREAM_FFMPEG_INPUT").is_none()

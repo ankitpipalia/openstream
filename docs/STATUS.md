@@ -115,6 +115,20 @@ The remaining work is not desktop work beyond that. Only `machine-service`
 depends on `host-broker`; the desktop drives `host-agent` directly and never
 speaks to the privileged broker.
 
+### Native multi-monitor is not implemented
+
+Runtime monitor selection works only on Linux X11, and only when this adapter
+controls the capture origin. The native Windows and macOS hosts always open with
+no display selected, advertise `multi_monitor = false`, and log and ignore any
+selection that arrives -- so nothing reports a switch that did not happen, but
+nothing performs one either.
+
+Adding it is not a matter of relaxing the gate. The requested display has to be
+carried as a **stable** identifier into `NativeConfig` (`display_id` on macOS,
+the DXGI output on Windows) and then verified against what the capture source
+actually opened: an index into a monitor list is not stable across hotplug, and
+a request that silently lands on the wrong screen is worse than one refused.
+
 ### The deployed backend is behind `main`
 
 `https://signal.ankitpipalia.site/healthz` answers, but `/version` returns

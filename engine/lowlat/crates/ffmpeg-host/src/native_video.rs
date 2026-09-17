@@ -561,6 +561,10 @@ mod macos_pipeline {
     const QUEUE_DEPTH: usize = 8;
     /// How long to wait for queue capacity before looking at control again.
     const SEND_RETRY: Duration = Duration::from_millis(1);
+    /// How many consecutive keepalive frames pass before saying so. At one a
+    /// second this is a line every thirty seconds of stillness, which is quiet
+    /// enough to leave on and loud enough to notice.
+    const STALL_REPORT_UNITS: u64 = 30;
 
     /// How long a static desktop goes before the last frame is re-sent.
     ///
@@ -732,6 +736,25 @@ mod macos_pipeline {
         epoch: Instant,
         interval: Duration,
         last_encode: Option<Instant>,
+        /// When the capture source last handed over a *new* surface.
+        ///
+        /// Deliberately separate from `last_encode`. The keepalive re-encodes
+        /// the last surface every second, so encoded output and the frame
+        /// counter keep advancing even when capture has wedged and no fresh
+        /// picture has arrived for minutes. Anything that judges capture health
+        /// from "are units still being produced" would call that healthy.
+        ///
+        /// So: capture health is judged from this, and transport liveness from
+        /// `last_encode`. They answer different questions and a repeated frame
+        /// is a legitimate answer to only one of them.
+        last_fresh_capture: Option<Instant>,
+        /// Access units produced from a surface the capture source had just
+        /// delivered.
+        fresh_units: u64,
+        /// Access units produced by re-encoding a surface already sent, to keep
+        /// the stream alive on a still screen. Counted apart so a session that
+        /// is all keepalive is visible as one.
+        repeated_units: u64,
         encoded: u64,
         /// The last surface the stream delivered, kept so a still screen can be
         /// re-sent as a keepalive. Only used by [`Source::Stream`].
@@ -757,6 +780,9 @@ mod macos_pipeline {
                 encoder,
                 epoch: Instant::now(),
                 last_encode: None,
+                last_fresh_capture: None,
+                fresh_units: 0,
+                repeated_units: 0,
                 encoded: 0,
                 last_surface: None,
             })
@@ -942,8 +968,10 @@ mod macos_pipeline {
                 // before anything else is submitted.
                 return self.emit_units(ready, units, control);
             }
+            let repeated = fresh.is_none();
             if let Some(surface) = fresh {
                 self.last_surface = Some(surface);
+                self.last_fresh_capture = Some(Instant::now());
             } else if self
                 .last_encode
                 .is_none_or(|last| last.elapsed() < KEEPALIVE)
@@ -964,7 +992,42 @@ mod macos_pipeline {
                 self.encoder
                     .encode_surface(surface.as_ptr().cast(), self.pts_now())
             };
+            self.note_capture_freshness(repeated);
             self.emit(encoded, units, control)
+        }
+
+        /// Record whether the frame about to be encoded came from a new capture
+        /// or is the keepalive re-sending the last one, and say so once when it
+        /// changes.
+        ///
+        /// The transition is logged rather than every repeat: a still desktop
+        /// produces one of these a second forever, and a log line per keepalive
+        /// would bury the moment capture actually stopped.
+        fn note_capture_freshness(&mut self, repeated: bool) {
+            if repeated {
+                self.repeated_units += 1;
+                if let Some(last) = self.last_fresh_capture
+                    && self.repeated_units % STALL_REPORT_UNITS == 0
+                {
+                    eprintln!(
+                        "OpenStream capture: no new surface for {:.1}s; the stream is being kept \
+alive by re-encoding the last frame",
+                        last.elapsed().as_secs_f32()
+                    );
+                }
+            } else {
+                self.fresh_units += 1;
+            }
+        }
+
+        /// How long capture has been silent, or `None` if it has never
+        /// delivered.
+        ///
+        /// This is the number that says whether capture is healthy. The encoded
+        /// frame counter is not: the keepalive keeps it moving regardless.
+        #[allow(dead_code)]
+        fn capture_silence(&self) -> Option<Duration> {
+            self.last_fresh_capture.map(|last| last.elapsed())
         }
 
         /// One turn of the CoreGraphics loop: pace, snapshot, copy, rescale,
