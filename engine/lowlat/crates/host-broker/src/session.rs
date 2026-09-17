@@ -16,6 +16,7 @@
 //! greeter contracts the grant the same way.
 
 use std::io;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use openstream_host_ipc::grant::SessionGrant;
@@ -110,34 +111,6 @@ impl std::fmt::Debug for GrantAuthority {
     }
 }
 
-/// The nonces this broker has already honoured, so a captured grant cannot be
-/// presented twice.
-///
-/// [`SessionGrant`] verifies one grant in isolation and cannot know it has seen
-/// it before; that is the caller's job, and this is the caller. Entries are
-/// dropped once their grant has expired, which bounds the set by how many
-/// approvals can be issued inside one validity window rather than by how long
-/// the broker has been running.
-#[derive(Debug, Default)]
-struct SeenNonces {
-    entries: Vec<(u128, u64)>,
-}
-
-impl SeenNonces {
-    /// Record `nonce` as used, or report that it already was.
-    ///
-    /// Expired entries are dropped on the way past, so a long-lived broker
-    /// does not accumulate them.
-    fn accept(&mut self, nonce: u128, expires_at_ms: u64, now_ms: u64) -> bool {
-        self.entries.retain(|(_, expiry)| *expiry >= now_ms);
-        if self.entries.iter().any(|(seen, _)| *seen == nonce) {
-            return false;
-        }
-        self.entries.push((nonce, expires_at_ms));
-        true
-    }
-}
-
 impl Default for BrokerPolicy {
     fn default() -> Self {
         Self {
@@ -146,9 +119,7 @@ impl Default for BrokerPolicy {
             // anything, and the machine service is network-facing: if its
             // configuration is missing or unreadable, the safe reading is that
             // the operator has not granted it capture or input, not that they
-            // granted it everything. The previous default was
-            // `Capabilities::all()`, which meant a service compromise reached
-            // straight through to the devices.
+            // granted it everything.
             ceiling: Capabilities::none(),
             frame_poll: Duration::from_millis(1),
         }
@@ -182,6 +153,133 @@ impl TokenSource for SystemEntropy {
             Err(_) => NO_GRANT,
         }
     }
+}
+
+/// The approvals this broker is honouring, and who holds each one.
+///
+/// A [`SessionGrant`] authorises one session for its validity window. What the
+/// broker has to decide is not "have I seen this nonce" but "is this the
+/// session it was issued for, and is anyone else already running it".
+///
+/// The distinction matters because a legitimate host reuses its approval. The
+/// lifecycle emits `StopCapture` when the peer is lost and `StartCapture` when
+/// it returns, and the machine service can restart and reconnect entirely --
+/// all with the same grant, because the control plane issued one per approval
+/// and not one per attempt. A registry that refused the second use would break
+/// reconnection, and one scoped to a single connection would refuse a restart
+/// while permitting a genuine replay from a fresh connection. That combination
+/// was the first thing built here and it is the worst of both.
+///
+/// So this lives on the server, across connections, and grants a *lease*:
+///
+/// * a grant nobody holds is granted, and bound to its session;
+/// * the holder may present it again as often as it likes;
+/// * a second, concurrent connection presenting it is refused;
+/// * a grant naming a different session than the one its nonce is bound to is
+///   refused, which is what stops a captured nonce being re-tagged;
+/// * a lease past its expiry is forgotten, and the grant carrying it fails its
+///   own expiry check anyway.
+#[derive(Debug, Default)]
+pub struct SessionLeases {
+    entries: Vec<Lease>,
+}
+
+#[derive(Debug)]
+struct Lease {
+    nonce: u128,
+    session_id: String,
+    expires_at_ms: u64,
+    /// The connection currently running this session, or `None` once it has
+    /// gone. The lease outlives the connection so the nonce stays bound to its
+    /// session for the rest of the window.
+    holder: Option<u64>,
+}
+
+/// What [`SessionLeases::acquire`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    /// Nobody held this approval; it is now this connection's.
+    Granted,
+    /// This connection already holds it, or it was free and has been taken
+    /// back. A restart or a reconnect.
+    Reattached,
+    /// Another live connection is running this session.
+    HeldElsewhere,
+    /// The nonce is bound to a different session than the grant claims.
+    SessionMismatch,
+}
+
+impl SessionLeases {
+    /// Take or reattach to the lease for `nonce`.
+    pub fn acquire(
+        &mut self,
+        nonce: u128,
+        session_id: &str,
+        expires_at_ms: u64,
+        now_ms: u64,
+        connection: u64,
+    ) -> LeaseOutcome {
+        self.entries.retain(|lease| lease.expires_at_ms >= now_ms);
+        if let Some(lease) = self.entries.iter_mut().find(|lease| lease.nonce == nonce) {
+            if lease.session_id != session_id {
+                return LeaseOutcome::SessionMismatch;
+            }
+            return match lease.holder {
+                Some(holder) if holder == connection => LeaseOutcome::Reattached,
+                Some(_) => LeaseOutcome::HeldElsewhere,
+                None => {
+                    lease.holder = Some(connection);
+                    LeaseOutcome::Reattached
+                }
+            };
+        }
+        self.entries.push(Lease {
+            nonce,
+            session_id: session_id.to_string(),
+            expires_at_ms,
+            holder: Some(connection),
+        });
+        LeaseOutcome::Granted
+    }
+
+    /// Give up whatever `connection` was holding.
+    ///
+    /// The entries stay: the nonce remains bound to its session until the
+    /// window closes, so a later connection can reattach but a different
+    /// session cannot claim the same nonce.
+    pub fn release(&mut self, connection: u64) {
+        for lease in &mut self.entries {
+            if lease.holder == Some(connection) {
+                lease.holder = None;
+            }
+        }
+    }
+
+    /// How many leases are being tracked. For tests and diagnostics.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing is tracked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// Wall-clock milliseconds since the epoch, for grant expiry.
+///
+/// A grant's window is written by the control plane in absolute time, so this
+/// has to be the wall clock and not a monotonic one. A machine whose clock is
+/// badly wrong will refuse valid grants -- reported as expired or not-yet-valid
+/// rather than silently accepted, which is the safe direction.
+fn system_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Parse an operator-configured capability ceiling.
@@ -221,20 +319,6 @@ pub fn parse_ceiling(spec: &str) -> Result<Capabilities, String> {
         ceiling = ceiling.with(capability);
     }
     Ok(ceiling)
-}
-
-/// Wall-clock milliseconds since the epoch, for grant expiry.
-///
-/// A grant's window is written by the control plane in absolute time, so this
-/// has to be the wall clock and not a monotonic one. A machine whose clock is
-/// badly wrong will refuse valid grants -- reported as expired or not-yet-valid
-/// rather than silently accepted, which is the safe direction.
-fn system_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-        })
 }
 
 /// The capabilities a seat can ever expose, regardless of what was requested.
@@ -284,8 +368,11 @@ pub struct BrokerSession {
     tokens: Box<dyn TokenSource + Send>,
     /// Who may say a session was approved, and which machine this is.
     authority: GrantAuthority,
-    /// Nonces already honoured, so a captured approval cannot be replayed.
-    seen: SeenNonces,
+    /// The server's lease registry, shared across connections so a reconnect
+    /// can reattach and a concurrent connection cannot.
+    leases: Arc<Mutex<SessionLeases>>,
+    /// This connection's identity within that registry.
+    connection: u64,
     /// What the verified approval allowed. A ceiling that survives a seat
     /// switch, so logging in cannot widen a session past its approval.
     approved_capabilities: Capabilities,
@@ -296,6 +383,18 @@ pub struct BrokerSession {
     /// Supplies "now" for expiry checks. A field so a test can move the clock
     /// without sleeping, and so the production value is named in one place.
     now_ms: Box<dyn FnMut() -> u64 + Send>,
+}
+
+impl Drop for BrokerSession {
+    fn drop(&mut self) {
+        // Give the lease back so a reconnect can take it. The entry itself
+        // stays until its window closes, which is what keeps the nonce bound
+        // to this session in the meantime.
+        self.leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(self.connection);
+    }
 }
 
 impl std::fmt::Debug for BrokerSession {
@@ -331,6 +430,29 @@ impl BrokerSession {
         Self::with_parts(
             policy,
             authority,
+            Arc::new(Mutex::new(SessionLeases::default())),
+            0,
+            Box::new(SystemEntropy),
+            Box::new(system_now_ms),
+        )
+    }
+
+    /// A session sharing `leases` with the rest of the server.
+    ///
+    /// `connection` identifies this one within the registry, so a lease can be
+    /// reattached by the holder and refused to anybody else.
+    #[must_use]
+    pub fn with_leases(
+        policy: BrokerPolicy,
+        authority: GrantAuthority,
+        leases: Arc<Mutex<SessionLeases>>,
+        connection: u64,
+    ) -> Self {
+        Self::with_parts(
+            policy,
+            authority,
+            leases,
+            connection,
             Box::new(SystemEntropy),
             Box::new(system_now_ms),
         )
@@ -346,6 +468,8 @@ impl BrokerSession {
     pub fn with_parts(
         policy: BrokerPolicy,
         authority: GrantAuthority,
+        leases: Arc<Mutex<SessionLeases>>,
+        connection: u64,
         tokens: Box<dyn TokenSource + Send>,
         now_ms: Box<dyn FnMut() -> u64 + Send>,
     ) -> Self {
@@ -360,7 +484,8 @@ impl BrokerSession {
             grant: None,
             tokens,
             authority,
-            seen: SeenNonces::default(),
+            leases,
+            connection,
             approved_capabilities: Capabilities::none(),
             session_id: None,
             now_ms,
@@ -401,19 +526,38 @@ impl BrokerSession {
             eprintln!("openstream-host-broker: refusing a session; {error}");
             "no session approval could be verified".to_string()
         })?;
-        // Replay is not something a single grant can rule out: it is the same
-        // bytes, correctly tagged, presented again. The broker is the only
-        // party that can remember.
-        if !self
-            .seen
-            .accept(approved.nonce, approved.expires_at_ms, now)
-        {
-            eprintln!(
-                "openstream-host-broker: refusing a session; this approval has already been used"
+        // A grant authorises a session, not a single request. The holder may
+        // present it again -- a capture restart after the peer was lost, or a
+        // reconnect after the service died -- but a second live connection may
+        // not, and a nonce may not be re-tagged onto a different session.
+        let outcome = self
+            .leases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .acquire(
+                approved.nonce,
+                &approved.session_id,
+                approved.expires_at_ms,
+                now,
+                self.connection,
             );
-            return Err("no session approval could be verified".into());
+        match outcome {
+            LeaseOutcome::Granted | LeaseOutcome::Reattached => Ok(approved),
+            LeaseOutcome::HeldElsewhere => {
+                eprintln!(
+                    "openstream-host-broker: refusing a session; this approval is already \
+                     running on another connection"
+                );
+                Err("no session approval could be verified".into())
+            }
+            LeaseOutcome::SessionMismatch => {
+                eprintln!(
+                    "openstream-host-broker: refusing a session; this approval's nonce belongs \
+                     to a different session"
+                );
+                Err("no session approval could be verified".into())
+            }
         }
-        Ok(approved)
     }
 
     /// Whether `token_id` is the grant this broker issued to this connection.
@@ -679,12 +823,29 @@ impl BrokerSession {
 /// # Errors
 /// Returns an I/O error if the transport fails. A clean EOF (the service closed
 /// the socket) returns `Ok(())`.
+/// Everything a connection needs beyond its own socket.
+///
+/// A struct rather than four more parameters: `serve_connection` already takes
+/// a reader, a writer, a peer and two device sinks, and a positional list that
+/// long is one transposition away from serving a connection under another
+/// one's lease.
+#[derive(Debug)]
+pub struct ConnectionContext {
+    /// The operator's standing capability ceiling for this machine.
+    pub policy: BrokerPolicy,
+    /// Who may say a session was approved.
+    pub authority: GrantAuthority,
+    /// The server's lease registry, shared by every connection.
+    pub leases: Arc<Mutex<SessionLeases>>,
+    /// This connection's identity within that registry.
+    pub connection: u64,
+}
+
 pub async fn serve_connection<R, W, F, I>(
     reader: &mut R,
     writer: &mut W,
     peer: PeerIdentity,
-    policy: BrokerPolicy,
-    authority: GrantAuthority,
+    context: ConnectionContext,
     frames: &mut F,
     input: &mut I,
 ) -> io::Result<()>
@@ -695,7 +856,13 @@ where
     I: InputSink,
 {
     let _ = peer;
-    let mut session = BrokerSession::with_authority(policy, authority);
+    let ConnectionContext {
+        policy,
+        authority,
+        leases,
+        connection,
+    } = context;
+    let mut session = BrokerSession::with_leases(policy, authority, leases, connection);
     let mut tick = tokio::time::interval(policy.frame_poll);
     loop {
         tokio::select! {
@@ -808,12 +975,40 @@ mod tests {
     }
 
     fn session_with(policy: BrokerPolicy, authority: GrantAuthority) -> BrokerSession {
-        BrokerSession::with_parts(
+        session_on(
             policy,
             authority,
+            Arc::new(Mutex::new(SessionLeases::default())),
+            0,
+        )
+    }
+
+    /// A session sharing a lease registry, so a test can model two
+    /// connections to the same broker.
+    fn session_on(
+        policy: BrokerPolicy,
+        authority: GrantAuthority,
+        leases: Arc<Mutex<SessionLeases>>,
+        connection: u64,
+    ) -> BrokerSession {
+        let mut session = BrokerSession::with_parts(
+            policy,
+            authority,
+            leases,
+            connection,
             Box::new(FixedToken(TEST_GRANT)),
             Box::new(|| TEST_NOW_MS),
-        )
+        );
+        let mut frames = FakeFrameSource::default();
+        let mut input = FakeInputSink::default();
+        session.handle_request(
+            ServiceRequest::Hello {
+                protocol: PROTOCOL_VERSION,
+            },
+            &mut frames,
+            &mut input,
+        );
+        session
     }
 
     /// Open a capture under `grant` and return the capability the broker
@@ -861,19 +1056,17 @@ mod tests {
         }
     }
 
+    /// A session that has completed its handshake, plus fresh fakes.
+    ///
+    /// `session_on` performs the handshake, so this does not repeat it: a
+    /// second `Hello` is a documented no-op and asserting on its (empty)
+    /// response fails.
     fn handshaken() -> (BrokerSession, FakeFrameSource, FakeInputSink) {
-        let mut session = session_with(permissive(), authority());
-        let mut frames = FakeFrameSource::default();
-        let mut input = FakeInputSink::default();
-        let events = session.handle_request(
-            ServiceRequest::Hello {
-                protocol: PROTOCOL_VERSION,
-            },
-            &mut frames,
-            &mut input,
-        );
-        assert!(matches!(events.as_slice(), [BrokerEvent::Hello { .. }]));
-        (session, frames, input)
+        (
+            session_with(permissive(), authority()),
+            FakeFrameSource::default(),
+            FakeInputSink::default(),
+        )
     }
 
     #[test]
@@ -1100,14 +1293,46 @@ mod tests {
         );
     }
 
-    /// The same approval presented twice is a replay. A single grant cannot
-    /// detect it; the broker remembers.
+    /// A capture restart reuses the same approval, and must work.
+    ///
+    /// The lifecycle emits `StopCapture` when the peer is lost and
+    /// `StartCapture` when it returns, with the approval the control plane
+    /// issued once for the session. The first version of this check refused
+    /// the second use as a replay, which would have broken every reconnect.
     #[test]
-    fn the_same_approval_cannot_be_used_twice() {
+    fn the_holder_may_present_its_approval_again() {
         let (mut session, mut frames, mut input) = handshaken();
         let approved = approval(Capabilities::all());
-        let first = open(
-            &mut session,
+        for attempt in 1..=3 {
+            let events = open(
+                &mut session,
+                &mut frames,
+                &mut input,
+                &approved,
+                Capabilities::all(),
+                Seat::User,
+            );
+            assert!(
+                matches!(events.as_slice(), [BrokerEvent::CaptureStarted { .. }]),
+                "attempt {attempt} was refused: {events:?}"
+            );
+        }
+    }
+
+    /// A second, live connection presenting the same approval is refused.
+    ///
+    /// This is the case a per-connection registry could never see, and it is
+    /// the one that matters: two services running one approval at once.
+    #[test]
+    fn a_concurrent_connection_cannot_run_the_same_approval() {
+        let leases = Arc::new(Mutex::new(SessionLeases::default()));
+        let approved = approval(Capabilities::all());
+        let mut frames = FakeFrameSource::default();
+        let mut input = FakeInputSink::default();
+
+        let mut first = session_on(permissive(), authority(), Arc::clone(&leases), 1);
+        let started = open(
+            &mut first,
             &mut frames,
             &mut input,
             &approved,
@@ -1115,12 +1340,13 @@ mod tests {
             Seat::User,
         );
         assert!(matches!(
-            first.as_slice(),
+            started.as_slice(),
             [BrokerEvent::CaptureStarted { .. }]
         ));
 
-        let replayed = open(
-            &mut session,
+        let mut second = session_on(permissive(), authority(), Arc::clone(&leases), 2);
+        let refused = open(
+            &mut second,
             &mut frames,
             &mut input,
             &approved,
@@ -1129,14 +1355,89 @@ mod tests {
         );
         assert!(
             matches!(
-                replayed.as_slice(),
+                refused.as_slice(),
                 [BrokerEvent::CaptureError {
                     code: code::UNAUTHORISED,
                     ..
                 }]
             ),
-            "got {replayed:?}"
+            "got {refused:?}"
         );
+    }
+
+    /// After the holder goes, a reconnect may take the lease back.
+    ///
+    /// A service that restarts reads the same pairing file and presents the
+    /// same approval. Refusing it would mean a crash costs a fresh approval
+    /// from a person.
+    #[test]
+    fn a_reconnect_may_reattach_once_the_holder_is_gone() {
+        let leases = Arc::new(Mutex::new(SessionLeases::default()));
+        let approved = approval(Capabilities::all());
+        let mut frames = FakeFrameSource::default();
+        let mut input = FakeInputSink::default();
+
+        {
+            let mut first = session_on(permissive(), authority(), Arc::clone(&leases), 1);
+            open(
+                &mut first,
+                &mut frames,
+                &mut input,
+                &approved,
+                Capabilities::all(),
+                Seat::User,
+            );
+        } // the connection ends here, releasing the lease
+
+        let mut reconnected = session_on(permissive(), authority(), Arc::clone(&leases), 2);
+        let events = open(
+            &mut reconnected,
+            &mut frames,
+            &mut input,
+            &approved,
+            Capabilities::all(),
+            Seat::User,
+        );
+        assert!(
+            matches!(events.as_slice(), [BrokerEvent::CaptureStarted { .. }]),
+            "a reconnect must be able to reattach: {events:?}"
+        );
+    }
+
+    /// A nonce stays bound to the session it was issued for. Re-tagging one
+    /// onto a different session is refused even by the connection that holds
+    /// it -- otherwise a captured nonce is a free session id.
+    #[test]
+    fn a_nonce_cannot_be_moved_to_another_session() {
+        let mut leases = SessionLeases::default();
+        assert_eq!(
+            leases.acquire(7, "session-a", 60_000, 0, 1),
+            LeaseOutcome::Granted
+        );
+        assert_eq!(
+            leases.acquire(7, "session-b", 60_000, 0, 1),
+            LeaseOutcome::SessionMismatch
+        );
+        assert_eq!(
+            leases.acquire(7, "session-a", 60_000, 0, 1),
+            LeaseOutcome::Reattached
+        );
+    }
+
+    /// Leases are forgotten once their window closes, so the registry is
+    /// bounded by how many approvals fit in one window rather than by uptime.
+    #[test]
+    fn expired_leases_are_forgotten() {
+        let mut leases = SessionLeases::default();
+        leases.acquire(7, "session-a", 1_000, 0, 1);
+        assert_eq!(leases.len(), 1);
+        // Past the expiry the entry goes, and a grant carrying that nonce
+        // would fail its own expiry check before ever reaching here.
+        assert_eq!(
+            leases.acquire(8, "session-b", 5_000, 2_000, 1),
+            LeaseOutcome::Granted
+        );
+        assert_eq!(leases.len(), 1);
     }
 
     /// An approval whose window has passed is refused, so a capability cannot
@@ -1146,6 +1447,8 @@ mod tests {
         let mut session = BrokerSession::with_parts(
             permissive(),
             authority(),
+            Arc::new(Mutex::new(SessionLeases::default())),
+            0,
             Box::new(FixedToken(TEST_GRANT)),
             // Past the 60_000 ms every test approval expires at.
             Box::new(|| 120_000),
@@ -1249,20 +1552,6 @@ mod tests {
             "got {events:?}"
         );
         assert_eq!(session.granted(), Capabilities::CAPTURE);
-    }
-
-    /// The nonce set is bounded by the validity window, not by uptime: an
-    /// entry is dropped once the approval it names could no longer be used.
-    #[test]
-    fn expired_nonces_are_forgotten() {
-        let mut seen = SeenNonces::default();
-        assert!(seen.accept(1, 1_000, 0));
-        assert!(!seen.accept(1, 1_000, 500), "still inside its window");
-        // Past the expiry, the entry is dropped -- and the same nonce is then
-        // accepted again, which is safe because a grant carrying it would fail
-        // its own expiry check first.
-        assert!(seen.accept(1, 1_000, 2_000));
-        assert_eq!(seen.entries.len(), 1);
     }
 
     /// The finding this whole change exists for: a service that names a grant
@@ -1687,8 +1976,12 @@ mod tests {
                 &mut reader,
                 &mut writer,
                 peer,
-                policy,
-                authority(),
+                ConnectionContext {
+                    policy,
+                    authority: authority(),
+                    leases: Arc::new(Mutex::new(SessionLeases::default())),
+                    connection: 0,
+                },
                 &mut frames,
                 &mut input,
             )

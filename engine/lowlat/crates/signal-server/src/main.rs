@@ -2559,11 +2559,16 @@ async fn connect_approve(
             // Minted here, for this device, from this approval. The host
             // relays it; it cannot produce one, which is what makes the
             // broker's check mean anything.
-            let session_grant = state
-                .accounts
-                .lock()
-                .await
-                .issue_session_grant(&control_plane::SessionGrantRequest {
+            // An issuance failure is a server fault, not "no grant".
+            //
+            // Swallowing it returned an otherwise valid host credential with
+            // no approval attached, so the host started and its broker refused
+            // it later with an authorisation error pointing nowhere near the
+            // CSPRNG or store fault that actually happened. The caller gets a
+            // 500 and can retry; only the deliberate legacy case -- a device
+            // enrolled before grant keys existed -- yields `None`.
+            let session_grant = match state.accounts.lock().await.issue_session_grant(
+                &control_plane::SessionGrantRequest {
                     account_id: &account_id,
                     device_id: &device_id,
                     session_id: &session_id,
@@ -2571,10 +2576,11 @@ async fn connect_approve(
                     capabilities: broker_capabilities(permissions),
                     now_ms: control_plane::now_ms(),
                     lifetime_ms: SESSION_GRANT_LIFETIME_MS,
-                })
-                .ok()
-                .flatten()
-                .map(|bytes| lowlat_crypto::hex(bytes.as_slice()));
+                },
+            ) {
+                Ok(grant) => grant.map(|bytes| lowlat_crypto::hex(bytes.as_slice())),
+                Err(error) => return control_error_response(error),
+            };
             Json(ConnectCredential {
                 websocket_path: format!("/v1/signal/{session_id}/host"),
                 relay_ticket: relay_ticket::mint(
