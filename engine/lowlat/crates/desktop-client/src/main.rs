@@ -581,7 +581,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    // Set when the network worker has returned for good, which is the only
+    // thing that drops its `UiSender`. Reconnects happen inside the worker, so
+    // this is a terminal end of session, not a gap between two of them.
+    let mut worker_finished = false;
+    while window.is_open() && !window.is_key_down(Key::Escape) && !worker_finished {
         loop {
             match ui_rx.try_recv() {
                 Ok(UiMessage::Ready {
@@ -781,6 +785,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     input_state.last_mouse = None;
                     input_state.last_window_mouse = None;
                     input_state.button_state = [false; 3];
+                    // The worker is gone and will not come back: it owns the
+                    // reconnect loop, so there is nothing left to wait for.
+                    // Leaving the window up here left a dead picture on screen
+                    // and a process that only a kill could end -- which is also
+                    // what the shell that launched it would be waiting on.
+                    // Critical messages and the newest frame are both drained
+                    // ahead of this lane, so nothing is dropped by leaving now.
+                    worker_finished = true;
                     break;
                 }
             }
@@ -3833,6 +3845,42 @@ mod tests {
         assert!(sender.send_frame(test_frame(0)).delivered());
         assert!(sender.send(UiMessage::End).is_ok());
         assert!(matches!(receiver.try_recv(), Ok(UiMessage::End)));
+    }
+
+    /// The window closes on `Disconnected`, so that outcome must only appear
+    /// once there is genuinely nothing left to show.
+    ///
+    /// The worker's `UiSender` drops only when the worker has returned for
+    /// good -- it owns the reconnect loop -- and the window treats that as the
+    /// end of the run. Before it can, every message already handed over has to
+    /// come out: a terminal error on the critical lane and the last decoded
+    /// picture both outrank the lane that reports the disconnect.
+    #[test]
+    fn a_dropped_worker_reports_disconnected_only_after_its_last_message() {
+        let (normal_tx, normal_rx) = mpsc::sync_channel(4);
+        let (critical_tx, critical_rx) = mpsc::sync_channel(CRITICAL_UI_QUEUE_CAPACITY);
+        let (frame_tx, frame_rx) = latest_frame();
+        let sender = UiSender {
+            normal: normal_tx,
+            critical: critical_tx,
+            frames: frame_tx,
+        };
+        let receiver = UiReceiver {
+            normal: normal_rx,
+            critical: critical_rx,
+            frames: frame_rx,
+        };
+
+        assert!(sender.send_frame(test_frame(0)).delivered());
+        assert!(sender.send(UiMessage::End).is_ok());
+        drop(sender);
+
+        assert!(matches!(receiver.try_recv(), Ok(UiMessage::End)));
+        assert!(matches!(receiver.try_recv(), Ok(UiMessage::Frame(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     fn input_channels() -> (InputSender, InputReceiver) {
