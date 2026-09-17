@@ -99,15 +99,18 @@ but they are **an experimental subsystem, not something an installer enables**:
   now live in root-owned files under `/etc/openstream` that `postinst` writes
   once with the account ids it has just resolved.
 - **Nothing has been installed or started on a real machine.** The units are
-  written and packaged; no one has booted them. What does now run is
-  `scripts/test-linux-packaging.sh`, in CI on a Linux runner: it starts the real
-  broker with the environment the package writes and requires that it listens,
-  with a negative control that must still fail. That is more than reading the
-  units and less than an install test, and it is not a substitute for one.
-  In particular the broker's `CapabilityBoundingSet` is deliberately left
-  unnarrowed, because guessing it wrong yields a service that will not start and
-  no one here can currently test it -- the unit says so and says where to start
-  once someone can.
+  written and packaged; no one has booted them.
+- `scripts/test-linux-packaging.sh` is the check that stops this recurring, and
+  only half of it has been run. Its static half ran locally and, against the
+  units as they were, failed on eight separate counts -- every problem listed
+  above. Its functional half, which starts the real broker with the environment
+  the package writes and requires that it listens (with a negative control that
+  must still fail), is **wired into CI but has never executed**: it needs Linux,
+  and this branch has no pull request, so no run has ever reached it. Do not
+  quote it as evidence until a run does.
+- The broker's `CapabilityBoundingSet` is deliberately left unnarrowed, because
+  guessing it wrong yields a service that will not start and no one here can
+  currently test it -- the unit says so and says where to start once someone can.
 
 ### Approval-bound authorisation: implemented, not yet delivered
 
