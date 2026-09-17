@@ -971,6 +971,41 @@ impl AccountStore {
         Ok(public)
     }
 
+    /// Remove a device from the account entirely.
+    ///
+    /// Enrolment is the only thing that issues a grant key, and it issues one
+    /// per device id: `enroll_device` refuses an id that already exists. So a
+    /// machine whose key was lost between being issued and being stored -- the
+    /// disk filled, the process was killed -- cannot simply enrol again. There
+    /// has to be a way to take the record back out, and without one the
+    /// installer's own advice to "remove the device and enrol it again" names
+    /// an operation that does not exist.
+    ///
+    /// Deliberately not a way to *read* a key back: this destroys the old one.
+    /// Re-enrolling mints a fresh key, so a stolen account credential used
+    /// here is a denial of service on that machine, not a way to obtain the
+    /// secret its broker is verifying against.
+    ///
+    /// Any credential the device holds dies with it, exactly as on revocation.
+    /// A removed device that kept a live access token would keep whatever the
+    /// removal was meant to end.
+    pub(crate) fn remove_device(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+    ) -> Result<(), ControlPlaneError> {
+        let account = self
+            .accounts
+            .get_mut(account_id)
+            .ok_or(ControlPlaneError::NotFound)?;
+        if account.devices.remove(device_id).is_none() {
+            return Err(ControlPlaneError::NotFound);
+        }
+        self.invalidate_device_tokens(account_id, device_id);
+        self.save()?;
+        Ok(())
+    }
+
     fn invalidate_device_tokens(&mut self, account_id: &str, device_id: &str) {
         self.access_tokens.retain(|_, token| {
             token.principal.account_id != account_id

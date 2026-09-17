@@ -14,6 +14,13 @@
 //! **What it prints.** The device id, and whether a key was written. Never the
 //! key, on success or on failure.
 //!
+//! **Why the destination is opened before the request.** The key exists for
+//! one instant: it is in the enrolment response and nowhere else, and no
+//! endpoint reads it back. So the command proves it can store a key -- creates
+//! the directory, checks it, creates the 0600 file -- *before* it asks for
+//! one. And if storing still fails, it removes the device it just enrolled,
+//! because a device id whose key was lost cannot be enrolled a second time.
+//!
 //! ```text
 //! OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key \
 //!   openstream-enrol --origin https://signal.example.com \
@@ -81,6 +88,34 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+/// Undo an enrolment whose key could not be stored.
+///
+/// Enrolment mints the grant key once and `POST /v1/devices` refuses an id it
+/// already holds, so a device enrolled without its key being written is a
+/// machine that can neither be provisioned nor enrolled again. Removing the
+/// record is what makes the next attempt possible.
+///
+/// If the removal itself fails there is nothing left to try automatically, and
+/// the message has to be the one an operator can act on -- it names the device
+/// and says plainly that the key is gone.
+#[cfg(unix)]
+async fn undo(origin: &str, access_token: &str, device_id: &str, why: &str) -> ExitCode {
+    eprintln!("openstream-enrol: {why}");
+    match openstream_client_core::enrolment::remove(origin, access_token, device_id).await {
+        Ok(()) => eprintln!(
+            "openstream-enrol: removed device {device_id} again. Nothing is left behind; fix the \
+             problem above and run this command again."
+        ),
+        Err(error) => eprintln!(
+            "openstream-enrol: device {device_id} is enrolled but its grant key was not stored \
+             anywhere, and removing the device failed: {error}\n\
+             openstream-enrol: the key cannot be re-issued for that id. Delete the device from \
+             the account's device list, then enrol this machine again."
+        ),
+    }
+    ExitCode::FAILURE
+}
+
 #[cfg(unix)]
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -95,9 +130,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Where the key will go, checked before the network call: enrolling and
-    // then discovering there is nowhere to put the key would burn the one
-    // chance to receive it.
     let key_path = match std::env::var("OPENSTREAM_BROKER_GRANT_KEY_FILE") {
         Ok(path) if !path.trim().is_empty() => path,
         _ => {
@@ -121,6 +153,26 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Everything that can fail about *storing* the key, done before anything
+    // issues one. A non-empty environment variable is not a destination: the
+    // directory may not exist, may be unwritable, may be one the broker will
+    // later refuse. Discovering any of that after enrolment means an enrolled
+    // device whose one key no longer exists anywhere.
+    //
+    // What this leaves for later is a write to an open descriptor and a rename
+    // inside one directory.
+    let prepared = match openstream_host_broker::grant_key::prepare(&key_path) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!(
+                "openstream-enrol: {key_path} cannot receive the grant key: {error}\n\
+                 openstream-enrol: nothing was enrolled. The key is issued once, so this refuses \
+                 to ask for one it could not store."
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     let identity = MachineIdentity {
         device_id: args.device_id,
         name: args.name,
@@ -135,25 +187,40 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Past this line the device exists and holds a key only this process has
+    // seen. Every failure from here has to put the record back, or the machine
+    // is stuck under an id that can never be provisioned and never re-enrolled.
     let device_id = enrolment.device_id.clone();
     let Some(key_hex) = enrolment.into_grant_key() else {
-        eprintln!(
-            "openstream-enrol: device {device_id} is enrolled, but the control plane returned no \
-             grant key. That happens when the device was already enrolled: the key is issued once \
-             and cannot be re-read. Remove the device and enrol it again to get a new one."
-        );
-        return ExitCode::FAILURE;
+        return undo(
+            &args.origin,
+            access_token,
+            &device_id,
+            "the control plane enrolled the device but returned no grant key, so its broker \
+             could never be provisioned",
+        )
+        .await;
     };
     let key = match openstream_host_broker::grant_key::from_hex(&key_hex) {
         Ok(key) => key,
         Err(error) => {
-            eprintln!("openstream-enrol: the control plane's grant key is unusable: {error}");
-            return ExitCode::FAILURE;
+            return undo(
+                &args.origin,
+                access_token,
+                &device_id,
+                &format!("the control plane's grant key is unusable: {error}"),
+            )
+            .await;
         }
     };
-    if let Err(error) = openstream_host_broker::grant_key::write(&key_path, &key) {
-        eprintln!("openstream-enrol: could not write {key_path}: {error}");
-        return ExitCode::FAILURE;
+    if let Err(error) = prepared.commit(&key) {
+        return undo(
+            &args.origin,
+            access_token,
+            &device_id,
+            &format!("could not store the grant key in {key_path}: {error}"),
+        )
+        .await;
     }
 
     println!("{device_id}");

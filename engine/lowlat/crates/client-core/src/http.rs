@@ -403,6 +403,11 @@ pub async fn get(origin: &str, path: &str, bearer: Option<&str>) -> Result<Respo
     request("GET", origin, path, bearer, &[]).await
 }
 
+/// `DELETE` a path.
+pub async fn delete(origin: &str, path: &str, bearer: Option<&str>) -> Result<Response, HttpError> {
+    request("DELETE", origin, path, bearer, &[]).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

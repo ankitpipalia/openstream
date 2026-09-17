@@ -185,6 +185,42 @@ pub async fn enrol(
     parse_enrolment(&response.body)
 }
 
+/// Where a single device is addressed.
+///
+/// Built here rather than formatted at each call site so the one place that
+/// has to match the server's route table is the one place [`DEVICES_PATH`]
+/// already covers.
+#[must_use]
+pub fn device_path(device_id: &str) -> String {
+    format!("{DEVICES_PATH}/{device_id}")
+}
+
+/// Remove a device, destroying the grant key enrolment issued for it.
+///
+/// This exists because enrolment is not idempotent: the key is minted once,
+/// and `POST /v1/devices` refuses an id it already holds. An installer that
+/// received a key and then could not store it would otherwise leave a device
+/// record that can never be provisioned and never be replaced.
+///
+/// So this is the undo. Call it when enrolment succeeded but storing the key
+/// did not -- and only for a device this process just created, because for any
+/// other device it is a device being deleted out from under whoever is using
+/// it.
+pub async fn remove(
+    origin: &str,
+    access_token: &str,
+    device_id: &str,
+) -> Result<(), EnrolmentError> {
+    let response = http::delete(origin, &device_path(device_id), Some(access_token)).await?;
+    if !response.is_success() {
+        return Err(EnrolmentError::Rejected {
+            status: response.status,
+            detail: response.text().chars().take(500).collect(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +241,16 @@ mod tests {
         // live service -- indistinguishable, from here, from a deployment too
         // old to support enrolment.
         assert_eq!(DEVICES_PATH, "/v1/devices");
+    }
+
+    #[test]
+    fn one_device_is_addressed_under_the_collection_that_created_it() {
+        // `DELETE /v1/devices/{device_id}` in `signal-server/src/main.rs`. The
+        // same no-compile-time-check problem as DEVICES_PATH, with a worse
+        // failure: a 404 here is reported as "the device could not be removed"
+        // during a rollback, which reads like the control plane refusing
+        // rather than the client asking the wrong question.
+        assert_eq!(device_path("device-abc"), "/v1/devices/device-abc");
     }
 
     #[test]

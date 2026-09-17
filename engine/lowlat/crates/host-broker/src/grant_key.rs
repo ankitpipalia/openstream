@@ -206,35 +206,168 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     Ok(trimmed.to_vec())
 }
 
-/// Write the grant key so only its owner can read it.
+/// A destination proved ready to receive the grant key.
 ///
-/// Created through a temporary file and renamed, so an interrupted write leaves
-/// either the old key or none rather than a truncated one -- a half-written key
-/// would fail every grant, and the failure would look like a control-plane
-/// problem rather than a local one.
+/// The grant key is issued exactly once, by the enrolment that creates the
+/// device, and no endpoint reads it back. So the order of operations around it
+/// is not a detail: everything that can fail about *storing* the key has to
+/// fail before the request that produces it, or a routine problem -- a
+/// mistyped path, a directory owned by someone else, a full disk -- turns into
+/// an enrolled device whose key no longer exists anywhere.
 ///
-/// The mode is set on the temporary file *before* the key is written to it, so
-/// there is no instant at which the secret exists in a world-readable file. A
-/// `create` then `set_permissions` would leave exactly that window.
-pub fn write(path: impl AsRef<Path>, key: &[u8]) -> Result<()> {
-    use std::io::Write;
+/// [`prepare`] does all of that work up front. It creates and checks the
+/// directory and then *actually creates the file*, 0600, in the directory the
+/// key will live in. What is left for [`PreparedKeyFile::commit`] is a write
+/// to an open descriptor and a rename within one directory: the two operations
+/// with nothing left to discover.
+///
+/// Dropping one without committing removes the empty staging file.
+#[must_use = "a prepared destination that is never committed just removes itself"]
+pub struct PreparedKeyFile {
+    /// Where the key ends up.
+    destination: std::path::PathBuf,
+    /// The directory holding both, fsynced after the rename.
+    parent: std::path::PathBuf,
+    /// The open 0600 staging file, taken by `commit`.
+    staging: Option<(std::path::PathBuf, std::fs::File)>,
+}
+
+impl std::fmt::Debug for PreparedKeyFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedKeyFile")
+            .field("destination", &self.destination)
+            .finish()
+    }
+}
+
+impl Drop for PreparedKeyFile {
+    fn drop(&mut self) {
+        // An uncommitted staging file is an empty 0600 file with this
+        // process's pid in its name. Harmless, but leaving it behind means the
+        // next run has to reason about it.
+        if let Some((staging, file)) = self.staging.take() {
+            drop(file);
+            let _ = std::fs::remove_file(staging);
+        }
+    }
+}
+
+impl PreparedKeyFile {
+    /// Where the key will be written.
+    #[must_use]
+    pub fn destination(&self) -> &Path {
+        &self.destination
+    }
+
+    /// Write the key and put it in place.
+    ///
+    /// The mode was set when the staging file was created, before this is
+    /// called, so there is no instant at which the secret exists in a
+    /// world-readable file. A `create` then `set_permissions` would leave
+    /// exactly that window.
+    ///
+    /// The rename is atomic, so an interrupted commit leaves either the old
+    /// key or none rather than a truncated one -- a half-written key fails
+    /// every grant, and the failure looks like a control-plane problem rather
+    /// than a local one.
+    pub fn commit(mut self, key: &[u8]) -> Result<()> {
+        use std::io::Write;
+
+        if key.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "refusing to write an empty grant key: it would authorise nothing and \
+                 the broker would report it as unconfigured",
+            ));
+        }
+        let Some((staging, mut file)) = self.staging.take() else {
+            return Err(Error::other(
+                "the prepared grant key file was already committed",
+            ));
+        };
+        let written = file.write_all(key).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&staging, &self.destination) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+        // The key's own bytes are on disk, but the directory entry naming them
+        // may not be: after a power cut the rename can be lost and the key
+        // with it. Syncing the parent is what makes the new name durable.
+        sync_directory(&self.parent)
+    }
+}
+
+/// Fsync a directory, tolerating filesystems that do not implement it.
+///
+/// Linux requires this to work and macOS implements it. Some network and
+/// pseudo filesystems answer `EINVAL` instead, and there the rename is as
+/// durable as it is going to get -- failing would roll back an enrolment whose
+/// key is in fact perfectly readable.
+fn sync_directory(parent: &Path) -> Result<()> {
+    match std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP)) => Ok(()),
+        Err(error) => Err(Error::new(
+            error.kind(),
+            format!(
+                "wrote the grant key but could not sync {}: {error}",
+                parent.display()
+            ),
+        )),
+    }
+}
+
+/// Prove the destination can hold the key, before anything issues one.
+///
+/// Creates the directory, tightens it, checks it is one [`read`] will accept,
+/// and creates the 0600 file the key will be written into. Succeeding here
+/// means the remaining work is a write to an open descriptor and a rename
+/// between two names in the same directory.
+///
+/// The staging file is a sibling of the destination rather than something in
+/// `/tmp`, which is what makes the rename a rename: across filesystems it
+/// would be a copy, and a copy can fail halfway for all the reasons this is
+/// trying to rule out.
+pub fn prepare(path: impl AsRef<Path>) -> Result<PreparedKeyFile> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let path = path.as_ref();
-    if key.is_empty() {
+    if path.as_os_str().is_empty() {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            "refusing to write an empty grant key: it would authorise nothing and \
-             the broker would report it as unconfigured",
+            "the grant key path is empty",
         ));
     }
-    let Some(parent) = path.parent() else {
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "the grant key path has no parent directory",
         ));
     };
-    std::fs::create_dir_all(parent)?;
+    // `create_dir_all` answers EEXIST when something on the path is a file,
+    // and "File exists" is a baffling thing to read about a key that does not.
+    if let Err(error) = std::fs::create_dir_all(parent) {
+        let existing = std::fs::symlink_metadata(parent);
+        return Err(match existing {
+            Ok(metadata) if !metadata.is_dir() => Error::new(
+                ErrorKind::NotADirectory,
+                format!("{} is not a directory", parent.display()),
+            ),
+            _ => Error::new(
+                error.kind(),
+                format!("could not create {}: {error}", parent.display()),
+            ),
+        });
+    }
     // The directory holds a secret, so it is the owner's too. Best effort: a
     // pre-existing directory may be owned by someone else, and the file's own
     // mode is what actually protects the key.
@@ -247,26 +380,39 @@ pub fn write(path: impl AsRef<Path>, key: &[u8]) -> Result<()> {
     check_directory_chain(path)?;
 
     let staging = parent.join(format!(".grant-key.{}.new", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&staging)?;
-    // An existing staging file keeps its old mode, which `.mode()` does not
-    // change. Set it explicitly before anything secret is written.
+    let mut options = std::fs::OpenOptions::new();
+    // `create_new` is O_CREAT|O_EXCL, so a symlink planted at this name is an
+    // error rather than a redirect, and two enrolments cannot share a file.
+    options.write(true).create_new(true).mode(0o600);
+    let file = match options.open(&staging) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            // Left by a run that died between creating this and renaming it.
+            // Only this process's pid names it, and the directory was just
+            // checked to be writable by nobody else, so removing it is safe.
+            std::fs::remove_file(&staging)?;
+            options.open(&staging)?
+        }
+        Err(error) => return Err(error),
+    };
+    // `open`'s mode argument is masked by the umask, which can only clear
+    // bits -- so 0600 cannot widen, but an unusual umask can narrow it to
+    // something the broker cannot open on a later run. Set it outright.
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let result = file.write_all(key).and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&staging);
-        return Err(error);
-    }
-    if let Err(error) = std::fs::rename(&staging, path) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(error);
-    }
-    Ok(())
+    Ok(PreparedKeyFile {
+        destination: path.to_path_buf(),
+        parent: parent.to_path_buf(),
+        staging: Some((staging, file)),
+    })
+}
+
+/// Write the grant key so only its owner can read it.
+///
+/// [`prepare`] then [`PreparedKeyFile::commit`], for callers that already hold
+/// the key and so have nothing to gain from separating the two. Anything that
+/// obtains the key over the network should prepare first: see [`prepare`].
+pub fn write(path: impl AsRef<Path>, key: &[u8]) -> Result<()> {
+    prepare(path)?.commit(key)
 }
 
 /// Decode a hex-encoded key.
@@ -537,6 +683,124 @@ mod tests {
             read(&path).expect("a freshly installed key must read back"),
             b"secret"
         );
+    }
+
+    #[test]
+    fn preparing_refuses_a_bad_destination_before_any_key_exists() {
+        // The whole point of the split. Every one of these used to be
+        // discovered *after* enrolment had already minted the one key the
+        // control plane will ever issue for that device.
+        let dir = TempDir::new("prepare-refuses");
+
+        // A path whose parent is a file, not a directory.
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("seed");
+        prepare(blocker.join("grant.key")).expect_err("a file cannot be a parent directory");
+
+        // A directory owned by this user but writable by everyone, which
+        // `read` refuses -- and which the repair cannot fix, because the test
+        // makes it loose again underneath a parent that stays loose.
+        let loose = dir.join("loose");
+        std::fs::create_dir_all(&loose).expect("mkdir");
+        let nested = loose.join("inner");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        let error = prepare(nested.join("grant.key"))
+            .expect_err("a chain with a world-writable directory must be refused");
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+
+        // An empty path: the shape an unset environment variable takes once it
+        // has been through a systemd unit that sets it to nothing.
+        prepare("").expect_err("an empty path must be refused");
+    }
+
+    #[test]
+    fn preparing_creates_the_file_so_committing_only_writes_and_renames() {
+        // What makes the ordering safe is that `prepare` leaves nothing to
+        // discover: the file exists, 0600, in the directory the key will live
+        // in, so the commit is a write to an open descriptor and a rename
+        // between two names in one directory.
+        let dir = TempDir::new("prepare-creates");
+        let path = dir.join("keys").join("grant.key");
+        let prepared = prepare(&path).expect("prepare");
+        assert_eq!(prepared.destination(), path.as_path());
+
+        let staging: Vec<_> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("readdir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(staging.len(), 1, "prepare must create exactly one file");
+        assert_eq!(
+            std::fs::metadata(&staging[0])
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the staging file must be private before the secret is written to it"
+        );
+        assert!(
+            !path.exists(),
+            "the destination must not exist until commit"
+        );
+
+        prepared.commit(b"secret").expect("commit");
+        assert_eq!(read(&path).expect("read"), b"secret");
+        let left: Vec<_> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("readdir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(left, vec![path], "the staging file must not be left behind");
+    }
+
+    #[test]
+    fn dropping_a_prepared_file_without_committing_leaves_nothing() {
+        // The enrolment path prepares first and then may never commit --
+        // because enrolment failed, or because the device already existed. It
+        // must not leave a stray file behind each time.
+        let dir = TempDir::new("prepare-drop");
+        let path = dir.join("keys").join("grant.key");
+        drop(prepare(&path).expect("prepare"));
+        let left: Vec<_> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("readdir")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert!(left.is_empty(), "an abandoned preparation left {left:?}");
+    }
+
+    #[test]
+    fn a_leftover_staging_file_does_not_block_a_retry() {
+        // A run killed between prepare and commit leaves an empty staging file
+        // named after its pid. A later run in the same process -- which is what
+        // a retry looks like in a test, and what pid reuse looks like on a
+        // machine -- must not fail on it.
+        let dir = TempDir::new("prepare-leftover");
+        let path = dir.join("grant.key");
+        let name = format!(".grant-key.{}.new", std::process::id());
+        let stale = dir.join(&name);
+        std::fs::write(&stale, b"leftover").expect("seed");
+        prepare(&path)
+            .expect("prepare")
+            .commit(b"secret")
+            .expect("commit");
+        assert_eq!(read(&path).expect("read"), b"secret");
+    }
+
+    #[test]
+    fn an_empty_key_is_refused_after_preparing_too() {
+        // `commit` is the last gate before a key file exists, and an empty one
+        // reads back as "unconfigured" with nothing saying why.
+        let dir = TempDir::new("prepare-empty-key");
+        let path = dir.join("grant.key");
+        let error = prepare(&path)
+            .expect("prepare")
+            .commit(b"")
+            .expect_err("empty key");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert!(!path.exists(), "no file may be left for an empty key");
     }
 
     #[test]
