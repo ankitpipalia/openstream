@@ -17,10 +17,12 @@ function snapshotWithEndpoint(origin: string): ProductSnapshot {
       {
         id: "client",
         label: "Client",
+        description: "Control-plane connection.",
         items: [
           {
             id: SIGNAL_ORIGIN_SETTING,
             label: "Control-plane endpoint",
+            description: "Where this desktop reaches its control plane.",
             value: origin,
             state: "available",
           },
