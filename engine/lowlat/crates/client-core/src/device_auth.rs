@@ -108,10 +108,14 @@ impl DeviceSession {
     /// result is never zero.
     #[must_use]
     pub fn refresh_after(&self) -> std::time::Duration {
-        // Milliseconds, so half of a one-second lifetime is 500 ms rather than
-        // a second rounded up to the moment it expires. Computed as `L * 500`
-        // rather than `L * 1000 / 2` so it cannot overflow on the way.
-        std::time::Duration::from_millis(self.access_expires_in_seconds.saturating_mul(500))
+        // Split rather than multiplied: `L * 500` milliseconds saturates for
+        // enormous lifetimes and stops being half, and `L * 1000 / 2` overflows
+        // outright. Whole seconds plus the 500 ms remainder of an odd one is
+        // exact for every `L`, including a one-second lifetime -- which is the
+        // case that needs sub-second resolution to land before expiry at all.
+        let seconds = self.access_expires_in_seconds / 2;
+        let remainder = self.access_expires_in_seconds % 2;
+        std::time::Duration::from_secs(seconds) + std::time::Duration::from_millis(remainder * 500)
     }
 }
 
@@ -293,7 +297,20 @@ mod tests {
         // thirty-second floor broke this for every short one, and measuring in
         // whole seconds still broke it for a one-second token -- so no lifetime
         // is exempted here.
-        for lifetime in [1_u64, 2, 5, 29, 30, 31, 59, 60, 120, 900, 86_400] {
+        for lifetime in [
+            1_u64,
+            2,
+            5,
+            29,
+            30,
+            31,
+            59,
+            60,
+            120,
+            900,
+            86_400,
+            u64::MAX / 2,
+        ] {
             let body =
                 format!(r#"{{"access_token":"abc","access_expires_in_seconds":{lifetime}}}"#);
             let session = parse_session(body.as_bytes()).expect("parse");
@@ -305,6 +322,12 @@ mod tests {
             assert!(
                 after < std::time::Duration::from_secs(lifetime),
                 "lifetime {lifetime}s renews at {after:?}, at or after it expires"
+            );
+            // And it really is half, not merely early.
+            assert_eq!(
+                after.as_millis() * 2,
+                u128::from(lifetime) * 1000,
+                "lifetime {lifetime}s did not renew at exactly half"
             );
         }
     }

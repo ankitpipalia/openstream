@@ -2196,7 +2196,7 @@ async fn authenticate_device(
 /// this exists to remove, and a hand-written 32 bytes is not obviously on the
 /// curve.
 ///
-/// **Primed at startup**, by the call in `run`. Generating it lazily inside the
+/// **Primed at startup**, by the call in `main`. Generating it lazily inside the
 /// first unknown-device request would make that one request pay for a keypair
 /// on top of the verification -- a smaller version of the same oracle, once per
 /// process. Priming also means the panic below can only happen at boot: by the
