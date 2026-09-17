@@ -2093,8 +2093,24 @@ async fn remove_account_device(
     if let Err(error) = accounts.can_manage_devices(&principal) {
         return control_error_response(error);
     }
-    match accounts.remove_device(&principal.account_id, &device_id) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    let result = accounts.remove_device(&principal.account_id, &device_id);
+    // Release the account lock before touching sessions: session teardown takes
+    // the sessions lock, and no other path holds accounts across it.
+    drop(accounts);
+    match result {
+        Ok(()) => {
+            // Removal is strictly stronger than revocation, so it has to do at
+            // least what revocation does. Invalidating the device's tokens
+            // leaves a live session signalling and relaying until its TTL
+            // expires -- on a device whose record, and whose grant key, no
+            // longer exist.
+            let senders =
+                revoke_owned_sessions(&state, &principal.account_id, Some(&device_id)).await;
+            for sender in senders {
+                let _ = sender.try_send(Message::Close(None));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(error) => control_error_response(error),
     }
 }
@@ -8465,6 +8481,88 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Removing a device ends its live sessions, not just its tokens.
+    ///
+    /// Revoking trust already does this, with a comment saying why: a device
+    /// that keeps its signalling and relay path alive until the session TTL is
+    /// a device that was not really revoked. Removal is strictly stronger --
+    /// the record is gone and its grant key with it -- so it has to do at least
+    /// as much, and the first version of this endpoint did not.
+    #[tokio::test]
+    async fn removing_a_device_tears_down_its_live_sessions() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (token, _) = register_with_device(&app, "operator", "device-client", 0x71).await;
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&token),
+            Some(serde_json::json!({
+                "device_id": "machine-two",
+                "name": "Studio",
+                "platform": "linux",
+                "public_key": hex::encode([0x72_u8; 32]),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "enrol: {body}");
+
+        // The account id is not on the wire anywhere, and the teardown filters
+        // on it, so a session built with the wrong one would be ignored and
+        // this test would pass for the wrong reason.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header"),
+        );
+        let account_id = super::account_principal(&state, &headers)
+            .await
+            .map(|principal| principal.account_id)
+            .unwrap_or_else(|_| panic!("the token just issued must authorize"));
+
+        let (doomed_tx, mut doomed_rx) = mpsc::channel(2);
+        let (survivor_tx, mut survivor_rx) = mpsc::channel(2);
+        {
+            let mut sessions = state.sessions.lock().await;
+            let mut doomed = owned_session(&account_id, "device-client", "machine-two");
+            doomed.host = Some(doomed_tx);
+            sessions.insert("doomed".to_string(), doomed);
+            // Same account, not involving machine-two: removing one device must
+            // not take down the rest of the fleet.
+            let mut survivor = owned_session(&account_id, "device-other", "device-third");
+            survivor.client = Some(survivor_tx);
+            sessions.insert("survivor".to_string(), survivor);
+        }
+
+        let (status, body) = call(
+            &app,
+            "DELETE",
+            "/v1/devices/machine-two",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "remove: {body}");
+
+        let remaining: Vec<String> = state.sessions.lock().await.keys().cloned().collect();
+        assert_eq!(
+            remaining,
+            vec!["survivor".to_string()],
+            "the removed device's session outlived the device"
+        );
+        assert!(
+            matches!(doomed_rx.recv().await, Some(Message::Close(None))),
+            "the removed device's socket was never told to close, so it keeps \
+             signalling and relaying on a device whose grant key no longer exists"
+        );
+        assert!(
+            survivor_rx.try_recv().is_err(),
+            "an unrelated session was closed too"
+        );
     }
 
     #[tokio::test]
