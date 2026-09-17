@@ -1058,4 +1058,32 @@ mod tests {
             "decoder did not recover after a bad access unit"
         );
     }
+
+    /// A keyframe whose SPS (type 7) and PPS (type 8) are a bare NAL header with
+    /// no parameter-set body. CoreMedia cannot build a format description from
+    /// them, which must surface as a clean `FormatDescription` error -- not a
+    /// panic, an invented frame, or a mislabelled `Decode` error. This exercises
+    /// the `configure` -> `CMVideoFormatDescriptionCreateFromH264ParameterSets`
+    /// failure path that the other tests never reach. Needs no ffmpeg fixture.
+    #[test]
+    fn a_malformed_parameter_set_is_a_clean_format_description_error() {
+        let mut decoder = VideoToolboxH264Decoder::new();
+        let access_unit = [
+            0x00, 0x00, 0x00, 0x01, 0x67, // SPS: header only, no RBSP
+            0x00, 0x00, 0x00, 0x01, 0x68, // PPS: header only, no RBSP
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, // an IDR slice
+        ];
+        match decoder.decode(&access_unit, 0, true) {
+            Err(VtError::FormatDescription(_)) => {}
+            other => panic!("expected a FormatDescription error, got {other:?}"),
+        }
+        // The decoder must still be usable afterwards: a real keyframe recovers.
+        if let Some(stream) = generate_h264("testsrc2=size=320x240:rate=5", 2, 2) {
+            let units = access_units_by_aud(&stream);
+            let recovered = decoder
+                .decode(&units[0], 100_000, true)
+                .expect("recovery keyframe decodes after a bad parameter set");
+            assert!(!recovered.is_empty(), "decoder did not recover");
+        }
+    }
 }
