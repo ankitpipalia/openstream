@@ -91,16 +91,25 @@ impl DeviceSession {
         &self.access_token
     }
 
-    /// When to re-authenticate, as a fraction of the lifetime.
+    /// When to re-authenticate: half the lifetime, and always inside it.
     ///
-    /// Early enough that a request is never made with a token about to expire,
-    /// and not so early that a service spends its life authenticating. A floor
-    /// because a control plane that hands out very short tokens would otherwise
-    /// have this spinning.
+    /// The earlier version took `max(lifetime / 2, 30)`, so a control plane
+    /// handing out very short tokens would not have this spinning. That floor
+    /// inverted the contract for exactly those tokens: a thirty-second lifetime
+    /// scheduled renewal at thirty seconds, the moment it expired, and anything
+    /// shorter renewed after it was already dead.
+    ///
+    /// Renewing too often wastes a request; renewing too late means every
+    /// request in between carries a credential the control plane has stopped
+    /// accepting. The second is worse, so the floor is gone and the result is
+    /// always strictly inside the lifetime. [`parse_session`] refuses a
+    /// response with no usable lifetime, so this never divides zero.
     #[must_use]
     pub fn refresh_after(&self) -> std::time::Duration {
-        let seconds = (self.access_expires_in_seconds / 2).max(30);
-        std::time::Duration::from_secs(seconds)
+        // For any lifetime of two seconds or more this is at most `L - 1`. The
+        // `max` matters only for a one-second token, where nothing is early
+        // enough and renewing at once is the closest thing to right.
+        std::time::Duration::from_secs((self.access_expires_in_seconds / 2).max(1))
     }
 }
 
@@ -149,10 +158,16 @@ pub fn parse_session(body: &[u8]) -> Result<DeviceSession, DeviceAuthError> {
         .filter(|token| !token.is_empty())
         .ok_or(DeviceAuthError::Incomplete("carries no access_token"))?
         .to_string();
+    // A missing or zero lifetime became zero and then, through the old floor,
+    // a renewal thirty seconds after a credential that was never valid. There
+    // is no sensible reading of it, so it is a malformed response.
     let access_expires_in_seconds = value
         .get("access_expires_in_seconds")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+        .filter(|seconds| *seconds > 0)
+        .ok_or(DeviceAuthError::Incomplete(
+            "carries no usable access_expires_in_seconds",
+        ))?;
     Ok(DeviceSession {
         access_token,
         access_expires_in_seconds,
@@ -270,15 +285,28 @@ mod tests {
     }
 
     #[test]
-    fn a_very_short_lifetime_does_not_turn_into_a_spin() {
-        let session = parse_session(br#"{"access_token":"abc","access_expires_in_seconds":2}"#)
-            .expect("parse");
-        assert_eq!(session.refresh_after(), std::time::Duration::from_secs(30));
+    fn renewal_is_always_scheduled_inside_the_lifetime() {
+        // The property that matters: a credential is replaced before it stops
+        // being accepted, whatever lifetime the control plane chose. The old
+        // thirty-second floor broke this for every short one.
+        for lifetime in [1_u64, 2, 5, 29, 30, 31, 59, 60, 120, 900, 86_400] {
+            let body =
+                format!(r#"{{"access_token":"abc","access_expires_in_seconds":{lifetime}}}"#);
+            let session = parse_session(body.as_bytes()).expect("parse");
+            let after = session.refresh_after().as_secs();
+            assert!(after >= 1, "lifetime {lifetime} scheduled a busy loop");
+            assert!(
+                after < lifetime || lifetime == 1,
+                "lifetime {lifetime} renews at {after}s, at or after it expires"
+            );
+        }
+    }
 
-        // A response with no lifetime at all lands on the same floor rather
-        // than re-authenticating without pause.
-        let unknown = parse_session(br#"{"access_token":"abc"}"#).expect("parse");
-        assert_eq!(unknown.refresh_after(), std::time::Duration::from_secs(30));
+    #[test]
+    fn a_response_with_no_usable_lifetime_is_refused() {
+        // Zero, or absent, has no reading that produces a safe renewal time.
+        assert!(parse_session(br#"{"access_token":"abc"}"#).is_err());
+        assert!(parse_session(br#"{"access_token":"abc","access_expires_in_seconds":0}"#).is_err());
     }
 
     #[test]

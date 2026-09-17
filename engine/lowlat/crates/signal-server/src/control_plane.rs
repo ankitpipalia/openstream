@@ -1131,6 +1131,7 @@ impl AccountStore {
                 public_device(device),
             )
         };
+        self.forget_expired_access_tokens(now_ms);
         let access_token = Uuid::new_v4().simple().to_string();
         self.access_tokens.insert(
             token_digest(&access_token),
@@ -1153,6 +1154,23 @@ impl AccountStore {
             user,
             device,
         })
+    }
+
+    /// Drop access tokens that have expired.
+    ///
+    /// `authorize_access` removes an expired token only when that exact token
+    /// is presented again, which never happens to one that was abandoned. A
+    /// host that re-authenticates on a timer abandons its previous token every
+    /// time, so without this the map grows for the life of the process: about
+    /// eight entries an hour per host, forever, for credentials that stopped
+    /// being usable fifteen minutes after they were issued.
+    ///
+    /// Called before issuing, which is the only moment the map grows, and
+    /// bounds it to the tokens issued within one [`ACCESS_TOKEN_TTL_MS`]
+    /// window rather than to the uptime of the service.
+    fn forget_expired_access_tokens(&mut self, now_ms: u64) {
+        self.access_tokens
+            .retain(|_, token| token.expires_at_ms > now_ms);
     }
 
     /// Drop nonces that can no longer be replayed anyway.
@@ -1291,6 +1309,7 @@ impl AccountStore {
         family: RefreshFamily,
         now_ms: u64,
     ) -> Result<IssuedTokens, ControlPlaneError> {
+        self.forget_expired_access_tokens(now_ms);
         let access_token = Uuid::new_v4().simple().to_string();
         let refresh_token = Uuid::new_v4().simple().to_string();
         let access_expires_at = now_ms.saturating_add(ACCESS_TOKEN_TTL_MS);
@@ -1745,6 +1764,77 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    /// A host renewing forever must not grow the access-token map forever.
+    ///
+    /// `authorize_access` evicts an expired token only when that same token is
+    /// presented again, and an abandoned one never is. A machine that
+    /// re-authenticates on a timer abandons its previous token every time, so
+    /// without pruning at issuance the map grows for the life of the process --
+    /// entries for credentials that stopped working fifteen minutes after they
+    /// were minted.
+    #[test]
+    fn renewing_a_device_credential_does_not_grow_the_token_map_without_bound() {
+        use openstream_protocol::IdentityKey;
+
+        let (mut store, directory) = test_store();
+        let start = 1_700_000_000_000_u64;
+        let account_id = registered_account(&mut store, start);
+
+        let machine = IdentityKey::generate().expect("identity");
+        let registration = DeviceRegistration {
+            device_id: "machine-busy".into(),
+            name: "Studio".into(),
+            platform: "linux".into(),
+            public_key: machine.public_key(),
+        };
+        store
+            .enroll_device(&account_id, registration, start)
+            .expect("enrol");
+
+        // A year of renewals at the client's cadence, with the clock advancing
+        // as it actually would.
+        let renewal_ms = ACCESS_TOKEN_TTL_MS / 2;
+        let mut now = start;
+        for round in 0..2_000_u64 {
+            now += renewal_ms;
+            let nonce = {
+                let mut bytes = [0_u8; 16];
+                bytes[..8].copy_from_slice(&round.to_be_bytes());
+                bytes
+            };
+            let signature = machine
+                .sign_device_auth(&account_id, "machine-busy", now, nonce)
+                .expect("sign");
+            store
+                .commit_device_auth(
+                    &account_id,
+                    "machine-busy",
+                    machine.public_key(),
+                    now,
+                    nonce,
+                    now,
+                )
+                .expect("authenticate");
+            let _ = signature;
+        }
+
+        // Only tokens still inside one lifetime may remain. At a renewal every
+        // half-life that is two, plus the one the registration left behind if
+        // it has not expired -- nothing like the two thousand issued.
+        assert!(
+            store.access_tokens.len() <= 4,
+            "the access-token map kept {} entries after 2000 renewals; expired \
+             credentials are never being dropped",
+            store.access_tokens.len()
+        );
+        // The same for the replay nonces, which are pruned on the same path.
+        assert!(
+            store.device_auth_nonces.len() <= 4,
+            "the nonce map kept {} entries",
+            store.device_auth_nonces.len()
+        );
+        cleanup(&directory);
+    }
     /// Register an account and return its id, which is not the username.
     fn registered_account(store: &mut AccountStore, now_ms: u64) -> String {
         let salt = AccountStore::registration_salt().expect("salt");

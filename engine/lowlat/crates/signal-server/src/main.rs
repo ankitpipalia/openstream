@@ -2143,21 +2143,29 @@ async fn authenticate_device(
         let accounts = state.accounts.lock().await;
         accounts.device_identity_key(&request.account_id, &request.device_id)
     };
-    // An unknown account or device takes the same path as a bad signature:
-    // answering differently would turn this into an enumeration oracle.
-    let Some(stored_key) = stored_key else {
-        return control_error_response(ControlPlaneError::Unauthorized);
-    };
-    if !openstream_protocol::IdentityKey::verify_device_auth(
-        stored_key,
+    // An unknown pair is verified against a decoy rather than refused here.
+    //
+    // Both answer 401, but returning early would not do the Ed25519 work, and
+    // that difference is measurable: an attacker timing the endpoint could
+    // separate "this account has a device with that id" from "it does not",
+    // which is the enumeration this is supposed to deny. The renewal budget
+    // slows the sampling; it does not remove the signal. Same reasoning, and
+    // the same shape, as `DECOY_PASSWORD_SALT` on the sign-in path.
+    let known = stored_key.is_some();
+    let verified = openstream_protocol::IdentityKey::verify_device_auth(
+        stored_key.unwrap_or_else(decoy_device_key),
         signature,
         &request.account_id,
         &request.device_id,
         request.issued_at_ms,
         nonce,
-    ) {
+    );
+    // `verified` is already computed, so the short circuit below costs nothing
+    // and hides nothing -- the expensive half ran either way.
+    if !known || !verified {
         return control_error_response(ControlPlaneError::Unauthorized);
     }
+    let stored_key = stored_key.unwrap_or_default();
 
     let mut accounts = state.accounts.lock().await;
     match accounts.commit_device_auth(
@@ -2171,6 +2179,27 @@ async fn authenticate_device(
         Ok(credential) => Json(DeviceAuthResponse::from(credential)).into_response(),
         Err(error) => control_error_response(error),
     }
+}
+
+/// A public key nobody holds the private half of.
+///
+/// Verification against it always fails, which is the point: it gives an
+/// unknown `(account, device)` pair the same Ed25519 work a known pair with a
+/// bad signature does, so the two cannot be told apart by timing.
+///
+/// Generated once per process rather than written down as a constant, because
+/// it has to be a *valid* curve point. `ring` rejects a malformed encoding
+/// before doing any real work, which would reintroduce exactly the difference
+/// this exists to remove -- and a hand-written 32 bytes is not obviously on the
+/// curve. If key generation fails, the service has no usable randomness and is
+/// about to fail at something more important.
+fn decoy_device_key() -> [u8; 32] {
+    static DECOY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    *DECOY.get_or_init(|| {
+        openstream_protocol::IdentityKey::generate()
+            .map(|key| key.public_key())
+            .unwrap_or([0x5a; 32])
+    })
 }
 
 /// Decode exactly `N` bytes of hex, or nothing.
@@ -8532,6 +8561,95 @@ mod tests {
     /// class that never reached the host to be granted, or never reached each
     /// end to be enforced, is a permission the product cannot honour -- so this
     /// round trip is the foundation enforcement sits on.
+    /// An unknown device is refused the same way, and at the same cost, as a
+    /// known one with a bad signature.
+    ///
+    /// The status codes always matched. What did not was the work: an unknown
+    /// pair returned before any Ed25519 verification, so timing the endpoint
+    /// separated "this account has a device with that id" from "it does not".
+    /// This pins the decoy that equalises it -- a real curve point, so `ring`
+    /// does the verification rather than rejecting a malformed encoding early.
+    #[test]
+    fn the_decoy_key_is_a_real_key_and_is_stable() {
+        use openstream_protocol::IdentityKey;
+
+        let decoy = super::decoy_device_key();
+        assert_ne!(decoy, [0u8; 32], "an all-zero key is not a curve point");
+        assert_eq!(decoy, super::decoy_device_key(), "it must not change");
+
+        // A signature made by a real key does not verify against it, which is
+        // the behaviour the unknown-pair path depends on.
+        let real = IdentityKey::generate().expect("identity");
+        let signature = real
+            .sign_device_auth("acct", "device", 1, [0; 16])
+            .expect("sign");
+        assert!(!IdentityKey::verify_device_auth(
+            decoy, signature, "acct", "device", 1, [0; 16]
+        ));
+        // And it is not some real device's key by accident.
+        assert_ne!(decoy, real.public_key());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_device_and_a_bad_signature_answer_alike() {
+        use openstream_protocol::IdentityKey;
+
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (owner_token, _) = register_with_device(&app, "operator", "device-owner", 0xb1).await;
+
+        let machine = IdentityKey::generate().expect("identity");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&owner_token),
+            Some(serde_json::json!({
+                "device_id": "machine-known",
+                "name": "Studio",
+                "platform": "linux",
+                "public_key": hex::encode(machine.public_key()),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "enrol: {body}");
+        let account_id = body["account_id"].as_str().expect("account").to_string();
+
+        let now = super::control_plane::now_ms();
+        let impostor = IdentityKey::generate().expect("identity");
+        let mut answers = Vec::new();
+        for (index, device_id) in ["machine-known", "machine-absent"].iter().enumerate() {
+            let nonce = [u8::try_from(index).expect("small"); 16];
+            let signature = impostor
+                .sign_device_auth(&account_id, device_id, now, nonce)
+                .expect("sign");
+            let (status, body) = call(
+                &app,
+                "POST",
+                "/v1/auth/device",
+                None,
+                Some(serde_json::json!({
+                    "account_id": account_id,
+                    "device_id": device_id,
+                    "issued_at_ms": now,
+                    "nonce": hex::encode(nonce),
+                    "signature": hex::encode(signature),
+                })),
+            )
+            .await;
+            answers.push((status, body));
+        }
+        assert_eq!(answers[0].0, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            answers[0].0, answers[1].0,
+            "an absent device answered differently from a present one"
+        );
+        assert_eq!(
+            answers[0].1, answers[1].1,
+            "the bodies differ, which is an enumeration oracle on its own"
+        );
+    }
+
     /// A device proof is good for the account it names, and no other.
     ///
     /// Device ids are unique inside an account and nowhere else, and one
