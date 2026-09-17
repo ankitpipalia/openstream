@@ -107,7 +107,7 @@ fn main() {
 
     // SAFETY: a context is current on this thread, the descriptor was exported
     // for the platform's opaque kind, and the size is the whole allocation.
-    let external = unsafe { cuda.import(frame_fd, bytes) }
+    let mut external = unsafe { cuda.import(frame_fd, bytes) }
         .unwrap_or_else(|e| fail(&format!("take the frame: {e}")));
     let plane = external
         .plane(0, bytes, exported.pitch as usize)

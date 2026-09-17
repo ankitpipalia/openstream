@@ -37,6 +37,48 @@ const WANTED: [vk::ExternalMemoryHandleTypeFlags; 2] = [
     vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
 ];
 
+/// Which external-memory handle kind a conversion target is exported as,
+/// chosen by the encoder backend it feeds. A target is built for exactly one
+/// kind: a driver may export each of these individually yet refuse to make one
+/// allocation carry both (their `compatible_handle_types` are disjoint), so
+/// asking for both at once -- as the codec-neutral path once did -- yields an
+/// allocation that exports as neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportKind {
+    /// The platform's opaque descriptor, which CUDA (NVENC) imports.
+    Opaque,
+    /// A DMA-BUF, which the VA-API display interface imports.
+    DmaBuf,
+}
+
+impl ExportKind {
+    fn handle(self) -> vk::ExternalMemoryHandleTypeFlags {
+        match self {
+            ExportKind::Opaque => vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+            ExportKind::DmaBuf => vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+        }
+    }
+}
+
+/// Name the external-memory feature bits for the capability probe.
+fn features_str(features: vk::ExternalMemoryFeatureFlags) -> String {
+    let mut names = Vec::new();
+    if features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE) {
+        names.push("EXPORTABLE");
+    }
+    if features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE) {
+        names.push("IMPORTABLE");
+    }
+    if features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY) {
+        names.push("DEDICATED_ONLY");
+    }
+    if names.is_empty() {
+        format!("none({:#x})", features.as_raw())
+    } else {
+        names.join("|")
+    }
+}
+
 /// The compiled shader, committed rather than built.
 ///
 /// A build-time shader compiler would be a dependency for something that
@@ -128,17 +170,35 @@ pub struct Exported {
     /// one luma plane in, which is what an encoder assumes and what this
     /// allocation is built to guarantee.
     pub planes: [PlaneLayout; 2],
+    /// The exact size of the allocation behind the planes. An importer that
+    /// needs the whole allocation (a CUDA OPAQUE_FD import) is given this
+    /// rather than a size reconstructed from the pitch and height, which an
+    /// alignment-padded chroma plane makes too small.
+    pub size: u64,
 }
 
 impl Exported {
     /// The layout one untiled region has when it carries both planes and the
-    /// colour plane begins exactly one luma plane in.
+    /// colour plane begins exactly one luma plane in, with the allocation size
+    /// derived as the tightly packed NV12 figure. Use [`Self::packed_sized`]
+    /// when the true allocation size is known.
     ///
     /// **Written once because an encoder is told it once.** It is given one
     /// address and one row length and derives the rest, so any interface that
     /// hands a frame on has to produce this same arrangement; two of them
     /// computing it separately is how they come to disagree.
     pub fn packed(width: u32, height: u32, pitch: u32) -> Self {
+        Self::packed_sized(
+            width,
+            height,
+            pitch,
+            u64::from(pitch) * u64::from(height) * 3 / 2,
+        )
+    }
+
+    /// [`Self::packed`] with the exact allocation size supplied rather than
+    /// derived, for an importer that must be handed the whole allocation.
+    pub fn packed_sized(width: u32, height: u32, pitch: u32, size: u64) -> Self {
         Self {
             width,
             height,
@@ -151,6 +211,7 @@ impl Exported {
                     pitch,
                 },
             ],
+            size,
         }
     }
 }
@@ -177,6 +238,14 @@ pub struct Nv12 {
     pub height: u32,
     /// Bytes per row, the same for both planes. An encoder is told this once.
     pub pitch: u32,
+    /// The external-memory handle kinds this allocation may actually be
+    /// exported as -- what the export gate checks, rather than a device-wide
+    /// query that a disjoint-compatibility driver collapses to nothing.
+    export_type: vk::ExternalMemoryHandleTypeFlags,
+    /// The exact allocation size behind the two planes. A CUDA import must be
+    /// given this, not a size reconstructed from the pitch and height, which an
+    /// alignment-padded chroma plane makes too small.
+    pub size: u64,
 }
 
 /// What a conversion writes into, named by handles rather than ownership.
@@ -640,23 +709,53 @@ impl Device {
     /// write support anywhere, while the single-component formats its planes
     /// are addressed by report it everywhere.
     pub fn allocate_nv12(&self, width: u32, height: u32) -> Result<Nv12, Error> {
+        // **Asked once, of the image that is actually made.** Both planes use
+        // the same tiling and usage and differ only in format and extent, and
+        // a device that answered differently for the two would leave one plane
+        // of a picture unexportable, so the narrower answer is what both are
+        // built with. This is the codec-neutral allocation, exportable as
+        // whatever the device will make one allocation carry; a backend that
+        // needs a specific kind (and whose driver refuses the pair) uses
+        // [`Self::allocate_nv12_for`] instead.
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        let image_types = self.exportable(vk::Format::R8_UNORM, usage, vk::ImageTiling::LINEAR)
+            & self.exportable(vk::Format::R8G8_UNORM, usage, vk::ImageTiling::LINEAR);
+        let memory_types = self.exportable_memory();
+        self.allocate_nv12_with(width, height, image_types, memory_types)
+    }
+
+    /// Allocate a conversion target exported as exactly one handle kind, the
+    /// one the chosen encoder backend imports (OPAQUE_FD for NVENC/CUDA,
+    /// DMA-BUF for VA-API). Unlike [`Self::allocate_nv12`] this never asks one
+    /// allocation to carry two kinds, so a driver that exports each alone but
+    /// names them mutually incompatible still yields a working target.
+    pub fn allocate_nv12_for(
+        &self,
+        width: u32,
+        height: u32,
+        kind: ExportKind,
+    ) -> Result<Nv12, Error> {
+        let handle = kind.handle();
+        self.allocate_nv12_with(width, height, handle, handle)
+    }
+
+    /// Shared allocation: `image_types` is what the plane images declare they
+    /// may be backed by, `memory_types` what the allocation is exported as.
+    fn allocate_nv12_with(
+        &self,
+        width: u32,
+        height: u32,
+        image_types: vk::ExternalMemoryHandleTypeFlags,
+        memory_types: vk::ExternalMemoryHandleTypeFlags,
+    ) -> Result<Nv12, Error> {
         // Both dimensions round up to even. A plane at half resolution has no
         // meaning for an odd one, and the shader's last block would write
         // outside the colour plane.
         let width = width.next_multiple_of(2);
         let height = height.next_multiple_of(2);
-
-        // **Asked once, of the image that is actually made.** Both planes use
-        // the same tiling and usage and differ only in format and extent, and
-        // a device that answered differently for the two would leave one plane
-        // of a picture unexportable, so the narrower answer is what both are
-        // built with.
-        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
-        let handle_types = self.exportable(vk::Format::R8_UNORM, usage, vk::ImageTiling::LINEAR)
-            & self.exportable(vk::Format::R8G8_UNORM, usage, vk::ImageTiling::LINEAR);
-        let luma_image = self.plane_image(width, height, vk::Format::R8_UNORM, handle_types)?;
+        let luma_image = self.plane_image(width, height, vk::Format::R8_UNORM, image_types)?;
         let chroma_image =
-            match self.plane_image(width / 2, height / 2, vk::Format::R8G8_UNORM, handle_types) {
+            match self.plane_image(width / 2, height / 2, vk::Format::R8G8_UNORM, image_types) {
                 Ok(image) => image,
                 Err(error) => {
                     // SAFETY: created just above and nothing refers to it.
@@ -665,7 +764,7 @@ impl Device {
                 }
             };
 
-        match self.bind_planes(luma_image, chroma_image, width, height) {
+        match self.bind_planes(luma_image, chroma_image, width, height, memory_types) {
             Ok(nv12) => Ok(nv12),
             Err(error) => {
                 // SAFETY: both created above; binding is what failed.
@@ -788,6 +887,179 @@ impl Device {
         offered & compatible
     }
 
+    /// Diagnose external-memory export capability per handle type, for the
+    /// exact images the NV12 conversion allocates (R8/RG8, LINEAR,
+    /// STORAGE|TRANSFER_SRC). This exists because the pipeline builds one
+    /// allocation asked to satisfy DMA-BUF and OPAQUE_FD at once, and a driver
+    /// that exports each individually but names them mutually incompatible
+    /// makes that impossible -- the failure the loop reports as "exports a
+    /// picture in neither way". The report says, per type: whether the image
+    /// and buffer queries answer, their features, their compatible set, and
+    /// whether a single-type allocation actually exports an fd. It changes no
+    /// pipeline behaviour; it only prints what the driver claims.
+    pub fn probe_export_capabilities(&self) -> Vec<String> {
+        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut out = Vec::new();
+        for (name, handle) in [
+            (
+                "DMA_BUF_EXT",
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+            ),
+            ("OPAQUE_FD", vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
+        ] {
+            for (fmt_name, format) in [
+                ("R8_UNORM", vk::Format::R8_UNORM),
+                ("R8G8_UNORM", vk::Format::R8G8_UNORM),
+            ] {
+                out.push(self.probe_image_query(name, handle, fmt_name, format, usage));
+            }
+            out.push(self.probe_buffer_query(name, handle));
+        }
+        // What the current combined logic yields -- the value the export gate
+        // reads. An empty result with non-empty per-type answers above is the
+        // intersection defect.
+        let image_combined = self.exportable(vk::Format::R8_UNORM, usage, vk::ImageTiling::LINEAR)
+            & self.exportable(vk::Format::R8G8_UNORM, usage, vk::ImageTiling::LINEAR);
+        out.push(format!(
+            "combined image handle_types (both planes) = {:#x}",
+            image_combined.as_raw()
+        ));
+        out.push(format!(
+            "combined memory handle_types (exportable_memory) = {:#x}",
+            self.exportable_memory().as_raw()
+        ));
+        // Does a single-type OPAQUE_FD allocation actually export? This is the
+        // path a fix would take, proven or refuted here.
+        out.push(self.probe_single_type_export(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD));
+        out.push(self.probe_single_type_export(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT));
+        out
+    }
+
+    fn probe_image_query(
+        &self,
+        name: &str,
+        handle: vk::ExternalMemoryHandleTypeFlags,
+        fmt_name: &str,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> String {
+        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default().handle_type(handle);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(usage)
+            .flags(vk::ImageCreateFlags::empty())
+            .push_next(&mut external);
+        let mut properties = vk::ExternalImageFormatProperties::default();
+        let mut out = vk::ImageFormatProperties2::default().push_next(&mut properties);
+        // SAFETY: both chains outlive the call.
+        let asked = unsafe {
+            self.instance.get_physical_device_image_format_properties2(
+                self.physical,
+                &info,
+                &mut out,
+            )
+        };
+        if let Err(error) = asked {
+            return format!("image  {name:<11} {fmt_name:<10} query refused ({error:?})");
+        }
+        let props = properties.external_memory_properties;
+        format!(
+            "image  {name:<11} {fmt_name:<10} features={} compatible={:#x}",
+            features_str(props.external_memory_features),
+            props.compatible_handle_types.as_raw(),
+        )
+    }
+
+    fn probe_buffer_query(&self, name: &str, handle: vk::ExternalMemoryHandleTypeFlags) -> String {
+        let info = vk::PhysicalDeviceExternalBufferInfo::default()
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .handle_type(handle);
+        let mut out = vk::ExternalBufferProperties::default();
+        // SAFETY: both structures outlive the call.
+        unsafe {
+            self.instance
+                .get_physical_device_external_buffer_properties(self.physical, &info, &mut out);
+        }
+        let props = out.external_memory_properties;
+        format!(
+            "buffer {name:<11}            features={} compatible={:#x}",
+            features_str(props.external_memory_features),
+            props.compatible_handle_types.as_raw(),
+        )
+    }
+
+    /// Create one LINEAR R8 image exportable as exactly `handle`, allocate a
+    /// dedicated export allocation, and try to pull an fd. Reports the memory
+    /// size and the fd outcome, then tears everything down. This is the exact
+    /// operation a per-backend allocation would perform.
+    fn probe_single_type_export(&self, handle: vk::ExternalMemoryHandleTypeFlags) -> String {
+        let name = if handle == vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD {
+            "OPAQUE_FD"
+        } else {
+            "DMA_BUF_EXT"
+        };
+        let image = match self.plane_image(256, 256, vk::Format::R8_UNORM, handle) {
+            Ok(image) => image,
+            Err(error) => return format!("single {name:<11} image create failed ({error:?})"),
+        };
+        // SAFETY: the image was created on this device just above.
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let index = match self.device_local_memory(requirements.memory_type_bits) {
+            Ok(index) => index,
+            Err(error) => {
+                // SAFETY: nothing is bound to the image.
+                unsafe { self.device.destroy_image(image, None) };
+                return format!("single {name:<11} no memory type ({error:?})");
+            }
+        };
+        let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(handle);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(index)
+            .push_next(&mut export)
+            .push_next(&mut dedicated);
+        // SAFETY: the chain outlives the call.
+        let memory = match unsafe { self.device.allocate_memory(&allocate, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                // SAFETY: nothing is bound to the image.
+                unsafe { self.device.destroy_image(image, None) };
+                return format!("single {name:<11} allocate_memory failed ({error:?})");
+            }
+        };
+        // SAFETY: neither handle is bound yet, both this device's.
+        let _ = unsafe { self.device.bind_image_memory(image, memory, 0) };
+        let external = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+        let info = vk::MemoryGetFdInfoKHR::default()
+            .memory(memory)
+            .handle_type(handle);
+        // SAFETY: the info outlives the call and the memory is this device's.
+        let fd_result = unsafe { external.get_memory_fd(&info) };
+        let verdict = match fd_result {
+            Ok(fd) => {
+                // SAFETY: a fresh owned descriptor from the driver; owning it
+                // closes it on drop.
+                let _owned =
+                    unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+                format!("EXPORTED fd (size={} bytes)", requirements.size)
+            }
+            Err(error) => format!(
+                "get_memory_fd FAILED ({error:?}), size={}",
+                requirements.size
+            ),
+        };
+        // SAFETY: nothing submitted references either; free after an idle wait.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.free_memory(memory, None);
+            self.device.destroy_image(image, None);
+        }
+        format!("single {name:<11} {verdict}")
+    }
+
     fn plane_image(
         &self,
         width: u32,
@@ -831,6 +1103,7 @@ impl Device {
         chroma_image: vk::Image,
         width: u32,
         height: u32,
+        exports: vk::ExternalMemoryHandleTypeFlags,
     ) -> Result<Nv12, Error> {
         let subresource = vk::ImageSubresource {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -871,13 +1144,14 @@ impl Device {
             self.device_local_memory(luma_needs.memory_type_bits & chroma_needs.memory_type_bits)?;
 
         // **What the allocation may become, not what its images may be backed
-        // by.** The two are asked separately because the drivers here answer
-        // them differently, and using one answer for both either declares a
-        // kind the image cannot carry or refuses an export that works.
-        let exports = self.exportable_memory();
+        // by.** The caller passes the export kinds -- one specific kind for a
+        // backend whose driver refuses the pair, or the device's combined set
+        // for the codec-neutral path -- rather than this querying a device-wide
+        // answer that a disjoint-compatibility driver collapses to nothing.
+        let size = colour_at + chroma_needs.size;
         let mut exportable = vk::ExportMemoryAllocateInfo::default().handle_types(exports);
         let allocate = vk::MemoryAllocateInfo::default()
-            .allocation_size(colour_at + chroma_needs.size)
+            .allocation_size(size)
             .memory_type_index(index);
         let allocate = if exports.is_empty() {
             allocate
@@ -944,6 +1218,8 @@ impl Device {
                 width,
                 height,
                 pitch,
+                export_type: exports,
+                size,
             }),
             Err(error) => {
                 // SAFETY: nothing is bound to it any more.
@@ -996,12 +1272,12 @@ impl Device {
         } else {
             vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD
         };
-        // **Refused here rather than at the far end.** The allocation declared
-        // what it may become; asking for anything else is asking for a
-        // descriptor that was never made, and what comes back from a driver
-        // that does not refuse it is one an encoder cannot import for a reason
-        // naming neither side.
-        if !self.exportable_memory().contains(wanted) {
+        // **Refused here rather than at the far end, and against the allocation
+        // that was actually made.** The gate reads this target's own export
+        // kinds, not a device-wide query -- a driver that exports each kind
+        // alone but refuses the pair reports a combined capability of nothing,
+        // which would refuse an export the allocation can perfectly well do.
+        if !nv12.export_type.contains(wanted) {
             return Err(Error::NoExport);
         }
         let external = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
@@ -1013,9 +1289,14 @@ impl Device {
         // SAFETY: the driver returned a fresh owned descriptor.
         let fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
 
-        // **Not queried back.** The layout is the one this allocation was built
-        // to, so reporting anything else would mean the two had drifted.
-        Ok((fd, Exported::packed(nv12.width, nv12.height, nv12.pitch)))
+        // **Not queried back.** The layout and the exact allocation size are the
+        // ones this target was built to, so reporting anything else would mean
+        // the two had drifted -- and the size in particular is what a CUDA
+        // import must be given rather than reconstructing it from the pitch.
+        Ok((
+            fd,
+            Exported::packed_sized(nv12.width, nv12.height, nv12.pitch, nv12.size),
+        ))
     }
 
     /// Release a conversion target.
