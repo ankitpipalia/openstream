@@ -542,9 +542,13 @@ impl SckCapture {
     ///
     /// `Some` is the framework itself reporting that the stream is over: the
     /// display was disconnected, Screen Recording permission was withdrawn, the
-    /// captured window closed. This is the signal a host can act on, and
-    /// nothing on the receiving side can be substituted for it -- a frozen
-    /// source and an untouched desktop produce identical silence.
+    /// captured window closed. That is a signal a host can act on, and nothing
+    /// on the receiving side substitutes for it -- a frozen source and an
+    /// untouched desktop produce identical silence.
+    ///
+    /// It is not a general stall detector. A capture that hangs without the
+    /// stream stopping leaves this `None` forever, and is indistinguishable
+    /// from a desktop nobody is touching.
     #[must_use]
     pub fn stopped(&self) -> Option<String> {
         self.sink.stopped_reason()
@@ -757,13 +761,18 @@ fn delegate_class() -> Option<objc::Class> {
 
 /// `- (void)stream:didStopWithError:`
 ///
-/// **The only signal that distinguishes a stalled capture from a still one.**
+/// **The framework saying this stream has stopped.** Apple documents it as
+/// notification that the stream stopped with an error: the display went away,
+/// Screen Recording was revoked, the captured window closed.
+///
+/// That is narrower than "capture has stalled", and the difference matters.
 /// ScreenCaptureKit delivers on change, so "no new surface" is what a frozen
-/// source and an untouched desktop both look like from the receiving end. This
-/// is the framework saying the stream itself has ended -- the display went
-/// away, the user revoked Screen Recording, the window being captured closed --
-/// and it is the difference between a host that reports a dead capture and one
-/// that serves a still picture forever.
+/// source and an untouched desktop both look like from the receiving end -- and
+/// a source that has wedged *without* the stream stopping still looks exactly
+/// like a still screen here. Nothing in this file detects that. What this does
+/// detect is the case where the framework knows, which is the difference
+/// between a host that reports a dead capture and one that serves a still
+/// picture forever.
 ///
 /// Runs on the stream's dispatch queue, like the output callback, and takes the
 /// same strong reference to the sink for the same reason.
