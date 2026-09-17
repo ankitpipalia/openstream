@@ -78,6 +78,10 @@ pub fn interpret(observation: ConnectObservation, expired: bool) -> ConnectStep 
                 permissions: credential
                     .permissions
                     .map(crate::control_plane::granted_permissions),
+                // Never on the client side. A grant authorises a broker to
+                // open devices on the *host's* machine; the client has no
+                // broker and no business holding one.
+                session_grant: None,
             }))
         }
         ConnectObservation::Waiting { state } => match state {
@@ -109,6 +113,7 @@ mod tests {
 
     fn granted_with(role: &str, permissions: Option<PermissionSet>) -> ConnectObservation {
         ConnectObservation::Granted(Box::new(ConnectCredential {
+            session_grant: None,
             session_id: "session-1".into(),
             role: role.into(),
             token: "CLIENT-CAPABILITY".into(),
@@ -133,6 +138,77 @@ mod tests {
     /// A narrowed grant survives every layer between the broker and the
     /// runner's own policy.
     ///
+    /// The approval the broker verifies must survive the layers between the
+    /// control plane and the pairing file, unchanged.
+    ///
+    /// Written for the same reason as the permissions test below it, and
+    /// against the same failure. Every layer here has a plausible reason to
+    /// drop the field -- none of them can read it, none of them can check it,
+    /// and it looks like an opaque blob -- and if any of them does, the host
+    /// writes a pairing with no approval, the broker refuses, and the session
+    /// fails with a message about authorisation that points nowhere near the
+    /// conversion that lost it.
+    #[test]
+    fn the_session_grant_reaches_the_pairing_file_unchanged() {
+        const GRANT: &str = "a10000000973657373696f6e2d31";
+
+        let credential = crate::control_plane::ConnectCredential {
+            session_id: "session-1".into(),
+            role: "host".into(),
+            token: "host-token".into(),
+            websocket_path: "/v1/signal/session-1/host".into(),
+            relay_address: None,
+            relay_ticket: "ticket".into(),
+            permissions: None,
+            session_grant: Some(GRANT.to_string()),
+        };
+
+        // The conversion the approval handler actually calls -- not a copy of
+        // it. A test that rebuilt this by hand would keep passing while the
+        // handler dropped the field.
+        let pairing = crate::control_plane::host_pairing_from(credential);
+        assert_eq!(pairing.session_grant.as_deref(), Some(GRANT));
+
+        // And through the file the agent actually reads, because that is the
+        // boundary the earlier bug hid behind.
+        let json = serde_json::to_string(&pairing).expect("serialise the pairing");
+        let reloaded: openstream_client_core::Pairing =
+            serde_json::from_str(&json).expect("reload the pairing");
+        assert_eq!(
+            reloaded.session_grant.as_deref(),
+            Some(GRANT),
+            "the approval must survive the pairing file the agent reads"
+        );
+    }
+
+    /// A client credential carries no approval. A grant authorises a broker to
+    /// open devices on the host's machine, and handing one to the other end
+    /// would put a bearer statement somewhere it can only be misused.
+    #[test]
+    fn a_client_credential_carries_no_approval() {
+        let step = interpret(
+            ConnectObservation::Granted(Box::new(crate::control_plane::ConnectCredential {
+                session_id: "session-1".into(),
+                role: "client".into(),
+                token: "client-token".into(),
+                websocket_path: "/v1/signal/session-1/client".into(),
+                relay_address: None,
+                relay_ticket: "ticket".into(),
+                permissions: None,
+                // Even if the control plane somehow sent one.
+                session_grant: Some("a1deadbeef".into()),
+            })),
+            false,
+        );
+        match step {
+            ConnectStep::Start(credential) => assert!(
+                credential.session_grant.is_none(),
+                "a client must not be handed a host's approval"
+            ),
+            other => panic!("expected a start, got {other:?}"),
+        }
+    }
+
     /// This is the test the feature was missing. Permissions were negotiated
     /// by the broker, rendered by the approval modal and enforced by the host
     /// policy, but the desktop credential in the middle had no field for them:

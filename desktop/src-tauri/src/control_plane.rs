@@ -214,6 +214,49 @@ pub struct ConnectCredential {
     /// present set is the ceiling the session runner enforces.
     #[serde(default)]
     pub permissions: Option<PermissionSet>,
+    /// The control plane's signed statement that this session was approved,
+    /// hex-encoded, for the host to hand to its privileged broker.
+    ///
+    /// Carried, never inspected. This process cannot produce one and has no
+    /// reason to read one: the broker verifies it against a key this process
+    /// cannot read, which is precisely what makes it worth anything.
+    ///
+    /// `None` on the client's credential, which has no broker to present it
+    /// to, and on a host whose device enrolled before grant keys existed.
+    #[serde(default)]
+    pub session_grant: Option<String>,
+}
+
+/// Turn the host's approval credential into the pairing the agent reads.
+///
+/// A named function rather than a literal inside the approval handler, so the
+/// conversion can be tested. A test that rebuilds this by hand proves only
+/// that the test is consistent with itself: dropping a field *here* would
+/// leave such a test passing, which is exactly the shape of the bug that let
+/// negotiated permissions be parsed and discarded.
+#[must_use]
+pub fn host_pairing_from(credential: ConnectCredential) -> openstream_client_core::Pairing {
+    openstream_client_core::Pairing::from_role_credential(openstream_client_core::RoleCredential {
+        session_id: credential.session_id,
+        role: openstream_client_core::Role::Host,
+        token: credential.token,
+        websocket_path: credential.websocket_path,
+        // The broker does not restate the session lifetime here; the session's
+        // own expiry governs and the runner learns it from the service.
+        expires_in_seconds: 0,
+        relay_address: credential.relay_address,
+        relay_ticket: Some(credential.relay_ticket),
+        turn: None,
+        // What the host just granted, carried through to the runner. A broker
+        // that predates permission negotiation sends nothing, and the runner
+        // treats that as unscoped; a present set is its ceiling.
+        permissions: credential.permissions.map(granted_permissions),
+        // Carried, not inspected. The agent writes it through to the broker,
+        // which verifies it against a key this process cannot read -- so a
+        // compromise here cannot manufacture an approval, only fail to relay
+        // one.
+        session_grant: credential.session_grant,
+    })
 }
 
 /// Carry a granted set across the layer boundary.
