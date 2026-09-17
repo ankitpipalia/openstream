@@ -122,8 +122,29 @@ rather than guessed -- `cargo run --release -p openstream-macos-host --example
 capture_timing` splits it per stage on the machine it runs on.
 
 On an M1 Max, the old `CGDisplayCreateImage` path cost 14.3 ms a frame against
-0.5 ms for the hardware encode it fed. ScreenCaptureKit removed that; the next
-constraint is the presenter and the swapchain, at 40 fps into a 60 Hz display.
+0.5 ms for the hardware encode it fed. ScreenCaptureKit removed that.
+
+The next one found was not a slow stage but a missing one. VideoToolbox
+finishes on its own thread, and the host only collected output as a side effect
+of submitting the next frame -- so every finished access unit waited for the
+next capture before anyone looked at it. `cargo run --release -p
+openstream-macos-host --example encode_queue_depth` measures it: 290 of 291
+access units were already finished before the next frame arrived, and the queue
+depth between submits averaged 0.02. The encoder was never the thing holding
+them.
+
+Waiting for the next frame in 2 ms slices, with the encoder checked between
+them, took submit-to-access-unit from a mean of 34.8 ms to 11.1 ms and p95 from
+103.3 ms to 12.6 ms at a comparable capture rate. The residual is the encode.
+
+What that exercise also settled, on this machine: Apple's low-latency rate
+control is accepted and now in force, `DataRateLimits` caps the burst at 1.111x
+the nominal bitrate, and `MaxFrameDelayCount` and the speed-over-quality hint
+are both refused -- which costs nothing, because the measurement above says the
+encoder's queue was never where the latency was.
+
+The next constraint is the presenter and the swapchain, at 40 fps into a 60 Hz
+display.
 
 ## Map of the other documents
 
