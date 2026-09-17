@@ -5,7 +5,7 @@ set -euo pipefail
 # Signing and repository publication remain protected release-environment work.
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-version="${OPENSTREAM_VERSION:-1.0.0-dev}"
+version="${OPENSTREAM_VERSION:-1.0.0}"
 output="${1:-$repo_dir/dist/OpenStream-${version}-amd64.deb}"
 artifact_dir="${OPENSTREAM_ARTIFACT_DIR:-$repo_dir/engine/lowlat/target/release}"
 # openstream.desktop launches the Tauri product shell, which is built from
