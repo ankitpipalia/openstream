@@ -15,6 +15,7 @@ members = [
     "crates/kessel",
     "crates/signal-server",
     "crates/client-core",
+    "crates/enrol",
     "crates/protocol",
     "crates/transport",
     "crates/reference-peer",

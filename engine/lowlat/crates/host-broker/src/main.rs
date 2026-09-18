@@ -95,9 +95,14 @@ async fn run() -> std::io::Result<()> {
     // The key is read from a file, not from the environment: an environment
     // variable is visible in /proc to anyone who can read the process's
     // environ, and the whole point of this secret is that the unprivileged
-    // machine service cannot obtain it. The file should be mode 0600 and owned
-    // by the broker's user; the broker refuses to use one that anybody else
-    // can read, because a secret the service can read is not a boundary.
+    // machine service cannot obtain it.
+    //
+    // `grant_key::read` enforces the rest: the file must be owned by this
+    // process's own user, be a regular file opened O_NOFOLLOW, carry no access
+    // for group or other, and sit under directories nobody else can write. Mode
+    // alone would not do it -- a file owned by the machine service with mode
+    // 0600 is private to the machine service, and a privileged reader would
+    // happily verify approvals against a key that process chose.
     let authority = match std::env::var("OPENSTREAM_BROKER_GRANT_KEY_FILE") {
         Ok(path) => {
             let key = openstream_host_broker::grant_key::read(&path)?;
@@ -133,13 +138,6 @@ async fn run() -> std::io::Result<()> {
     server.run().await
 }
 
-/// Read the grant key, refusing one anybody else can read.
-///
-/// A secret the machine service can read is not a boundary: it could then tag
-/// a grant naming any session and any permissions, which is exactly what this
-/// key exists to prevent. Permissions are checked rather than assumed, because
-/// the failure is silent -- a world-readable key file works perfectly until
-/// someone looks.
 #[cfg(target_os = "linux")]
 /// Install the grant key this machine was enrolled with.
 ///

@@ -32,6 +32,11 @@ lowlat-inject = { workspace = true }
 lowlat-core = { workspace = true }
 lowlat-net = { workspace = true }
 openstream-media = { path = "../media" }
+
+# Not Linux-only: `grant_key` enforces the key file's ownership and the safety
+# of the directories above it through `geteuid` and `O_NOFOLLOW`, and those
+# checks are tested on every Unix runner rather than only where the broker runs.
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [lints]

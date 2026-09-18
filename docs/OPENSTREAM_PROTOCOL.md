@@ -139,7 +139,7 @@ same event to their native haptic layer. A zero-strength update stops both
 motors. Windows/macOS virtual gamepad host backends are still separate
 platform work; unsupported host paths do not silently claim to provide them.
 
-The shared `PeerSession` implementation performs steps 3–7 for both the
+The shared `PeerSession` implementation performs steps 3-7 for both the
 headless client and the Linux host adapter and provides the capability
 exchange as `negotiate_host`/`negotiate_client`; platform UIs should call it
 rather than reimplementing the handshake.
@@ -147,7 +147,7 @@ rather than reimplementing the handshake.
 ### Pen input
 
 Pen/stylus uses three `OI` kinds on the same reliable control channel:
-`PenMotion` (9: absolute output coordinates plus pressure 0–8191 and an
+`PenMotion` (9: absolute output coordinates plus pressure 0-8191 and an
 eraser-end flag), `PenButton` (10: tip/barrel index plus press state), and
 `PenProximity` (11: hover-range presence). Hosts translate motion/buttons
 through their absolute pointer path; pressure and tilt beyond position are
@@ -187,7 +187,7 @@ host-minted guest bearer tokens with input tiers
 (`POST /v1/session/{id}/guests`), redacted listing, and kick by the returned
 non-secret `guest_id` (`DELETE /v1/session/{id}/guests/{guest_id}`) with prompt
 close. The guest bearer token is returned only in the create response and is
-sent in the WebSocket `Authorization` header, never in a management URL. Media stays 1:1 — the first connected guest with no legacy client
+sent in the WebSocket `Authorization` header, never in a management URL. Media stays 1:1 -- the first connected guest with no legacy client
 attached goes active while the rest park with promotion on disconnect; the
 active guest may use the relay under the client role. Session-scoped TURN
 credentials come from `GET /v1/session/{id}/turn` (TURN REST HMAC-SHA1 over
@@ -269,7 +269,7 @@ representation only at the `/dev/uinput` boundary. The portable FFmpeg host
 uses the same authenticated envelope with native Windows `SendInput` and
 macOS CoreGraphics translations. Absolute-input extent is taken from the
 negotiated stream dimensions, so a client requesting a scaled mode does not
-map pointer coordinates against the host's 1920×1080 default.
+map pointer coordinates against the host's 1920x1080 default.
 
 The `OI` envelope is deliberately fixed-width:
 

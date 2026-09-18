@@ -1323,14 +1323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/v1/auth/register", post(register_account))
         .route("/v1/auth/login", post(login_account))
         .route("/v1/auth/refresh", post(refresh_account))
-        .route(
-            "/v1/devices",
-            get(list_account_devices).post(enroll_account_device),
-        )
-        .route(
-            "/v1/devices/{device_id}/trust",
-            patch(set_account_device_trust),
-        )
+        .merge(device_routes())
         .route(
             "/v1/presence",
             post(connect_presence).delete(connect_offline),
@@ -2052,6 +2045,74 @@ struct EnrolledDevice {
     /// Hex, and present only on the enrolment that created the device.
     #[serde(skip_serializing_if = "Option::is_none")]
     grant_key: Option<String>,
+}
+
+/// The device-management routes, in one place.
+///
+/// The test router is a hand-written copy of the production route table, which
+/// means a route added to one and not the other is a route whose tests all
+/// pass against a 404. Shared here so that cannot happen to the endpoints that
+/// carry enrolment.
+fn device_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/v1/devices",
+            get(list_account_devices).post(enroll_account_device),
+        )
+        .route(
+            "/v1/devices/{device_id}",
+            axum::routing::delete(remove_account_device),
+        )
+        .route(
+            "/v1/devices/{device_id}/trust",
+            patch(set_account_device_trust),
+        )
+}
+
+/// Remove a device, and with it the grant key enrolment issued for it.
+///
+/// The one operation that makes enrolment recoverable. A grant key is returned
+/// exactly once and `enroll_device` refuses an id it already holds, so an
+/// installer that received a key and then could not store it -- a full disk, a
+/// kill between the response and the write -- leaves a device record that can
+/// never be provisioned. Without this the machine is stuck under that id
+/// forever.
+///
+/// It is not a way to read the key back: the old key is destroyed here and
+/// re-enrolling mints a new one.
+async fn remove_account_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> Response {
+    let principal = match account_principal(&state, &headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let mut accounts = state.accounts.lock().await;
+    if let Err(error) = accounts.can_manage_devices(&principal) {
+        return control_error_response(error);
+    }
+    let result = accounts.remove_device(&principal.account_id, &device_id);
+    // Release the account lock before touching sessions: session teardown takes
+    // the sessions lock, and no other path holds accounts across it.
+    drop(accounts);
+    match result {
+        Ok(()) => {
+            // Removal is strictly stronger than revocation, so it has to do at
+            // least what revocation does. Invalidating the device's tokens
+            // leaves a live session signalling and relaying until its TTL
+            // expires -- on a device whose record, and whose grant key, no
+            // longer exist.
+            let senders =
+                revoke_owned_sessions(&state, &principal.account_id, Some(&device_id)).await;
+            for sender in senders {
+                let _ = sender.try_send(Message::Close(None));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => control_error_response(error),
+    }
 }
 
 async fn set_account_device_trust(
@@ -4810,14 +4871,13 @@ mod tests {
         admit_primary_socket as admit_primary_socket_with_cancel, authorize_registration,
         authorized, bearer_token, cleanup_primary_socket, close_primary_pair, connect_approve,
         connect_deny, connect_observe, connect_offline, connect_pending, connect_presence,
-        connect_request, consume_dual_budget, create_session, direct_message_route,
-        dispatch_generic_message, enroll_account_device, healthz, is_private_lan_address,
-        list_account_devices, login_account, max_guests_for_new_session,
-        prune_direct_establishment_messages, publish_ready, queue_pending, reap_expired_sessions,
-        register_account, registration_capability, relay_owner_for_ticket, relay_ticket,
-        request_source, revoke_owned_sessions, sessions_owned_by, set_account_device_trust,
-        signal_socket, supplied_token_is_host, validate_signal_message, validate_startup_auth,
-        version_info,
+        connect_request, consume_dual_budget, create_session, device_routes, direct_message_route,
+        dispatch_generic_message, healthz, is_private_lan_address, login_account,
+        max_guests_for_new_session, prune_direct_establishment_messages, publish_ready,
+        queue_pending, reap_expired_sessions, register_account, registration_capability,
+        relay_owner_for_ticket, relay_ticket, request_source, revoke_owned_sessions,
+        sessions_owned_by, signal_socket, supplied_token_is_host, validate_signal_message,
+        validate_startup_auth, version_info,
     };
     use axum::Router;
     use axum::body::to_bytes;
@@ -7592,14 +7652,8 @@ mod tests {
             .route("/v1/auth/registration", get(registration_capability))
             .route("/v1/auth/register", post(register_account))
             .route("/v1/auth/login", post(login_account))
-            .route(
-                "/v1/devices",
-                get(list_account_devices).post(enroll_account_device),
-            )
-            .route(
-                "/v1/devices/{device_id}/trust",
-                axum::routing::patch(set_account_device_trust),
-            )
+            // The real device routes, not a copy of them.
+            .merge(device_routes())
             .route(
                 "/v1/presence",
                 post(connect_presence).delete(connect_offline),
@@ -8333,6 +8387,184 @@ mod tests {
     /// class that never reached the host to be granted, or never reached each
     /// end to be enforced, is a permission the product cannot honour -- so this
     /// round trip is the foundation enforcement sits on.
+    /// Removing a device is what makes a lost grant key recoverable.
+    ///
+    /// The key is returned by exactly one request -- the enrolment that creates
+    /// the device -- and enrolling the same id again is a conflict, not a
+    /// re-issue. So an installer that received a key and could not store it
+    /// (a full disk, a kill between the response and the write) leaves a
+    /// device that can never be provisioned. `openstream-enrol` reacts by
+    /// deleting the device it just created; this is the endpoint that has to
+    /// make that work, and has to hand out a *different* key next time.
+    #[tokio::test]
+    async fn a_removed_device_enrols_again_and_receives_a_different_key() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (token, _) = register_with_device(&app, "operator", "device-client", 0x61).await;
+
+        let enrolment = serde_json::json!({
+            "device_id": "machine-one",
+            "name": "Studio",
+            "platform": "linux",
+            "public_key": hex::encode([0x62_u8; 32]),
+        });
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&token),
+            Some(enrolment.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "first enrolment: {body}");
+        let first_key = body["grant_key"]
+            .as_str()
+            .expect("the enrolment that creates a device must return its grant key")
+            .to_string();
+
+        // The reason removal has to exist: the second attempt is refused, so a
+        // machine cannot simply ask again for the key it dropped.
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&token),
+            Some(enrolment.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "re-enrolling must not quietly mint a second key for one device"
+        );
+
+        let (status, body) = call(
+            &app,
+            "DELETE",
+            "/v1/devices/machine-one",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "remove: {body}");
+        let (status, body) = call(&app, "GET", "/v1/devices", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !body
+                .as_array()
+                .expect("device list")
+                .iter()
+                .any(|device| device["device_id"] == "machine-one"),
+            "the removed device is still listed: {body}"
+        );
+
+        let (status, body) = call(&app, "POST", "/v1/devices", Some(&token), Some(enrolment)).await;
+        assert_eq!(status, StatusCode::OK, "re-enrolment after removal: {body}");
+        let second_key = body["grant_key"]
+            .as_str()
+            .expect("re-enrolment must return a key")
+            .to_string();
+        assert_ne!(
+            first_key, second_key,
+            "re-enrolment reissued the old key; removal must destroy it, or deleting a device \
+             becomes a way to hand the same secret to whoever asks next"
+        );
+
+        // Removing something that is not there is a 404, not a success: the
+        // installer's rollback reports what actually happened.
+        let (status, _) = call(
+            &app,
+            "DELETE",
+            "/v1/devices/never-enrolled",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Removing a device ends its live sessions, not just its tokens.
+    ///
+    /// Revoking trust already does this, with a comment saying why: a device
+    /// that keeps its signalling and relay path alive until the session TTL is
+    /// a device that was not really revoked. Removal is strictly stronger --
+    /// the record is gone and its grant key with it -- so it has to do at least
+    /// as much, and the first version of this endpoint did not.
+    #[tokio::test]
+    async fn removing_a_device_tears_down_its_live_sessions() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (token, _) = register_with_device(&app, "operator", "device-client", 0x71).await;
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&token),
+            Some(serde_json::json!({
+                "device_id": "machine-two",
+                "name": "Studio",
+                "platform": "linux",
+                "public_key": hex::encode([0x72_u8; 32]),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "enrol: {body}");
+
+        // The account id is not on the wire anywhere, and the teardown filters
+        // on it, so a session built with the wrong one would be ignored and
+        // this test would pass for the wrong reason.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("header"),
+        );
+        let account_id = super::account_principal(&state, &headers)
+            .await
+            .map(|principal| principal.account_id)
+            .unwrap_or_else(|_| panic!("the token just issued must authorize"));
+
+        let (doomed_tx, mut doomed_rx) = mpsc::channel(2);
+        let (survivor_tx, mut survivor_rx) = mpsc::channel(2);
+        {
+            let mut sessions = state.sessions.lock().await;
+            let mut doomed = owned_session(&account_id, "device-client", "machine-two");
+            doomed.host = Some(doomed_tx);
+            sessions.insert("doomed".to_string(), doomed);
+            // Same account, not involving machine-two: removing one device must
+            // not take down the rest of the fleet.
+            let mut survivor = owned_session(&account_id, "device-other", "device-third");
+            survivor.client = Some(survivor_tx);
+            sessions.insert("survivor".to_string(), survivor);
+        }
+
+        let (status, body) = call(
+            &app,
+            "DELETE",
+            "/v1/devices/machine-two",
+            Some(&token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "remove: {body}");
+
+        let remaining: Vec<String> = state.sessions.lock().await.keys().cloned().collect();
+        assert_eq!(
+            remaining,
+            vec!["survivor".to_string()],
+            "the removed device's session outlived the device"
+        );
+        assert!(
+            matches!(doomed_rx.recv().await, Some(Message::Close(None))),
+            "the removed device's socket was never told to close, so it keeps \
+             signalling and relaying on a device whose grant key no longer exists"
+        );
+        assert!(
+            survivor_rx.try_recv().is_err(),
+            "an unrelated session was closed too"
+        );
+    }
+
     #[tokio::test]
     async fn permissions_negotiate_through_the_connect_flow() {
         let state = connect_test_state();

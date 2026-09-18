@@ -1,0 +1,27 @@
+[package]
+name = "openstream-enrol"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors = ["OpenStream contributors"]
+
+# A one-shot, install-time tool that enrols this machine with the control plane
+# and writes the grant key its privileged broker needs. Deliberately a separate
+# binary rather than a subcommand of the broker: the broker is a resident root
+# process, and this needs an HTTP client and a TLS stack that the broker should
+# not carry for the sake of a step that runs once.
+[[bin]]
+name = "openstream-enrol"
+path = "src/main.rs"
+
+[dependencies]
+openstream-client-core = { path = "../client-core" }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+openstream-host-broker = { path = "../host-broker" }
+
+[lints]
+workspace = true

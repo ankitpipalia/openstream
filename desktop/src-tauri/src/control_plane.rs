@@ -71,6 +71,16 @@ pub struct PublicUser {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A device as the control plane describes it to the owner.
+///
+/// Deliberately without the one-time `grant_key` the enrolment response also
+/// carries. That key decides whether a session approval is genuine, and this is
+/// an unprivileged, network-facing, long-running process -- giving it a second
+/// home here would put it somewhere with none of the protections the broker's
+/// 0600, owner-checked file has. `openstream-enrol` reads the enrolment
+/// response, writes the key and exits; see `docs/BUILD.md`.
+///
+/// Its absence is a decision, not an oversight.
 pub struct PublicDevice {
     pub device_id: String,
     pub name: String,
