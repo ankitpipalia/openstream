@@ -757,6 +757,89 @@ impl IdentityKey {
             .verify(&message, &signature_bytes)
             .is_ok()
     }
+
+    /// Sign a statement that this device is itself, for the control plane.
+    ///
+    /// The key this proves possession of is the one the device registered at
+    /// enrolment, so the control plane can check it without the device holding
+    /// any account credential. That is what lets a headless host authenticate:
+    /// the alternative is an account password sitting in a service that faces
+    /// the network.
+    pub fn sign_device_auth(
+        &self,
+        account_id: &str,
+        device_id: &str,
+        issued_at_ms: u64,
+        nonce: [u8; 16],
+    ) -> Result<[u8; 64], IdentityError> {
+        let key_pair = Ed25519KeyPair::from_pkcs8(&self.pkcs8)
+            .map_err(|_| IdentityError::InvalidKeyMaterial)?;
+        let message = device_auth_transcript(account_id, device_id, issued_at_ms, nonce);
+        let signature = key_pair.sign(&message);
+        <[u8; 64]>::try_from(signature.as_ref()).map_err(|_| IdentityError::SigningFailed)
+    }
+
+    /// Verify a device's proof that it holds the key it enrolled with.
+    ///
+    /// Possession is all this establishes. Freshness and replay are the
+    /// caller's to enforce -- a signature is valid forever, so the control
+    /// plane bounds `issued_at_ms` and remembers the nonce.
+    pub fn verify_device_auth(
+        public: [u8; 32],
+        signature_bytes: [u8; 64],
+        account_id: &str,
+        device_id: &str,
+        issued_at_ms: u64,
+        nonce: [u8; 16],
+    ) -> bool {
+        let message = device_auth_transcript(account_id, device_id, issued_at_ms, nonce);
+        signature::UnparsedPublicKey::new(&signature::ED25519, public)
+            .verify(&message, &signature_bytes)
+            .is_ok()
+    }
+}
+
+/// Build the message a device signs to authenticate itself.
+///
+/// Its own domain separator, so a signature made here can never be replayed as
+/// a key-exchange signature or the other way round -- the two are produced by
+/// the same key, and a shared prefix would make one a valid forgery of the
+/// other.
+///
+/// **The account is part of what is signed, not just the device.** A device id
+/// is unique inside an account and nowhere else, so two accounts can hold one
+/// with the same name -- and one physical machine legitimately has a single
+/// identity key while signing in to several accounts, because the key belongs
+/// to the operating-system user rather than to the account. Without the account
+/// in here, a proof made for one account also verifies against the record in
+/// another, and which one answers is whatever order the store happens to
+/// iterate in. With it, a proof names exactly one (account, device) pair, and
+/// the control plane looks that pair up directly instead of searching every
+/// account for a device with the right name.
+///
+/// Both identifiers are length-prefixed for the reason the session id is in
+/// [`key_exchange_transcript`]: without it, `("ab", "c")` and `("a", "bc")`
+/// concatenate identically.
+#[must_use]
+pub fn device_auth_transcript(
+    account_id: &str,
+    device_id: &str,
+    issued_at_ms: u64,
+    nonce: [u8; 16],
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(48 + account_id.len() + device_id.len());
+    message.extend_from_slice(b"OpenStream device authentication\0");
+    for identifier in [account_id, device_id] {
+        message.extend_from_slice(
+            &u32::try_from(identifier.len())
+                .unwrap_or(u32::MAX)
+                .to_be_bytes(),
+        );
+        message.extend_from_slice(identifier.as_bytes());
+    }
+    message.extend_from_slice(&issued_at_ms.to_be_bytes());
+    message.extend_from_slice(&nonce);
+    message
 }
 
 /// Identity-key failures. The concrete ring error is intentionally not
@@ -1442,6 +1525,105 @@ mod tests {
             2,
             ephemeral.public_key()
         ));
+    }
+
+    #[test]
+    fn device_authentication_binds_the_account_device_time_and_nonce() {
+        let identity = IdentityKey::generate().expect("identity generation");
+        let public = identity.public_key();
+        let nonce = [7_u8; 16];
+        let signature = identity
+            .sign_device_auth("acct-1", "machine-one", 1_700_000_000_000, nonce)
+            .expect("device signature");
+
+        assert!(IdentityKey::verify_device_auth(
+            public,
+            signature,
+            "acct-1",
+            "machine-one",
+            1_700_000_000_000,
+            nonce
+        ));
+        // Every field is bound. The account one is the reason this exists: a
+        // device id is unique inside an account and nowhere else, and one
+        // machine has a single identity key across every account it signs in
+        // to -- so without the account here, a proof for one account is a
+        // valid proof against a same-named device in another.
+        assert!(!IdentityKey::verify_device_auth(
+            public,
+            signature,
+            "acct-2",
+            "machine-one",
+            1_700_000_000_000,
+            nonce
+        ));
+        assert!(!IdentityKey::verify_device_auth(
+            public,
+            signature,
+            "acct-1",
+            "machine-two",
+            1_700_000_000_000,
+            nonce
+        ));
+        assert!(!IdentityKey::verify_device_auth(
+            public,
+            signature,
+            "acct-1",
+            "machine-one",
+            1_700_000_000_001,
+            nonce
+        ));
+        assert!(!IdentityKey::verify_device_auth(
+            public,
+            signature,
+            "acct-1",
+            "machine-one",
+            1_700_000_000_000,
+            [8_u8; 16]
+        ));
+        // And it is the enrolled key that matters, not any key.
+        let other = IdentityKey::generate().expect("identity generation");
+        assert!(!IdentityKey::verify_device_auth(
+            other.public_key(),
+            signature,
+            "acct-1",
+            "machine-one",
+            1_700_000_000_000,
+            nonce
+        ));
+    }
+
+    #[test]
+    fn a_device_proof_is_not_a_key_exchange_proof() {
+        // Both are made by the same key. Without separate domain prefixes, a
+        // signature gathered from one protocol would be a valid forgery in the
+        // other -- the classic cross-protocol attack, and the reason the
+        // transcripts start with different constants.
+        let a = device_auth_transcript("acct", "x", 1, [0; 16]);
+        let b = key_exchange_transcript("x", 1, [0; 32]);
+        assert_ne!(a, b);
+        assert!(a.starts_with(b"OpenStream device authentication\0"));
+        assert!(!b.starts_with(b"OpenStream device authentication\0"));
+    }
+
+    #[test]
+    fn a_device_transcript_cannot_be_confused_by_a_shifted_boundary() {
+        // Without the length prefix these two would be the same bytes, and a
+        // proof for one device would authenticate the other.
+        assert_ne!(
+            device_auth_transcript("acct", "ab", 0, [0; 16]),
+            device_auth_transcript("acct", "a", 0, [0; 16])
+        );
+        let mut shifted = device_auth_transcript("acct", "a", 0, [0; 16]);
+        let straight = device_auth_transcript("acct", "ab", 0, [0; 16]);
+        shifted.truncate(straight.len());
+        assert_ne!(shifted, straight);
+        // The same shift across the account/device boundary: without two
+        // length prefixes, ("ab","c") and ("a","bc") would be one string.
+        assert_ne!(
+            device_auth_transcript("ab", "c", 0, [0; 16]),
+            device_auth_transcript("a", "bc", 0, [0; 16])
+        );
     }
 
     #[test]

@@ -219,6 +219,7 @@ async fn main() -> ExitCode {
     // seen. Every failure from here has to put the record back, or the machine
     // is stuck under an id that can never be provisioned and never re-enrolled.
     let device_id = enrolment.device_id.clone();
+    let account_id = enrolment.account_id.clone();
     let Some(key_hex) = enrolment.into_grant_key() else {
         return undo(
             &args.origin,
@@ -256,6 +257,10 @@ async fn main() -> ExitCode {
     eprintln!(
         "openstream-enrol: set OPENSTREAM_BROKER_DEVICE_ID={device_id} in the broker's unit, \
          alongside OPENSTREAM_BROKER_GRANT_KEY_FILE={key_path}"
+    );
+    eprintln!(
+        "openstream-enrol: this machine belongs to account {account_id}. It needs both that and \
+         its device id to authenticate later: a device proof names the pair it is good for."
     );
     ExitCode::SUCCESS
 }

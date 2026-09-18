@@ -36,6 +36,22 @@ const PASSWORD_MAX_BYTES: usize = 256;
 const USERNAME_MIN_BYTES: usize = 3;
 const USERNAME_MAX_BYTES: usize = 128;
 const DEVICE_ID_MAX_BYTES: usize = 128;
+/// How far a device-authentication proof may be from the service's clock, in
+/// either direction.
+///
+/// Both directions, because the machine and the service keep their own time and
+/// neither is authoritative. Thirty seconds is comfortably more than any clock
+/// skew a machine running NTP will show, and short enough that a proof captured
+/// off the wire is useless long before anyone could act on it.
+const DEVICE_AUTH_WINDOW_MS: u64 = 30_000;
+/// Cap on remembered device-authentication nonces.
+///
+/// The map is pruned by age on every attempt, so reaching this needs a genuine
+/// flood. At that point new proofs are still verified and still work -- what
+/// stops is recording their nonces, which is a bounded loss of replay
+/// protection inside a thirty-second window rather than an outage, and it does
+/// not let anything unauthenticated through.
+const MAX_DEVICE_AUTH_NONCES: usize = 100_000;
 const DEVICE_NAME_MAX_BYTES: usize = 128;
 const PLATFORM_MAX_BYTES: usize = 64;
 const ACCESS_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
@@ -114,6 +130,20 @@ pub(crate) struct IssuedTokens {
     pub refresh_expires_in_seconds: u64,
     pub user: PublicUser,
     pub device: Option<PublicDevice>,
+}
+
+/// What a device gets for proving it holds its enrolled identity key.
+///
+/// Deliberately not [`IssuedTokens`]: there is no refresh token here, and a
+/// type that carried an unused one would invite the ordinary issuance path to
+/// be reused -- which is exactly the bug this replaced, where every
+/// re-authentication consumed one of the account's sixteen refresh slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceCredential {
+    pub access_token: String,
+    pub access_expires_in_seconds: u64,
+    pub user: PublicUser,
+    pub device: PublicDevice,
 }
 
 #[derive(Debug)]
@@ -361,6 +391,15 @@ pub(crate) struct AccountStore {
     /// invalidates all active access tokens; refresh tokens are rotated and
     /// stored as hashes, never as bearer values.
     access_tokens: HashMap<[u8; 32], AccessTokenRecord>,
+    /// Device-authentication nonces seen inside the freshness window, with the
+    /// time each was accepted.
+    ///
+    /// A signature is valid forever, so possession of one lets anyone who saw
+    /// it replay the proof. The freshness window bounds how long a captured
+    /// proof stays useful and this bounds it to *once*. Memory-only for the
+    /// same reason the access tokens are: a restart invalidates every token
+    /// those proofs bought, so an old nonce buys nothing either.
+    device_auth_nonces: HashMap<[u8; 16], u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -413,6 +452,7 @@ impl AccountStore {
             path,
             accounts,
             access_tokens: HashMap::new(),
+            device_auth_nonces: HashMap::new(),
         })
     }
 
@@ -971,6 +1011,178 @@ impl AccountStore {
         Ok(public)
     }
 
+    /// The identity key `device_id` enrolled under `account_id`.
+    ///
+    /// Split out so the Ed25519 verification can happen *outside* the store
+    /// lock. `/v1/auth/device` is unauthenticated by construction -- it is how
+    /// a caller becomes authenticated -- so anything it does while holding the
+    /// global account mutex is something an unauthenticated flood can put in
+    /// front of every login, device listing and token check in the service.
+    /// Verification is the expensive part and needs no lock: one public key and
+    /// one signature.
+    pub(crate) fn device_identity_key(
+        &self,
+        account_id: &str,
+        device_id: &str,
+    ) -> Option<[u8; 32]> {
+        self.accounts
+            .get(account_id)?
+            .devices
+            .get(device_id)
+            .map(|device| device.registration.public_key)
+    }
+
+    /// Finish a device authentication whose signature has already verified.
+    ///
+    /// **Why this exists.** Every other way to obtain a device-bound token goes
+    /// through the account password, and a headless host must not hold one: the
+    /// machine service faces the network, and a password there is an account
+    /// compromise waiting for a bug. What it does hold is the private half of
+    /// the identity key registered at enrolment, in the operating system's own
+    /// custody. Proving possession of that is enough to say "I am this device",
+    /// which is all presence and connect need.
+    ///
+    /// **What it deliberately does not check: trust.** A pending device
+    /// authenticates successfully and then finds every useful endpoint refuses
+    /// it, exactly as a password sign-in from a pending device does. Refusing
+    /// the token instead would leave an unapproved machine unable to say
+    /// anything at all, including that it is waiting.
+    ///
+    /// Three things bound the proof, because a signature on its own is valid
+    /// forever:
+    ///
+    /// - the transcript binds the account *and* the device, so a proof is good
+    ///   for exactly one pair and the lookup is a direct one rather than a
+    ///   search through every account for a device of that name;
+    /// - `issued_at_ms` must be within [`DEVICE_AUTH_WINDOW_MS`] of now, in
+    ///   either direction, so a captured proof expires;
+    /// - the nonce must be one this service has not already accepted, so the
+    ///   proof works once even inside that window.
+    ///
+    /// `verified_against` is the key the caller actually checked the signature
+    /// with. The device can be removed or re-enrolled between that read and
+    /// this call, so the key is read again and has to be the same one --
+    /// otherwise this would mint a credential from a verification against a key
+    /// the account no longer holds.
+    pub(crate) fn commit_device_auth(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        verified_against: [u8; 32],
+        issued_at_ms: u64,
+        nonce: [u8; 16],
+        now_ms: u64,
+    ) -> Result<DeviceCredential, ControlPlaneError> {
+        if now_ms.abs_diff(issued_at_ms) > DEVICE_AUTH_WINDOW_MS {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+        if self.device_identity_key(account_id, device_id) != Some(verified_against) {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+        // Checked and consumed under one lock, or two proofs racing with the
+        // same nonce would both find it absent and both be accepted.
+        self.forget_stale_device_nonces(now_ms);
+        if self.device_auth_nonces.contains_key(&nonce) {
+            return Err(ControlPlaneError::Unauthorized);
+        }
+        // Recorded only once the proof is known good. Burning a nonce on a
+        // failed attempt would let anyone who can guess one deny the real
+        // device its next authentication.
+        if self.device_auth_nonces.len() < MAX_DEVICE_AUTH_NONCES {
+            self.device_auth_nonces.insert(nonce, now_ms);
+        }
+        self.issue_device_access(account_id, device_id, now_ms)
+    }
+
+    /// Mint an access token for a device, and nothing else.
+    ///
+    /// **No refresh token, deliberately.** A device re-authenticates by signing
+    /// a fresh proof with a key it already holds, so a refresh token would be a
+    /// second long-lived secret to store and lose for no gain -- and the client
+    /// discarded it anyway. Issuing one through the ordinary path was actively
+    /// harmful: refresh tokens are capped at [`MAX_REFRESH_TOKENS_PER_ACCOUNT`]
+    /// per account and pruned oldest-first, they live thirty days so they never
+    /// age out, and a host re-authenticating every few minutes filled the whole
+    /// allowance within hours -- evicting its owner's real sign-ins.
+    ///
+    /// Nothing here is persisted, so unlike the password paths this does not
+    /// write the store while holding the lock.
+    fn issue_device_access(
+        &mut self,
+        account_id: &str,
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<DeviceCredential, ControlPlaneError> {
+        let (user, device) = {
+            let account = self
+                .accounts
+                .get(account_id)
+                .ok_or(ControlPlaneError::NotFound)?;
+            let device = account
+                .devices
+                .get(device_id)
+                .ok_or(ControlPlaneError::NotFound)?;
+            (
+                PublicUser {
+                    account_id: account.account_id.clone(),
+                    username: account.username.clone(),
+                    created_at_ms: account.created_at_ms,
+                },
+                public_device(device),
+            )
+        };
+        self.forget_expired_access_tokens(now_ms);
+        let access_token = Uuid::new_v4().simple().to_string();
+        self.access_tokens.insert(
+            token_digest(&access_token),
+            AccessTokenRecord {
+                principal: AccountPrincipal {
+                    account_id: account_id.to_string(),
+                    device_id: Some(device_id.to_string()),
+                },
+                // Its own family of one. Families exist so a compromised
+                // sign-in can be condemned whole; this credential descends from
+                // no sign-in and shares its fate with nothing. Revoking or
+                // removing the device still reaches it, by device id.
+                family_id: Uuid::new_v4().simple().to_string(),
+                expires_at_ms: now_ms.saturating_add(ACCESS_TOKEN_TTL_MS),
+            },
+        );
+        Ok(DeviceCredential {
+            access_token,
+            access_expires_in_seconds: ACCESS_TOKEN_TTL_MS / 1000,
+            user,
+            device,
+        })
+    }
+
+    /// Drop access tokens that have expired.
+    ///
+    /// `authorize_access` removes an expired token only when that exact token
+    /// is presented again, which never happens to one that was abandoned. A
+    /// host that re-authenticates on a timer abandons its previous token every
+    /// time, so without this the map grows for the life of the process: about
+    /// eight entries an hour per host, forever, for credentials that stopped
+    /// being usable fifteen minutes after they were issued.
+    ///
+    /// Called before issuing, which is the only moment the map grows, and
+    /// bounds it to the tokens issued within one [`ACCESS_TOKEN_TTL_MS`]
+    /// window rather than to the uptime of the service.
+    fn forget_expired_access_tokens(&mut self, now_ms: u64) {
+        self.access_tokens
+            .retain(|_, token| token.expires_at_ms > now_ms);
+    }
+
+    /// Drop nonces that can no longer be replayed anyway.
+    ///
+    /// A proof outside the freshness window is refused before the nonce is ever
+    /// consulted, so remembering it past that point protects nothing and only
+    /// grows the map.
+    fn forget_stale_device_nonces(&mut self, now_ms: u64) {
+        self.device_auth_nonces
+            .retain(|_, seen_at| now_ms.saturating_sub(*seen_at) <= DEVICE_AUTH_WINDOW_MS);
+    }
+
     /// Remove a device from the account entirely.
     ///
     /// Enrolment is the only thing that issues a grant key, and it issues one
@@ -1097,6 +1309,7 @@ impl AccountStore {
         family: RefreshFamily,
         now_ms: u64,
     ) -> Result<IssuedTokens, ControlPlaneError> {
+        self.forget_expired_access_tokens(now_ms);
         let access_token = Uuid::new_v4().simple().to_string();
         let refresh_token = Uuid::new_v4().simple().to_string();
         let access_expires_at = now_ms.saturating_add(ACCESS_TOKEN_TTL_MS);
@@ -1551,6 +1764,80 @@ mod tests {
         let _ = fs::remove_dir_all(directory);
     }
 
+    /// A host renewing forever must not grow the access-token map forever.
+    ///
+    /// `authorize_access` evicts an expired token only when that same token is
+    /// presented again, and an abandoned one never is. A machine that
+    /// re-authenticates on a timer abandons its previous token every time, so
+    /// without pruning at issuance the map grows for the life of the process --
+    /// entries for credentials that stopped working fifteen minutes after they
+    /// were minted.
+    ///
+    /// This drives `commit_device_auth` directly, which is the half that owns
+    /// the map. It does not verify a signature, so it is not evidence about the
+    /// endpoint: `a_device_authenticates_with_its_identity_key_and_can_announce_presence`
+    /// and `an_unknown_device_and_a_bad_signature_answer_alike` cover that, over
+    /// HTTP. What this needs is a clock it can move, and two thousand requests
+    /// through the router would take the wall-clock time it is simulating.
+    #[test]
+    fn renewing_a_device_credential_does_not_grow_the_token_map_without_bound() {
+        use openstream_protocol::IdentityKey;
+
+        let (mut store, directory) = test_store();
+        let start = 1_700_000_000_000_u64;
+        let account_id = registered_account(&mut store, start);
+
+        let machine = IdentityKey::generate().expect("identity");
+        let registration = DeviceRegistration {
+            device_id: "machine-busy".into(),
+            name: "Studio".into(),
+            platform: "linux".into(),
+            public_key: machine.public_key(),
+        };
+        store
+            .enroll_device(&account_id, registration, start)
+            .expect("enrol");
+
+        // A year of renewals at the client's cadence, with the clock advancing
+        // as it actually would.
+        let renewal_ms = ACCESS_TOKEN_TTL_MS / 2;
+        let mut now = start;
+        for round in 0..2_000_u64 {
+            now += renewal_ms;
+            let nonce = {
+                let mut bytes = [0_u8; 16];
+                bytes[..8].copy_from_slice(&round.to_be_bytes());
+                bytes
+            };
+            store
+                .commit_device_auth(
+                    &account_id,
+                    "machine-busy",
+                    machine.public_key(),
+                    now,
+                    nonce,
+                    now,
+                )
+                .expect("authenticate");
+        }
+
+        // Only tokens still inside one lifetime may remain. At a renewal every
+        // half-life that is two, plus the one the registration left behind if
+        // it has not expired -- nothing like the two thousand issued.
+        assert!(
+            store.access_tokens.len() <= 4,
+            "the access-token map kept {} entries after 2000 renewals; expired \
+             credentials are never being dropped",
+            store.access_tokens.len()
+        );
+        // The same for the replay nonces, which are pruned on the same path.
+        assert!(
+            store.device_auth_nonces.len() <= 4,
+            "the nonce map kept {} entries",
+            store.device_auth_nonces.len()
+        );
+        cleanup(&directory);
+    }
     /// Register an account and return its id, which is not the username.
     fn registered_account(store: &mut AccountStore, now_ms: u64) -> String {
         let salt = AccountStore::registration_salt().expect("salt");

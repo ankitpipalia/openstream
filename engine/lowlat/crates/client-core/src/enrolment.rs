@@ -84,6 +84,12 @@ pub struct MachineIdentity {
 pub struct Enrolment {
     /// The device id the control plane recorded.
     pub device_id: String,
+    /// The account the device now belongs to.
+    ///
+    /// Needed to authenticate later: a device proof names the (account, device)
+    /// pair it is good for, and this response is the only place the machine is
+    /// told which account it joined.
+    pub account_id: String,
     /// The grant key, hex-encoded. Present only on the enrolment that created
     /// the device; a machine that was already enrolled gets nothing here, and
     /// its key cannot be recovered -- it has to be un-enrolled and enrolled
@@ -113,6 +119,7 @@ impl std::fmt::Debug for Enrolment {
         formatter
             .debug_struct("Enrolment")
             .field("device_id", &self.device_id)
+            .field("account_id", &self.account_id)
             .field(
                 "grant_key",
                 &self.grant_key_hex.as_ref().map(|_| "<redacted>"),
@@ -151,6 +158,11 @@ pub fn parse_enrolment(body: &[u8]) -> Result<Enrolment, EnrolmentError> {
         .and_then(serde_json::Value::as_str)
         .ok_or(EnrolmentError::Incomplete("carries no device_id"))?
         .to_string();
+    let account_id = value
+        .get("account_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(EnrolmentError::Incomplete("carries no account_id"))?
+        .to_string();
     let grant_key_hex = value
         .get("grant_key")
         .and_then(serde_json::Value::as_str)
@@ -158,6 +170,7 @@ pub fn parse_enrolment(body: &[u8]) -> Result<Enrolment, EnrolmentError> {
         .map(ToString::to_string);
     Ok(Enrolment {
         device_id,
+        account_id,
         grant_key_hex,
     })
 }
@@ -331,8 +344,10 @@ mod tests {
 
     #[test]
     fn a_fresh_enrolment_yields_a_key() {
-        let enrolment =
-            parse_enrolment(br#"{"device_id":"device-abc","grant_key":"00ff"}"#).expect("parse");
+        let enrolment = parse_enrolment(
+            br#"{"device_id":"device-abc","account_id":"acct-1","grant_key":"00ff"}"#,
+        )
+        .expect("parse");
         assert_eq!(enrolment.device_id, "device-abc");
         assert!(enrolment.has_grant_key());
         assert_eq!(enrolment.into_grant_key().as_deref(), Some("00ff"));
@@ -345,11 +360,13 @@ mod tests {
         // re-enrolment look like a transport failure; treating an empty one as
         // present would have the caller write an empty key file, which the
         // broker reports as unconfigured with no clue why.
-        let enrolment = parse_enrolment(br#"{"device_id":"device-abc"}"#).expect("parse");
+        let enrolment =
+            parse_enrolment(br#"{"device_id":"device-abc","account_id":"acct-1"}"#).expect("parse");
         assert!(!enrolment.has_grant_key());
 
         let empty =
-            parse_enrolment(br#"{"device_id":"device-abc","grant_key":""}"#).expect("parse");
+            parse_enrolment(br#"{"device_id":"device-abc","account_id":"acct-1","grant_key":""}"#)
+                .expect("parse");
         assert!(
             !empty.has_grant_key(),
             "an empty key is absent, not a key made of nothing"
@@ -366,8 +383,10 @@ mod tests {
     fn the_key_never_reaches_a_debug_line() {
         // Enrolment output is the sort of thing that ends up in an installer
         // log. The key must not be in it.
-        let enrolment =
-            parse_enrolment(br#"{"device_id":"device-abc","grant_key":"c0ffee"}"#).expect("parse");
+        let enrolment = parse_enrolment(
+            br#"{"device_id":"device-abc","account_id":"acct-1","grant_key":"c0ffee"}"#,
+        )
+        .expect("parse");
         let rendered = format!("{enrolment:?}");
         assert!(rendered.contains("device-abc"), "{rendered}");
         assert!(
