@@ -109,6 +109,12 @@ jobs:
       - uses: actions/checkout@v7
       - name: The classifier's own cases
         run: bash scripts/check-ci-classifier.sh
+      # Runs here, in the job that is never skipped, because the failure this
+      # catches is a target quietly ceasing to be built. A job that no longer
+      # exists cannot go red, and a word removed from a space-separated list of
+      # targets is quieter still.
+      - name: CI target coverage
+        run: python3 scripts/check-ci-target-coverage.py
       - name: MVP acceptance documentation boundary
         run: |
           grep -Fq 'physical Linux-NVIDIA' README.md
@@ -260,7 +266,7 @@ jobs:
         run: cargo test --locked -p openstream-linux-host
 
   openstream-target-matrix:
-    name: OpenStream target (${{ matrix.target }})
+    name: OpenStream target (${{ matrix.label }})
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     strategy:
@@ -268,40 +274,57 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            label: x86_64-unknown-linux-gnu
             target: x86_64-unknown-linux-gnu
-            host: true
+            targets: x86_64-unknown-linux-gnu
+            host_targets: x86_64-unknown-linux-gnu
+            mobile_targets: ""
             linux_host: true
           - os: ubuntu-latest
+            label: aarch64-unknown-linux-gnu
             target: aarch64-unknown-linux-gnu
-            host: true
+            targets: aarch64-unknown-linux-gnu
+            host_targets: aarch64-unknown-linux-gnu
+            mobile_targets: ""
             linux_host: true
+          # Windows and macOS are one job per OS rather than one per target.
+          #
+          # Five separate jobs cost 31 of this workflow's 100 job-minutes, and
+          # most of that was paid five times over: runner acquisition, toolchain
+          # install, and a cold build of every shared dependency. Targets on the
+          # same OS share a `~/.cargo` registry and a `target/` directory within
+          # a job, so the second and third are close to free.
+          #
+          # Linux keeps one job per target: its entries carry the Android NDK
+          # setup, which writes per-target compiler paths into $GITHUB_ENV, and
+          # $GITHUB_ENV is job-scoped. Folding those together would mean
+          # rewriting that as shell state for a platform that is not where the
+          # time goes.
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            host: true
-            linux_host: false
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            host: true
+            label: windows
+            targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+            host_targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+            mobile_targets: ""
             linux_host: false
           - os: macos-latest
-            target: x86_64-apple-darwin
-            host: true
-            linux_host: false
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            host: true
-            linux_host: false
-          - os: macos-latest
-            target: aarch64-apple-ios
-            host: false
+            label: macos
+            targets: x86_64-apple-darwin aarch64-apple-darwin aarch64-apple-ios
+            host_targets: x86_64-apple-darwin aarch64-apple-darwin
+            mobile_targets: aarch64-apple-ios
             linux_host: false
           - os: ubuntu-latest
+            label: aarch64-linux-android
             target: aarch64-linux-android
-            host: false
+            targets: aarch64-linux-android
+            host_targets: ""
+            mobile_targets: aarch64-linux-android
             linux_host: false
           - os: ubuntu-latest
+            label: x86_64-linux-android
             target: x86_64-linux-android
-            host: false
+            targets: x86_64-linux-android
+            host_targets: ""
+            mobile_targets: x86_64-linux-android
             linux_host: false
     runs-on: ${{ matrix.os }}
     steps:
@@ -356,79 +379,144 @@ jobs:
           echo "RANLIB_x86_64-linux-android=$ranlib" >> "$GITHUB_ENV"
           echo "RANLIB_x86_64_linux_android=$ranlib" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$clang" >> "$GITHUB_ENV"
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install targets
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            rustup target add "$target"
+          done
+      # Every build below loops over this entry's targets rather than running
+      # once. Nothing is skipped relative to the per-target jobs this replaces:
+      # the same commands run for the same targets, sharing one checkout, one
+      # toolchain and one `target/` directory.
+      #
+      # Each loop records failures and continues, then fails the step with the
+      # list. Without that, `bash -e` ends the step on the first bad target and
+      # the rest of the OS's targets never run -- which is the fail-fast the
+      # matrix sets `fail-fast: false` to avoid, reintroduced one level down.
+      # The point of a red run is to learn everything that is broken.
       - name: Check portable target subset
+        shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: >-
-          cargo check --locked --target ${{ matrix.target }}
-          -p openstream-protocol
-          -p openstream-transport
-          -p openstream-media
-          -p openstream-platform
-          -p openstream-client-core
-          -p openstream-mobile-ffi
-          -p openstream-host-agent
+        run: |
+          failed=""
+          for target in ${{ matrix.targets }}; do
+            echo "::group::portable subset for $target"
+            cargo check --locked --target "$target" \
+              -p openstream-protocol \
+              -p openstream-transport \
+              -p openstream-media \
+              -p openstream-platform \
+              -p openstream-client-core \
+              -p openstream-mobile-ffi \
+              -p openstream-host-agent || failed="$failed $target"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::portable subset failed for:$failed"
+            exit 1
+          fi
       # `openstream-ffmpeg-host` and `openstream-linux-host` are not checked
-      # separately: the two release builds below compile and link both, for the
+      # separately: the release builds below compile and link both, for the
       # same target. The portable subset above stays, because those crates are
       # not in any release build here and would otherwise go unbuilt.
       - name: Build OpenStream desktop release artifacts
-        if: matrix.host
+        if: matrix.host_targets != ''
+        shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: >-
-          cargo build --locked --release --target ${{ matrix.target }}
-          -p openstream-ffmpeg-host
-          -p openstream-client
-          -p openstream-signal-server
+        run: |
+          failed=""
+          for target in ${{ matrix.host_targets }}; do
+            echo "::group::desktop release for $target"
+            cargo build --locked --release --target "$target" \
+              -p openstream-ffmpeg-host \
+              -p openstream-client \
+              -p openstream-signal-server || failed="$failed $target"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::desktop release failed for:$failed"
+            exit 1
+          fi
       - name: Build OpenStream Linux host release artifact
         if: matrix.linux_host
+        shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-linux-host
       - name: Build OpenStream mobile bridge release artifact
-        if: matrix.target == 'aarch64-linux-android' || matrix.target == 'x86_64-linux-android' || matrix.target == 'aarch64-apple-ios'
-        run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-mobile-ffi
+        if: matrix.mobile_targets != ''
+        shell: bash
+        run: |
+          failed=""
+          for target in ${{ matrix.mobile_targets }}; do
+            echo "::group::mobile bridge for $target"
+            cargo build --locked --release --target "$target" -p openstream-mobile-ffi \
+              || failed="$failed $target"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::mobile bridge failed for:$failed"
+            exit 1
+          fi
 
   openstream-desktop-target-matrix:
-    name: OpenStream desktop client (${{ matrix.target }})
+    name: OpenStream desktop client (${{ matrix.label }})
     needs: classify
     if: needs.classify.outputs.docs_only != 'true'
     strategy:
       fail-fast: false
       matrix:
+        # One job per OS. The two Windows targets alone were 14.7 of this
+        # workflow's 100 job-minutes, and the second target reuses almost
+        # everything the first one compiled.
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            label: linux
+            targets: x86_64-unknown-linux-gnu
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
+            label: windows
+            targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
           - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            target: aarch64-apple-darwin
+            label: macos
+            targets: x86_64-apple-darwin aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Install native Linux desktop dependency
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.label == 'linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
-      - name: Install target
-        run: rustup target add ${{ matrix.target }}
+      - name: Install targets
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            rustup target add "$target"
+          done
       # No `cargo check` first: the release build below compiles the same
       # crate for the same target and links it, which is strictly stronger.
       # Running both cost about 141s of the 361s build on the Windows job.
       - name: Build desktop client release artifact
+        shell: bash
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-        run: cargo build --locked --release --target ${{ matrix.target }} -p openstream-desktop-client
+        run: |
+          failed=""
+          for target in ${{ matrix.targets }}; do
+            echo "::group::desktop client for $target"
+            cargo build --locked --release --target "$target" -p openstream-desktop-client \
+              || failed="$failed $target"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::desktop client failed for:$failed"
+            exit 1
+          fi
 
   desktop-shell:
     name: OpenStream desktop product shell
