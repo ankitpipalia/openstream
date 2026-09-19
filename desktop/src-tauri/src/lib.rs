@@ -420,6 +420,15 @@ async fn control_plane_sign_out(
     }
     {
         let mut client = control_plane.lock().await;
+        // Withdraw before the token goes, not after: withdrawal needs the
+        // token, so clearing first leaves the device advertised until presence
+        // lapses on the service's own timer -- up to a full TTL of being
+        // offered as connectable by an account that has signed out.
+        //
+        // Best effort, like the announcement itself. A withdrawal that does
+        // not land must not stop someone signing out, and the TTL is the
+        // backstop that makes that safe.
+        let _ = client.withdraw_presence().await;
         client.clear_credentials();
     }
     let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
@@ -1118,18 +1127,16 @@ async fn maintain_presence_forever(state: SharedRuntime, control_plane: SharedCo
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        let hosting = {
+        let advertise = {
             let Ok(runtime) = state.lock() else {
                 continue;
             };
-            !matches!(
-                runtime.host_status(),
-                openstream_app_core::HostStatus::Disabled
-            )
+            presence::advertises_presence(&runtime.host_status())
         };
-        if !hosting {
-            // Not a failure to back off from. Forgetting the schedule is what
-            // makes the next enable announce at once.
+        if !advertise {
+            // Not a failure to back off from, so the schedule is forgotten
+            // rather than retried: that is what makes the next Ready announce
+            // at once instead of waiting out an interval that started earlier.
             schedule.reset();
             continue;
         }

@@ -12,6 +12,7 @@
 //! sleeping, which keeps the assertions about this schedule rather than about
 //! the operating system's scheduler.
 
+use openstream_app_core::HostStatus;
 use std::time::{Duration, Instant};
 
 /// The service's own presence lifetime. Not ours to choose; it is
@@ -27,8 +28,13 @@ pub const SERVER_PRESENCE_TTL: Duration = Duration::from_secs(90);
 /// well before expiry rather than just before it.
 pub const RENEW_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Added to `RENEW_INTERVAL`, never subtracted, so jitter can never shorten
-/// the margin against the TTL.
+/// Spread, so a fleet restarted by one script does not beat in lockstep.
+///
+/// It is *added* to [`RENEW_INTERVAL`], so it lengthens the gap between beats
+/// and therefore **narrows** the margin against the TTL rather than widening
+/// it: the worst case is a 35-second gap against a 90-second lifetime, which
+/// still leaves room for one missed beat and a retry. That is why it is a
+/// small fixed bound and not a fraction of the interval.
 pub const RENEW_JITTER: Duration = Duration::from_secs(5);
 
 /// First retry delay after a failed beat, doubling up to [`RETRY_MAX`].
@@ -37,6 +43,22 @@ pub const RETRY_MIN: Duration = Duration::from_secs(2);
 /// The retry ceiling. Deliberately far below the TTL: a host whose beats are
 /// failing should keep trying often enough that one success rescues it.
 pub const RETRY_MAX: Duration = Duration::from_secs(15);
+
+/// Whether a host in this state should be advertised as connectable.
+///
+/// `Ready` and nothing else. The tempting version of this is "anything but
+/// `Disabled`", which is what the hosting lifecycle elsewhere asks, and it is
+/// wrong here: [`HostStatus`] also has `Failed`, so a host whose agent crashed
+/// or exhausted its restart budget would go on announcing itself for as long
+/// as the shell stayed open. The device would sit in its owner's list looking
+/// connectable, and every request to it would time out with nothing to explain
+/// why. `Starting` is excluded for the same reason -- there is nothing behind
+/// it yet, and the wait is short enough that the first beat lands as soon as
+/// it becomes `Ready`.
+#[must_use]
+pub fn advertises_presence(status: &HostStatus) -> bool {
+    matches!(status, HostStatus::Ready)
+}
 
 /// What the presence task should do on this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,9 +294,9 @@ mod tests {
         assert_eq!(retry_delay(40), RETRY_MAX);
     }
 
-    /// Jitter spreads a fleet, so it has to vary; it is added and never
-    /// subtracted, so it can only ever widen the gap, never shorten the
-    /// margin against the TTL.
+    /// Jitter spreads a fleet, so it has to vary. Because it is added it
+    /// narrows the margin against the TTL, so what matters is that the widened
+    /// gap still lands well inside the service's lifetime.
     #[test]
     fn renewal_is_spread_without_drifting_past_the_ttl() {
         let start = Instant::now();
@@ -300,6 +322,27 @@ mod tests {
             gaps.iter().any(|gap| *gap != first),
             "every gap was identical, so nothing is being spread"
         );
+    }
+
+    /// The state that mattered and was wrong: a host that failed kept being
+    /// advertised, because the check asked "not Disabled" rather than "Ready".
+    #[test]
+    fn only_a_ready_host_is_advertised() {
+        assert!(advertises_presence(&HostStatus::Ready));
+        assert!(!advertises_presence(&HostStatus::Disabled));
+        assert!(
+            !advertises_presence(&HostStatus::Starting),
+            "a host that has not started yet cannot serve a session"
+        );
+        for retryable in [true, false] {
+            assert!(
+                !advertises_presence(&HostStatus::Failed {
+                    message: "the agent exited".into(),
+                    retryable,
+                }),
+                "a failed host must stop advertising, retryable={retryable}"
+            );
+        }
     }
 
     /// Switching hosting off and on again must not leave the device
