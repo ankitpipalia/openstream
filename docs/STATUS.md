@@ -1,6 +1,6 @@
 # OpenStream: where the product actually is
 
-**Updated 2026-09-17.** This is the one file to read first. Everything else in
+**Updated 2026-09-20.** This is the one file to read first. Everything else in
 `docs/` is either a per-topic reference or a historical record; where they
 disagree with this file, this file is right and the other one is stale.
 
@@ -101,6 +101,54 @@ output and advertise `multi_monitor = false`.
 
 The two PASS rows are the same pair of machines. Everything else is either unimplemented, or
 implemented and never exercised.
+
+### The four-platform campaign
+
+The available machines do **not** currently make all 16 host/client directions testable. The
+Ubuntu and Arch guests have no capturable output or usable hardware encoder, and Linux has no
+in-process client decoder. The Windows and SteamOS/NVIDIA roles also share one dual-boot machine,
+so they cannot be opposite ends of the same live session. A green build or subsystem test does not
+remove any of those physical constraints.
+
+This is the no-FFmpeg matrix; an FFmpeg fallback is intentionally not counted as a product result:
+
+| Host \\ client | macOS Apple Silicon | Windows 10 / GTX 970 | Ubuntu ARM64 VM | Arch ARM64 VM |
+|---|---|---|---|---|
+| **macOS Apple Silicon** | **PASS**, native live loopback | **next live test**; both native paths exist, Windows decode is subsystem-proven | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
+| **Windows 10 / GTX 970** | **next live test**; Windows capture/encode and macOS decode are individually proven | not accepted: only one physical Windows desktop, and no live session has run | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
+| **Ubuntu ARM64 VM** | unavailable on this VM: no capturable display/GPU encoder | same | same-machine media unavailable | same-machine media unavailable |
+| **Arch ARM64 VM** | unavailable on this VM: preflight correctly reports no capture/encoder | same | same-machine media unavailable | same-machine media unavailable |
+
+Ubuntu and Arch still have useful roles: package/install/systemd/control-plane acceptance,
+portability, fail-closed preflight and service lifecycle. They are not GPU media rigs. Completing a
+four-platform media matrix requires (1) a native Linux client decoder, (2) Linux guests or physical
+machines with capturable desktops and supported encoders, and (3) a second Windows-capable machine
+if Windows and the SteamOS/NVIDIA rig must communicate while the present rig remains dual-boot.
+
+### Removing FFmpeg from the product path
+
+The Parsec-style direction has been implemented as native components, but it has **not** been made
+the product default. That is why FFmpeg still appears. The remaining work is explicit:
+
+1. Make native capture/encode the default on macOS and Windows; now that the hardware MFT has been
+   physically proven, make hardware-first Media Foundation selection the normal Windows policy with
+   a native software-MFT fallback.
+2. Make native VideoToolbox and Media Foundation decode the default for H.264 on macOS and Windows.
+   An explicit diagnostic/developer switch may retain FFmpeg temporarily, but an environment
+   override must not silently move a release run off the native path.
+3. Route supported Linux hosts to `openstream-linux-host` instead of the FFmpeg host. Finish a
+   production capture path that does not require privileged DRM/KMS access for ordinary Wayland
+   desktops; the current NVIDIA DRM/NVENC path remains hardware-specific.
+4. Implement an in-process Linux client decoder and presenter path. Until that exists, Ubuntu and
+   Arch cannot be claimed as no-FFmpeg clients regardless of whether the external binary is present.
+5. Remove the desktop package's `Depends: ffmpeg` only after every shipped role has a tested native
+   path. FFmpeg may remain a development/test-fixture tool without being a runtime dependency.
+6. Add release checks that launch each supported default with FFmpeg absent, assert the selected
+   backend from telemetry, and fail if a shipped process tries to spawn FFmpeg.
+
+Changing only the environment defaults would make macOS and Windows substantially closer, but it
+would not finish Linux, and it would not by itself prove either Windows-to-macOS direction. Those two
+live sessions are the highest-value tests while the dual-boot rig is still running Windows.
 
 ## What is not verified, and why
 
