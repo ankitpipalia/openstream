@@ -219,8 +219,17 @@ jobs:
       # paths from the repository root. One step doing both built nothing: at
       # the root there is no Cargo.toml, and `cargo build` exited 101 before
       # the script ever ran.
-      - name: Build the broker for the packaging check
-        run: cargo build --locked -p openstream-host-broker
+      # All three, not just the broker. The packaging check builds a real
+      # package to inspect it, and that now requires dpkg-shlibdeps to find
+      # real library dependencies -- which a stub shell script does not have,
+      # so the section skips rather than passing on something it did not
+      # measure.
+      - name: Build the headless binaries for the packaging check
+        run: |
+          cargo build --locked \
+            -p openstream-host-broker \
+            -p openstream-machine-service \
+            -p openstream-enrol
 
       - name: Linux packaging configuration
         run: bash scripts/test-linux-packaging.sh

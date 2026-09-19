@@ -72,6 +72,25 @@ machine:
   installing one over the other would have failed on overlapping files rather
   than replacing it. They now declare `Conflicts`/`Replaces`.
 
+A second round found two more in the same area:
+
+- **The desktop shell was never analysed.** `dpkg-shlibdeps` ran over the
+  engine binaries only, and the shell is installed separately, so a desktop
+  package could omit its GTK and WebKit runtime while its metadata looked
+  automatically generated. The headless CI job cannot see this, because it
+  never builds the desktop profile. The packaging check now builds a desktop
+  package with a system binary standing in for the shell, chosen because it
+  links a library the Rust binaries do not, and asserts that library reaches
+  the package's `Depends`. Removing the shell from the analysis fails it with
+  "omits what only its shell links against: libselinux1".
+- **Dependency analysis was fail-open.** A missing or failing
+  `dpkg-shlibdeps` printed a warning and produced the package anyway, which is
+  the exact condition the change was meant to prevent, with metadata that now
+  looked generated. It is required now: absent tooling, a failed run, or no
+  dependencies at all each refuse. A fully static build is the one legitimate
+  case for no dependencies and has to say so through
+  `OPENSTREAM_ALLOW_NO_SHLIB_DEPS=1`.
+
 ## What is still not proven
 
 - Capture, encode or any media path on this machine.

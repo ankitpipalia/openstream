@@ -406,17 +406,23 @@ else
             break
         fi
     done
-    if [ -n "$real_bin_dir" ]; then
-        pkg_bin_dir="$real_bin_dir"
-    else
-        pkg_bin_dir="$pkg_scratch/bin"
-        for stub in openstream-host-broker openstream-machine-service openstream-enrol; do
-            printf '#!/bin/sh\necho stub\n' >"$pkg_scratch/bin/$stub"
-            chmod 0755 "$pkg_scratch/bin/$stub"
-        done
+    if [ -z "$real_bin_dir" ]; then
+        # Stubs used to do for the contents checks, and cannot any more: the
+        # build requires dpkg-shlibdeps to find real library dependencies, and
+        # a shell script has none. Skipping is honest; passing on a package
+        # built from stubs would not measure what this section claims to.
+        printf 'ok: (skipped) package contents need the three binaries built\n'
+        printf '     build them with: cargo build -p openstream-host-broker \\\n'
+        printf '       -p openstream-machine-service -p openstream-enrol\n'
+        rm -rf -- "$pkg_scratch"
+        pkg_scratch=""
+        real_bin_dir=""
     fi
+    pkg_bin_dir="$real_bin_dir"
     deb="$pkg_scratch/headless.deb"
-    if OPENSTREAM_ARTIFACT_DIR="$pkg_bin_dir" \
+    if [ -z "$real_bin_dir" ]; then
+        :
+    elif OPENSTREAM_ARTIFACT_DIR="$pkg_bin_dir" \
         bash "$build_deb" --profile headless "$deb" >/dev/null 2>"$pkg_scratch/err"; then
         pass "the headless profile builds a package"
 
@@ -463,9 +469,7 @@ every server for a fallback 1.0 does not exercise"
         # call. Declaring only adduser was true of postinst and false of the
         # binaries, so a machine missing the C runtime installed the package
         # happily and then could not run it.
-        if [ -z "$real_bin_dir" ]; then
-            printf 'ok: (skipped) library dependencies need real binaries, not stubs\n'
-        elif printf '%s' "$control" | grep -qE '^Depends:.*libc'; then
+        if printf '%s' "$control" | grep -qE '^Depends:.*libc'; then
             pass "the headless package declares the libraries its binaries need"
         else
             fail "the headless package declares no C library dependency:
@@ -496,6 +500,67 @@ An arm64 package labelled amd64 installs nowhere and blames the machine."
         fi
     else
         fail "the headless profile did not build: $(cat "$pkg_scratch/err")"
+    fi
+
+    # The desktop profile's own dependency metadata, which the headless
+    # package cannot speak for: the shell is installed separately and was left
+    # out of the analysis entirely, so a desktop package could omit its GTK and
+    # WebKit runtime while looking automatically generated.
+    #
+    # Built from stand-ins. The desktop profile wants seven engine binaries and
+    # this machine may only have the three headless ones, so the rest are
+    # copies of a real one; what matters is that they are real ELF objects. The
+    # shell stand-in is a system binary chosen because it links something the
+    # Rust binaries do not, so the assertion cannot pass on a dependency the
+    # engine contributed.
+    if [ -n "$real_bin_dir" ] && [ -x /bin/ls ]; then
+        desk="$(mktemp -d "${TMPDIR:-/tmp}/openstream-desktop-deps.XXXXXX")"
+        mkdir -p "$desk/bin" "$desk/shell" "$desk/probe/debian"
+        for b in openstream-host-broker openstream-machine-service openstream-enrol; do
+            cp "$real_bin_dir/$b" "$desk/bin/$b"
+        done
+        for b in openstream-host-agent openstream-ffmpeg-host openstream-linux-host \
+            openstream-signal-server; do
+            cp "$real_bin_dir/openstream-enrol" "$desk/bin/$b"
+        done
+        cp /bin/ls "$desk/shell/openstream-desktop"
+
+        # What the shell needs that the engine does not. If this comes out
+        # empty the test cannot distinguish anything and says so.
+        printf 'Source: t\n\nPackage: t\nArchitecture: %s\n' "$(dpkg --print-architecture)" \
+            >"$desk/probe/debian/control"
+        cp /bin/ls "$desk/probe/shell-probe"
+        cp "$real_bin_dir/openstream-enrol" "$desk/probe/engine-probe"
+        shell_deps="$(cd "$desk/probe" && dpkg-shlibdeps -O --ignore-missing-info \
+            ./shell-probe 2>/dev/null | sed -n 's/^shlibs:Depends=//p' |
+            tr ',' '\n' | awk '{print $1}' | sort -u)"
+        engine_deps="$(cd "$desk/probe" && dpkg-shlibdeps -O --ignore-missing-info \
+            ./engine-probe 2>/dev/null | sed -n 's/^shlibs:Depends=//p' |
+            tr ',' '\n' | awk '{print $1}' | sort -u)"
+        only_shell="$(comm -23 <(printf '%s\n' "$shell_deps") <(printf '%s\n' "$engine_deps"))"
+
+        if [ -z "$only_shell" ]; then
+            printf 'ok: (skipped) the shell stand-in shares every library with the engine\n'
+        elif OPENSTREAM_ARTIFACT_DIR="$desk/bin" OPENSTREAM_SHELL_DIR="$desk/shell" \
+            bash "$build_deb" --profile desktop "$desk/desktop.deb" \
+            >/dev/null 2>"$desk/err"; then
+            desktop_depends="$(dpkg-deb -f "$desk/desktop.deb" Depends)"
+            missing=""
+            for dep in $only_shell; do
+                printf '%s' "$desktop_depends" | grep -q -- "$dep" || missing="$missing $dep"
+            done
+            if [ -z "$missing" ]; then
+                pass "the desktop package analyses its shell binary too"
+            else
+                fail "the desktop package omits what only its shell links against:$missing
+The shell is installed separately from the engine binaries, so leaving it out
+of dpkg-shlibdeps ships a package without its GUI runtime while the metadata
+still looks generated."
+            fi
+        else
+            fail "the desktop profile did not build: $(cat "$desk/err")"
+        fi
+        rm -rf -- "$desk"
     fi
 fi
 

@@ -162,49 +162,74 @@ if [[ "$profile" != headless ]]; then
     mkdir -p "$stage/usr/lib/systemd/user" "$stage/usr/share/applications"
 fi
 
-# What the binaries actually link against, asked of the binaries rather than
-# assumed from the build machine. Declaring only `adduser` was true of the
-# maintainer scripts and false of the programs: they need the C library, libm
-# and libgcc_s at least, and a machine without them installed the package
-# happily and then could not run it.
+# What the programs actually link against, asked of the programs.
 #
-# `-O` prints the field instead of writing a debian/ tree, and the run is
-# best-effort: dpkg-shlibdeps is part of dpkg-dev, which a machine building a
-# package normally has but is not guaranteed.
-shlib_depends=""
-if command -v dpkg-shlibdeps >/dev/null 2>&1; then
-    # It insists on a debian/control in the working directory even with -O,
-    # and fails with "cannot read debian/control" otherwise -- which is how
-    # this silently produced nothing on the first attempt. A two-stanza
-    # skeleton is enough, and it is removed again before the package is built
-    # so it cannot end up inside it.
-    mkdir -p "$stage/debian"
-    cat >"$stage/debian/control" <<EOF
+# Declaring only `adduser` was true of the maintainer scripts and false of the
+# binaries: they need the C library and libgcc_s at least, and a machine
+# missing those installed the package happily and then could not run it.
+#
+# Required, not best effort. A warning that still produces a package recreates
+# exactly the condition this exists to prevent, and the package looks as though
+# its metadata were generated when it was not.
+command -v dpkg-shlibdeps >/dev/null 2>&1 || {
+    echo "dpkg-shlibdeps is required to compute library dependencies" >&2
+    echo "install dpkg-dev, or the package would claim dependencies it has not measured" >&2
+    exit 2
+}
+
+# The desktop shell is analysed too. It is installed separately from the engine
+# binaries and was left out of this, so the desktop package could omit its GTK
+# and WebKit runtime while appearing to have generated metadata -- and the
+# headless CI job cannot see that, because it never builds the desktop profile.
+shlib_sources=()
+for binary in "${binaries[@]}"; do
+    shlib_sources+=("$artifact_dir/$binary")
+done
+if [[ "$profile" != headless ]]; then
+    shlib_sources+=("$shell_dir/openstream-desktop")
+fi
+
+# It insists on a debian/control in the working directory even with -O, and
+# fails with "cannot read debian/control" otherwise -- which is how this
+# silently produced nothing on the first attempt. A two-stanza skeleton is
+# enough, and it is removed again before the package is built so it cannot end
+# up inside it. The binaries are analysed where they were built: they are not
+# in the stage directory yet, which is how it silently produced nothing on the
+# second attempt.
+mkdir -p "$stage/debian"
+cat >"$stage/debian/control" <<EOF
 Source: $package_name
 
 Package: $package_name
 Architecture: $arch
 EOF
-    # The binaries are analysed where they were built. They are not in the
-    # stage directory yet -- the control file is written before they are
-    # installed -- and passing usr/bin/... here simply found nothing, which is
-    # the first way this silently produced no dependencies.
-    shlib_sources=()
-    for binary in "${binaries[@]}"; do
-        shlib_sources+=("$artifact_dir/$binary")
-    done
-    shlib_depends="$(
-        cd "$stage" &&
-            dpkg-shlibdeps -O --ignore-missing-info "${shlib_sources[@]}" 2>/dev/null |
-            sed -n 's/^shlibs:Depends=//p'
-    )" || shlib_depends=""
+shlib_stderr="$stage/debian/shlibdeps.err"
+if ! shlib_output="$(
+    cd "$stage" && dpkg-shlibdeps -O --ignore-missing-info "${shlib_sources[@]}" \
+        2>"$shlib_stderr"
+)"; then
+    echo "dpkg-shlibdeps failed:" >&2
+    sed 's/^/  /' "$shlib_stderr" >&2
     rm -rf -- "$stage/debian"
+    exit 1
 fi
-if [[ -n "$shlib_depends" ]]; then
-    package_depends="$package_depends, $shlib_depends"
+shlib_depends="$(printf '%s\n' "$shlib_output" | sed -n 's/^shlibs:Depends=//p')"
+rm -rf -- "$stage/debian"
+
+if [[ -z "$shlib_depends" ]]; then
+    # Legitimate for a fully static build and for nothing else, so it has to be
+    # said out loud rather than assumed.
+    if [[ "${OPENSTREAM_ALLOW_NO_SHLIB_DEPS:-}" == 1 ]]; then
+        printf 'note: no library dependencies; OPENSTREAM_ALLOW_NO_SHLIB_DEPS=1 was set\n' >&2
+    else
+        echo "dpkg-shlibdeps found no library dependencies for:" >&2
+        printf '  %s\n' "${shlib_sources[@]}" >&2
+        echo "that is correct only for a fully static build; set" >&2
+        echo "OPENSTREAM_ALLOW_NO_SHLIB_DEPS=1 if that is genuinely the case" >&2
+        exit 1
+    fi
 else
-    printf 'warning: dpkg-shlibdeps produced nothing; %s declares no library dependencies\n' \
-        "$package_name" >&2
+    package_depends="$package_depends, $shlib_depends"
 fi
 
 cat >"$stage/DEBIAN/control" <<EOF
