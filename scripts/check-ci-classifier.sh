@@ -31,7 +31,7 @@ check ".github/workflows/ci.yml" full
 check "scripts/build-release-artifacts.sh" full
 check "engine/lowlat/Cargo.lock" full
 check "packaging/linux/build-deb.sh" full
-check "deploy/openstream-host-broker.service" full
+check "packaging/linux/openstream-host-broker.service" full
 check "release/openstream-1.0-gates.tsv" full
 check "engine/lowlat/crates/net/README.md" full
 check "$(printf 'docs/STATUS.md\nengine/lowlat/src/lib.rs')" full

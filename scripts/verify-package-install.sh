@@ -38,6 +38,23 @@ case "$package" in
             echo "Debian package is missing openstream-ffmpeg-host, the default host child" >&2
             exit 1
         }
+        # The machine-level pre-login subsystem. It was built and tested for
+        # months while being in no package at all, which is what kept it an
+        # experiment rather than something an installer could turn on. These
+        # assertions are what stop that recurring quietly.
+        deb_contents="$(dpkg-deb --contents "$package")"
+        for binary in openstream-host-broker openstream-machine-service openstream-enrol; do
+            grep -q "/usr/bin/$binary\$" <<<"$deb_contents" || {
+                echo "Debian package is missing $binary, so machine-level hosting cannot be installed" >&2
+                exit 1
+            }
+        done
+        for unit in openstream-host-broker openstream-machine-service; do
+            grep -q "/usr/lib/systemd/system/$unit.service\$" <<<"$deb_contents" || {
+                echo "Debian package is missing $unit.service; the binary ships with no way to run it" >&2
+                exit 1
+            }
+        done
         printf 'package structure verified: Debian package %s\n' "$package"
         ;;
     *.dmg)
@@ -82,6 +99,20 @@ case "$package" in
             echo "archive is missing the product shell" >&2
             exit 1
         }
+        # The tarball and the Debian package must ship the same set, or an
+        # operator who installed from one finds a feature the other one has.
+        for binary in openstream-host-broker openstream-machine-service openstream-enrol; do
+            grep -q "usr/bin/$binary\$" <<<"$listing" || {
+                echo "archive is missing $binary, so machine-level hosting cannot be installed" >&2
+                exit 1
+            }
+        done
+        for unit in openstream-host-broker openstream-machine-service; do
+            grep -q "usr/lib/systemd/system/$unit.service\$" <<<"$listing" || {
+                echo "archive is missing $unit.service; the binary ships with no way to run it" >&2
+                exit 1
+            }
+        done
         printf 'package structure verified: tar archive %s\n' "$package"
         ;;
     *.zip)

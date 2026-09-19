@@ -59,7 +59,7 @@ believing it.
 
 | Gap | Blocker |
 |---|---|
-| Windows hosting and the LocalSystem/WTS service model | No Windows machine. Builds in CI on both MSVC targets; **nothing has ever run**. There is no Windows physical record in this repository -- the GTX 970 evidence in `docs/BUILD.md` is a Linux SteamOS host streaming to a macOS client, not a Windows run, and has been mistaken for one |
+| Windows hosting end to end, and the LocalSystem/WTS service model | The **native subsystems were physically tested** on Windows 10 19045.6456 with a GTX 970, in an interactive session: Desktop Duplication capture, `SendInput` injection, WASAPI loopback, the SCM lifecycle state machine, and D3D11/DXVA hardware decode. See PRs #43 and #45. What has *not* run is a **live end-to-end Windows session** or the service lifecycle under LocalSystem, so Windows hosting is not a supported 1.0 platform. Do not read the per-subsystem passes as a session, and do not read the SteamOS GTX 970 evidence in `docs/BUILD.md` as a Windows run -- that one is a Linux host streaming to a macOS client, and has been mistaken for one before |
 | Android and iOS clients | No devices |
 | Linux reboot-to-login-screen acceptance | Needs the physical rig |
 | WAN, TURN, NAT matrix | No public TURN deployment |
@@ -85,8 +85,62 @@ but they are **an experimental subsystem, not something an installer enables**:
   the endpoint, the transcript and the client library exist and are tested, and
   nothing announces anything until the service is wired to them.
 - Audio and clipboard are explicitly disabled in it.
-- **Neither binary is in the Linux tarball or the Debian package**, and neither
-  are their systemd units. Only the older per-user host-agent service ships.
+- The three binaries and two systemd units are now **in the tarball and the
+  Debian package**, with `scripts/verify-package-install.sh` asserting each one
+  so the gap cannot reopen quietly. The units ship **disabled**: without a grant
+  key the broker refuses every session by design, so enabling the pair on
+  install would leave a privileged service running and a network-facing one
+  restart-looping for a feature nobody asked for. `postinst` prints what to do.
+- The configuration those units ship with **could not have started either
+  service**, and was fixed only after review: five variables were assigned the
+  empty string, which a process reads as a value rather than as unset, and the
+  uid the broker admits was never set anywhere, so it fell back to admitting
+  root and would have refused the unprivileged service it ships with. Settings
+  now live in root-owned files under `/etc/openstream` that `postinst` writes
+  once with the account ids it has just resolved.
+- **Installed and started on a real machine, 2026-09-19.** On Ubuntu 26.04
+  arm64: the package installs, `systemd-analyze verify` accepts both units, the
+  broker starts, `/run/openstream` comes out `750 root:openstream` and its
+  socket `660 root:openstream`, and the unprivileged `openstream` account
+  opened that socket -- the privilege split working on an installed package for
+  the first time. Survives a reboot with only a greeter session present.
+  Upgrade, downgrade, remove and purge all behave, and nothing under
+  `/etc/openstream` or `/var/lib/openstream` is world-readable. The transcript
+  is `audit-runs/2026-09-19-m1-headless-package/`. A `linux-deb-install` CI job
+  repeats it on x86-64 per pull request and fails outright if PID 1 is not
+  systemd rather than claiming a start test it did not perform.
+- **That run found what reading could not.** The unenrolled machine service
+  restart-looped for as long as the machine was up -- 12 restarts in the first
+  35 seconds, with `systemctl is-active` reporting `activating`, so an operator
+  looking for why the machine never came online saw a service that appeared to
+  be trying. A start limit holds it in `failed` now, where the status and the
+  journal name the reason.
+- **What this does not prove: capture, encode, or any media session.** The VM
+  has no accepted capture hardware, and the machine service still fails closed
+  because it has no device identity. Pre-login *capture* at the greeter is also
+  not shown; the broker being active with only a greeter session present is the
+  service's startup case, not the capture case.
+- One of those was a directive systemd does not have. `RuntimeDirectoryGroup=`
+  is not a `systemd.exec` setting -- a `RuntimeDirectory`'s ownership comes from
+  the unit's `User=` and `Group=` -- so it was accepted into the file, silently
+  ignored at runtime, and left `/run/openstream` root-owned and unreachable by
+  the service that has to find the socket in it. It is `Group=openstream` now,
+  and the packaging check refuses the non-existent directive by name.
+- `scripts/test-linux-packaging.sh` is the check that stops this recurring, and
+  it now runs in full. Its static half had run locally and, against the units as
+  they were, failed on eight separate counts. Its functional half had **never
+  executed**, and could not have passed if it had: it killed the broker and then
+  connected to its socket, and a socket file outlives the process, which is
+  precisely the case it was written to catch. The kill happens after the
+  connection attempt now. The CI step that invokes it had never run either --
+  it called `cargo` from the repository root, where there is no workspace, and
+  exited 101 before reaching the script. All three shared one cause: the step
+  only runs on a pull request, and this branch had none for weeks.
+  It still does not start the systemd units; the `linux-deb-install` job does
+  that, and that is the install evidence.
+- The broker's `CapabilityBoundingSet` is deliberately left unnarrowed, because
+  guessing it wrong yields a service that will not start and no one here can
+  currently test it -- the unit says so and says where to start once someone can.
 
 ### Approval-bound authorisation: implemented, not yet delivered
 
