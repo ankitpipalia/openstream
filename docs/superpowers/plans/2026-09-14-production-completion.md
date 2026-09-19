@@ -4,7 +4,7 @@
 > (2026-09-14).** Deliberately narrower than "implemented": secure remote
 > Connect, native VideoToolbox decode, raw mouse capture, WAN/TURN validation,
 > packaging and signing all remain incomplete, and are listed under "Remaining
-> implementation gaps" in [`handoff.md`](../../../handoff.md). What has been
+> implementation gaps" in [`docs/SESSION-HANDOFF.md`](../../SESSION-HANDOFF.md). What has been
 > established is that the runtime spine and control plane build, hold together
 > and pass every check this machine can run.
 >
@@ -12,7 +12,7 @@
 > (1101 passed / 0 failed / 30 ignored), the Tauri suite (46), the frontend
 > suite (16) and bundle, the locked release build, fuzz-harness compilation,
 > `cargo deny`, loom, and every local acceptance smoke pass. Nine defects were
-> found and fixed during that pass; see [`handoff.md`](../../../handoff.md) for
+> found and fixed during that pass; see [`docs/SESSION-HANDOFF.md`](../../SESSION-HANDOFF.md) for
 > each one.
 >
 > The changes remain **uncommitted** on `codex/production-completion`, and

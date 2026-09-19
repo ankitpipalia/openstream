@@ -244,4 +244,5 @@ display.
 | `docs/DEFERRED_FEATURES.md` | Deliberately out of scope, with reasons | Current |
 | `docs/ARCHITECTURE.md`, `docs/OPENSTREAM_PROTOCOL.md` | Design references | Current |
 | `docs/acceptance/`, `docs/research/`, `docs/FACT_CHECK.md`, `docs/REVERSE_ENGINEERING.md` | Historical records of particular runs and investigations | **Archive.** Dated snapshots; do not act on them without re-checking |
-| `handoff.md` (untracked) | Working notes for the session in progress | Working notes only |
+| `docs/SESSION-HANDOFF.md` | What a next session needs in order to continue without repeating work: open branches, what each test machine can and cannot prove, and the traps already paid for | Current; dated in its own preamble |
+| `docs/plans/` | The 1.0 completion plan and a design note per milestone | Current |
