@@ -190,7 +190,13 @@ it rather than rediscover it.
 | --- | --- | --- |
 | **Ubuntu arm64 VM** | packaging, install, systemd unit start, privilege separation, the broker socket, and the control-plane chain once the loop exists | anything about media: it has no accepted capture hardware |
 | **Homelab** | that the backend runs and is reachable through a tunnel | nothing about hosting; it is the control plane, not a host |
-| **Linux NVIDIA rig** | the one physical host-to-client media path this 1.0 claims | it has been unreachable throughout this work |
+| **The dual-boot rig** | as Windows: the native subsystems, physically re-run 2026-09-19. As SteamOS: the one physical host-to-client media path this 1.0 claims | it cannot be both at once, so its availability is a scheduling constraint |
+
+**The rig was never unreachable; it was booted into Windows.** It was recorded
+as down on the strength of a failed ping and a failed port-22 check, and
+Windows blocks ICMP by default. SSH answers on the recorded key. Before
+concluding a machine is off, try the protocol you actually need rather than
+the one that is easiest to run.
 
 Two properties of the homelab constrain how the backend is built and deployed,
 and they are worth stating because they are easy to get wrong: it is
@@ -319,8 +325,8 @@ The ordering lives in `docs/plans/OPENSTREAM-1.0-COMPLETION-PLAN.md`
    be built there from a clean checkout at the frozen SHA. No `curl` on that
    box, and the unit is `openstream-signal.service`.
 5. **Then the chain end to end on the VM (M7)**, and only after that the
-   hardware-blocked rows: the NVIDIA rig, a live Windows session, Android, iOS,
-   and WAN.
+   hardware-blocked rows: the rig rebooted into SteamOS, a live Windows
+   session, Android, iOS, and WAN.
 
 ## Three things worth copying
 
