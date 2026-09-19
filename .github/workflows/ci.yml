@@ -808,19 +808,38 @@ jobs:
           sudo -u openstream python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect('/run/openstream/broker.sock'); s.close(); print('the service account reached the broker')"
         working-directory: .
 
+      # Asserting the expected state, not merely "not the bad one". Accepting
+      # anything other than `activating` would also accept `active`, which
+      # would mean an unenrolled machine had started hosting.
       - name: An unenrolled machine service fails closed and stops trying
         run: |
           set -euo pipefail
           sudo systemctl start openstream-machine-service || true
           sleep 40
           state="$(systemctl is-active openstream-machine-service || true)"
-          if [ "$state" = activating ]; then
-            echo "the machine service is still restarting after 40s; an unenrolled
-          machine is a configuration state, not a transient fault, and it must
-          stop and say so rather than loop" >&2
+          if [ "$state" != failed ]; then
+            echo "expected the unenrolled machine service to settle in 'failed', got '$state'." >&2
+            echo "'activating' means it is still looping; anything else means it is running" >&2
+            echo "without a pairing, which it must never do." >&2
             exit 1
           fi
-          echo "machine service settled as: $state"
+          # The reason, not just the state: a service that failed for some
+          # other cause would otherwise pass this as though it had failed
+          # closed on purpose.
+          sudo journalctl -u openstream-machine-service -b --no-pager -o cat \
+            | grep -q 'PairingRequired' || {
+              echo "the service failed, but not with PairingRequired" >&2
+              sudo journalctl -u openstream-machine-service -b --no-pager -o cat | tail -20 >&2
+              exit 1
+            }
+          # Bounded, so a future RestartSec change cannot reintroduce the loop
+          # this replaced -- it ran 12 restarts in the first 35 seconds.
+          restarts="$(systemctl show openstream-machine-service -p NRestarts --value)"
+          if [ "$restarts" -gt 3 ]; then
+            echo "restarted $restarts times; the start limit is meant to stop it at 3" >&2
+            exit 1
+          fi
+          echo "failed closed with PairingRequired after $restarts restarts"
         working-directory: .
 
       - name: Upgrade, downgrade, remove, purge

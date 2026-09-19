@@ -16,7 +16,7 @@ capture, encoding, or a media session: the VM has no accepted capture hardware.
 
 | Check | Result |
 |---|---|
-| Package metadata | `Package: openstream-headless-host`, `Architecture: arm64`, `Depends: adduser` |
+| Package metadata | `Package: openstream-headless-host`, `Architecture: arm64`, `Depends: adduser, libc6 (>= 2.34), libgcc-s1 (>= 4.2)`, `Conflicts`/`Replaces: openstream` |
 | Contents | the three binaries and two system units only; no shell, signal server, host agent, FFmpeg host or `.desktop` entry |
 | Account | `openstream:x:100:106::/nonexistent:/usr/sbin/nologin` |
 | Configuration | `/etc/openstream` `700 root:root`; both `.env` files `600 root:root` |
@@ -50,6 +50,27 @@ the check was written to catch. It had never run, because the workflow step that
 invokes it only runs on a pull request and the branch had none. The kill now
 happens after the connection attempt, and the check passes against a live
 broker.
+
+## Added after review, 2026-09-19
+
+The review of this branch found three more things, each verified on the same
+machine:
+
+- The published **tarball** still omitted the subsystem. The fallback in
+  `scripts/build-release-artifacts.sh` had been updated, but the release
+  workflow supplies `OPENSTREAM_LINUX_PACKAGE`, so that fallback never runs and
+  the tarball is whatever the `linux-package` job staged: four binaries and no
+  system units. The job builds and stages all seven now, and inspects what it
+  produced rather than what it assembled.
+- The package **declared no library dependencies**. `Depends: adduser` was true
+  of the maintainer scripts and false of the programs. `dpkg-shlibdeps` now
+  supplies them, which took two corrections to get working: it needs a
+  `debian/control` in its working directory, and it must be pointed at the
+  binaries where they were built, because the control file is written before
+  they are staged. It produced nothing, quietly, until both were right.
+- The two profiles **own the same paths** with no declared relationship, so
+  installing one over the other would have failed on overlapping files rather
+  than replacing it. They now declare `Conflicts`/`Replaces`.
 
 ## What is still not proven
 

@@ -43,6 +43,23 @@ pass() {
     printf 'ok: %s\n' "$1"
 }
 
+# One cleanup for every scratch directory this script makes.
+#
+# There is only ever one EXIT trap: a second `trap ... EXIT` silently replaces
+# the first, which is what happened here -- the postinst scratch directory was
+# registered, the broker's working directory replaced it, and the first was
+# left behind on every run.
+scratch=""
+work=""
+pkg_scratch=""
+cleanup() {
+    [ -n "$scratch" ] && rm -rf -- "$scratch"
+    [ -n "$work" ] && rm -rf -- "$work"
+    [ -n "$pkg_scratch" ] && rm -rf -- "$pkg_scratch"
+    return 0
+}
+trap cleanup EXIT
+
 # ---------------------------------------------------------------------------
 # 1. No variable is assigned the empty string.
 #
@@ -143,7 +160,6 @@ whatever capability ceiling the operator configured"
 # the account tools stubbed, and the files it produces are inspected.
 # ---------------------------------------------------------------------------
 scratch="$(mktemp -d)"
-trap 'rm -rf -- "$scratch"' EXIT
 mkdir -p "$scratch/etc" "$scratch/bin"
 
 # getent is what the postinst asks for the account's numeric ids.
@@ -265,7 +281,6 @@ elif [ -z "$broker" ] || [ ! -x "$broker" ]; then
 or pass its path as the first argument"
 else
     work="$(mktemp -d)"
-    trap 'rm -rf -- "$work"' EXIT
     mkdir -p "$work/etc" "$work/run"
     chmod 0700 "$work/etc"
 
@@ -372,17 +387,36 @@ fi
 if ! command -v dpkg-deb >/dev/null 2>&1; then
     printf 'ok: (skipped) headless package contents need dpkg-deb\n'
 else
-    # Removed explicitly rather than through a trap: the functional section
-    # below installs its own EXIT trap, and the second one silently replaces
-    # the first.
     pkg_scratch="$(mktemp -d "${TMPDIR:-/tmp}/openstream-deb-test.XXXXXX")"
     mkdir -p "$pkg_scratch/bin"
-    for stub in openstream-host-broker openstream-machine-service openstream-enrol; do
-        printf '#!/bin/sh\necho stub\n' >"$pkg_scratch/bin/$stub"
-        chmod 0755 "$pkg_scratch/bin/$stub"
+    # Real binaries when this machine has them, stubs otherwise.
+    #
+    # Which files a package chooses needs no compiler, so stubs are enough for
+    # the contents checks. What it declares it links against cannot be asked of
+    # a shell script: dpkg-shlibdeps reads ELF headers, so a stub package
+    # correctly declares no libraries and the dependency assertion below is
+    # skipped rather than made to pass on something it did not measure.
+    real_bin_dir=""
+    for candidate in "$repo_dir/engine/lowlat/target/release" \
+        "$repo_dir/engine/lowlat/target/debug"; do
+        if [ -x "$candidate/openstream-host-broker" ] &&
+            [ -x "$candidate/openstream-machine-service" ] &&
+            [ -x "$candidate/openstream-enrol" ]; then
+            real_bin_dir="$candidate"
+            break
+        fi
     done
+    if [ -n "$real_bin_dir" ]; then
+        pkg_bin_dir="$real_bin_dir"
+    else
+        pkg_bin_dir="$pkg_scratch/bin"
+        for stub in openstream-host-broker openstream-machine-service openstream-enrol; do
+            printf '#!/bin/sh\necho stub\n' >"$pkg_scratch/bin/$stub"
+            chmod 0755 "$pkg_scratch/bin/$stub"
+        done
+    fi
     deb="$pkg_scratch/headless.deb"
-    if OPENSTREAM_ARTIFACT_DIR="$pkg_scratch/bin" \
+    if OPENSTREAM_ARTIFACT_DIR="$pkg_bin_dir" \
         bash "$build_deb" --profile headless "$deb" >/dev/null 2>"$pkg_scratch/err"; then
         pass "the headless profile builds a package"
 
@@ -425,6 +459,33 @@ every server for a fallback 1.0 does not exercise"
             fail "the headless package is not named openstream-headless-host"
         fi
 
+        # What the programs link against, not just what the maintainer scripts
+        # call. Declaring only adduser was true of postinst and false of the
+        # binaries, so a machine missing the C runtime installed the package
+        # happily and then could not run it.
+        if [ -z "$real_bin_dir" ]; then
+            printf 'ok: (skipped) library dependencies need real binaries, not stubs\n'
+        elif printf '%s' "$control" | grep -qE '^Depends:.*libc'; then
+            pass "the headless package declares the libraries its binaries need"
+        else
+            fail "the headless package declares no C library dependency:
+$(printf '%s' "$control" | grep '^Depends:')
+dpkg-shlibdeps needs a debian/control in its working directory and the
+binaries at the paths it is given, and produces nothing, quietly, without
+both."
+        fi
+
+        # Both profiles install the same three binaries and the same two units
+        # into the same paths. Without a declared relationship that is a dpkg
+        # file-overwrite error at install time rather than a clear refusal.
+        if printf '%s' "$control" | grep -q '^Conflicts: openstream$' &&
+            printf '%s' "$control" | grep -q '^Replaces: openstream$'; then
+            pass "the headless package says it cannot be co-installed with the desktop one"
+        else
+            fail "the headless and desktop packages own the same paths and declare
+no relationship, so installing one over the other fails on overlapping files"
+        fi
+
         host_arch="$(dpkg --print-architecture)"
         if printf '%s' "$control" | grep -q "^Architecture: $host_arch"; then
             pass "the package is labelled $host_arch, the architecture it was built for"
@@ -436,7 +497,6 @@ An arm64 package labelled amd64 installs nowhere and blames the machine."
     else
         fail "the headless profile did not build: $(cat "$pkg_scratch/err")"
     fi
-    rm -rf -- "$pkg_scratch"
 fi
 
 if [ "$failures" -gt 0 ]; then

@@ -93,12 +93,18 @@ artifact_dir="${OPENSTREAM_ARTIFACT_DIR:-$repo_dir/engine/lowlat/target/release}
 # desktop entry without this binary produced a menu item that did nothing.
 shell_dir="${OPENSTREAM_SHELL_DIR:-$repo_dir/desktop/src-tauri/target/release}"
 
+# The two profiles install the same three binaries and the same two system
+# units into the same paths, so they cannot be co-installed. Saying so is what
+# turns a confusing dpkg file-overwrite error into "installing this removes
+# that", which is the truth: the desktop package is a superset.
 if [[ "$profile" == headless ]]; then
     package_name="openstream-headless-host"
     package_depends="adduser"
+    package_breaks="openstream"
 else
     package_name="openstream"
-    package_depends="ffmpeg"
+    package_depends="ffmpeg, adduser"
+    package_breaks="openstream-headless-host"
 fi
 output="${output:-$repo_dir/dist/${package_name}_${version}_${arch}.deb}"
 
@@ -156,6 +162,51 @@ if [[ "$profile" != headless ]]; then
     mkdir -p "$stage/usr/lib/systemd/user" "$stage/usr/share/applications"
 fi
 
+# What the binaries actually link against, asked of the binaries rather than
+# assumed from the build machine. Declaring only `adduser` was true of the
+# maintainer scripts and false of the programs: they need the C library, libm
+# and libgcc_s at least, and a machine without them installed the package
+# happily and then could not run it.
+#
+# `-O` prints the field instead of writing a debian/ tree, and the run is
+# best-effort: dpkg-shlibdeps is part of dpkg-dev, which a machine building a
+# package normally has but is not guaranteed.
+shlib_depends=""
+if command -v dpkg-shlibdeps >/dev/null 2>&1; then
+    # It insists on a debian/control in the working directory even with -O,
+    # and fails with "cannot read debian/control" otherwise -- which is how
+    # this silently produced nothing on the first attempt. A two-stanza
+    # skeleton is enough, and it is removed again before the package is built
+    # so it cannot end up inside it.
+    mkdir -p "$stage/debian"
+    cat >"$stage/debian/control" <<EOF
+Source: $package_name
+
+Package: $package_name
+Architecture: $arch
+EOF
+    # The binaries are analysed where they were built. They are not in the
+    # stage directory yet -- the control file is written before they are
+    # installed -- and passing usr/bin/... here simply found nothing, which is
+    # the first way this silently produced no dependencies.
+    shlib_sources=()
+    for binary in "${binaries[@]}"; do
+        shlib_sources+=("$artifact_dir/$binary")
+    done
+    shlib_depends="$(
+        cd "$stage" &&
+            dpkg-shlibdeps -O --ignore-missing-info "${shlib_sources[@]}" 2>/dev/null |
+            sed -n 's/^shlibs:Depends=//p'
+    )" || shlib_depends=""
+    rm -rf -- "$stage/debian"
+fi
+if [[ -n "$shlib_depends" ]]; then
+    package_depends="$package_depends, $shlib_depends"
+else
+    printf 'warning: dpkg-shlibdeps produced nothing; %s declares no library dependencies\n' \
+        "$package_name" >&2
+fi
+
 cat >"$stage/DEBIAN/control" <<EOF
 Package: $package_name
 Version: $version
@@ -164,6 +215,8 @@ Priority: optional
 Architecture: $arch
 Maintainer: OpenStream contributors
 Depends: $package_depends
+Conflicts: $package_breaks
+Replaces: $package_breaks
 Description: Self-hosted low-latency desktop streaming ($profile)
 EOF
 
