@@ -4662,6 +4662,93 @@ fn opposite_role(role: Role) -> Role {
     }
 }
 
+/// Where an opened device identity came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentitySource {
+    /// An identity already existed at this location and was loaded.
+    Loaded,
+    /// Nothing was there, so one was generated and published by this call.
+    Created,
+}
+
+/// A device identity, and whether this call is what brought it into being.
+///
+/// The distinction is not cosmetic. Enrolment registers a *public key* with
+/// the control plane, so a tool that silently minted a second identity would
+/// enrol the machine as a different device and leave the first one stranded.
+/// A caller that expected to find an identity and is told `Created` has
+/// learned something it needs to stop on.
+#[derive(Debug)]
+pub struct OpenedIdentity {
+    key: IdentityKey,
+    source: IdentitySource,
+}
+
+impl OpenedIdentity {
+    /// The key, borrowed for signing.
+    #[must_use]
+    pub fn key(&self) -> &IdentityKey {
+        &self.key
+    }
+
+    /// Take ownership of the key, to hold for the process lifetime.
+    #[must_use]
+    pub fn into_key(self) -> IdentityKey {
+        self.key
+    }
+
+    #[must_use]
+    pub fn source(&self) -> IdentitySource {
+        self.source
+    }
+
+    /// Whether this call generated the identity rather than finding it.
+    #[must_use]
+    pub fn was_created(&self) -> bool {
+        matches!(self.source, IdentitySource::Created)
+    }
+}
+
+/// The device identity held at an explicit path.
+///
+/// **Why this exists alongside [`local_identity_public_key`].** That path
+/// resolves its location from process-global environment
+/// (`OPENSTREAM_IDENTITY_KEY`, `OPENSTREAM_IDENTITY_KEY_FILE`,
+/// `OPENSTREAM_IDENTITY_STORE`) and otherwise from a home-derived directory.
+/// That is right for a desktop application, where one installation has one
+/// user and one location. It is wrong for a system service: the account it
+/// runs as has `/nonexistent` for a home, `ProtectHome=` hides one anyway,
+/// and a service whose key location depends on ambient environment is one
+/// whose identity can move because something edited a unit file. So a product
+/// service names the path, and this is the API that takes it.
+///
+/// **Open once.** The key is owned by the caller and meant to be held for the
+/// process lifetime. Re-reading it per use would multiply the number of times
+/// a private key is parsed off disk for no benefit, and would let the identity
+/// change underneath a running process. Rotation is an explicit restart, not
+/// something that happens between two signatures.
+///
+/// Everything the file-backed path enforces still applies: the directory is
+/// made `0700`, the key is written `0600` through a private staging file and
+/// published by `link` so concurrent creators converge on one identity, the
+/// file is opened `O_NOFOLLOW`, and on Unix it is refused unless it is owned
+/// by this user with no group or other permission bits. Keystore custody,
+/// where it has been asked for, is honoured exactly as it is for the
+/// environment-driven path.
+#[derive(Debug)]
+pub struct DeviceIdentityStore;
+
+impl DeviceIdentityStore {
+    /// Load the identity at `path`, or create one there.
+    ///
+    /// `path` must be absolute: a relative one would resolve against whatever
+    /// directory the service happened to be started in.
+    pub fn open(path: impl AsRef<Path>) -> Result<OpenedIdentity, Error> {
+        let (key, source) = load_or_create_identity(path.as_ref())?;
+        Ok(OpenedIdentity { key, source })
+    }
+}
+
 fn local_identity() -> Result<IdentityKey, Error> {
     if let Ok(encoded) = std::env::var("OPENSTREAM_IDENTITY_KEY") {
         if std::env::var("OPENSTREAM_DEVELOPER_OVERRIDE").as_deref() != Ok("1") {
@@ -4677,7 +4764,7 @@ fn local_identity() -> Result<IdentityKey, Error> {
     }
 
     let path = identity_store_path()?;
-    load_or_create_identity(&path)
+    load_or_create_identity(&path).map(|(key, _)| key)
 }
 
 /// Return the stable public half of this process's device identity.
@@ -4853,7 +4940,13 @@ fn store_and_verify(account: &str, key: &[u8]) -> Result<(), String> {
     }
 }
 
-fn load_or_create_identity_in_keystore(path: &Path) -> Result<IdentityKey, Error> {
+fn load_or_create_identity_in_keystore(
+    path: &Path,
+) -> Result<(IdentityKey, IdentitySource), Error> {
+    // Repeated here, not only in the caller. The account name and the custody
+    // marker below are both derived from this path, so a relative one would
+    // make this device's keystore entry depend on a working directory.
+    validate_identity_store_path(path)?;
     let account = keystore_account(path);
     let recorded = keystore_marker_path(path).exists();
     let refuse = |reason: &str| {
@@ -4883,7 +4976,7 @@ identity is one a later outage would silently replace",
                     })?;
                 }
                 eprintln!("OpenStream identity source=keystore");
-                return Ok(identity);
+                return Ok((identity, IdentitySource::Loaded));
             }
             Err(_) if recorded && !path.exists() => {
                 return refuse("the entry it holds is unreadable");
@@ -4960,7 +5053,9 @@ running as this user",
                 path.display()
             ),
         }
-        return Ok(identity);
+        // The key came from the retained file; the keystore is where it now
+        // also lives, but nothing was minted here.
+        return Ok((identity, IdentitySource::Loaded));
     }
 
     // No file yet, so there is nothing to preserve and no reason to write one:
@@ -4981,7 +5076,7 @@ is one a later outage would silently replace",
                 ))
             })?;
             eprintln!("OpenStream identity source=keystore");
-            Ok(identity)
+            Ok((identity, IdentitySource::Created))
         }
         Err(error) => {
             eprintln!(
@@ -5122,7 +5217,28 @@ whose custody went unrecorded is one a later outage would silently replace"
     }
 }
 
-fn load_or_create_identity(path: &Path) -> Result<IdentityKey, Error> {
+/// Where an identity store may live.
+///
+/// A named rule rather than an inline check, because it has to hold for
+/// *both* backends and a test that goes through one of them proves nothing
+/// about the other. The file backend has always refused a relative path. The
+/// keystore backend is chosen first when custody is requested and available,
+/// and it never reached that refusal: it would accept a relative path and
+/// derive its account name and its custody marker from it, so the identity a
+/// process found would depend on the directory it happened to start in. For a
+/// service that is the difference between one device and several.
+fn validate_identity_store_path(path: &Path) -> Result<(), Error> {
+    if path.is_absolute() {
+        return Ok(());
+    }
+    Err(Error::InvalidMessage(
+        "the identity store path must be absolute".into(),
+    ))
+}
+
+fn load_or_create_identity(path: &Path) -> Result<(IdentityKey, IdentitySource), Error> {
+    // Before the custody decision, not inside one branch of it.
+    validate_identity_store_path(path)?;
     if keystore_custody_requested() {
         if keystore::available() {
             return load_or_create_identity_in_keystore(path);
@@ -5136,7 +5252,7 @@ process running as this user can read"
     load_or_create_identity_file(path)
 }
 
-fn load_or_create_identity_file(path: &Path) -> Result<IdentityKey, Error> {
+fn load_or_create_identity_file(path: &Path) -> Result<(IdentityKey, IdentitySource), Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidMessage(
             "identity store path must be absolute".into(),
@@ -5157,7 +5273,7 @@ fn load_or_create_identity_file(path: &Path) -> Result<IdentityKey, Error> {
     // An identity that is already published is the answer, and the common
     // case by far.
     if path.exists() {
-        return load_identity_file(path);
+        return load_identity_file(path).map(|key| (key, IdentitySource::Loaded));
     }
 
     // Publishing the name and the contents has to be one step.
@@ -5212,11 +5328,17 @@ fn load_or_create_identity_file(path: &Path) -> Result<IdentityKey, Error> {
     let published = std::fs::hard_link(&temporary, path);
     let _ = std::fs::remove_file(&temporary);
     match published {
-        Ok(()) => Ok(identity),
+        Ok(()) => Ok((identity, IdentitySource::Created)),
         // Someone else published first. Their file is complete by
-        // construction, because they linked it only after writing it.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => load_identity_file(path),
-        Err(_) if path.exists() => load_identity_file(path),
+        // construction, because they linked it only after writing it. The
+        // loser reports Loaded, which is what happened: this process did not
+        // publish the identity the caller is holding.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            load_identity_file(path).map(|key| (key, IdentitySource::Loaded))
+        }
+        Err(_) if path.exists() => {
+            load_identity_file(path).map(|key| (key, IdentitySource::Loaded))
+        }
         Err(_) => Err(Error::InvalidMessage(
             "identity store could not be published".into(),
         )),
@@ -5563,7 +5685,7 @@ mod tests {
                     let barrier = Arc::clone(&barrier);
                     std::thread::spawn(move || {
                         barrier.wait();
-                        load_or_create_identity(&path)
+                        load_or_create_identity(&path).map(|(key, _)| key)
                     })
                 })
                 .collect();
@@ -5607,9 +5729,159 @@ mod tests {
             std::env::temp_dir().join(format!("openstream-identity-reuse-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("identity directory");
         let path = directory.join("device-identity.pk8");
-        let first = load_or_create_identity(&path).expect("first load creates");
-        let second = load_or_create_identity(&path).expect("second load reuses");
+        let (first, first_source) = load_or_create_identity(&path).expect("first load creates");
+        let (second, second_source) = load_or_create_identity(&path).expect("second load reuses");
         assert_eq!(first.public_key(), second.public_key());
+        // The source has to distinguish these two, because a caller that
+        // expected to find an identity and quietly minted one would enrol the
+        // machine as a different device.
+        assert_eq!(first_source, IdentitySource::Created);
+        assert_eq!(second_source, IdentitySource::Loaded);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The store names its own location, and reports honestly whether this
+    /// call is what created the identity.
+    #[test]
+    fn the_store_creates_once_and_loads_afterwards() {
+        let directory = std::env::temp_dir().join(format!(
+            "openstream-identity-store-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&directory).expect("identity directory");
+        let path = directory.join("device-identity.pk8");
+
+        let created = DeviceIdentityStore::open(&path).expect("create");
+        assert!(created.was_created());
+        assert_eq!(created.source(), IdentitySource::Created);
+        assert!(
+            path.exists(),
+            "the identity must be written where the caller said, not where the environment says"
+        );
+
+        let loaded = DeviceIdentityStore::open(&path).expect("load");
+        assert!(!loaded.was_created());
+        assert_eq!(loaded.source(), IdentitySource::Loaded);
+        assert_eq!(
+            created.key().public_key(),
+            loaded.key().public_key(),
+            "reopening must not enrol this machine as a different device"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A relative path would resolve against whatever directory the service
+    /// happened to be started in, which for a systemd unit is not a property
+    /// anyone has chosen.
+    ///
+    /// Asserted against the dispatcher as well as the public entry point,
+    /// because the refusal used to live in the file backend and the keystore
+    /// backend is chosen *first*. Under keystore custody a relative path was
+    /// accepted, and the account name and custody marker were then derived
+    /// from it. The check is now the first statement in
+    /// `load_or_create_identity`, so it precedes the custody decision by
+    /// construction rather than by which backend happens to be selected.
+    #[test]
+    fn the_store_refuses_a_relative_path() {
+        assert!(DeviceIdentityStore::open("device-identity.pk8").is_err());
+        assert!(DeviceIdentityStore::open("./device-identity.pk8").is_err());
+        assert!(DeviceIdentityStore::open("../device-identity.pk8").is_err());
+        assert!(
+            load_or_create_identity(Path::new("relative/device-identity.pk8")).is_err(),
+            "the dispatcher must refuse before it chooses a backend"
+        );
+    }
+
+    /// The rule itself, tested as a rule.
+    ///
+    /// Going through `DeviceIdentityStore::open` on a developer machine only
+    /// ever exercises the file backend, which had its own check all along --
+    /// so the test above passed even with the dispatcher's guard deleted, and
+    /// proved nothing about the keystore path. Forcing the keystore branch
+    /// would mean mutating `OPENSTREAM_IDENTITY_CUSTODY`, which is
+    /// process-global and would race every other test in this binary. So the
+    /// rule is named, asserted directly, and invoked at the top of the
+    /// dispatcher and of the keystore backend both.
+    #[test]
+    fn an_identity_store_path_must_be_absolute() {
+        for relative in [
+            "device-identity.pk8",
+            "./device-identity.pk8",
+            "../device-identity.pk8",
+            "state/openstream/device-identity.pk8",
+        ] {
+            assert!(
+                validate_identity_store_path(Path::new(relative)).is_err(),
+                "{relative} is relative and must be refused"
+            );
+        }
+        // Absolute means absolute on the platform doing the asking. A
+        // Unix-style rooted path is *not* absolute on Windows, because it has
+        // no drive prefix and resolves against whichever drive is current --
+        // which is the same class of ambiguity this rule exists to refuse, so
+        // the refusal there is correct rather than something to special-case.
+        #[cfg(unix)]
+        assert!(validate_identity_store_path(Path::new("/var/lib/openstream/k.pk8")).is_ok());
+        #[cfg(windows)]
+        assert!(
+            validate_identity_store_path(Path::new(r"C:\ProgramData\OpenStream\k.pk8")).is_ok()
+        );
+        #[cfg(windows)]
+        assert!(
+            validate_identity_store_path(Path::new("/var/lib/openstream/k.pk8")).is_err(),
+            "a rooted path with no drive resolves against the current drive"
+        );
+    }
+
+    /// The private key must not reach a log line, a panic message or a crash
+    /// dump through a derived Debug.
+    #[test]
+    fn an_opened_identity_does_not_print_its_key() {
+        let directory = std::env::temp_dir().join(format!(
+            "openstream-identity-debug-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&directory).expect("identity directory");
+        let path = directory.join("device-identity.pk8");
+        let opened = DeviceIdentityStore::open(&path).expect("create");
+
+        let rendered = format!("{opened:?}");
+        let secret = hex::encode(opened.key().pkcs8());
+        assert!(
+            !rendered.to_lowercase().contains(&secret),
+            "the private key appeared in Debug output"
+        );
+        assert!(rendered.contains("Created"), "{rendered}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The key a service signs with must be private to the account that runs
+    /// it. A file the group can read is one another account can take.
+    #[cfg(unix)]
+    #[test]
+    fn the_store_refuses_a_key_others_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!(
+            "openstream-identity-mode-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&directory).expect("identity directory");
+        let path = directory.join("device-identity.pk8");
+        DeviceIdentityStore::open(&path).expect("create");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("widen the mode");
+        assert!(
+            DeviceIdentityStore::open(&path).is_err(),
+            "a group-readable identity must be refused, not used"
+        );
+
         let _ = std::fs::remove_dir_all(&directory);
     }
 
