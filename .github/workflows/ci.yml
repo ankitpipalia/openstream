@@ -214,10 +214,16 @@ jobs:
       # It does NOT start the systemd units, and does not exercise the
       # machine-service -> socket -> broker path as the unprivileged user. It is
       # not an install test and does not stand in for one.
+      # Two steps, because they run from different directories. This job
+      # defaults to engine/lowlat, where the workspace is; the script resolves
+      # paths from the repository root. One step doing both built nothing: at
+      # the root there is no Cargo.toml, and `cargo build` exited 101 before
+      # the script ever ran.
+      - name: Build the broker for the packaging check
+        run: cargo build --locked -p openstream-host-broker
+
       - name: Linux packaging configuration
-        run: |
-          cargo build --locked -p openstream-host-broker
-          bash scripts/test-linux-packaging.sh
+        run: bash scripts/test-linux-packaging.sh
         working-directory: .
 
       - name: Keystore round trip against a real Secret Service
