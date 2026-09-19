@@ -2641,6 +2641,21 @@ async fn connect_request(
     // presence is soft state and trust is not.
     {
         let accounts = state.accounts.lock().await;
+        // The asker has to be trusted too, and nothing else says so.
+        //
+        // Enrolment leaves a device Pending until its owner trusts it, and
+        // until this check existed only the *target* was verified: a pending
+        // or revoked device could still ask a trusted host for a session, and
+        // the host would see an ordinary request to approve. Presence already
+        // gates on `can_create_session`, so using it here means "may this
+        // device take part in sessions" has one answer across the service
+        // rather than one per endpoint.
+        if let Err(error) = accounts.can_create_session(&control_plane::AccountPrincipal {
+            account_id: account_id.clone(),
+            device_id: Some(device_id.clone()),
+        }) {
+            return control_error_response(error);
+        }
         let devices = match accounts.list_devices(&account_id) {
             Ok(devices) => devices,
             Err(error) => return control_error_response(error),
@@ -9726,6 +9741,163 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Trust is required of the asker, not only of the target.
+    ///
+    /// Enrolment leaves a device Pending until its owner accepts it, and the
+    /// target's trust used to be the only trust checked here. So a device the
+    /// owner had never accepted could still put a request in front of a
+    /// trusted host, where it appeared as an ordinary approval prompt.
+    #[tokio::test]
+    async fn an_untrusted_device_cannot_ask_for_a_session() {
+        let app = connect_router(connect_test_state());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "the host is trusted, so it is online and askable"
+        );
+
+        // Enrolled by signing in, never accepted by the owner.
+        let stranger_token = sign_in_as_device(&app, "operator", "device-stranger", 0x33).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&stranger_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a pending device must not be able to ask a trusted host: {body}"
+        );
+
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body.as_array().map(Vec::len),
+            Some(0),
+            "a refused request must never reach the host: {body}"
+        );
+
+        // The same device, once accepted, is allowed through -- so the
+        // refusal above is about trust and not about the device being new.
+        let (status, _) = call(
+            &app,
+            "PATCH",
+            "/v1/devices/device-stranger/trust",
+            Some(&client_token),
+            Some(serde_json::json!({ "trust": "trusted" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let accepted_token = sign_in_as_device(&app, "operator", "device-stranger", 0x33).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&accepted_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "an accepted device may ask: {body}");
+    }
+
+    /// Revoking a device has to stop it authenticating, not merely stop the
+    /// token it is given from working.
+    ///
+    /// `authorize_access` evicts a revoked device's token the first time it is
+    /// presented, so before this a revoked machine authenticated successfully,
+    /// was refused on its next call, re-authenticated, and repeated that for
+    /// as long as it ran.
+    #[tokio::test]
+    async fn a_revoked_device_cannot_mint_a_token() {
+        use openstream_protocol::IdentityKey;
+
+        let app = connect_router(connect_test_state());
+        let (owner_token, _) = register_with_device(&app, "operator", "device-owner", 0x81).await;
+
+        let machine = IdentityKey::generate().expect("identity");
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/devices",
+            Some(&owner_token),
+            Some(serde_json::json!({
+                "device_id": "machine-headless",
+                "name": "Studio",
+                "platform": "linux",
+                "public_key": hex::encode(machine.public_key()),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "enrol: {body}");
+        let account_id = body["account_id"]
+            .as_str()
+            .expect("enrolment names the account")
+            .to_string();
+
+        let proof = |issued_at_ms: u64, nonce: [u8; 16]| {
+            let signature = machine
+                .sign_device_auth(&account_id, "machine-headless", issued_at_ms, nonce)
+                .expect("sign");
+            serde_json::json!({
+                "account_id": account_id.clone(),
+                "device_id": "machine-headless",
+                "issued_at_ms": issued_at_ms,
+                "nonce": hex::encode(nonce),
+                "signature": hex::encode(signature),
+            })
+        };
+
+        let now = super::control_plane::now_ms();
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(proof(now, [21; 16])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an enrolled device authenticates: {body}"
+        );
+
+        let (status, _) = call(
+            &app,
+            "PATCH",
+            "/v1/devices/machine-headless/trust",
+            Some(&owner_token),
+            Some(serde_json::json!({ "trust": "revoked" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The private key is untouched, so the proof still verifies. What
+        // changed is that the account no longer accepts this device at all.
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/auth/device",
+            None,
+            Some(proof(now, [22; 16])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a revoked device must be told so, not handed a token that is \
+             evicted on first use: {body}"
+        );
     }
 
     /// A refusal is reported as a refusal.

@@ -1079,6 +1079,28 @@ impl AccountStore {
         if self.device_identity_key(account_id, device_id) != Some(verified_against) {
             return Err(ControlPlaneError::Unauthorized);
         }
+        // Revocation has to stick at the point a token is minted, and this is
+        // the first line where trust may be consulted at all.
+        //
+        // Not above it: the proof is what establishes that the caller is this
+        // device, and answering "revoked" before verifying would tell anyone
+        // who asked which devices an account has revoked. Below it there is
+        // nothing left to leak, because only the holder of the private half
+        // reaches this line.
+        //
+        // Without this the token is refused anyway, but a round trip later and
+        // forever: `authorize_access` evicts a revoked device's token the
+        // first time it is presented, so the device authenticates, is refused
+        // on the next call, re-authenticates, and repeats for as long as it
+        // runs. A stable 403 is something a client can back off from.
+        let revoked = self
+            .accounts
+            .get(account_id)
+            .and_then(|account| account.devices.get(device_id))
+            .is_some_and(|device| device.trust == DeviceTrust::Revoked);
+        if revoked {
+            return Err(ControlPlaneError::DeviceRevoked);
+        }
         // Checked and consumed under one lock, or two proofs racing with the
         // same nonce would both find it absent and both be accepted.
         self.forget_stale_device_nonces(now_ms);
