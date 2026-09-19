@@ -463,31 +463,6 @@ async fn runtime_dispatch(
     .await
 }
 
-/// Tell the service whether this device is available to host.
-///
-/// Best effort on purpose. Hosting has already started or stopped locally by
-/// the time this runs, and failing the whole command because a presence
-/// heartbeat did not land would turn a cosmetic problem -- the device shows
-/// as offline until the next beat -- into a refusal to host at all. In local
-/// mode there is no control plane signed in and this is simply a no-op.
-async fn announce_presence_best_effort(control_plane: &SharedControlPlane, online: bool) {
-    let mut client = control_plane.lock().await;
-    if !client.is_authenticated() {
-        return;
-    }
-    let outcome = if online {
-        client.announce_presence().await
-    } else {
-        client.withdraw_presence().await
-    };
-    if outcome.is_err() {
-        // Not surfaced as a command failure; see above. Logged so an
-        // operator wondering why a machine never appears has something to
-        // find.
-        eprintln!("OpenStream could not update host presence with the control plane");
-    }
-}
-
 /// Requests this device is being asked to approve.
 #[tauri::command]
 async fn host_connect_requests(
@@ -689,20 +664,19 @@ async fn dispatch_command_with_session(
     command: RuntimeCommand,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     match command {
-        RuntimeCommand::EnableHosting => {
-            let result = dispatch_host_lifecycle(state, host_lock, true).await?;
-            // Presence follows hosting. A device that is not hosting must not
-            // appear connectable: offering it would produce a request nobody
-            // can approve, and the person who pressed connect would watch it
-            // time out with no explanation.
-            announce_presence_best_effort(control_plane, true).await;
-            Ok(result)
-        }
-        RuntimeCommand::DisableHosting => {
-            let result = dispatch_host_lifecycle(state, host_lock, false).await?;
-            announce_presence_best_effort(control_plane, false).await;
-            Ok(result)
-        }
+        // Presence is deliberately not announced here.
+        //
+        // Enabling hosting asks the agent to start; it does not mean the agent
+        // is running. This path announced unconditionally as soon as the
+        // request returned, so a host that came back Starting -- or Failed --
+        // was advertised as connectable anyway, and whoever pressed connect
+        // watched it time out with nothing to explain why.
+        //
+        // `maintain_presence_forever` owns every presence transition now. It
+        // announces on becoming Ready and withdraws on leaving it, which also
+        // covers the agent dying later on: no command path ever sees that.
+        RuntimeCommand::EnableHosting => dispatch_host_lifecycle(state, host_lock, true).await,
+        RuntimeCommand::DisableHosting => dispatch_host_lifecycle(state, host_lock, false).await,
         RuntimeCommand::RestartHosting => dispatch_restart_hosting(state, host_lock).await,
         RuntimeCommand::Connect {
             device_id,
@@ -1133,32 +1107,49 @@ async fn maintain_presence_forever(state: SharedRuntime, control_plane: SharedCo
             };
             presence::advertises_presence(&runtime.host_status())
         };
-        if !advertise {
-            // Not a failure to back off from, so the schedule is forgotten
-            // rather than retried: that is what makes the next Ready announce
-            // at once instead of waiting out an interval that started earlier.
+        // The cheap pre-check only applies while nothing is owed. A device
+        // that was advertised and has stopped being ready owes a withdrawal,
+        // and that must not wait for a renewal that is half a minute away.
+        if !schedule.is_advertised() && !advertise {
             schedule.reset();
             continue;
         }
-        if !schedule.is_due(std::time::Instant::now()) {
+        if !schedule.is_due(std::time::Instant::now()) && !schedule.is_advertised() {
             continue;
         }
         let mut client = control_plane.lock().await;
-        if schedule.poll(std::time::Instant::now(), true, client.is_authenticated())
-            != presence::PresenceAction::Announce
-        {
-            continue;
-        }
-        let delivered = client.announce_presence().await.is_ok();
-        drop(client);
-        let now = std::time::Instant::now();
-        if delivered {
-            schedule.record_success(now);
-        } else {
-            // Logged once per failed beat rather than once per tick, because
-            // the schedule is what decides when to try again.
-            eprintln!("OpenStream could not renew host presence with the control plane");
-            schedule.record_failure(now);
+        let action = schedule.poll(
+            std::time::Instant::now(),
+            advertise,
+            client.is_authenticated(),
+        );
+        match action {
+            presence::PresenceAction::Wait => continue,
+            presence::PresenceAction::Announce => {
+                let delivered = client.announce_presence().await.is_ok();
+                drop(client);
+                let now = std::time::Instant::now();
+                if delivered {
+                    schedule.record_success(now);
+                } else {
+                    // Logged once per failed beat rather than once per tick,
+                    // because the schedule decides when to try again.
+                    eprintln!("OpenStream could not renew host presence with the control plane");
+                    schedule.record_failure(now);
+                }
+            }
+            presence::PresenceAction::Withdraw => {
+                let withdrawn = client.withdraw_presence().await.is_ok();
+                drop(client);
+                if withdrawn {
+                    schedule.record_withdrawn();
+                } else {
+                    // Keep trying: until this lands the service still offers
+                    // a host that is not there.
+                    eprintln!("OpenStream could not withdraw host presence with the control plane");
+                    schedule.record_failure(std::time::Instant::now());
+                }
+            }
         }
     }
 }

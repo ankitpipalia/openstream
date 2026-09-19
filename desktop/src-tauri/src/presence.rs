@@ -69,6 +69,14 @@ pub enum PresenceAction {
     /// [`PresenceSchedule::record_success`] or
     /// [`PresenceSchedule::record_failure`].
     Announce,
+    /// This device was advertised and is no longer ready to host. Withdraw
+    /// now, then report through [`PresenceSchedule::record_withdrawn`] or
+    /// [`PresenceSchedule::record_failure`].
+    ///
+    /// Without this a host that crashed stayed listed as connectable until
+    /// the service's own lifetime ran out, and every request to it in that
+    /// window went to a host that was not there.
+    Withdraw,
 }
 
 /// When the next presence beat is due.
@@ -79,11 +87,18 @@ pub enum PresenceAction {
 /// tick.
 #[derive(Debug)]
 pub struct PresenceSchedule {
-    /// `None` means "beat at the next opportunity": either nothing has been
-    /// sent yet, or hosting has just been switched back on.
+    /// `None` means "act at the next opportunity": either nothing has been
+    /// sent yet, or readiness has just changed.
     next_due: Option<Instant>,
     consecutive_failures: u32,
     seed: u64,
+    /// Whether the service has been told this device is online and has not
+    /// been told otherwise. This is what makes withdrawal possible: a host
+    /// that never announced has nothing to take back, and one that did must
+    /// take it back rather than waiting out the lifetime.
+    advertised: bool,
+    /// Whether the current run of work is a withdrawal rather than a beat.
+    withdrawing: bool,
 }
 
 impl PresenceSchedule {
@@ -96,6 +111,8 @@ impl PresenceSchedule {
             next_due: None,
             consecutive_failures: 0,
             seed,
+            advertised: false,
+            withdrawing: false,
         }
     }
 
@@ -114,16 +131,42 @@ impl PresenceSchedule {
     /// tracked here: hosting can stop because the agent died, not only
     /// because someone pressed a button, and a schedule that believed its own
     /// last answer would keep announcing a host that is gone.
-    pub fn poll(&mut self, now: Instant, hosting: bool, authenticated: bool) -> PresenceAction {
-        if !hosting || !authenticated {
-            // Not an error, and not something to back off from. Forget the
-            // schedule so that enabling hosting again beats at once instead
-            // of leaving the device invisible for most of a renewal interval.
+    pub fn poll(&mut self, now: Instant, ready: bool, authenticated: bool) -> PresenceAction {
+        if !authenticated {
+            // Nothing can be withdrawn without a token, and there is no one
+            // to withdraw on behalf of. Sign-out withdraws on its own path
+            // while it still holds the token; anything else lapses on the
+            // service's lifetime, which is what that lifetime is for.
             self.reset();
             return PresenceAction::Wait;
         }
+        if ready {
+            self.withdrawing = false;
+            return if self.is_due(now) {
+                PresenceAction::Announce
+            } else {
+                PresenceAction::Wait
+            };
+        }
+        // Not ready. A device that was never advertised has nothing to take
+        // back, so this is simply the idle state: forget the schedule, so
+        // that becoming ready announces at once rather than waiting out an
+        // interval that started earlier.
+        if !self.advertised {
+            self.reset();
+            return PresenceAction::Wait;
+        }
+        // It was advertised and is not ready any more, which is the case that
+        // used to leave a dead host listed. Withdraw on the first tick after
+        // the transition rather than at the next renewal, and pace retries on
+        // the same backoff as a failed beat.
+        if !self.withdrawing {
+            self.withdrawing = true;
+            self.next_due = None;
+            self.consecutive_failures = 0;
+        }
         if self.is_due(now) {
-            PresenceAction::Announce
+            PresenceAction::Withdraw
         } else {
             PresenceAction::Wait
         }
@@ -141,15 +184,32 @@ impl PresenceSchedule {
         }
     }
 
-    /// Hosting stopped, or nobody is signed in.
+    /// Forget the schedule. Does not change whether the device is currently
+    /// advertised, because forgetting when to act says nothing about what the
+    /// service has been told.
     pub fn reset(&mut self) {
         self.next_due = None;
         self.consecutive_failures = 0;
+        self.withdrawing = false;
     }
 
+    /// A beat landed: the service now believes this device is online.
     pub fn record_success(&mut self, now: Instant) {
         self.consecutive_failures = 0;
+        self.advertised = true;
         self.next_due = Some(now + RENEW_INTERVAL + self.next_jitter());
+    }
+
+    /// A withdrawal landed: the service no longer believes it.
+    pub fn record_withdrawn(&mut self) {
+        self.advertised = false;
+        self.reset();
+    }
+
+    /// Whether the service has been told this device is online.
+    #[must_use]
+    pub fn is_advertised(&self) -> bool {
+        self.advertised
     }
 
     pub fn record_failure(&mut self, now: Instant) {
@@ -324,6 +384,95 @@ mod tests {
         );
     }
 
+    /// The transitions, in the order a host actually goes through them.
+    ///
+    /// Starting is the one that was wrong in two places at once: the command
+    /// path announced as soon as it had asked the agent to start, and the
+    /// loop had no way to take that back. A host that never became Ready was
+    /// advertised as connectable, and a host that became Ready and then died
+    /// stayed advertised until the service's lifetime ran out.
+    #[test]
+    fn presence_follows_readiness_in_both_directions() {
+        let start = Instant::now();
+        let mut schedule = PresenceSchedule::new(0x51a7);
+
+        // Starting: nothing is claimed, so there is nothing to take back.
+        assert_eq!(
+            schedule.poll(start, false, true),
+            PresenceAction::Wait,
+            "a host that has not started must not be announced"
+        );
+        assert!(!schedule.is_advertised());
+
+        // Ready: announce, and only now is the device claimed to be online.
+        assert_eq!(schedule.poll(start, true, true), PresenceAction::Announce);
+        assert!(
+            !schedule.is_advertised(),
+            "nothing is claimed until the announcement actually lands"
+        );
+        schedule.record_success(start);
+        assert!(schedule.is_advertised());
+
+        // Still ready, not yet due: quiet.
+        let soon = start + Duration::from_secs(5);
+        assert_eq!(schedule.poll(soon, true, true), PresenceAction::Wait);
+
+        // The agent dies. The withdrawal is owed at once, not at the next
+        // renewal, which would leave a dead host listed for most of a minute.
+        assert_eq!(
+            schedule.poll(soon, false, true),
+            PresenceAction::Withdraw,
+            "a host that stopped being ready must be taken back immediately"
+        );
+        schedule.record_withdrawn();
+        assert!(!schedule.is_advertised());
+
+        // And once withdrawn, it stays quiet rather than withdrawing forever.
+        assert_eq!(
+            schedule.poll(soon + Duration::from_secs(1), false, true),
+            PresenceAction::Wait
+        );
+    }
+
+    /// A withdrawal that does not land is owed until it does. Until then the
+    /// service is still offering a host that is not there.
+    #[test]
+    fn a_failed_withdrawal_is_retried() {
+        let start = Instant::now();
+        let mut schedule = PresenceSchedule::new(9);
+        assert_eq!(schedule.poll(start, true, true), PresenceAction::Announce);
+        schedule.record_success(start);
+
+        let mut now = start + Duration::from_secs(1);
+        assert_eq!(schedule.poll(now, false, true), PresenceAction::Withdraw);
+        schedule.record_failure(now);
+
+        // Not immediately -- that would spin -- but on the same backoff a
+        // failed beat uses, and still owed.
+        assert_eq!(schedule.poll(now, false, true), PresenceAction::Wait);
+        now += RETRY_MAX + Duration::from_secs(1);
+        assert_eq!(
+            schedule.poll(now, false, true),
+            PresenceAction::Withdraw,
+            "the device is still advertised, so the withdrawal is still owed"
+        );
+        assert!(schedule.is_advertised());
+    }
+
+    /// Signing out takes the token with it, so there is nothing to withdraw
+    /// with. The sign-out path withdraws while it still holds one.
+    #[test]
+    fn losing_the_token_does_not_try_to_withdraw() {
+        let start = Instant::now();
+        let mut schedule = PresenceSchedule::new(13);
+        assert_eq!(schedule.poll(start, true, true), PresenceAction::Announce);
+        schedule.record_success(start);
+        assert_eq!(
+            schedule.poll(start + Duration::from_secs(1), false, false),
+            PresenceAction::Wait
+        );
+    }
+
     /// The state that mattered and was wrong: a host that failed kept being
     /// advertised, because the check asked "not Disabled" rather than "Ready".
     #[test]
@@ -361,11 +510,21 @@ mod tests {
 
         let later = start + Duration::from_secs(5);
         assert_eq!(schedule.poll(later, true, true), PresenceAction::Wait);
+
+        // Stopping is not simply silence any more: the device was announced,
+        // so it has to be taken back before it can be quiet.
+        assert_eq!(
+            schedule.poll(later, false, true),
+            PresenceAction::Withdraw,
+            "a device that was advertised and stopped hosting must be withdrawn"
+        );
+        schedule.record_withdrawn();
         assert_eq!(
             schedule.poll(later, false, true),
             PresenceAction::Wait,
-            "a device that is not hosting must not announce"
+            "once withdrawn it is quiet"
         );
+
         assert_eq!(
             schedule.poll(later + Duration::from_secs(1), true, true),
             PresenceAction::Announce,

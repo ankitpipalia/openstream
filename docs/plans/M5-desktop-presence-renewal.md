@@ -40,6 +40,14 @@ watchers that already exist.
 - Withdraw on sign-out *before* clearing the token, since withdrawal needs it.
   Clearing first leaves the device advertised for up to a full TTL by an
   account that has signed out.
+- **The loop owns every presence transition.** Enabling hosting used to
+  announce unconditionally as soon as the agent had been asked to start, so a
+  host that came back `Starting`, or `Failed`, was advertised anyway and
+  nothing could take that back. The command path no longer announces at all.
+  The schedule announces on entering `Ready`, tracks that the device is
+  advertised, and withdraws once on leaving `Ready` -- which is also the only
+  thing that covers an agent dying later, since no command path sees that.
+  A withdrawal that does not land stays owed and retries on the same backoff.
 - On failure, back off 2, 4, 8, capped at 15 seconds, and keep trying. A
   failed beat must never disable hosting: hosting is a local fact and the
   control plane's opinion of it is advisory.
