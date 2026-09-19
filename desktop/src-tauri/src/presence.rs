@@ -172,10 +172,28 @@ impl PresenceSchedule {
         }
     }
 
-    /// Whether a beat is due, ignoring hosting and sign-in state.
+    /// Whether this tick has anything to do, without changing anything.
     ///
-    /// The task uses this as a cheap pre-check so that an ordinary tick with
-    /// nothing to do does not take the control-plane lock at all.
+    /// The task's pre-check, so an ordinary tick with nothing owed does not
+    /// take the control-plane lock. It has to distinguish "ready and not due"
+    /// from "not ready with a withdrawal owed": asking only whether a beat is
+    /// due took the lock every second for as long as a device stayed
+    /// advertised, and asking only whether the device is advertised did the
+    /// same.
+    #[must_use]
+    pub fn wants_attention(&self, now: Instant, ready: bool) -> bool {
+        if ready {
+            return self.is_due(now);
+        }
+        if !self.advertised {
+            return false;
+        }
+        // A withdrawal is owed. Immediately on the transition, and afterwards
+        // paced like any other retry.
+        !self.withdrawing || self.is_due(now)
+    }
+
+    /// Whether a beat is due, ignoring hosting and sign-in state.
     #[must_use]
     pub fn is_due(&self, now: Instant) -> bool {
         match self.next_due {
@@ -457,6 +475,44 @@ mod tests {
             "the device is still advertised, so the withdrawal is still owed"
         );
         assert!(schedule.is_advertised());
+    }
+
+    /// The pre-check has to agree with what `poll` would decide, or the loop
+    /// either takes the control-plane lock every second for nothing or misses
+    /// work it owes.
+    #[test]
+    fn the_pre_check_agrees_with_the_decision() {
+        let start = Instant::now();
+        let mut schedule = PresenceSchedule::new(0x7ea);
+
+        // Ready and nothing sent yet: a beat is owed.
+        assert!(schedule.wants_attention(start, true));
+        schedule.record_success(start);
+
+        // Ready and not due: nothing owed, and so no lock taken.
+        let soon = start + Duration::from_secs(5);
+        assert!(
+            !schedule.wants_attention(soon, true),
+            "an advertised device with no beat due must not wake the loop"
+        );
+        assert_eq!(schedule.poll(soon, true, true), PresenceAction::Wait);
+
+        // Ready and due again.
+        let due = start + RENEW_INTERVAL + RENEW_JITTER + Duration::from_secs(1);
+        assert!(schedule.wants_attention(due, true));
+
+        // Not ready, and advertised: owed at once, whatever the beat schedule
+        // said.
+        assert!(
+            schedule.wants_attention(soon, false),
+            "a withdrawal must not wait for the next renewal"
+        );
+        assert_eq!(schedule.poll(soon, false, true), PresenceAction::Withdraw);
+        schedule.record_withdrawn();
+
+        // Not ready and not advertised: nothing owed, ever.
+        assert!(!schedule.wants_attention(soon, false));
+        assert!(!schedule.wants_attention(due, false));
     }
 
     /// Signing out takes the token with it, so there is nothing to withdraw

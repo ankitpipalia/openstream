@@ -1107,22 +1107,22 @@ async fn maintain_presence_forever(state: SharedRuntime, control_plane: SharedCo
             };
             presence::advertises_presence(&runtime.host_status())
         };
-        // The cheap pre-check only applies while nothing is owed. A device
-        // that was advertised and has stopped being ready owes a withdrawal,
-        // and that must not wait for a renewal that is half a minute away.
-        if !schedule.is_advertised() && !advertise {
-            schedule.reset();
-            continue;
-        }
-        if !schedule.is_due(std::time::Instant::now()) && !schedule.is_advertised() {
+        // Nothing owed, no lock. This has to tell "ready and not due" apart
+        // from "not ready with a withdrawal owed": the first must not wake the
+        // loop at all, and the second must not wait for a renewal that is half
+        // a minute away.
+        let now = std::time::Instant::now();
+        if !schedule.wants_attention(now, advertise) {
+            if !advertise && !schedule.is_advertised() {
+                // Idle. Forgetting the schedule is what makes the next Ready
+                // announce at once rather than waiting out an interval that
+                // started before this device stopped hosting.
+                schedule.reset();
+            }
             continue;
         }
         let mut client = control_plane.lock().await;
-        let action = schedule.poll(
-            std::time::Instant::now(),
-            advertise,
-            client.is_authenticated(),
-        );
+        let action = schedule.poll(now, advertise, client.is_authenticated());
         match action {
             presence::PresenceAction::Wait => continue,
             presence::PresenceAction::Announce => {
