@@ -4943,6 +4943,10 @@ fn store_and_verify(account: &str, key: &[u8]) -> Result<(), String> {
 fn load_or_create_identity_in_keystore(
     path: &Path,
 ) -> Result<(IdentityKey, IdentitySource), Error> {
+    // Repeated here, not only in the caller. The account name and the custody
+    // marker below are both derived from this path, so a relative one would
+    // make this device's keystore entry depend on a working directory.
+    validate_identity_store_path(path)?;
     let account = keystore_account(path);
     let recorded = keystore_marker_path(path).exists();
     let refuse = |reason: &str| {
@@ -5213,7 +5217,28 @@ whose custody went unrecorded is one a later outage would silently replace"
     }
 }
 
+/// Where an identity store may live.
+///
+/// A named rule rather than an inline check, because it has to hold for
+/// *both* backends and a test that goes through one of them proves nothing
+/// about the other. The file backend has always refused a relative path. The
+/// keystore backend is chosen first when custody is requested and available,
+/// and it never reached that refusal: it would accept a relative path and
+/// derive its account name and its custody marker from it, so the identity a
+/// process found would depend on the directory it happened to start in. For a
+/// service that is the difference between one device and several.
+fn validate_identity_store_path(path: &Path) -> Result<(), Error> {
+    if path.is_absolute() {
+        return Ok(());
+    }
+    Err(Error::InvalidMessage(
+        "the identity store path must be absolute".into(),
+    ))
+}
+
 fn load_or_create_identity(path: &Path) -> Result<(IdentityKey, IdentitySource), Error> {
+    // Before the custody decision, not inside one branch of it.
+    validate_identity_store_path(path)?;
     if keystore_custody_requested() {
         if keystore::available() {
             return load_or_create_identity_in_keystore(path);
@@ -5750,9 +5775,49 @@ mod tests {
     /// A relative path would resolve against whatever directory the service
     /// happened to be started in, which for a systemd unit is not a property
     /// anyone has chosen.
+    ///
+    /// Asserted against the dispatcher as well as the public entry point,
+    /// because the refusal used to live in the file backend and the keystore
+    /// backend is chosen *first*. Under keystore custody a relative path was
+    /// accepted, and the account name and custody marker were then derived
+    /// from it. The check is now the first statement in
+    /// `load_or_create_identity`, so it precedes the custody decision by
+    /// construction rather than by which backend happens to be selected.
     #[test]
     fn the_store_refuses_a_relative_path() {
         assert!(DeviceIdentityStore::open("device-identity.pk8").is_err());
+        assert!(DeviceIdentityStore::open("./device-identity.pk8").is_err());
+        assert!(DeviceIdentityStore::open("../device-identity.pk8").is_err());
+        assert!(
+            load_or_create_identity(Path::new("relative/device-identity.pk8")).is_err(),
+            "the dispatcher must refuse before it chooses a backend"
+        );
+    }
+
+    /// The rule itself, tested as a rule.
+    ///
+    /// Going through `DeviceIdentityStore::open` on a developer machine only
+    /// ever exercises the file backend, which had its own check all along --
+    /// so the test above passed even with the dispatcher's guard deleted, and
+    /// proved nothing about the keystore path. Forcing the keystore branch
+    /// would mean mutating `OPENSTREAM_IDENTITY_CUSTODY`, which is
+    /// process-global and would race every other test in this binary. So the
+    /// rule is named, asserted directly, and invoked at the top of the
+    /// dispatcher and of the keystore backend both.
+    #[test]
+    fn an_identity_store_path_must_be_absolute() {
+        for relative in [
+            "device-identity.pk8",
+            "./device-identity.pk8",
+            "../device-identity.pk8",
+            "state/openstream/device-identity.pk8",
+        ] {
+            assert!(
+                validate_identity_store_path(Path::new(relative)).is_err(),
+                "{relative} is relative and must be refused"
+            );
+        }
+        assert!(validate_identity_store_path(Path::new("/var/lib/openstream/k.pk8")).is_ok());
     }
 
     /// The private key must not reach a log line, a panic message or a crash

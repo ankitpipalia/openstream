@@ -55,7 +55,14 @@ no group or other bits. Keystore custody is honoured where it was asked for.
 
 - `the_store_creates_once_and_loads_afterwards`: `Created` then `Loaded`, same
   public key, and the file lands where the caller said.
-- `the_store_refuses_a_relative_path`.
+- `the_store_refuses_a_relative_path`, and `an_identity_store_path_must_be_absolute`
+  on the rule itself. The first test alone was not enough: on a developer
+  machine it only ever reaches the file backend, which had its own check all
+  along, so it passed even with the dispatcher's guard deleted. The keystore
+  backend is selected *first* when custody is requested, and it never reached
+  that check -- it would have derived its account name and custody marker from
+  a relative path. The rule is named now, asserted directly, and invoked at the
+  top of the dispatcher and of the keystore backend both.
 - `the_store_refuses_a_key_others_can_read`: widen to `0640` and it is refused.
 - `an_opened_identity_does_not_print_its_key`.
 - `an_existing_identity_is_reused_rather_than_replaced` now asserts the source.
