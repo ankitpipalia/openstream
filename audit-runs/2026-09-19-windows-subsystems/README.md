@@ -67,8 +67,20 @@ It establishes that the native Windows subsystems work on this hardware, in an i
 session, at this SHA: capture, input injection, audio loopback, process lifecycle, hardware
 decode and hardware encode.
 
-It does **not** establish Windows hosting. `openstream-windows-host` and
-`openstream-windows-media` are library-only, with no `[[bin]]` and no `src/bin`. There is no
-capture-to-encode-to-transport executable, no LocalSystem or WTS session broker, and no
-pre-login hosting, and the release workflow has no Windows host job. No live Windows session
-has run, in either direction.
+It does **not** establish Windows hosting, though not for the reason first written here.
+
+An earlier version of this file said there was no capture-to-encode-to-transport executable.
+That is wrong. `openstream-windows-host` and `openstream-windows-media` are indeed
+library-only, but their consumer is `openstream-ffmpeg-host`, which is a binary, is built for
+both Windows targets in CI, and contains a `#[cfg(windows)]` native pipeline wiring Desktop
+Duplication to the Media Foundation H.264 encoder. `OPENSTREAM_CAPTURE_BACKEND=native`
+selects it and `OPENSTREAM_MF_HARDWARE_ENCODE=1` opts into the hardware MFT. Reading the
+library crates' manifests and stopping there was the mistake.
+
+What is genuinely missing is narrower: **no live Windows session has ever run**, in either
+direction; there is no LocalSystem or WTS session broker and so no pre-login hosting; there
+is no Windows host artifact in the release workflow, only a test-build client; and neither
+Windows nor macOS implements multi-monitor discovery, so both always open the first output.
+
+So the subsystems are proven on this hardware and the host path exists in code. What has not
+happened is running it.

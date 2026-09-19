@@ -55,11 +55,58 @@ measurement of this tree reported a 28 ms/frame saving that was 2.2 ms when
 measured properly. If a number looks surprising, check the profile before
 believing it.
 
+## Host and client, by platform
+
+Which role each platform can play **in code**, separate from what has been run. The rule
+that shapes this table: a 1.0 path is native and in-process, so an ffmpeg fallback does not
+count as a supported path even where it works.
+
+**FFmpeg is still the default on every platform, and that is a gap.** With
+`OPENSTREAM_CAPTURE_BACKEND` unset, `openstream-ffmpeg-host` picks `x11grab` on Linux,
+`avfoundation` on macOS and `gdigrab` on Windows, and spawns FFmpeg. The native in-process
+pipelines are reached only by setting that variable to `native`, and setting
+`OPENSTREAM_FFMPEG_ARGS` sends it back to FFmpeg regardless. The hardware MFT on Windows is
+a second opt-in on top, `OPENSTREAM_MF_HARDWARE_ENCODE=1`, marked "off by default until
+physically verified" -- a condition the run of 2026-09-19 has now met.
+
+So the native path is not what the product does; it is what the product can be asked to do.
+Nothing in the code enforces the no-FFmpeg rule, and a release that ships defaults ships the
+FFmpeg path.
+
+| Platform | Host | Client |
+|---|---|---|
+| **Linux x86-64 with NVIDIA** | `openstream-linux-host`: DRM/KMS scanout, Vulkan NV12, NVENC | no native decode; ffmpeg only, so not a 1.0 path |
+| **macOS Apple Silicon** | `openstream-ffmpeg-host` with `OPENSTREAM_CAPTURE_BACKEND=native`: ScreenCaptureKit into VideoToolbox | `openstream-desktop-client` with `OPENSTREAM_DECODER=native`: VideoToolbox into Metal |
+| **Windows** | same binary and switch: Desktop Duplication into Media Foundation H.264, hardware MFT via `OPENSTREAM_MF_HARDWARE_ENCODE=1` | `openstream-desktop-client` with `OPENSTREAM_DECODER=native`: Media Foundation |
+| **Linux VM (Parallels)** | none: no capturable output and no GPU encoder, so it can run the control plane and the broker but produce no frames | none: no native decode path on Linux |
+
+Three places FFmpeg remains, beyond the defaults above: `openstream-ffmpeg-host` has no
+native pipeline on Linux at all, so native Linux hosting lives in a different binary
+(`openstream-linux-host`); the desktop client has no native decoder on Linux, only macOS and
+Windows; and the desktop Debian package declares `Depends: ffmpeg`. The headless package
+does not.
+
+Neither Windows nor macOS implements multi-monitor discovery. Both always open the first
+output and advertise `multi_monitor = false`.
+
+## What has actually run, host to client
+
+| Host | Client | Status |
+|---|---|---|
+| macOS Apple Silicon | macOS Apple Silicon | **PASS** -- 608 access units at 40.4/s, zero-copy both ends |
+| Linux NVIDIA (SteamOS) | macOS Apple Silicon | **PASS** -- 2026-09-15, pixels and input verified off the screen |
+| Windows | anything | **never run** -- subsystems pass, the session does not exist |
+| anything | Windows | **never run** -- the client builds as a test artifact only |
+| Ubuntu or Arch VM | anything | **not possible on this hardware** -- nothing to capture |
+
+The two PASS rows are the same pair of machines. Everything else is either unimplemented, or
+implemented and never exercised.
+
 ## What is not verified, and why
 
 | Gap | Blocker |
 |---|---|
-| Windows hosting end to end, and the LocalSystem/WTS service model | The **native subsystems were physically re-run on 2026-09-19 at `c8bf194`**, on Windows 10 19045 with a GTX 970, in the interactive session (`session_id=1`, through a scheduled task) with both test gates forced: 24 + 15 tests, all passed. Desktop Duplication captured 2560x1440 in exactly `2560x1440x4` bytes, D3D11 decode produced pixels, and the selected encoder was `NVIDIA H.264 Encoder MFT` with `hardware=true`. See `audit-runs/2026-09-19-windows-subsystems/`, and PRs #43 and #45 for the earlier run. What has *not* run is a **live end-to-end Windows session** or the service lifecycle under LocalSystem, and both Windows crates are library-only with no host executable, so Windows hosting is not a supported 1.0 platform. Do not read the per-subsystem passes as a session, and do not read the SteamOS GTX 970 evidence in `docs/BUILD.md` as a Windows run -- that one is a Linux host streaming to a macOS client, and has been mistaken for one before |
+| Windows hosting end to end, and the LocalSystem/WTS service model | The **native subsystems were physically re-run on 2026-09-19 at `c8bf194`**, on Windows 10 19045 with a GTX 970, in the interactive session (`session_id=1`, through a scheduled task) with both test gates forced: 24 + 15 tests, all passed. Desktop Duplication captured 2560x1440 in exactly `2560x1440x4` bytes, D3D11 decode produced pixels, and the selected encoder was `NVIDIA H.264 Encoder MFT` with `hardware=true`. See `audit-runs/2026-09-19-windows-subsystems/`, and PRs #43 and #45 for the earlier run. What has *not* run is a **live end-to-end Windows session** or the service lifecycle under LocalSystem, and both Windows crates are library-only with no host executable, so Windows hosting is not a supported 1.0 platform -- but note the host path *exists*: `openstream-ffmpeg-host` carries a `cfg(windows)` native pipeline from Desktop Duplication to the Media Foundation encoder, selected by `OPENSTREAM_CAPTURE_BACKEND=native`. What is missing is a live run, a LocalSystem/WTS broker, and a release artifact. Do not read the per-subsystem passes as a session, and do not read the SteamOS GTX 970 evidence in `docs/BUILD.md` as a Windows run -- that one is a Linux host streaming to a macOS client, and has been mistaken for one before |
 | Android and iOS clients | No devices |
 | Linux reboot-to-login-screen acceptance | Needs the physical rig, rebooted into SteamOS |
 | WAN, TURN, NAT matrix | No public TURN deployment |
