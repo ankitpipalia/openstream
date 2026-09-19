@@ -52,10 +52,12 @@ pass() {
 scratch=""
 work=""
 pkg_scratch=""
+unmapped=""
 cleanup() {
     [ -n "$scratch" ] && rm -rf -- "$scratch"
     [ -n "$work" ] && rm -rf -- "$work"
     [ -n "$pkg_scratch" ] && rm -rf -- "$pkg_scratch"
+    [ -n "$unmapped" ] && rm -rf -- "$unmapped"
     return 0
 }
 trap cleanup EXIT
@@ -561,6 +563,48 @@ still looks generated."
             fail "the desktop profile did not build: $(cat "$desk/err")"
         fi
         rm -rf -- "$desk"
+    fi
+
+    # A library no Debian package provides must stop the build, not be
+    # dropped from the metadata.
+    #
+    # This is the case `--ignore-missing-info` used to hide, and removing that
+    # flag is not enough on its own: a library that cannot be located at all is
+    # reported as a warning and dpkg-shlibdeps still exits zero, having emitted
+    # dependencies for everything else. The package then ships looking as
+    # though its metadata were generated, missing a library it needs.
+    if [ -n "$real_bin_dir" ] && command -v gcc >/dev/null 2>&1; then
+        unmapped="$(mktemp -d "${TMPDIR:-/tmp}/openstream-unmapped.XXXXXX")"
+        mkdir -p "$unmapped/bin" "$unmapped/shell"
+        for b in openstream-host-broker openstream-machine-service openstream-enrol \
+            openstream-host-agent openstream-ffmpeg-host openstream-linux-host \
+            openstream-signal-server; do
+            cp "$real_bin_dir/openstream-enrol" "$unmapped/bin/$b"
+        done
+        printf 'int unmapped_symbol(void) { return 42; }\n' >"$unmapped/lib.c"
+        printf 'int unmapped_symbol(void);\nint main(void) { return unmapped_symbol(); }\n' \
+            >"$unmapped/main.c"
+        if gcc -shared -fPIC -o "$unmapped/shell/libunmapped.so" "$unmapped/lib.c" \
+            2>/dev/null &&
+            gcc -o "$unmapped/shell/openstream-desktop" "$unmapped/main.c" \
+                -L"$unmapped/shell" -lunmapped -Wl,-rpath,'$ORIGIN' 2>/dev/null; then
+            if OPENSTREAM_ARTIFACT_DIR="$unmapped/bin" OPENSTREAM_SHELL_DIR="$unmapped/shell" \
+                bash "$build_deb" --profile desktop "$unmapped/x.deb" \
+                >/dev/null 2>"$unmapped/err"; then
+                fail "a binary linked to a library no package provides still produced a
+package. Its Depends would name only the libraries dpkg could map, while
+looking automatically generated."
+            elif grep -q 'could not resolve every library' "$unmapped/err"; then
+                pass "a library dpkg cannot map stops the package being built"
+            else
+                fail "the build failed, but not on the unresolved library:
+$(sed 's/^/  /' "$unmapped/err")"
+            fi
+        else
+            printf 'ok: (skipped) could not build the unmapped-library fixture\n'
+        fi
+        rm -rf -- "$unmapped"
+        unmapped=""
     fi
 fi
 

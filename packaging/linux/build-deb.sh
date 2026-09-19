@@ -205,14 +205,42 @@ Architecture: $arch
 EOF
 shlib_stderr="$stage/debian/shlibdeps.err"
 if ! shlib_output="$(
-    cd "$stage" && dpkg-shlibdeps -O --ignore-missing-info "${shlib_sources[@]}" \
-        2>"$shlib_stderr"
+    cd "$stage" && dpkg-shlibdeps -O "${shlib_sources[@]}" 2>"$shlib_stderr"
 )"; then
     echo "dpkg-shlibdeps failed:" >&2
     sed 's/^/  /' "$shlib_stderr" >&2
     rm -rf -- "$stage/debian"
     exit 1
 fi
+
+# Exiting zero is not the same as having resolved everything.
+#
+# `--ignore-missing-info` used to be passed here, and dropping it is not enough
+# on its own: a library that cannot be located at all -- an unresolvable RPATH,
+# say -- is reported as a *warning*, and dpkg-shlibdeps still exits zero having
+# emitted dependencies for everything it could map. The non-empty check then
+# passes and the package ships claiming generated metadata while silently
+# missing a library it needs.
+#
+# So the warnings are read. Two are routine on a merged-/usr Debian and mean
+# nothing about resolution; anything else is treated as unresolved.
+if [[ -s "$shlib_stderr" ]]; then
+    unexpected="$(
+        grep -E '^dpkg-shlibdeps: (warning|error):' "$shlib_stderr" |
+            grep -v "binaries to analyze should already be installed in their package's directory" |
+            grep -v 'diversions involved - output may be incorrect' ||
+            true
+    )"
+    if [[ -n "$unexpected" ]]; then
+        echo "dpkg-shlibdeps could not resolve every library:" >&2
+        printf '%s\n' "$unexpected" | sed 's/^/  /' >&2
+        echo "the package would declare only the libraries it managed to map," >&2
+        echo "which is metadata that looks generated and is incomplete" >&2
+        rm -rf -- "$stage/debian"
+        exit 1
+    fi
+fi
+
 shlib_depends="$(printf '%s\n' "$shlib_output" | sed -n 's/^shlibs:Depends=//p')"
 rm -rf -- "$stage/debian"
 

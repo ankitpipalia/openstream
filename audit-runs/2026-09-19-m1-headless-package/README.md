@@ -83,6 +83,17 @@ A second round found two more in the same area:
   links a library the Rust binaries do not, and asserts that library reaches
   the package's `Depends`. Removing the shell from the analysis fails it with
   "omits what only its shell links against: libselinux1".
+- **And it was still fail-open after that.** `--ignore-missing-info` was being
+  passed, and dropping it turned out not to be enough on its own: a library
+  that cannot be located at all, an unresolvable RPATH for instance, is
+  reported as a *warning* and `dpkg-shlibdeps` still exits zero having emitted
+  dependencies for everything it could map. Measured on the VM: an ELF linked
+  to a library no package provides produced `shlibs:Depends=libc6` and exit 0,
+  with and without the flag. The non-empty check passed and the package would
+  have shipped looking generated while missing a library it needs. The
+  warnings are read now, with two routine merged-`/usr` ones allowed and
+  everything else treated as unresolved. A fixture linked against a
+  deliberately unmapped library is built and the package creation must fail.
 - **Dependency analysis was fail-open.** A missing or failing
   `dpkg-shlibdeps` printed a warning and produced the package anyway, which is
   the exact condition the change was meant to prevent, with metadata that now
