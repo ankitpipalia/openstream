@@ -5817,7 +5817,22 @@ mod tests {
                 "{relative} is relative and must be refused"
             );
         }
+        // Absolute means absolute on the platform doing the asking. A
+        // Unix-style rooted path is *not* absolute on Windows, because it has
+        // no drive prefix and resolves against whichever drive is current --
+        // which is the same class of ambiguity this rule exists to refuse, so
+        // the refusal there is correct rather than something to special-case.
+        #[cfg(unix)]
         assert!(validate_identity_store_path(Path::new("/var/lib/openstream/k.pk8")).is_ok());
+        #[cfg(windows)]
+        assert!(
+            validate_identity_store_path(Path::new(r"C:\ProgramData\OpenStream\k.pk8")).is_ok()
+        );
+        #[cfg(windows)]
+        assert!(
+            validate_identity_store_path(Path::new("/var/lib/openstream/k.pk8")).is_err(),
+            "a rooted path with no drive resolves against the current drive"
+        );
     }
 
     /// The private key must not reach a log line, a panic message or a crash
