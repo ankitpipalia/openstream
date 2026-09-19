@@ -41,15 +41,19 @@ continue without repeating work.
 6. **Do not `git add -A` from the repository root.** `engine/lowlat/fuzz/corpus`
    accumulates machine-generated inputs that will otherwise land in a commit.
 7. **Back up an untracked file before any scripted rewrite of it.** This file
-   is tracked now, but `OPERATOR-NOTES.md`, `new-plan.md` and anything under
-   `audit-runs/` you have not committed are not, and `git checkout --` restores
-   nothing for them. See the note above for what that cost once.
+   is tracked now, but `OPERATOR-NOTES.md` and anything under `audit-runs/`
+   you have not committed are not, and `git checkout --` restores nothing for
+   them. See the note above for what that cost once.
 
 ## Where things stand
 
-Read `docs/STATUS.md`. In brief: native capture, encode, decode and presentation
-work on macOS and Linux with hardware evidence; Windows, Android and iOS have
-never run; the release checker reports NOT READY and should.
+Read `docs/STATUS.md`. In brief: native capture, encode, decode and
+presentation work on macOS and Linux with hardware evidence. Windows's native
+subsystems were physically tested on a GTX 970 -- capture, input, audio,
+lifecycle and hardware decode, see PRs #43 and #45 -- but no live end-to-end
+Windows session or LocalSystem service lifecycle has ever run, so Windows
+hosting is not a 1.0 platform. Android and iOS have never run at all. The
+release checker reports NOT READY and should.
 
 ## The review round of 2026-09-18
 
@@ -108,9 +112,10 @@ evidence from a superseded head.
 ## Open branches, and what each is waiting for
 
 **Written 2026-09-19.** Six pull requests are open against `main` at
-`c8bf194`, all green on the `CI gate`. None is merged: branch protection
-requires an approving review, and GitHub refuses to let an author approve
-their own pull request.
+`c8bf194`. None is merged: branch protection requires an approving review, and
+GitHub refuses to let an author approve their own pull request. Check each
+one's current `CI gate` rather than trusting a state written down here; four of
+the six were reworked in review after first going green.
 
 | PR | Branch | What it is |
 | --- | --- | --- |
@@ -153,6 +158,25 @@ root where there is no `Cargo.toml`, exited 101, and never reached the script.
 All three share one cause: the workflow step only runs on a pull request, and
 the branch had none for weeks. A fourth was found only by installing: the
 unenrolled machine service restart-looped forever, 12 restarts in 35 seconds.
+
+### A privacy note that is not resolved
+
+An earlier revision of this file, published to this public repository, carried
+SSH account names, the VM and LAN addresses, the device model of the machine
+running the backend, its bind address and unit name, the current public WAN
+address, and the private upstream hops. It was removed by rewriting the branch,
+so it is absent from the branch and from the pull request diff.
+
+**That is not the same as removing it from public history.** The superseded
+commit is still retrievable through GitHub's API by its SHA, and a force-push
+does not purge unreachable objects or cached views. Only GitHub can do that,
+through their sensitive-data removal process. Nothing in it was a credential --
+no password, token or key -- so no rotation is called for, but do not describe
+it as gone.
+
+The lesson is cheaper than the remedy: no secret scanner flags a LAN address or
+an ISP hop, so "contains no credentials" is not the test. The test is whether a
+reader needs it.
 
 ### The test machines, by what they can prove
 
@@ -256,10 +280,10 @@ dependency ahead of what needs it, adjusted if GitHub reports a conflict:
 
 ## What to do next, in order
 
-The ordering lives in `new-plan.md` (milestones M1 to M10). In terms of what
-is actually blocked on what, right now:
+The ordering lives in `docs/plans/OPENSTREAM-1.0-COMPLETION-PLAN.md`
+(milestones M1 to M10). In terms of what is actually blocked on what:
 
-1. **Review and merge the five open pull requests.** Nothing downstream can
+1. **Review and merge the six open pull requests.** Nothing downstream can
    start until the two libraries are on `main`, and merging needs an approval
    the sole collaborator cannot give himself. The procedure used last time is
    recorded under "What is merged" below.
@@ -295,7 +319,8 @@ is actually blocked on what, right now:
    be built there from a clean checkout at the frozen SHA. No `curl` on that
    box, and the unit is `openstream-signal.service`.
 5. **Then the chain end to end on the VM (M7)**, and only after that the
-   hardware-blocked rows: the NVIDIA rig, Windows, Android, iOS, and WAN.
+   hardware-blocked rows: the NVIDIA rig, a live Windows session, Android, iOS,
+   and WAN.
 
 ## Three things worth copying
 

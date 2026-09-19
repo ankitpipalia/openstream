@@ -117,13 +117,16 @@ protection requires an approval the sole collaborator cannot give himself.
 
 | Milestone | PR | State |
 |---|---|---|
-| M5 desktop presence renewal | #97 | CI green |
-| M3 server authorization | #98 | CI green |
-| M1 headless package | #99 | install job green on x86-64; rerun after a CI fix |
-| M3 portable control client | #100 | CI running |
-| M2, M4, M6 to M10 | none | not started |
+| M5 desktop presence renewal | #97 | open, reworked twice in review |
+| M3 server authorization | #98 | open, passed review |
+| M1 headless package | #99 | open, reworked twice in review |
+| M3 portable control client | #100 | open, passed review |
+| M2 device identity store | #101 | open, reworked in review |
+| Tracked handoff and plan | #102 | open, reworked in review |
+| M4, M6 to M10 | none | not started |
+| M2 enrolment half | none | not started; belongs on the packaging branch |
 
-Three faults were found by running things that had never run, all on the
+Four faults were found by running things that had never run, all on the
 packaging branch, and all of which read correctly:
 
 - `RuntimeDirectoryGroup=`, a systemd directive that does not exist. Found
@@ -137,8 +140,17 @@ packaging branch, and all of which read correctly:
 The common cause is the same one the milestone order is built around: that
 step only runs on a pull request, and the branch had none for weeks.
 
-A fourth was found by installing the package: the unenrolled machine service
+A fourth, the CI step that invoked the packaging check, ran `cargo` from the
+repository root where there is no workspace and exited 101 before reaching it.
+
+Installing the package found a fifth: the unenrolled machine service
 restart-looped forever, 12 restarts in 35 seconds, reporting `activating`.
+
+Review then found more of the same shape, each a case where a test covered one
+path while another behaved differently: the release workflow rather than the
+script it calls, the keystore branch rather than the file branch, a failed host
+rather than a disabled one, the desktop profile rather than the headless one,
+and a fresh clone rather than this working copy.
 
 The Ubuntu arm64 VM is provisioned: an installed key, a Rust toolchain and
 passwordless sudo, with the repository synced into it. Its sizing was raised
