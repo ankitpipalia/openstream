@@ -18,6 +18,7 @@ pub mod connect_flow;
 mod control_plane;
 pub mod device_store;
 pub mod host_agent;
+pub mod presence;
 pub mod runtime;
 pub mod session;
 
@@ -28,6 +29,10 @@ pub mod session;
 /// the shell's `HostStatus` only ever changes when the operator happens to
 /// press a button.
 const HOST_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the presence task asks whether a beat is due. Far finer than the
+/// renewal interval itself, so that enabling hosting is reflected promptly
+/// rather than at the end of whatever interval happened to be running.
+const PRESENCE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -415,6 +420,15 @@ async fn control_plane_sign_out(
     }
     {
         let mut client = control_plane.lock().await;
+        // Withdraw before the token goes, not after: withdrawal needs the
+        // token, so clearing first leaves the device advertised until presence
+        // lapses on the service's own timer -- up to a full TTL of being
+        // offered as connectable by an account that has signed out.
+        //
+        // Best effort, like the announcement itself. A withdrawal that does
+        // not land must not stop someone signing out, and the TTL is the
+        // backstop that makes that safe.
+        let _ = client.withdraw_presence().await;
         client.clear_credentials();
     }
     let mut state = runtime.lock().map_err(|_| ControlPlaneError::Transport)?;
@@ -447,31 +461,6 @@ async fn runtime_dispatch(
         command,
     )
     .await
-}
-
-/// Tell the service whether this device is available to host.
-///
-/// Best effort on purpose. Hosting has already started or stopped locally by
-/// the time this runs, and failing the whole command because a presence
-/// heartbeat did not land would turn a cosmetic problem -- the device shows
-/// as offline until the next beat -- into a refusal to host at all. In local
-/// mode there is no control plane signed in and this is simply a no-op.
-async fn announce_presence_best_effort(control_plane: &SharedControlPlane, online: bool) {
-    let mut client = control_plane.lock().await;
-    if !client.is_authenticated() {
-        return;
-    }
-    let outcome = if online {
-        client.announce_presence().await
-    } else {
-        client.withdraw_presence().await
-    };
-    if outcome.is_err() {
-        // Not surfaced as a command failure; see above. Logged so an
-        // operator wondering why a machine never appears has something to
-        // find.
-        eprintln!("OpenStream could not update host presence with the control plane");
-    }
 }
 
 /// Requests this device is being asked to approve.
@@ -675,20 +664,19 @@ async fn dispatch_command_with_session(
     command: RuntimeCommand,
 ) -> Result<RuntimeDispatchResult, RuntimeError> {
     match command {
-        RuntimeCommand::EnableHosting => {
-            let result = dispatch_host_lifecycle(state, host_lock, true).await?;
-            // Presence follows hosting. A device that is not hosting must not
-            // appear connectable: offering it would produce a request nobody
-            // can approve, and the person who pressed connect would watch it
-            // time out with no explanation.
-            announce_presence_best_effort(control_plane, true).await;
-            Ok(result)
-        }
-        RuntimeCommand::DisableHosting => {
-            let result = dispatch_host_lifecycle(state, host_lock, false).await?;
-            announce_presence_best_effort(control_plane, false).await;
-            Ok(result)
-        }
+        // Presence is deliberately not announced here.
+        //
+        // Enabling hosting asks the agent to start; it does not mean the agent
+        // is running. This path announced unconditionally as soon as the
+        // request returned, so a host that came back Starting -- or Failed --
+        // was advertised as connectable anyway, and whoever pressed connect
+        // watched it time out with nothing to explain why.
+        //
+        // `maintain_presence_forever` owns every presence transition now. It
+        // announces on becoming Ready and withdraws on leaving it, which also
+        // covers the agent dying later on: no command path ever sees that.
+        RuntimeCommand::EnableHosting => dispatch_host_lifecycle(state, host_lock, true).await,
+        RuntimeCommand::DisableHosting => dispatch_host_lifecycle(state, host_lock, false).await,
         RuntimeCommand::RestartHosting => dispatch_restart_hosting(state, host_lock).await,
         RuntimeCommand::Connect {
             device_id,
@@ -1096,6 +1084,76 @@ async fn reconcile_host_health_forever(state: SharedRuntime, host_lock: SharedHo
     }
 }
 
+/// Keep a hosting device listed by the control plane.
+///
+/// `POST /v1/presence` is a heartbeat with a server-side lifetime, so
+/// announcing once when hosting starts leaves the device invisible a minute
+/// and a half later while it is still hosting -- and a Secure Connect request
+/// against it is then refused as offline. This task is the only thing that
+/// renews it; see `docs/plans/M5-desktop-presence-renewal.md`.
+///
+/// Every failure here is non-fatal, like the watchers above it. Hosting is a
+/// local fact and the control plane's opinion of it is advisory: a beat that
+/// does not land is retried on a bounded backoff, and never stops the host.
+async fn maintain_presence_forever(state: SharedRuntime, control_plane: SharedControlPlane) {
+    let mut schedule = presence::PresenceSchedule::from_clock();
+    let mut ticker = tokio::time::interval(PRESENCE_TICK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let advertise = {
+            let Ok(runtime) = state.lock() else {
+                continue;
+            };
+            presence::advertises_presence(&runtime.host_status())
+        };
+        // Nothing owed, no lock. This has to tell "ready and not due" apart
+        // from "not ready with a withdrawal owed": the first must not wake the
+        // loop at all, and the second must not wait for a renewal that is half
+        // a minute away.
+        let now = std::time::Instant::now();
+        if !schedule.wants_attention(now, advertise) {
+            if !advertise && !schedule.is_advertised() {
+                // Idle. Forgetting the schedule is what makes the next Ready
+                // announce at once rather than waiting out an interval that
+                // started before this device stopped hosting.
+                schedule.reset();
+            }
+            continue;
+        }
+        let mut client = control_plane.lock().await;
+        let action = schedule.poll(now, advertise, client.is_authenticated());
+        match action {
+            presence::PresenceAction::Wait => continue,
+            presence::PresenceAction::Announce => {
+                let delivered = client.announce_presence().await.is_ok();
+                drop(client);
+                let now = std::time::Instant::now();
+                if delivered {
+                    schedule.record_success(now);
+                } else {
+                    // Logged once per failed beat rather than once per tick,
+                    // because the schedule decides when to try again.
+                    eprintln!("OpenStream could not renew host presence with the control plane");
+                    schedule.record_failure(now);
+                }
+            }
+            presence::PresenceAction::Withdraw => {
+                let withdrawn = client.withdraw_presence().await.is_ok();
+                drop(client);
+                if withdrawn {
+                    schedule.record_withdrawn();
+                } else {
+                    // Keep trying: until this lands the service still offers
+                    // a host that is not there.
+                    eprintln!("OpenStream could not withdraw host presence with the control plane");
+                    schedule.record_failure(std::time::Instant::now());
+                }
+            }
+        }
+    }
+}
+
 /// Poll the native session runner and reflect only its secret-free lifecycle
 /// observations into `AppModel`. The runner owns all media and network
 /// buffers; this task never receives a frame and never forwards a bearer
@@ -1382,7 +1440,9 @@ pub fn run() {
             app.manage(Arc::clone(&host_lock));
             app.manage(Arc::clone(&session));
             app.manage(Arc::clone(&device_store));
-            app.manage(Arc::new(tokio::sync::Mutex::new(control_plane)) as SharedControlPlane);
+            let control_plane: SharedControlPlane =
+                Arc::new(tokio::sync::Mutex::new(control_plane));
+            app.manage(Arc::clone(&control_plane));
             // Adopt whatever the agent is already doing, then keep adopting
             // it. A shell that has just opened over a running agent would
             // otherwise report hosting as disabled until someone pressed a
@@ -1391,6 +1451,12 @@ pub fn run() {
             tauri::async_runtime::spawn(reconcile_host_health_forever(
                 Arc::clone(&runtime),
                 Arc::clone(&host_lock),
+            ));
+            // Presence lapses on the service's own timer, so a host that
+            // announced once when it started is forgotten while still hosting.
+            tauri::async_runtime::spawn(maintain_presence_forever(
+                Arc::clone(&runtime),
+                control_plane,
             ));
             tauri::async_runtime::spawn(reconcile_session_forever(runtime, session));
             Ok(())
