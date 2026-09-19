@@ -3,15 +3,104 @@ set -euo pipefail
 
 # Build an unsigned local Debian package from an already-built release tree.
 # Signing and repository publication remain protected release-environment work.
+#
+# Two profiles, because two different machines are being served.
+#
+#   desktop   the workstation package: the product shell and the per-user host,
+#             plus the machine-level subsystem for an operator who wants it.
+#   headless  a server or an unattended host: the privileged broker, the
+#             network-facing machine service, and the enrolment tool. Nothing
+#             else. No shell, no signal server, no FFmpeg host, and no
+#             `Depends: ffmpeg` -- a headless host has no graphical session to
+#             run a shell in, and the accepted media path does not use FFmpeg,
+#             so declaring it would pull a large dependency onto every server
+#             for a fallback that 1.0 does not exercise.
+#
+# The profile is an argument rather than an environment switch, because which
+# files land in a package is not a detail to be discovered by reading the
+# script that built it.
+
+usage() {
+    cat <<'USAGE'
+usage: build-deb.sh [--profile desktop|headless] [--arch DEB_ARCH] [OUTPUT]
+
+  --profile  desktop (default) or headless
+  --arch     Debian architecture; defaults to `dpkg --print-architecture`
+  OUTPUT     path of the .deb to write; defaults to a name under dist/
+USAGE
+}
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 version="${OPENSTREAM_VERSION:-1.0.0}"
-output="${1:-$repo_dir/dist/OpenStream-${version}-amd64.deb}"
+profile=desktop
+arch=""
+output=""
+
+while (($# > 0)); do
+    case "$1" in
+        --profile)
+            profile="${2:-}"
+            shift 2 || { usage >&2; exit 2; }
+            ;;
+        --arch)
+            arch="${2:-}"
+            shift 2 || { usage >&2; exit 2; }
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            printf 'unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            output="$1"
+            shift
+            ;;
+    esac
+done
+
+case "$profile" in
+    desktop|headless) ;;
+    *)
+        printf 'unknown profile: %s\n' "$profile" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+# Never guess the architecture. An arm64 package labelled amd64 installs
+# nowhere useful and fails in a way that blames the machine rather than the
+# build, so the label comes from dpkg on the machine doing the building unless
+# an explicit one is supplied.
+if [[ -z "$arch" ]]; then
+    command -v dpkg >/dev/null 2>&1 || {
+        echo "dpkg is required to determine the architecture; pass --arch" >&2
+        exit 2
+    }
+    arch="$(dpkg --print-architecture)"
+fi
+[[ "$arch" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+    printf 'not a Debian architecture: %s\n' "$arch" >&2
+    exit 2
+}
+
 artifact_dir="${OPENSTREAM_ARTIFACT_DIR:-$repo_dir/engine/lowlat/target/release}"
 # openstream.desktop launches the Tauri product shell, which is built from
 # desktop/src-tauri and so lands in its own target directory. Packaging the
 # desktop entry without this binary produced a menu item that did nothing.
 shell_dir="${OPENSTREAM_SHELL_DIR:-$repo_dir/desktop/src-tauri/target/release}"
+
+if [[ "$profile" == headless ]]; then
+    package_name="openstream-headless-host"
+    package_depends="adduser"
+else
+    package_name="openstream"
+    package_depends="ffmpeg"
+fi
+output="${output:-$repo_dir/dist/${package_name}_${version}_${arch}.deb}"
 
 command -v dpkg-deb >/dev/null 2>&1 || {
     echo "dpkg-deb is required to build the Linux package" >&2
@@ -22,43 +111,60 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 # pre-login binaries were built and tested for months without ever being in a
 # package, which is what kept machine-level hosting an experiment rather than
 # something an installer could turn on.
-binaries=(
-    openstream-host-agent
-    openstream-ffmpeg-host
-    openstream-linux-host
-    openstream-signal-server
-    openstream-host-broker
-    openstream-machine-service
-    openstream-enrol
-)
+if [[ "$profile" == headless ]]; then
+    # Exactly the three programs machine-level hosting needs, and nothing a
+    # server would never run.
+    binaries=(
+        openstream-host-broker
+        openstream-machine-service
+        openstream-enrol
+    )
+else
+    binaries=(
+        openstream-host-agent
+        openstream-ffmpeg-host
+        openstream-linux-host
+        openstream-signal-server
+        openstream-host-broker
+        openstream-machine-service
+        openstream-enrol
+    )
+fi
 for binary in "${binaries[@]}"; do
     [[ -x "$artifact_dir/$binary" ]] || {
         echo "missing release binary: $artifact_dir/$binary" >&2
         exit 1
     }
 done
-[[ -x "$shell_dir/openstream-desktop" ]] || {
-    echo "missing product shell binary: $shell_dir/openstream-desktop" >&2
-    echo "build it with: cd desktop && npm run tauri build" >&2
-    echo "or set OPENSTREAM_SHELL_DIR to the directory that holds it" >&2
-    exit 1
-}
+if [[ "$profile" != headless ]]; then
+    [[ -x "$shell_dir/openstream-desktop" ]] || {
+        echo "missing product shell binary: $shell_dir/openstream-desktop" >&2
+        echo "build it with: cd desktop && npm run tauri build" >&2
+        echo "or set OPENSTREAM_SHELL_DIR to the directory that holds it" >&2
+        exit 1
+    }
+fi
 
 stage="$(mktemp -d "${TMPDIR:-/tmp}/openstream-deb.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
-mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/user" \
-    "$stage/usr/lib/systemd/system" "$stage/usr/share/applications" \
+mkdir -p "$stage/DEBIAN" "$stage/usr/bin" "$stage/usr/lib/systemd/system" \
     "$stage/etc/openstream"
+# Only the desktop profile has a shell to launch or a menu entry to launch it
+# from; a headless package that created these would own two empty directories
+# on every server.
+if [[ "$profile" != headless ]]; then
+    mkdir -p "$stage/usr/lib/systemd/user" "$stage/usr/share/applications"
+fi
 
 cat >"$stage/DEBIAN/control" <<EOF
-Package: openstream
+Package: $package_name
 Version: $version
 Section: net
 Priority: optional
-Architecture: amd64
+Architecture: $arch
 Maintainer: OpenStream contributors
-Depends: ffmpeg
-Description: Self-hosted low-latency desktop streaming
+Depends: $package_depends
+Description: Self-hosted low-latency desktop streaming ($profile)
 EOF
 
 # The machine service runs as its own unprivileged user so the broker's
@@ -207,14 +313,45 @@ exit 0
 PRERM
 chmod 0755 "$stage/DEBIAN/prerm"
 
+# Purge means purge. `remove` deliberately keeps the operator's configuration
+# and the machine's identity, so that reinstalling does not force a
+# re-enrolment; `purge` is the explicit request to leave nothing behind, and
+# what it leaves behind matters here because /var/lib/openstream holds the
+# device's private identity key. A purge that left a key on disk would be a
+# key nobody is managing any more.
+#
+# The system account is kept. Removing it could orphan files elsewhere on the
+# machine that this package cannot see, and an unused account with nologin and
+# no home is not a hazard.
+cat >"$stage/DEBIAN/postrm" <<'POSTRM'
+#!/bin/sh
+set -e
+
+if [ "$1" = "purge" ]; then
+    rm -f /etc/openstream/broker.env /etc/openstream/machine-service.env
+    rm -f /etc/openstream/grant.key
+    rm -rf /var/lib/openstream
+    # Only if this package was the only thing in it.
+    rmdir /etc/openstream 2>/dev/null || true
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0
+POSTRM
+chmod 0755 "$stage/DEBIAN/postrm"
+
 for binary in "${binaries[@]}"; do
     install -m 0755 "$artifact_dir/$binary" "$stage/usr/bin/$binary"
 done
-install -m 0755 "$shell_dir/openstream-desktop" "$stage/usr/bin/openstream-desktop"
-install -m 0644 "$repo_dir/packaging/linux/openstream-host-agent.service" \
-    "$stage/usr/lib/systemd/user/openstream-host-agent.service"
-install -m 0644 "$repo_dir/packaging/linux/openstream.desktop" \
-    "$stage/usr/share/applications/openstream.desktop"
+if [[ "$profile" != headless ]]; then
+    install -m 0755 "$shell_dir/openstream-desktop" "$stage/usr/bin/openstream-desktop"
+    install -m 0644 "$repo_dir/packaging/linux/openstream-host-agent.service" \
+        "$stage/usr/lib/systemd/user/openstream-host-agent.service"
+    install -m 0644 "$repo_dir/packaging/linux/openstream.desktop" \
+        "$stage/usr/share/applications/openstream.desktop"
+fi
 
 # System units for the pre-login subsystem. Shipped but NOT enabled: see
 # DEBIAN/postinst for why.

@@ -302,9 +302,12 @@ ENV
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-
+    # The broker stays up until the connection below has been attempted.
+    # Killing it here and then connecting -- which is what this did -- tests
+    # nothing except that a dead process does not accept connections: the
+    # socket file outlives the process, so the connect always failed and the
+    # check could never pass. It had never run, because the workflow step that
+    # invokes this script only runs on a pull request and the branch had none.
     if [ "$ready" = 1 ]; then
         pass "the broker starts and listens with the configuration the package writes"
         # A socket file is not a listener. `RuntimeDirectory` would leave one
@@ -327,6 +330,8 @@ listening on the path the machine service is configured to use"
         fail "the broker did not start with the configuration the package writes:
 $(cat "$work/out")"
     fi
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 
     # Negative control. Without this the test above passes just as happily
     # against a broker that ignores its configuration entirely.
@@ -350,6 +355,88 @@ the check above proves nothing about the configuration"
     else
         pass "an empty gid is still rejected, so the check above is measuring something"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. The headless package contains what a server needs, and nothing else.
+#
+# Built here from stub binaries rather than real ones. What is being checked is
+# the packaging decision -- which files are chosen, what the control file
+# claims -- and that does not need a compiler. Building it for real is the
+# install test on a machine, which is a separate exercise.
+#
+# The bug this exists to catch: a headless host package that declares
+# `Depends: ffmpeg`, or carries the desktop shell, pulls a graphical stack onto
+# every server for a component the accepted media path does not use.
+# ---------------------------------------------------------------------------
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+    printf 'ok: (skipped) headless package contents need dpkg-deb\n'
+else
+    # Removed explicitly rather than through a trap: the functional section
+    # below installs its own EXIT trap, and the second one silently replaces
+    # the first.
+    pkg_scratch="$(mktemp -d "${TMPDIR:-/tmp}/openstream-deb-test.XXXXXX")"
+    mkdir -p "$pkg_scratch/bin"
+    for stub in openstream-host-broker openstream-machine-service openstream-enrol; do
+        printf '#!/bin/sh\necho stub\n' >"$pkg_scratch/bin/$stub"
+        chmod 0755 "$pkg_scratch/bin/$stub"
+    done
+    deb="$pkg_scratch/headless.deb"
+    if OPENSTREAM_ARTIFACT_DIR="$pkg_scratch/bin" \
+        bash "$build_deb" --profile headless "$deb" >/dev/null 2>"$pkg_scratch/err"; then
+        pass "the headless profile builds a package"
+
+        contents="$(dpkg-deb -c "$deb")"
+        control="$(dpkg-deb -f "$deb")"
+
+        for wanted in usr/bin/openstream-host-broker \
+            usr/bin/openstream-machine-service \
+            usr/bin/openstream-enrol \
+            usr/lib/systemd/system/openstream-host-broker.service \
+            usr/lib/systemd/system/openstream-machine-service.service; do
+            if printf '%s' "$contents" | grep -q "$wanted"; then
+                pass "headless package ships $wanted"
+            else
+                fail "headless package is missing $wanted"
+            fi
+        done
+
+        for unwanted in openstream-desktop openstream-signal-server \
+            openstream-host-agent openstream-ffmpeg-host openstream-linux-host \
+            openstream.desktop; do
+            if printf '%s' "$contents" | grep -q "$unwanted"; then
+                fail "headless package carries $unwanted, which a server never runs"
+            else
+                pass "headless package does not carry $unwanted"
+            fi
+        done
+
+        if printf '%s' "$control" | grep -qi '^Depends:.*ffmpeg'; then
+            fail "the headless package declares a dependency on ffmpeg; the
+accepted media path does not use it, so this pulls a large dependency onto
+every server for a fallback 1.0 does not exercise"
+        else
+            pass "the headless package does not depend on ffmpeg"
+        fi
+
+        if printf '%s' "$control" | grep -q '^Package: openstream-headless-host'; then
+            pass "the headless package has its own name"
+        else
+            fail "the headless package is not named openstream-headless-host"
+        fi
+
+        host_arch="$(dpkg --print-architecture)"
+        if printf '%s' "$control" | grep -q "^Architecture: $host_arch"; then
+            pass "the package is labelled $host_arch, the architecture it was built for"
+        else
+            fail "the package is not labelled $host_arch: $(printf '%s' "$control" |
+                grep '^Architecture:')
+An arm64 package labelled amd64 installs nowhere and blames the machine."
+        fi
+    else
+        fail "the headless profile did not build: $(cat "$pkg_scratch/err")"
+    fi
+    rm -rf -- "$pkg_scratch"
 fi
 
 if [ "$failures" -gt 0 ]; then
