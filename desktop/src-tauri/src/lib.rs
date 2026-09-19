@@ -18,6 +18,7 @@ pub mod connect_flow;
 mod control_plane;
 pub mod device_store;
 pub mod host_agent;
+pub mod presence;
 pub mod runtime;
 pub mod session;
 
@@ -28,6 +29,10 @@ pub mod session;
 /// the shell's `HostStatus` only ever changes when the operator happens to
 /// press a button.
 const HOST_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the presence task asks whether a beat is due. Far finer than the
+/// renewal interval itself, so that enabling hosting is reflected promptly
+/// rather than at the end of whatever interval happened to be running.
+const PRESENCE_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const SESSION_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1096,6 +1101,61 @@ async fn reconcile_host_health_forever(state: SharedRuntime, host_lock: SharedHo
     }
 }
 
+/// Keep a hosting device listed by the control plane.
+///
+/// `POST /v1/presence` is a heartbeat with a server-side lifetime, so
+/// announcing once when hosting starts leaves the device invisible a minute
+/// and a half later while it is still hosting -- and a Secure Connect request
+/// against it is then refused as offline. This task is the only thing that
+/// renews it; see `docs/plans/M5-desktop-presence-renewal.md`.
+///
+/// Every failure here is non-fatal, like the watchers above it. Hosting is a
+/// local fact and the control plane's opinion of it is advisory: a beat that
+/// does not land is retried on a bounded backoff, and never stops the host.
+async fn maintain_presence_forever(state: SharedRuntime, control_plane: SharedControlPlane) {
+    let mut schedule = presence::PresenceSchedule::from_clock();
+    let mut ticker = tokio::time::interval(PRESENCE_TICK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let hosting = {
+            let Ok(runtime) = state.lock() else {
+                continue;
+            };
+            !matches!(
+                runtime.host_status(),
+                openstream_app_core::HostStatus::Disabled
+            )
+        };
+        if !hosting {
+            // Not a failure to back off from. Forgetting the schedule is what
+            // makes the next enable announce at once.
+            schedule.reset();
+            continue;
+        }
+        if !schedule.is_due(std::time::Instant::now()) {
+            continue;
+        }
+        let mut client = control_plane.lock().await;
+        if schedule.poll(std::time::Instant::now(), true, client.is_authenticated())
+            != presence::PresenceAction::Announce
+        {
+            continue;
+        }
+        let delivered = client.announce_presence().await.is_ok();
+        drop(client);
+        let now = std::time::Instant::now();
+        if delivered {
+            schedule.record_success(now);
+        } else {
+            // Logged once per failed beat rather than once per tick, because
+            // the schedule is what decides when to try again.
+            eprintln!("OpenStream could not renew host presence with the control plane");
+            schedule.record_failure(now);
+        }
+    }
+}
+
 /// Poll the native session runner and reflect only its secret-free lifecycle
 /// observations into `AppModel`. The runner owns all media and network
 /// buffers; this task never receives a frame and never forwards a bearer
@@ -1382,7 +1442,9 @@ pub fn run() {
             app.manage(Arc::clone(&host_lock));
             app.manage(Arc::clone(&session));
             app.manage(Arc::clone(&device_store));
-            app.manage(Arc::new(tokio::sync::Mutex::new(control_plane)) as SharedControlPlane);
+            let control_plane: SharedControlPlane =
+                Arc::new(tokio::sync::Mutex::new(control_plane));
+            app.manage(Arc::clone(&control_plane));
             // Adopt whatever the agent is already doing, then keep adopting
             // it. A shell that has just opened over a running agent would
             // otherwise report hosting as disabled until someone pressed a
@@ -1391,6 +1453,12 @@ pub fn run() {
             tauri::async_runtime::spawn(reconcile_host_health_forever(
                 Arc::clone(&runtime),
                 Arc::clone(&host_lock),
+            ));
+            // Presence lapses on the service's own timer, so a host that
+            // announced once when it started is forgotten while still hosting.
+            tauri::async_runtime::spawn(maintain_presence_forever(
+                Arc::clone(&runtime),
+                control_plane,
             ));
             tauri::async_runtime::spawn(reconcile_session_forever(runtime, session));
             Ok(())
