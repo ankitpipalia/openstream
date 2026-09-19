@@ -35,7 +35,7 @@ What the checker is missing falls into two groups:
 |---|---|
 | Built artifacts, checksums | Regenerate from one frozen SHA; nothing is staged for the current version |
 | Signing and notarization evidence | No code-signing identity is available |
-| `physical-linux-nvidia-to-apple-silicon` | Needs the LAN host rig; unreachable at the time of writing |
+| `physical-linux-nvidia-to-apple-silicon` | Needs the LAN host rig, which **dual-boots** and is currently running Windows. It has to be rebooted into SteamOS for this gate, and it cannot serve the Windows rows at the same time |
 | `wan-turn` | No public TURN deployment |
 | `package-launch-upgrade` | Needs the packages above, then a clean-machine install/upgrade run |
 
@@ -59,9 +59,9 @@ believing it.
 
 | Gap | Blocker |
 |---|---|
-| Windows hosting end to end, and the LocalSystem/WTS service model | The **native subsystems were physically tested** on Windows 10 19045.6456 with a GTX 970, in an interactive session: Desktop Duplication capture, `SendInput` injection, WASAPI loopback, the SCM lifecycle state machine, and D3D11/DXVA hardware decode. See PRs #43 and #45. What has *not* run is a **live end-to-end Windows session** or the service lifecycle under LocalSystem, so Windows hosting is not a supported 1.0 platform. Do not read the per-subsystem passes as a session, and do not read the SteamOS GTX 970 evidence in `docs/BUILD.md` as a Windows run -- that one is a Linux host streaming to a macOS client, and has been mistaken for one before |
+| Windows hosting end to end, and the LocalSystem/WTS service model | The **native subsystems were physically re-run on 2026-09-19 at `c8bf194`**, on Windows 10 19045 with a GTX 970, in the interactive session (`session_id=1`, through a scheduled task) with both test gates forced: 24 + 15 tests, all passed. Desktop Duplication captured 2560x1440 in exactly `2560x1440x4` bytes, D3D11 decode produced pixels, and the selected encoder was `NVIDIA H.264 Encoder MFT` with `hardware=true`. See `audit-runs/2026-09-19-windows-subsystems/`, and PRs #43 and #45 for the earlier run. What has *not* run is a **live end-to-end Windows session** or the service lifecycle under LocalSystem, and both Windows crates are library-only with no host executable, so Windows hosting is not a supported 1.0 platform. Do not read the per-subsystem passes as a session, and do not read the SteamOS GTX 970 evidence in `docs/BUILD.md` as a Windows run -- that one is a Linux host streaming to a macOS client, and has been mistaken for one before |
 | Android and iOS clients | No devices |
-| Linux reboot-to-login-screen acceptance | Needs the physical rig |
+| Linux reboot-to-login-screen acceptance | Needs the physical rig, rebooted into SteamOS |
 | WAN, TURN, NAT matrix | No public TURN deployment |
 | Signed/notarized installers | No signing identity |
 | macOS login-window capture | Blocked by Apple; not a scheduling problem, see `docs/DEFERRED_FEATURES.md` |
@@ -190,7 +190,8 @@ session:
   device list afterwards confirms no device was created by that attempt.
 
 That is the enrolment half of the chain working for real. It is still not the
-chain: the broker is Linux-only, the Linux rig was unreachable, and nothing has
+chain: the broker is Linux-only, the Linux rig was booted into its other
+operating system, and nothing has
 verified an approval or a frame.
 
 **What would finish it:** enrol one machine with a real account token, start the
