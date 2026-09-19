@@ -95,7 +95,8 @@ output and advertise `multi_monitor = false`.
 |---|---|---|
 | macOS Apple Silicon | macOS Apple Silicon | **PASS** -- 608 access units at 40.4/s, zero-copy both ends |
 | Linux NVIDIA (SteamOS) | macOS Apple Silicon | **PASS** -- 2026-09-15, pixels and input verified off the screen |
-| Windows | anything | **never run** -- subsystems pass, the session does not exist |
+| macOS Apple Silicon | Windows 10 / GTX 970 | **PASS** -- 2026-09-19, direct UDP, SCK into VideoToolbox hardware H.264, Media Foundation in-process decode, 961 access units, `stalls_observed=0`, no FFmpeg at either end |
+| Windows | anything | **never run as host** -- subsystems pass, the host path exists, no session |
 | anything | Windows | **never run** -- the client builds as a test artifact only |
 | Ubuntu or Arch VM | anything | **not possible on this hardware** -- nothing to capture |
 
@@ -114,8 +115,8 @@ This is the no-FFmpeg matrix; an FFmpeg fallback is intentionally not counted as
 
 | Host \\ client | macOS Apple Silicon | Windows 10 / GTX 970 | Ubuntu ARM64 VM | Arch ARM64 VM |
 |---|---|---|---|---|
-| **macOS Apple Silicon** | **PASS**, native live loopback | **next live test**; both native paths exist, Windows decode is subsystem-proven | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
-| **Windows 10 / GTX 970** | **next live test**; Windows capture/encode and macOS decode are individually proven | not accepted: only one physical Windows desktop, and no live session has run | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
+| **macOS Apple Silicon** | **PASS**, native live loopback | **PASS**, 2026-09-19: direct UDP, no FFmpeg either end; see `audit-runs/2026-09-19-macos-host-windows-client/` | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
+| **Windows 10 / GTX 970** | **next live test**, and now the only untested native pair; Windows capture/encode and macOS decode are each proven separately | not accepted: only one physical Windows desktop, and no live session has run | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
 | **Ubuntu ARM64 VM** | unavailable on this VM: no capturable display/GPU encoder | same | same-machine media unavailable | same-machine media unavailable |
 | **Arch ARM64 VM** | unavailable on this VM: preflight correctly reports no capture/encoder | same | same-machine media unavailable | same-machine media unavailable |
 
