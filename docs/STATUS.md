@@ -1,6 +1,6 @@
 # OpenStream: where the product actually is
 
-**Updated 2026-09-17.** This is the one file to read first. Everything else in
+**Updated 2026-09-20.** This is the one file to read first. Everything else in
 `docs/` is either a per-topic reference or a historical record; where they
 disagree with this file, this file is right and the other one is stale.
 
@@ -35,7 +35,7 @@ What the checker is missing falls into two groups:
 |---|---|
 | Built artifacts, checksums | Regenerate from one frozen SHA; nothing is staged for the current version |
 | Signing and notarization evidence | No code-signing identity is available |
-| `physical-linux-nvidia-to-apple-silicon` | Needs the LAN host rig; unreachable at the time of writing |
+| `physical-linux-nvidia-to-apple-silicon` | Needs the LAN host rig, which **dual-boots** and is currently running Windows. It has to be rebooted into SteamOS for this gate, and it cannot serve the Windows rows at the same time |
 | `wan-turn` | No public TURN deployment |
 | `package-launch-upgrade` | Needs the packages above, then a clean-machine install/upgrade run |
 
@@ -55,13 +55,109 @@ measurement of this tree reported a 28 ms/frame saving that was 2.2 ms when
 measured properly. If a number looks surprising, check the profile before
 believing it.
 
+## Host and client, by platform
+
+Which role each platform can play **in code**, separate from what has been run. The rule
+that shapes this table: a 1.0 path is native and in-process, so an ffmpeg fallback does not
+count as a supported path even where it works.
+
+**FFmpeg is still the default on every platform, and that is a gap.** With
+`OPENSTREAM_CAPTURE_BACKEND` unset, `openstream-ffmpeg-host` picks `x11grab` on Linux,
+`avfoundation` on macOS and `gdigrab` on Windows, and spawns FFmpeg. The native in-process
+pipelines are reached only by setting that variable to `native`, and setting
+`OPENSTREAM_FFMPEG_ARGS` sends it back to FFmpeg regardless. The hardware MFT on Windows is
+a second opt-in on top, `OPENSTREAM_MF_HARDWARE_ENCODE=1`, marked "off by default until
+physically verified" -- a condition the run of 2026-09-19 has now met.
+
+So the native path is not what the product does; it is what the product can be asked to do.
+Nothing in the code enforces the no-FFmpeg rule, and a release that ships defaults ships the
+FFmpeg path.
+
+| Platform | Host | Client |
+|---|---|---|
+| **Linux x86-64 with NVIDIA** | `openstream-linux-host`: DRM/KMS scanout, Vulkan NV12, NVENC | no native decode; ffmpeg only, so not a 1.0 path |
+| **macOS Apple Silicon** | `openstream-ffmpeg-host` with `OPENSTREAM_CAPTURE_BACKEND=native`: ScreenCaptureKit into VideoToolbox | `openstream-desktop-client` with `OPENSTREAM_DECODER=native`: VideoToolbox into Metal |
+| **Windows** | same binary and switch: Desktop Duplication into Media Foundation H.264, hardware MFT via `OPENSTREAM_MF_HARDWARE_ENCODE=1` | `openstream-desktop-client` with `OPENSTREAM_DECODER=native`: Media Foundation |
+| **Linux VM (Parallels)** | none: no capturable output and no GPU encoder, so it can run the control plane and the broker but produce no frames | none: no native decode path on Linux |
+
+Three places FFmpeg remains, beyond the defaults above: `openstream-ffmpeg-host` has no
+native pipeline on Linux at all, so native Linux hosting lives in a different binary
+(`openstream-linux-host`); the desktop client has no native decoder on Linux, only macOS and
+Windows; and the desktop Debian package declares `Depends: ffmpeg`. The headless package
+does not.
+
+Neither Windows nor macOS implements multi-monitor discovery. Both always open the first
+output and advertise `multi_monitor = false`.
+
+## What has actually run, host to client
+
+| Host | Client | Status |
+|---|---|---|
+| macOS Apple Silicon | macOS Apple Silicon | **PASS** -- 608 access units at 40.4/s, zero-copy both ends |
+| Linux NVIDIA (SteamOS) | macOS Apple Silicon | **PASS** -- 2026-09-15, pixels and input verified off the screen |
+| macOS Apple Silicon | Windows 10 / GTX 970 | **VIDEO PASS; acceptance incomplete** -- 2026-09-19, direct UDP, SCK into VideoToolbox hardware H.264, Media Foundation in-process decode, 961 access units, zero observed stalls, no FFmpeg at either end. Audio, input, sustained operation, recovery and hardware decode were not exercised |
+| Windows | anything | **never run as host** -- subsystems pass, the host path exists, no session |
+| hosts other than macOS | Windows | **never run** -- macOS is the only host exercised with this client |
+| Ubuntu or Arch VM | anything | **not possible on this hardware** -- nothing to capture |
+
+The two PASS rows are the same pair of machines. Everything else is either unimplemented, or
+implemented and never exercised.
+
+### The four-platform campaign
+
+The available machines do **not** currently make all 16 host/client directions testable. The
+Ubuntu and Arch guests have no capturable output or usable hardware encoder, and Linux has no
+in-process client decoder. The Windows and SteamOS/NVIDIA roles also share one dual-boot machine,
+so they cannot be opposite ends of the same live session. A green build or subsystem test does not
+remove any of those physical constraints.
+
+This is the no-FFmpeg matrix; an FFmpeg fallback is intentionally not counted as a product result:
+
+| Host \\ client | macOS Apple Silicon | Windows 10 / GTX 970 | Ubuntu ARM64 VM | Arch ARM64 VM |
+|---|---|---|---|---|
+| **macOS Apple Silicon** | **PASS**, native live loopback | **VIDEO PASS, acceptance incomplete**, 2026-09-19: direct UDP, no FFmpeg either end; see `audit-runs/2026-09-19-macos-host-windows-client/` | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
+| **Windows 10 / GTX 970** | **next live test**, the only remaining currently runnable cross-OS native direction; Windows capture/encode and macOS decode are each proven separately | not accepted: only one physical Windows desktop, and no live session has run | blocked: no native Linux client decoder | blocked: no native Linux client decoder |
+| **Ubuntu ARM64 VM** | unavailable on this VM: no capturable display/GPU encoder | same | same-machine media unavailable | same-machine media unavailable |
+| **Arch ARM64 VM** | unavailable on this VM: preflight correctly reports no capture/encoder | same | same-machine media unavailable | same-machine media unavailable |
+
+Ubuntu and Arch still have useful roles: package/install/systemd/control-plane acceptance,
+portability, fail-closed preflight and service lifecycle. They are not GPU media rigs. Completing a
+four-platform media matrix requires (1) a native Linux client decoder, (2) Linux guests or physical
+machines with capturable desktops and supported encoders, and (3) a second Windows-capable machine
+if Windows and the SteamOS/NVIDIA rig must communicate while the present rig remains dual-boot.
+
+### Removing FFmpeg from the product path
+
+The Parsec-style direction has been implemented as native components, but it has **not** been made
+the product default. That is why FFmpeg still appears. The remaining work is explicit:
+
+1. Make native capture/encode the default on macOS and Windows; now that the hardware MFT has been
+   physically proven, make hardware-first Media Foundation selection the normal Windows policy with
+   a native software-MFT fallback.
+2. Make native VideoToolbox and Media Foundation decode the default for H.264 on macOS and Windows.
+   An explicit diagnostic/developer switch may retain FFmpeg temporarily, but an environment
+   override must not silently move a release run off the native path.
+3. Route supported Linux hosts to `openstream-linux-host` instead of the FFmpeg host. Finish a
+   production capture path that does not require privileged DRM/KMS access for ordinary Wayland
+   desktops; the current NVIDIA DRM/NVENC path remains hardware-specific.
+4. Implement an in-process Linux client decoder and presenter path. Until that exists, Ubuntu and
+   Arch cannot be claimed as no-FFmpeg clients regardless of whether the external binary is present.
+5. Remove the desktop package's `Depends: ffmpeg` only after every shipped role has a tested native
+   path. FFmpeg may remain a development/test-fixture tool without being a runtime dependency.
+6. Add release checks that launch each supported default with FFmpeg absent, assert the selected
+   backend from telemetry, and fail if a shipped process tries to spawn FFmpeg.
+
+Changing only the environment defaults would make macOS and Windows substantially closer, but it
+would not finish Linux, and it would not by itself prove either Windows-to-macOS direction. Those two
+live sessions are the highest-value tests while the dual-boot rig is still running Windows.
+
 ## What is not verified, and why
 
 | Gap | Blocker |
 |---|---|
-| Windows hosting and the LocalSystem/WTS service model | No Windows machine. Builds in CI on both MSVC targets; **nothing has ever run**. There is no Windows physical record in this repository -- the GTX 970 evidence in `docs/BUILD.md` is a Linux SteamOS host streaming to a macOS client, not a Windows run, and has been mistaken for one |
+| Windows hosting end to end, and the LocalSystem/WTS service model | The **native subsystems were physically re-run on 2026-09-19 at `c8bf194`**, on Windows 10 19045 with a GTX 970, in the interactive session (`session_id=1`, through a scheduled task) with both test gates forced: 24 + 15 tests, all passed. Desktop Duplication captured 2560x1440 in exactly `2560x1440x4` bytes, D3D11 decode produced pixels, and the selected encoder was `NVIDIA H.264 Encoder MFT` with `hardware=true`. See `audit-runs/2026-09-19-windows-subsystems/`, and PRs #43 and #45 for the earlier run. What has *not* run is a **live end-to-end Windows session** or the service lifecycle under LocalSystem, and both Windows crates are library-only with no host executable, so Windows hosting is not a supported 1.0 platform -- but note the host path *exists*: `openstream-ffmpeg-host` carries a `cfg(windows)` native pipeline from Desktop Duplication to the Media Foundation encoder, selected by `OPENSTREAM_CAPTURE_BACKEND=native`. What is missing is a live run, a LocalSystem/WTS broker, and a release artifact. Do not read the per-subsystem passes as a session, and do not read the SteamOS GTX 970 evidence in `docs/BUILD.md` as a Windows run -- that one is a Linux host streaming to a macOS client, and has been mistaken for one before |
 | Android and iOS clients | No devices |
-| Linux reboot-to-login-screen acceptance | Needs the physical rig |
+| Linux reboot-to-login-screen acceptance | Needs the physical rig, rebooted into SteamOS |
 | WAN, TURN, NAT matrix | No public TURN deployment |
 | Signed/notarized installers | No signing identity |
 | macOS login-window capture | Blocked by Apple; not a scheduling problem, see `docs/DEFERRED_FEATURES.md` |
@@ -85,8 +181,62 @@ but they are **an experimental subsystem, not something an installer enables**:
   the endpoint, the transcript and the client library exist and are tested, and
   nothing announces anything until the service is wired to them.
 - Audio and clipboard are explicitly disabled in it.
-- **Neither binary is in the Linux tarball or the Debian package**, and neither
-  are their systemd units. Only the older per-user host-agent service ships.
+- The three binaries and two systemd units are now **in the tarball and the
+  Debian package**, with `scripts/verify-package-install.sh` asserting each one
+  so the gap cannot reopen quietly. The units ship **disabled**: without a grant
+  key the broker refuses every session by design, so enabling the pair on
+  install would leave a privileged service running and a network-facing one
+  restart-looping for a feature nobody asked for. `postinst` prints what to do.
+- The configuration those units ship with **could not have started either
+  service**, and was fixed only after review: five variables were assigned the
+  empty string, which a process reads as a value rather than as unset, and the
+  uid the broker admits was never set anywhere, so it fell back to admitting
+  root and would have refused the unprivileged service it ships with. Settings
+  now live in root-owned files under `/etc/openstream` that `postinst` writes
+  once with the account ids it has just resolved.
+- **Installed and started on a real machine, 2026-09-19.** On Ubuntu 26.04
+  arm64: the package installs, `systemd-analyze verify` accepts both units, the
+  broker starts, `/run/openstream` comes out `750 root:openstream` and its
+  socket `660 root:openstream`, and the unprivileged `openstream` account
+  opened that socket -- the privilege split working on an installed package for
+  the first time. Survives a reboot with only a greeter session present.
+  Upgrade, downgrade, remove and purge all behave, and nothing under
+  `/etc/openstream` or `/var/lib/openstream` is world-readable. The transcript
+  is `audit-runs/2026-09-19-m1-headless-package/`. A `linux-deb-install` CI job
+  repeats it on x86-64 per pull request and fails outright if PID 1 is not
+  systemd rather than claiming a start test it did not perform.
+- **That run found what reading could not.** The unenrolled machine service
+  restart-looped for as long as the machine was up -- 12 restarts in the first
+  35 seconds, with `systemctl is-active` reporting `activating`, so an operator
+  looking for why the machine never came online saw a service that appeared to
+  be trying. A start limit holds it in `failed` now, where the status and the
+  journal name the reason.
+- **What this does not prove: capture, encode, or any media session.** The VM
+  has no accepted capture hardware, and the machine service still fails closed
+  because it has no device identity. Pre-login *capture* at the greeter is also
+  not shown; the broker being active with only a greeter session present is the
+  service's startup case, not the capture case.
+- One of those was a directive systemd does not have. `RuntimeDirectoryGroup=`
+  is not a `systemd.exec` setting -- a `RuntimeDirectory`'s ownership comes from
+  the unit's `User=` and `Group=` -- so it was accepted into the file, silently
+  ignored at runtime, and left `/run/openstream` root-owned and unreachable by
+  the service that has to find the socket in it. It is `Group=openstream` now,
+  and the packaging check refuses the non-existent directive by name.
+- `scripts/test-linux-packaging.sh` is the check that stops this recurring, and
+  it now runs in full. Its static half had run locally and, against the units as
+  they were, failed on eight separate counts. Its functional half had **never
+  executed**, and could not have passed if it had: it killed the broker and then
+  connected to its socket, and a socket file outlives the process, which is
+  precisely the case it was written to catch. The kill happens after the
+  connection attempt now. The CI step that invokes it had never run either --
+  it called `cargo` from the repository root, where there is no workspace, and
+  exited 101 before reaching the script. All three shared one cause: the step
+  only runs on a pull request, and this branch had none for weeks.
+  It still does not start the systemd units; the `linux-deb-install` job does
+  that, and that is the install evidence.
+- The broker's `CapabilityBoundingSet` is deliberately left unnarrowed, because
+  guessing it wrong yields a service that will not start and no one here can
+  currently test it -- the unit says so and says where to start once someone can.
 
 ### Approval-bound authorisation: implemented, not yet delivered
 
@@ -136,7 +286,8 @@ session:
   device list afterwards confirms no device was created by that attempt.
 
 That is the enrolment half of the chain working for real. It is still not the
-chain: the broker is Linux-only, the Linux rig was unreachable, and nothing has
+chain: the broker is Linux-only, the Linux rig was booted into its other
+operating system, and nothing has
 verified an approval or a frame.
 
 **What would finish it:** enrol one machine with a real account token, start the
