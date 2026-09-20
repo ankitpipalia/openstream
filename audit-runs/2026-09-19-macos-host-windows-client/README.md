@@ -70,19 +70,25 @@ was proven separately on this machine, but this session did not force it.
 ## The candidate finding, which is worth acting on
 
 The Mac has three addresses: one on the LAN, and two on Parallels bridge interfaces that no
-other machine on the LAN can reach. ICE offered candidates from the bridges, the peer could
-not reach them, and the session failed with `NoReachableCandidate` and nothing pointing at
-the cause.
+other machine on the LAN can reach. OpenStream's project-owned direct-candidate path offered
+the bridge addresses, the peer could not reach them, and the session failed with
+`NoReachableCandidate` and nothing pointing at the cause. This run did not select the full
+`webrtc-ice` path, so describing the failure as ICE would identify the wrong implementation.
 
 Raw UDP between the two machines worked throughout, so this was not a firewall.
 
 Binding the host explicitly with `OPENSTREAM_UDP_BIND=<lan-address>:0` fixed it immediately
-and the session established on the first try.
+and the session established on the first try. That proves automatic candidate selection or
+pairing was involved. It does not prove the LAN address was absent: the code enumerates every
+interface, sorts remote candidates by kind and address, then probes them sequentially with a
+connected UDP socket. The failed run did not record the attempted order on both peers, so an
+omitted LAN candidate and two peers walking mismatched candidate pairs cannot be distinguished
+from this evidence alone.
 
-Any machine running a hypervisor has interfaces like these, so this will affect ordinary
-users, not just this rig. Two things would help: prefer or at least include the route-to-peer
-interface when gathering host candidates, and name the candidates that were tried in the
-`NoReachableCandidate` error so the failure is diagnosable without packet capture.
+Machines running hypervisors commonly have interfaces like these, so this can affect ordinary
+users, not just this rig. The fix should make direct nomination route-aware (or use the full
+ICE agent), and the failure should report the attempted candidate kinds/order. Literal
+addresses belong only in an explicit local diagnostic because ordinary logs may be published.
 
 ## What this does not establish
 
