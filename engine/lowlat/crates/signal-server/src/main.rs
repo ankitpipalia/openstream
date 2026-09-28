@@ -2890,13 +2890,20 @@ async fn connect_approve(
     }
 }
 
-/// How long a session grant is good for.
+/// How long a session grant is good for: exactly as long as the session.
 ///
-/// Long enough to cover a reconnect or two -- a host that drops and comes back
-/// should not need a fresh approval -- and short enough that a captured grant
-/// is worth little. The broker also refuses a repeat of the same nonce, so the
-/// window bounds how long it has to remember one.
-const SESSION_GRANT_LIFETIME_MS: u64 = 10 * 60 * 1000;
+/// The broker re-verifies the grant on every `OpenCapture`, and the machine
+/// service presents the same one for the life of the session -- a logout
+/// that drops to the greeter reopens capture with it. A grant shorter than
+/// the session therefore ended pre-login capture for good partway through a
+/// session that was still valid. A captured grant stays bounded all the
+/// same: it names one target device and one session, and the broker's nonce
+/// lease refuses it on a second live connection.
+const SESSION_GRANT_LIFETIME_MS: u64 = DEFAULT_TTL_SECONDS * 1000;
+const _: () = assert!(
+    SESSION_GRANT_LIFETIME_MS >= DEFAULT_TTL_SECONDS * 1000,
+    "a session grant must outlive the session it approves"
+);
 
 /// Translate the negotiated permission classes into the broker's capability
 /// bits.
