@@ -139,6 +139,7 @@ struct AuthResponse {
 #[derive(Debug, Serialize)]
 struct RefreshRequest<'a> {
     refresh_token: &'a str,
+    retry_key: &'a str,
 }
 
 /// The control plane's answer to "would an anonymous registration succeed?".
@@ -311,6 +312,15 @@ pub struct ControlPlaneClient {
     http: reqwest::Client,
     access_token: Option<String>,
     refresh_token: Option<String>,
+    /// The key of a refresh attempt that got no answer, re-sent with the same
+    /// token on the next attempt.
+    ///
+    /// The server rotates the refresh token before it replies, so a lost
+    /// reply leaves this client holding a token the server has retired, and
+    /// presenting a retired token revokes the whole sign-in. Re-sending the
+    /// attempt's key tells the server this is that attempt again rather than
+    /// a copied token. Memory only: it proves nothing if it can be read back.
+    refresh_retry_key: Option<String>,
     access_expires_at: Option<std::time::Instant>,
     account: Option<AuthenticatedAccount>,
 }
@@ -341,6 +351,7 @@ impl ControlPlaneClient {
             http,
             access_token: None,
             refresh_token: None,
+            refresh_retry_key: None,
             access_expires_at: None,
             account: None,
         })
@@ -415,15 +426,27 @@ impl ControlPlaneClient {
             .refresh_token
             .clone()
             .ok_or(ControlPlaneError::NotAuthenticated)?;
+        let retry_key = self
+            .refresh_retry_key
+            .clone()
+            .map_or_else(new_retry_key, Ok)?;
+        self.refresh_retry_key = Some(retry_key.clone());
         let response = self
             .http
             .post(self.endpoint("/v1/auth/refresh")?)
             .json(&RefreshRequest {
                 refresh_token: &refresh_token,
+                retry_key: &retry_key,
             })
             .send()
             .await
             .map_err(|_| ControlPlaneError::Transport)?;
+        // A status is the server's answer to this attempt, so the key is spent
+        // whatever it says. Only a transport failure, or a success whose body
+        // never arrived, leaves the attempt unanswered and the key kept.
+        if !response.status().is_success() {
+            self.refresh_retry_key = None;
+        }
         let response: AuthResponse = parse_response(response).await?;
         Ok(self.accept_auth(response))
     }
@@ -617,6 +640,7 @@ impl ControlPlaneClient {
     pub fn clear_credentials(&mut self) {
         self.access_token = None;
         self.refresh_token = None;
+        self.refresh_retry_key = None;
         self.access_expires_at = None;
         self.account = None;
     }
@@ -628,6 +652,7 @@ impl ControlPlaneClient {
         };
         self.access_token = Some(response.access_token);
         self.refresh_token = Some(response.refresh_token);
+        self.refresh_retry_key = None;
         self.access_expires_at = Some(
             std::time::Instant::now()
                 + Duration::from_secs(response.access_expires_in_seconds.max(1)),
@@ -675,6 +700,14 @@ impl ControlPlaneClient {
             .ok_or(ControlPlaneError::NotAuthenticated)?;
         Ok(request.bearer_auth(token))
     }
+}
+
+/// A fresh per-attempt refresh key: 128 random bits, hex, which is the form
+/// the server accepts for any token.
+fn new_retry_key() -> Result<String, ControlPlaneError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|_| ControlPlaneError::Transport)?;
+    Ok(hex::encode(bytes))
 }
 
 /// Accept a success that carries no body.
@@ -788,6 +821,87 @@ fn local_registration(name: &str, platform: &str) -> Result<DeviceRegistration, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tiny HTTP server that answers each refresh by `plan`, recording the
+    /// retry key each request carried.
+    ///
+    /// `None` closes the connection without replying -- the lost response;
+    /// `Some(status)` replies with that status and, for 200, a token pair.
+    async fn refresh_server(
+        plan: Vec<Option<u16>>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            let mut keys = Vec::new();
+            for (turn, answer) in plan.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                // Read until the JSON body has closed.
+                while !request.ends_with(b"}") {
+                    let read = stream.read(&mut buffer).await.expect("read");
+                    assert!(read > 0, "request ended early");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let text = String::from_utf8(request).expect("utf-8");
+                let body = &text[text.find("\r\n\r\n").expect("headers") + 4..];
+                let json: serde_json::Value = serde_json::from_str(body).expect("json");
+                keys.push(json["retry_key"].as_str().expect("retry key").to_string());
+                let Some(status) = answer else {
+                    continue; // Dropped: the reply is lost.
+                };
+                let payload = if status == 200 {
+                    serde_json::json!({
+                        "access_token": format!("access-{turn}"),
+                        "refresh_token": format!("refresh-{turn}"),
+                        "access_expires_in_seconds": 900,
+                        "refresh_expires_in_seconds": 3600,
+                        "user": {"account_id": "a", "username": "u", "created_at_ms": 0},
+                        "device": null,
+                    })
+                    .to_string()
+                } else {
+                    String::new()
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                stream.write_all(reply.as_bytes()).await.expect("write");
+            }
+            keys
+        });
+        (origin, server)
+    }
+
+    /// A refresh whose reply was lost is retried with the same key, so the
+    /// server can tell the retry from a copied token; an answered attempt
+    /// spends its key.
+    #[tokio::test]
+    async fn a_refresh_retry_resends_the_unanswered_attempts_key() {
+        let (origin, server) = refresh_server(vec![None, Some(200), Some(401), Some(200)]).await;
+        let mut client = ControlPlaneClient::new(&origin).expect("client");
+        client.refresh_token = Some("refresh-sentinel".to_string());
+
+        assert_eq!(client.refresh().await, Err(ControlPlaneError::Transport));
+        client.refresh().await.expect("the retry is answered");
+        client.refresh_token = Some("refresh-sentinel".to_string());
+        assert_eq!(client.refresh().await, Err(ControlPlaneError::Unauthorized));
+        client.refresh_token = Some("refresh-sentinel".to_string());
+        client.refresh().await.expect("answered");
+
+        let keys = server.await.expect("server");
+        assert_eq!(keys[0], keys[1], "the lost attempt's key is re-sent");
+        assert_ne!(keys[1], keys[2], "an answered attempt spends its key");
+        assert_ne!(keys[2], keys[3], "so does a refusal");
+        assert!(keys
+            .iter()
+            .all(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())));
+    }
 
     #[test]
     fn origin_policy_allows_local_http_and_remote_https_only() {

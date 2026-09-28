@@ -1496,6 +1496,10 @@ struct AccountCredentials {
 #[derive(Debug, Deserialize)]
 struct RefreshAccount {
     refresh_token: String,
+    /// Per-attempt key a client re-sends only when retrying an attempt whose
+    /// response it never received. Optional: older clients omit it.
+    #[serde(default)]
+    retry_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1964,7 +1968,11 @@ async fn refresh_account(
         return response;
     }
     let mut accounts = state.accounts.lock().await;
-    match accounts.refresh(&request.refresh_token, control_plane::now_ms()) {
+    match accounts.refresh_with_retry_key(
+        &request.refresh_token,
+        request.retry_key.as_deref(),
+        control_plane::now_ms(),
+    ) {
         Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
         Err(error) => control_error_response(error),
     }
