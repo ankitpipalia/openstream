@@ -4965,7 +4965,7 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                 if let Ok(registration) = relay::decode_registration(datagram) {
                     let accepted = {
                         let mut sessions = state.sessions.lock().await;
-                        match sessions.get_mut(registration.session_id) {
+                        let accepted = match sessions.get_mut(registration.session_id) {
                             None => false,
                             Some(session) if session.expires_at <= Instant::now() => false,
                             Some(session) => {
@@ -5015,7 +5015,27 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                                     }
                                 }
                             }
+                        };
+                        // Forwarding finds a sender by address alone, so one
+                        // address may hold a slot in one session only. A host
+                        // that crashed without unregistering and now serves a
+                        // new session from the same port would otherwise keep
+                        // its old slot -- refreshed by every packet it sends,
+                        // so never reaped -- and its traffic could go to the
+                        // old session's peer.
+                        if accepted {
+                            for (session_id, session) in sessions.iter_mut() {
+                                if session_id.as_str() == registration.session_id {
+                                    continue;
+                                }
+                                for slot in [&mut session.relay_host, &mut session.relay_client] {
+                                    if slot.as_ref().is_some_and(|owned| owned.addr == source) {
+                                        *slot = None;
+                                    }
+                                }
+                            }
                         }
+                        accepted
                     };
                     if accepted {
                         let _ = socket
@@ -6919,6 +6939,92 @@ mod tests {
             .expect("relay task joins");
     }
 
+    /// A host that re-registers its address for a new session gives up its
+    /// slot in the old one, so its traffic reaches only the new session's
+    /// peer. Before, forwarding took whichever session the map yielded first,
+    /// and every packet refreshed the stale slot so it was never reaped.
+    #[tokio::test]
+    async fn one_relay_address_holds_a_slot_in_one_session_only() {
+        let (host_one, _host_one_rx) = mpsc::channel(1);
+        let (host_two, _host_two_rx) = mpsc::channel(1);
+        let (client_one, _client_one_rx) = mpsc::channel(1);
+        let (client_two, _client_two_rx) = mpsc::channel(1);
+        let mut first = test_session();
+        first.host = Some(host_one);
+        first.host_generation = 1;
+        first.client = Some(client_one);
+        first.client_generation = 1;
+        let mut second = test_session();
+        second.host = Some(host_two);
+        second.host_generation = 1;
+        second.client = Some(client_two);
+        second.client_generation = 1;
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([
+                ("session-1".into(), first),
+                ("session-2".into(), second),
+            ]))),
+            ..connect_test_state()
+        };
+        let secret = state.relay_secret.clone();
+
+        let relay_socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let relay_address = relay_socket.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let relay_task = tokio::spawn(super::run_relay(relay_socket, state.clone(), shutdown_rx));
+
+        let bind = || UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let host = bind().await.unwrap();
+        let old_client = bind().await.unwrap();
+        let new_client = bind().await.unwrap();
+        let register = async |socket: &UdpSocket, session: &str, role: relay::Role| {
+            register_relay(&secret, relay_address, socket, session, role).await;
+        };
+        register(&old_client, "session-1", relay::Role::Client).await;
+        register(&new_client, "session-2", relay::Role::Client).await;
+        // The same host address, first for the old session and then, without
+        // unregistering, for the new one.
+        register(&host, "session-1", relay::Role::Host).await;
+        register(&host, "session-2", relay::Role::Host).await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(
+                sessions["session-1"].relay_host.is_none(),
+                "the old session's host slot is released"
+            );
+            assert_eq!(
+                sessions["session-2"]
+                    .relay_host
+                    .as_ref()
+                    .map(|slot| slot.addr),
+                Some(host.local_addr().unwrap())
+            );
+        }
+
+        host.send_to(b"media", relay_address).await.unwrap();
+        let mut bytes = [0_u8; 16];
+        let (length, _) = timeout(Duration::from_secs(1), new_client.recv_from(&mut bytes))
+            .await
+            .expect("the new session's client receives the packet")
+            .unwrap();
+        assert_eq!(&bytes[..length], b"media");
+        assert!(
+            timeout(Duration::from_millis(200), old_client.recv_from(&mut bytes))
+                .await
+                .is_err(),
+            "the old session's client receives nothing"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("relay exits")
+            .expect("relay task joins");
+    }
+
     #[tokio::test]
     async fn replaced_connection_cannot_reissue_or_register_old_relay_ticket() {
         let secret = b"test-relay-secret-0123456789".to_vec();
@@ -7078,6 +7184,23 @@ mod tests {
             .await
             .expect("relay exits")
             .expect("relay task joins");
+    }
+
+    async fn register_relay(
+        secret: &[u8],
+        relay_address: SocketAddr,
+        socket: &UdpSocket,
+        session: &str,
+        role: relay::Role,
+    ) {
+        let (class, subject) = match role {
+            relay::Role::Host => ("host", "host"),
+            relay::Role::Client => ("client", "client"),
+        };
+        let ticket = relay_ticket::mint(secret, session, class, subject, 1);
+        let datagram = relay::encode_registration(session, role, &ticket).expect("encode");
+        socket.send_to(&datagram, relay_address).await.unwrap();
+        receive_relay_ack(socket, role).await;
     }
 
     async fn receive_relay_ack(socket: &UdpSocket, role: relay::Role) {
