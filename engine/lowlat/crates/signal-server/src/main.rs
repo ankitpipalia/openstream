@@ -2589,6 +2589,29 @@ fn seconds_until(deadline: Instant, now: Instant) -> u64 {
     deadline.saturating_duration_since(now).as_secs()
 }
 
+/// Refuse unless this device is one its account currently trusts.
+///
+/// Signing in from a new device issues an access token for a *pending*
+/// device, and that token authenticates. Anything that takes part in a
+/// session -- announcing, asking, or collecting a credential -- must also
+/// pass the trust boundary, or a password alone is enough to reach a host.
+#[allow(clippy::result_large_err, reason = "the error is an HTTP response")]
+async fn require_trusted_device(
+    state: &AppState,
+    account_id: &str,
+    device_id: &str,
+) -> Result<(), Response> {
+    state
+        .accounts
+        .lock()
+        .await
+        .can_create_session(&control_plane::AccountPrincipal {
+            account_id: account_id.to_string(),
+            device_id: Some(device_id.to_string()),
+        })
+        .map_err(control_error_response)
+}
+
 /// Announce that this device is online and able to host.
 async fn connect_presence(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let (account_id, device_id) = match connect_principal(&state, &headers).await {
@@ -2599,14 +2622,8 @@ async fn connect_presence(State(state): State<AppState>, headers: HeaderMap) -> 
     // accepted from a device the account has actually trusted. A pending or
     // revoked device announcing itself would appear in its owner's list as a
     // connectable machine.
-    {
-        let accounts = state.accounts.lock().await;
-        if let Err(error) = accounts.can_create_session(&control_plane::AccountPrincipal {
-            account_id: account_id.clone(),
-            device_id: Some(device_id.clone()),
-        }) {
-            return control_error_response(error);
-        }
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
     }
     state
         .connect
@@ -2636,6 +2653,12 @@ async fn connect_request(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    // The requester has to be trusted too. A pending device holds a valid
+    // access token, and without this it could put a prompt in front of the
+    // owner and, if approved, receive a live session.
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
+    }
     // The target has to be a device this account owns and trusts. Checked
     // against the store rather than inferred from the broker, because
     // presence is soft state and trust is not.
@@ -2721,6 +2744,24 @@ async fn connect_approve(
         account_id: &account_id,
         device_id: &device_id,
     };
+
+    // Both ends are re-checked here, not only when the request was made: a
+    // requester revoked while its prompt was on screen must not be handed a
+    // session by an approval the owner gave without knowing.
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
+    }
+    let requester = state
+        .connect
+        .lock()
+        .await
+        .requester_for_target(&request_id, party);
+    if let Some(requester) = requester
+        && let Err(response) = require_trusted_device(&state, &account_id, &requester).await
+    {
+        state.connect.lock().await.withdraw(&request_id);
+        return response;
+    }
 
     // Approve first. If this is refused -- the request expired, or this is
     // not the device being asked -- no session is created, so a rejected
@@ -2915,6 +2956,10 @@ async fn connect_observe(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    // A device revoked after asking may still poll, but must not collect.
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
+    }
     let now = Instant::now();
     let mut broker = state.connect.lock().await;
     let observed = match broker.observe(&request_id, &account_id, &device_id, now) {
@@ -9449,6 +9494,90 @@ mod tests {
         assert!(!ownership.account_id.is_empty());
         assert_eq!(session.host_token, host_capability);
         assert_eq!(session.client_token, client_capability);
+    }
+
+    /// A device the owner has not trusted cannot ask a host for a session.
+    ///
+    /// Signing in from a new machine leaves it pending but still issues an
+    /// access token. Without the requester check that token was enough to put
+    /// a prompt in front of the owner, and an approval handed it a session.
+    #[tokio::test]
+    async fn a_pending_device_cannot_request_a_session() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (owner_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &owner_token, "device-host", 0x22).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Same password, new machine: pending, but holding a token.
+        let intruder_token = sign_in_as_device(&app, "operator", "device-new", 0x33).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&intruder_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "pending requester: {body}");
+
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]), "the owner is never prompted");
+    }
+
+    /// Revoking the requester while its prompt is open withdraws it: the
+    /// owner's later approval creates no session.
+    #[tokio::test]
+    async fn approving_a_revoked_requesters_prompt_creates_no_session() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "connect request: {body}");
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            "/v1/devices/device-client/trust",
+            Some(&host_token),
+            Some(serde_json::json!({ "trust": "revoked" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "revoke requester: {body}");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "approve: {body}");
+        assert!(
+            state.sessions.lock().await.is_empty(),
+            "no session may exist for a revoked requester"
+        );
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]), "the prompt is withdrawn");
     }
 
     /// Neither end can take the other's capability, and a retry of one's own
