@@ -5,7 +5,10 @@ user logs in, without running the network-facing process as root.
 
 ## Architecture
 
-Two boot-time system services (see the unit files beside this doc):
+Two boot-time system services. Their unit files are the packaged ones, in
+`packaging/linux/`, and there is deliberately no second copy here: two
+copies of a unit drift, and the one an operator reads is then not the one
+the package installs.
 
 - **`openstream-host-broker`** -- the only privileged process. It holds the two
   privileges that need elevation: reading the DRM/KMS scanout to capture and

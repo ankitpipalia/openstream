@@ -1,0 +1,82 @@
+[Unit]
+# The network-facing half of machine-level hosting: signalling, ICE, the peer
+# connection and the session approval. It holds none of the privileges that need
+# elevation -- for capture and input it asks the broker over a Unix socket, so
+# the process an attacker can reach from the network never runs as root.
+Description=OpenStream machine service
+Documentation=file:///usr/share/doc/openstream/BUILD.md
+After=network-online.target openstream-host-broker.service
+Wants=network-online.target
+# Requires, not Wants: without the broker there is nothing to capture, and a
+# machine service that starts anyway would sit answering the network with an
+# offer it cannot fulfil.
+Requires=openstream-host-broker.service
+
+# A machine that has not been enrolled is a configuration state, not a
+# transient fault, and restarting cannot change it. Without a limit the service
+# exits, restarts, and exits again every few seconds for as long as the machine
+# is up: measured at 12 restarts in the first 35 seconds on a fresh install,
+# with `systemctl is-active` still reporting "activating". An operator looking
+# for why the machine never came online sees a service that appears to be
+# trying rather than one that has stopped and said why.
+#
+# Three attempts inside a minute, then systemd holds it in `failed` where the
+# status and the journal name the reason.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/openstream-machine-service
+Restart=on-failure
+RestartSec=5
+
+# Unprivileged, and its own user so the broker's SO_PEERCRED check has something
+# specific to admit. The broker is told this account's numeric uid at install
+# time; the two have to agree or every connection is refused.
+User=openstream
+Group=openstream
+DynamicUser=false
+
+# The origin and the pairing file, in a root-owned file for the same reasons as
+# the broker's: an upgrade replaces this unit, and what belongs here differs per
+# machine. See /etc/openstream/machine-service.env.
+# Its own durable directory, created and owned by systemd as this unit's
+# User=/Group=. The device identity key lives here: the account runs with
+# --home /nonexistent, so there is no home directory for a state path to be
+# derived from, and ProtectHome=true would hide one anyway.
+StateDirectory=openstream
+StateDirectoryMode=0700
+
+EnvironmentFile=-/etc/openstream/machine-service.env
+
+# Set here because it is the same on every install: it is where the broker's
+# unit puts the socket, and the two are packaged together. Everything that
+# varies is in the environment file, and nothing is assigned an empty value --
+# an empty OPENSTREAM_SIGNAL_ORIGIN overrides the program's own default with an
+# unusable one, and an empty OPENSTREAM_PAIRING_FILE turns "no pairing
+# configured" into "pairing configured, at a path that cannot be opened".
+Environment=OPENSTREAM_BROKER_SOCKET=/run/openstream/broker.sock
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
