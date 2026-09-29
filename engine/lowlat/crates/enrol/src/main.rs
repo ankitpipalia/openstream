@@ -254,15 +254,192 @@ async fn main() -> ExitCode {
 
     println!("{device_id}");
     eprintln!("openstream-enrol: enrolled {device_id}; grant key written to {key_path}");
+
+    // Record it where the broker reads from, if the installer said where.
+    //
+    // The alternative is what the package used to print: "now set these two
+    // variables in the unit file". That is a device id copied by hand into a
+    // file a package upgrade replaces, and both halves of that are avoidable.
+    //
+    // Deliberately not fatal. The key is already stored at this point, and the
+    // enrolment is good; failing here would undo a device over a file that can
+    // be edited in ten seconds. It says exactly what to write instead.
+    match std::env::var("OPENSTREAM_BROKER_ENV_FILE") {
+        Ok(env_path) if !env_path.trim().is_empty() => {
+            match record_in_env_file(&env_path, &key_path, &device_id) {
+                Ok(()) => {
+                    eprintln!("openstream-enrol: recorded the key path and device id in {env_path}")
+                }
+                Err(error) => eprintln!(
+                    "openstream-enrol: enrolled, but could not update {env_path}: {error}\n\
+                     openstream-enrol: add these two lines to it by hand:\n\
+                     \x20 OPENSTREAM_BROKER_GRANT_KEY_FILE={key_path}\n\
+                     \x20 OPENSTREAM_BROKER_DEVICE_ID={device_id}"
+                ),
+            }
+        }
+        _ => eprintln!(
+            "openstream-enrol: add these two lines to the broker's environment file:\n\
+             \x20 OPENSTREAM_BROKER_GRANT_KEY_FILE={key_path}\n\
+             \x20 OPENSTREAM_BROKER_DEVICE_ID={device_id}"
+        ),
+    }
+
+    // Printed, not written. The account id is what the *machine service* needs
+    // to authenticate -- a device proof names the (account, device) pair it is
+    // good for -- and that service reads its own environment file, not the
+    // broker's. Inventing a key for it here, in the file the broker reads,
+    // would put it in the wrong place for the one process that will use it.
     eprintln!(
-        "openstream-enrol: set OPENSTREAM_BROKER_DEVICE_ID={device_id} in the broker's unit, \
-         alongside OPENSTREAM_BROKER_GRANT_KEY_FILE={key_path}"
-    );
-    eprintln!(
-        "openstream-enrol: this machine belongs to account {account_id}. It needs both that and \
-         its device id to authenticate later: a device proof names the pair it is good for."
+        "openstream-enrol: this machine is device {device_id} in account {account_id}. The \
+         machine service needs both to authenticate; wiring that up is not done yet."
     );
     ExitCode::SUCCESS
+}
+
+/// Set `name` to `value` in an environment file's text.
+///
+/// Replaces an existing assignment in place, uncomments a commented-out one, or
+/// appends. Kept as a string function so every one of those cases is testable
+/// without a filesystem -- the commented-out case in particular is the one the
+/// package ships, so it is the one that has to work.
+#[cfg(unix)]
+#[must_use]
+fn set_env_line(contents: &str, name: &str, value: &str) -> String {
+    let assignment = format!("{name}={value}");
+    let mut replaced = false;
+    let mut lines: Vec<String> = contents
+        .lines()
+        .map(|line| {
+            let bare = line.trim_start().trim_start_matches('#').trim_start();
+            if !replaced && bare.starts_with(&format!("{name}=")) {
+                replaced = true;
+                assignment.clone()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(assignment);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// Write the grant key path and device id into the broker's environment file.
+///
+/// Rewritten through a sibling temporary and renamed, so a failure partway
+/// leaves the old file rather than half of a new one: the broker reads this at
+/// every start, and a truncated line is a broker that will not start.
+#[cfg(unix)]
+fn record_in_env_file(path: &str, key_path: &str, device_id: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let existing = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    // Keep whatever mode the file already had; the package writes 0600 and an
+    // upgrade must not loosen it.
+    let mode = std::fs::metadata(path)
+        .map(|metadata| metadata.permissions().mode() & 0o777)
+        .unwrap_or(0o600);
+
+    let updated = set_env_line(&existing, "OPENSTREAM_BROKER_GRANT_KEY_FILE", key_path);
+    let updated = set_env_line(&updated, "OPENSTREAM_BROKER_DEVICE_ID", device_id);
+
+    let staging = format!("{path}.{}.new", std::process::id());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(mode)
+        .open(&staging)?;
+    let result = file
+        .write_all(updated.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staging, path) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::set_env_line;
+
+    #[test]
+    fn a_commented_out_assignment_is_the_one_that_gets_set() {
+        // Exactly what the package ships: the variable is present, commented
+        // out, with its explanation above it. Appending a second copy would
+        // work by luck -- later assignments win in a systemd environment file
+        // -- and would leave the file saying two different things.
+        let shipped = "\
+# Written by `openstream-enrol`.
+#OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key
+#OPENSTREAM_BROKER_DEVICE_ID=
+";
+        let updated = set_env_line(shipped, "OPENSTREAM_BROKER_DEVICE_ID", "machine-one");
+        assert_eq!(
+            updated,
+            "\
+# Written by `openstream-enrol`.
+#OPENSTREAM_BROKER_GRANT_KEY_FILE=/etc/openstream/grant.key
+OPENSTREAM_BROKER_DEVICE_ID=machine-one
+"
+        );
+        assert_eq!(
+            updated.matches("OPENSTREAM_BROKER_DEVICE_ID=").count(),
+            1,
+            "the file must not end up with two answers"
+        );
+    }
+
+    #[test]
+    fn re_enrolling_replaces_the_old_device_id_rather_than_stacking() {
+        let existing = "OPENSTREAM_BROKER_DEVICE_ID=old\nOPENSTREAM_BROKER_CEILING=capture\n";
+        let updated = set_env_line(existing, "OPENSTREAM_BROKER_DEVICE_ID", "new");
+        assert_eq!(
+            updated,
+            "OPENSTREAM_BROKER_DEVICE_ID=new\nOPENSTREAM_BROKER_CEILING=capture\n"
+        );
+    }
+
+    #[test]
+    fn a_variable_that_is_not_there_is_appended() {
+        let updated = set_env_line("OPENSTREAM_BROKER_CEILING=capture\n", "NEW", "value");
+        assert_eq!(updated, "OPENSTREAM_BROKER_CEILING=capture\nNEW=value\n");
+    }
+
+    #[test]
+    fn an_empty_file_becomes_one_assignment_with_a_trailing_newline() {
+        // systemd tolerates a missing final newline; leaving one off makes the
+        // next append land on the same line, which is a different variable.
+        assert_eq!(set_env_line("", "NAME", "value"), "NAME=value\n");
+    }
+
+    #[test]
+    fn a_variable_whose_name_is_a_prefix_of_another_is_not_touched() {
+        // OPENSTREAM_BROKER_SOCKET and OPENSTREAM_BROKER_SOCKET_GID both exist,
+        // so matching on the name alone would rewrite the wrong line. The `=`
+        // is what makes the match exact.
+        let existing = "OPENSTREAM_BROKER_SOCKET_GID=1001\n";
+        let updated = set_env_line(existing, "OPENSTREAM_BROKER_SOCKET", "/run/x.sock");
+        assert_eq!(
+            updated,
+            "OPENSTREAM_BROKER_SOCKET_GID=1001\nOPENSTREAM_BROKER_SOCKET=/run/x.sock\n"
+        );
+    }
 }
 
 #[cfg(not(unix))]

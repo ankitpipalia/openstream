@@ -197,6 +197,44 @@ jobs:
       - name: Tests
         run: cargo test --workspace --all-features --locked -- --test-threads=1
 
+      # The shipped Linux configuration, checked by running it rather than by
+      # reading it.
+      #
+      # Everything about the pre-login units used to be checked by reading them:
+      # the package built, the binaries passed their tests, and the pair could
+      # not start on any machine -- five variables were assigned the empty
+      # string, which a process reads as a value rather than as unset, and the
+      # broker exited parsing an empty gid. A sixth was a directive systemd does
+      # not have, silently ignored, leaving the runtime directory unreachable.
+      #
+      # This runs postinst and inspects what it writes, then launches the broker
+      # binary with that environment and connects to its socket, with a negative
+      # control so a broker that ignored its configuration would not pass.
+      #
+      # It does NOT start the systemd units, and does not exercise the
+      # machine-service -> socket -> broker path as the unprivileged user. It is
+      # not an install test and does not stand in for one.
+      # Two steps, because they run from different directories. This job
+      # defaults to engine/lowlat, where the workspace is; the script resolves
+      # paths from the repository root. One step doing both built nothing: at
+      # the root there is no Cargo.toml, and `cargo build` exited 101 before
+      # the script ever ran.
+      # All three, not just the broker. The packaging check builds a real
+      # package to inspect it, and that now requires dpkg-shlibdeps to find
+      # real library dependencies -- which a stub shell script does not have,
+      # so the section skips rather than passing on something it did not
+      # measure.
+      - name: Build the headless binaries for the packaging check
+        run: |
+          cargo build --locked \
+            -p openstream-host-broker \
+            -p openstream-machine-service \
+            -p openstream-enrol
+
+      - name: Linux packaging configuration
+        run: bash scripts/test-linux-packaging.sh
+        working-directory: .
+
       - name: Keystore round trip against a real Secret Service
         # The keystore tests are ignored by default because they write to the
         # developer's own keyring. They are the only thing that exercises a
@@ -711,6 +749,144 @@ jobs:
     # The Tauri shell is the actual product surface. It was previously absent
     # from CI entirely, so a change that broke it could still go green.
 
+  linux-deb-install:
+    name: headless package install
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
+
+      # A start test is only a start test where systemd is PID 1. A container
+      # without it would run every step below, report success, and have proved
+      # nothing about whether the units start -- so refuse rather than pretend.
+      - name: Refuse to claim a start test without systemd
+        run: |
+          init="$(ps -p 1 -o comm= | tr -d ' ')"
+          if [ "$init" != systemd ]; then
+            echo "PID 1 is '$init', not systemd: this job cannot prove a unit starts" >&2
+            exit 1
+          fi
+          echo "PID 1 is systemd"
+
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/lowlat/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the three headless binaries
+        working-directory: engine/lowlat
+        run: |
+          cargo build --release --locked \
+            -p openstream-host-broker \
+            -p openstream-machine-service \
+            -p openstream-enrol
+
+      - name: Build and install the package
+        run: |
+          set -euo pipefail
+          arch="$(dpkg --print-architecture)"
+          OPENSTREAM_ARTIFACT_DIR="$PWD/engine/lowlat/target/release" \
+            bash packaging/linux/build-deb.sh --profile headless
+          sudo dpkg -i "dist/openstream-headless-host_1.0.0_${arch}.deb"
+          sudo systemd-analyze verify \
+            /usr/lib/systemd/system/openstream-host-broker.service \
+            /usr/lib/systemd/system/openstream-machine-service.service
+        working-directory: .
+
+      - name: The unprivileged account can reach the privileged broker
+        run: |
+          set -euo pipefail
+          sudo systemctl daemon-reload
+          sudo systemctl start openstream-host-broker
+          for _ in $(seq 1 50); do
+            [ -S /run/openstream/broker.sock ] && break
+            sleep 0.2
+          done
+          sudo systemctl is-active --quiet openstream-host-broker
+          sudo stat -c '%a %U:%G %n' /run/openstream /run/openstream/broker.sock
+          # The whole point of the privilege split: the network-facing account
+          # opens the socket, and it is not root.
+          sudo -u openstream python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect('/run/openstream/broker.sock'); s.close(); print('the service account reached the broker')"
+        working-directory: .
+
+      # Asserting the expected state, not merely "not the bad one". Accepting
+      # anything other than `activating` would also accept `active`, which
+      # would mean an unenrolled machine had started hosting.
+      - name: An unenrolled machine service fails closed and stops trying
+        run: |
+          set -euo pipefail
+          sudo systemctl start openstream-machine-service || true
+          sleep 40
+          state="$(systemctl is-active openstream-machine-service || true)"
+          if [ "$state" != failed ]; then
+            echo "expected the unenrolled machine service to settle in 'failed', got '$state'." >&2
+            echo "'activating' means it is still looping; anything else means it is running" >&2
+            echo "without a pairing, which it must never do." >&2
+            exit 1
+          fi
+          # The reason, not just the state: a service that failed for some
+          # other cause would otherwise pass this as though it had failed
+          # closed on purpose.
+          sudo journalctl -u openstream-machine-service -b --no-pager -o cat \
+            | grep -q 'PairingRequired' || {
+              echo "the service failed, but not with PairingRequired" >&2
+              sudo journalctl -u openstream-machine-service -b --no-pager -o cat | tail -20 >&2
+              exit 1
+            }
+          # Bounded, so a future RestartSec change cannot reintroduce the loop
+          # this replaced -- it ran 12 restarts in the first 35 seconds.
+          restarts="$(systemctl show openstream-machine-service -p NRestarts --value)"
+          if [ "$restarts" -gt 3 ]; then
+            echo "restarted $restarts times; the start limit is meant to stop it at 3" >&2
+            exit 1
+          fi
+          echo "failed closed with PairingRequired after $restarts restarts"
+        working-directory: .
+
+      - name: Upgrade, downgrade, remove, purge
+        run: |
+          set -euo pipefail
+          arch="$(dpkg --print-architecture)"
+          sudo sed -i 's|^#OPENSTREAM_BROKER_CEILING=.*|OPENSTREAM_BROKER_CEILING=capture,keyboard|' \
+            /etc/openstream/broker.env
+          OPENSTREAM_VERSION=1.0.1 OPENSTREAM_ARTIFACT_DIR="$PWD/engine/lowlat/target/release" \
+            bash packaging/linux/build-deb.sh --profile headless
+          sudo dpkg -i "dist/openstream-headless-host_1.0.1_${arch}.deb"
+          # An upgrade that discarded this would silently take away every
+          # capability the machine was granting.
+          sudo grep -q '^OPENSTREAM_BROKER_CEILING=capture,keyboard' /etc/openstream/broker.env
+          sudo dpkg -i --force-downgrade "dist/openstream-headless-host_1.0.0_${arch}.deb"
+          sudo grep -q '^OPENSTREAM_BROKER_CEILING=capture,keyboard' /etc/openstream/broker.env
+          sudo dpkg -r openstream-headless-host
+          ! ls /usr/bin/openstream-host-broker 2>/dev/null
+          sudo test -f /etc/openstream/broker.env
+          sudo dpkg -P openstream-headless-host
+          ! sudo test -d /etc/openstream
+          ! sudo test -d /var/lib/openstream
+          echo "remove keeps configuration; purge removes it, identity key included"
+        working-directory: .
+
+      - name: Nothing the package wrote is world-readable
+        run: |
+          set -euo pipefail
+          arch="$(dpkg --print-architecture)"
+          sudo dpkg -i "dist/openstream-headless-host_1.0.0_${arch}.deb"
+          found="$(sudo find /etc/openstream /var/lib/openstream -perm /o+r -print 2>/dev/null || true)"
+          if [ -n "$found" ]; then
+            echo "world-readable: $found" >&2
+            exit 1
+          fi
+          echo "nothing world-readable"
+        working-directory: .
+
   ci-gate:
     name: CI gate
     if: ${{ always() }}
@@ -729,6 +905,7 @@ jobs:
       - sanitizers
       - alpine-musl
       - secret-scan
+      - linux-deb-install
     runs-on: ubuntu-latest
     steps:
       - name: Require every CI job to pass
@@ -748,6 +925,7 @@ jobs:
           SANITIZERS: ${{ needs.sanitizers.result }}
           ALPINE_MUSL: ${{ needs.alpine-musl.result }}
           SECRET_SCAN: ${{ needs.secret-scan.result }}
+          DEB_INSTALL: ${{ needs.linux-deb-install.result }}
         run: |
           # The classifier decides whether a skip is allowed at all, so it has
           # to have succeeded itself. A classifier that failed or was skipped
@@ -768,7 +946,7 @@ jobs:
           for result in "$CHECK" "$PORTABLE" "$TARGETS" "$DESKTOP_TARGETS" \
               "$DESKTOP_SHELL" "$DESKTOP_RUNTIME" "$LOOM" "$DENY" "$SMOKE" \
               "$SANITIZERS" "$ALPINE_MUSL" \
-              "$SECRET_SCAN"; do
+              "$SECRET_SCAN" "$DEB_INSTALL"; do
             # A skipped job passes the gate only on a change the classifier
             # proved is documentation only. Everywhere else a skip is a
             # failure, so a job that silently stops running cannot slip past.

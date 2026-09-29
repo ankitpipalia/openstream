@@ -63,6 +63,11 @@ jobs:
             desktop/src-tauri/target
           key: ${{ runner.os }}-release-${{ hashFiles('**/Cargo.lock') }}
 
+      # The machine-level subsystem is built here too. It was added to the
+      # fallback path in scripts/build-release-artifacts.sh, but this job sets
+      # OPENSTREAM_LINUX_PACKAGE, so that fallback never runs and the published
+      # tarball kept shipping without the broker, the machine service, the
+      # enrolment tool or their system units.
       - name: Build engine release binaries
         working-directory: engine/lowlat
         run: |
@@ -70,7 +75,10 @@ jobs:
             -p openstream-host-agent \
             -p openstream-ffmpeg-host \
             -p openstream-linux-host \
-            -p openstream-signal-server
+            -p openstream-signal-server \
+            -p openstream-host-broker \
+            -p openstream-machine-service \
+            -p openstream-enrol
 
       - name: Build the product shell
         working-directory: desktop
@@ -83,8 +91,10 @@ jobs:
           set -euo pipefail
           stage="$(mktemp -d)"
           mkdir -p "$stage/usr/bin" "$stage/usr/lib/systemd/user" \
-            "$stage/usr/share/applications"
-          for binary in openstream-host-agent openstream-ffmpeg-host openstream-linux-host openstream-signal-server; do
+            "$stage/usr/lib/systemd/system" "$stage/usr/share/applications"
+          for binary in openstream-host-agent openstream-ffmpeg-host \
+            openstream-linux-host openstream-signal-server \
+            openstream-host-broker openstream-machine-service openstream-enrol; do
             install -m 0755 \
               "engine/lowlat/target/x86_64-unknown-linux-gnu/release/$binary" \
               "$stage/usr/bin/$binary"
@@ -93,11 +103,36 @@ jobs:
             "$stage/usr/bin/openstream-desktop"
           install -m 0644 packaging/linux/openstream-host-agent.service \
             "$stage/usr/lib/systemd/user/openstream-host-agent.service"
+          # Shipped, not enabled. Machine-level hosting needs the machine
+          # enrolled first; the Debian package's postinst explains what to do.
+          for unit in openstream-host-broker openstream-machine-service; do
+            install -m 0644 "packaging/linux/$unit.service" \
+              "$stage/usr/lib/systemd/system/$unit.service"
+          done
           install -m 0644 packaging/linux/openstream.desktop \
             "$stage/usr/share/applications/openstream.desktop"
           mkdir -p out
           tar -czf out/OpenStream-Linux-x86_64.tar.gz -C "$stage" usr
           rm -rf -- "$stage"
+
+      # Against the tarball this job actually produced, not against a tree it
+      # was assembled from.
+      - name: Inspect the staged tarball
+        run: |
+          set -euo pipefail
+          scripts/verify-package-install.sh out/OpenStream-Linux-x86_64.tar.gz
+          contents="$(tar -tzf out/OpenStream-Linux-x86_64.tar.gz)"
+          for required in usr/bin/openstream-host-broker \
+            usr/bin/openstream-machine-service \
+            usr/bin/openstream-enrol \
+            usr/lib/systemd/system/openstream-host-broker.service \
+            usr/lib/systemd/system/openstream-machine-service.service; do
+            printf '%s' "$contents" | grep -q "$required" || {
+              echo "the published tarball is missing $required" >&2
+              exit 1
+            }
+          done
+          echo "the tarball ships the machine-level subsystem"
 
       - uses: actions/upload-artifact@v4
         with:
