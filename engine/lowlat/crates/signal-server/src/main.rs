@@ -2672,21 +2672,6 @@ async fn connect_request(
     // presence is soft state and trust is not.
     {
         let accounts = state.accounts.lock().await;
-        // The asker has to be trusted too, and nothing else says so.
-        //
-        // Enrolment leaves a device Pending until its owner trusts it, and
-        // until this check existed only the *target* was verified: a pending
-        // or revoked device could still ask a trusted host for a session, and
-        // the host would see an ordinary request to approve. Presence already
-        // gates on `can_create_session`, so using it here means "may this
-        // device take part in sessions" has one answer across the service
-        // rather than one per endpoint.
-        if let Err(error) = accounts.can_create_session(&control_plane::AccountPrincipal {
-            account_id: account_id.clone(),
-            device_id: Some(device_id.clone()),
-        }) {
-            return control_error_response(error);
-        }
         let devices = match accounts.list_devices(&account_id) {
             Ok(devices) => devices,
             Err(error) => return control_error_response(error),

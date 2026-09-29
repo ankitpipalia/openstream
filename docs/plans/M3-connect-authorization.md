@@ -30,8 +30,11 @@ machine to stop.
 
 ## The changes
 
-- `connect_request` calls `can_create_session` for the requester inside the
-  account lock it already takes, before the existing target check.
+- `connect_request` checks the requester before the existing target check.
+  PR #103 landed the same check first, as `require_trusted_device`, a wrapper
+  over `can_create_session` that presence, observe and approve also use. This
+  change now relies on that one check rather than adding a second copy inside
+  the account lock.
 - `commit_device_auth` refuses a `Revoked` device with `DeviceRevoked`, which
   renders as 403.
 
@@ -54,9 +57,9 @@ refusing it at the door would leave it unable to tell "not accepted yet" from
 - `a_revoked_device_cannot_mint_a_token`: a device authenticates, its owner
   revokes it, and the same valid proof is then refused 403.
 
-Teeth: with the `can_create_session` call removed the first test sees 200 and a
-`request_id`; with the revoked check removed the second is handed a token whose
-own body reports `"trust":"revoked"`.
+Teeth: with the requester check in `connect_request` removed, the first test
+sees 200 and a `request_id`. With the revoked check removed, the second is
+handed a token whose own body reports `"trust":"revoked"`.
 
 The client half of M3, the portable presence and connect modules in
 `client-core`, follows separately.
