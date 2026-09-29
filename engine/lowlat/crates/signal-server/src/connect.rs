@@ -598,6 +598,24 @@ impl ConnectBroker {
             .map(|request| request.requester_device_id.clone())
     }
 
+    /// The device that asked, but only when `target` is the one being asked.
+    ///
+    /// Scoped to the target so that a caller holding someone else's request id
+    /// learns nothing and cannot act on it.
+    pub(crate) fn requester_for_target(
+        &self,
+        request_id: &str,
+        target: Party<'_>,
+    ) -> Option<String> {
+        self.requests
+            .get(request_id)
+            .filter(|request| {
+                request.account_id == target.account_id
+                    && request.target_device_id == target.device_id
+            })
+            .map(|request| request.requester_device_id.clone())
+    }
+
     /// The pair of credentials an approval just minted.
     ///
     /// Used once, by the approving request, to build the session the two
