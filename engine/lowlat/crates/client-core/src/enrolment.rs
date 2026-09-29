@@ -224,7 +224,7 @@ pub fn device_path(device_id: &str) -> String {
 /// encoding them costs nothing and removes a class of question. Hand-rolled
 /// rather than pulling in a crate for fifteen lines.
 #[must_use]
-fn percent_encode_segment(segment: &str) -> String {
+pub(crate) fn percent_encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
