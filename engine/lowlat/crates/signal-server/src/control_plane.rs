@@ -366,7 +366,27 @@ struct RetiredRefreshToken {
     /// its family is still live would reopen exactly the replay window it
     /// exists to close.
     expires_at_ms: u64,
+    /// Digest of the retry key the rotating request carried, if any.
+    ///
+    /// A client that loses the response to a refresh still holds the token it
+    /// sent and the key it sent with it. Presenting both again, soon enough,
+    /// is a retry of that one request, not a replay: a thief who copied the
+    /// stored token has no copy of a key that only ever lived in the
+    /// client's memory for one request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_key: Option<[u8; 32]>,
+    #[serde(default)]
+    retired_at_ms: u64,
+    /// The live token this rotation issued, so a retry can take its place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor: Option<[u8; 32]>,
 }
+
+/// How long after a rotation its retry key may still recover a lost response.
+///
+/// Long enough for a client to come back from a dropped connection on its
+/// next scheduled renewal, which is at most one access-token lifetime away.
+const REFRESH_RETRY_GRACE_MS: u64 = ACCESS_TOKEN_TTL_MS;
 
 /// Family id for records written before families existed.
 ///
@@ -696,13 +716,36 @@ impl AccountStore {
         self.issue_tokens(&account_id, device_id, now_ms)
     }
 
+    /// A refresh with no retry key, as older clients send it.
+    #[cfg(test)]
     pub(crate) fn refresh(
         &mut self,
         refresh_token: &str,
         now_ms: u64,
     ) -> Result<IssuedTokens, ControlPlaneError> {
+        self.refresh_with_retry_key(refresh_token, None, now_ms)
+    }
+
+    /// Rotate a refresh token, optionally as a retry of an earlier attempt.
+    ///
+    /// `retry_key` is a random value the client generates per refresh attempt
+    /// and re-sends, unchanged, only if that attempt got no response. It lets
+    /// the one legitimate retry through the replay check below without
+    /// letting a copied token through it.
+    pub(crate) fn refresh_with_retry_key(
+        &mut self,
+        refresh_token: &str,
+        retry_key: Option<&str>,
+        now_ms: u64,
+    ) -> Result<IssuedTokens, ControlPlaneError> {
         validate_token(refresh_token)?;
-        let digest = token_digest(refresh_token);
+        if let Some(key) = retry_key {
+            validate_token(key)?;
+        }
+        let retry_digest = retry_key.map(token_digest);
+        let mut digest = token_digest(refresh_token);
+        // Tombstones whose successor becomes whatever this call issues.
+        let mut relink = vec![digest];
 
         // Replay first, before anything else looks at the live tokens.
         //
@@ -715,11 +758,22 @@ impl AccountStore {
         // forced to sign in again, which is the cost of the only reading that
         // is safe to act on.
         if let Some((account_id, family_id)) = self.find_retired_family(&digest, now_ms) {
-            self.revoke_refresh_family(&account_id, &family_id);
-            self.save()?;
-            return Err(ControlPlaneError::Unauthorized);
+            // A retry of a rotation whose response was lost: same token, same
+            // key, within the grace window, and the token that rotation issued
+            // has never been used. It is treated as a presentation of that
+            // unused token, which is exactly what the client would have sent
+            // had the response arrived. Anything else is a replay.
+            if let Some(successor) =
+                self.unused_successor(&account_id, &digest, retry_digest.as_ref(), now_ms)
+            {
+                digest = successor;
+                relink.push(successor);
+            } else {
+                self.revoke_refresh_family(&account_id, &family_id);
+                self.save()?;
+                return Err(ControlPlaneError::Unauthorized);
+            }
         }
-
         let mut principal = None;
         let mut expired = false;
         for account in self.accounts.values_mut() {
@@ -742,6 +796,9 @@ impl AccountStore {
                     digest: record.digest,
                     family_id: record.family_id.clone(),
                     expires_at_ms: record.expires_at_ms,
+                    retry_key: retry_digest,
+                    retired_at_ms: now_ms,
+                    successor: None,
                 });
                 principal = Some((
                     account.account_id.clone(),
@@ -781,7 +838,35 @@ impl AccountStore {
         }
         self.prune_retired_refresh_tokens(&account_id, now_ms);
         self.save()?;
-        self.issue_tokens_in_family(&account_id, device_id, family, now_ms)
+        self.issue_tokens_in_family(&account_id, device_id, family, &relink, now_ms)
+    }
+
+    /// The live token a rotation of `retired` issued, if `retry_key` proves
+    /// this is a retry of that rotation and the token is still unused.
+    fn unused_successor(
+        &self,
+        account_id: &str,
+        retired: &[u8; 32],
+        retry_key: Option<&[u8; 32]>,
+        now_ms: u64,
+    ) -> Option<[u8; 32]> {
+        let retry_key = retry_key?;
+        let account = self.accounts.get(account_id)?;
+        let tombstone = account
+            .retired_refresh_tokens
+            .iter()
+            .find(|tombstone| &tombstone.digest == retired)?;
+        if tombstone.retry_key.as_ref() != Some(retry_key)
+            || now_ms.saturating_sub(tombstone.retired_at_ms) > REFRESH_RETRY_GRACE_MS
+        {
+            return None;
+        }
+        let successor = tombstone.successor?;
+        account
+            .refresh_tokens
+            .iter()
+            .any(|live| live.digest == successor && live.expires_at_ms > now_ms)
+            .then_some(successor)
     }
 
     /// The family a retired token belonged to, if this digest is one.
@@ -1079,6 +1164,28 @@ impl AccountStore {
         if self.device_identity_key(account_id, device_id) != Some(verified_against) {
             return Err(ControlPlaneError::Unauthorized);
         }
+        // Revocation has to stick at the point a token is minted, and this is
+        // the first line where trust may be consulted at all.
+        //
+        // Not above it: the proof is what establishes that the caller is this
+        // device, and answering "revoked" before verifying would tell anyone
+        // who asked which devices an account has revoked. Below it there is
+        // nothing left to leak, because only the holder of the private half
+        // reaches this line.
+        //
+        // Without this the token is refused anyway, but a round trip later and
+        // forever: `authorize_access` evicts a revoked device's token the
+        // first time it is presented, so the device authenticates, is refused
+        // on the next call, re-authenticates, and repeats for as long as it
+        // runs. A stable 403 is something a client can back off from.
+        let revoked = self
+            .accounts
+            .get(account_id)
+            .and_then(|account| account.devices.get(device_id))
+            .is_some_and(|device| device.trust == DeviceTrust::Revoked);
+        if revoked {
+            return Err(ControlPlaneError::DeviceRevoked);
+        }
         // Checked and consumed under one lock, or two proofs racing with the
         // same nonce would both find it absent and both be accepted.
         self.forget_stale_device_nonces(now_ms);
@@ -1299,14 +1406,17 @@ impl AccountStore {
             family_id: Uuid::new_v4().simple().to_string(),
             generation: 0,
         };
-        self.issue_tokens_in_family(account_id, device_id, family, now_ms)
+        self.issue_tokens_in_family(account_id, device_id, family, &[], now_ms)
     }
 
+    /// Issue a token pair; `successor_of` names retired tokens whose
+    /// successor the new refresh token becomes, recorded in the same save.
     fn issue_tokens_in_family(
         &mut self,
         account_id: &str,
         device_id: Option<String>,
         family: RefreshFamily,
+        successor_of: &[[u8; 32]],
         now_ms: u64,
     ) -> Result<IssuedTokens, ControlPlaneError> {
         self.forget_expired_access_tokens(now_ms);
@@ -1330,8 +1440,16 @@ impl AccountStore {
                 .accounts
                 .get_mut(account_id)
                 .ok_or(ControlPlaneError::NotFound)?;
+            let refresh_digest = token_digest(&refresh_token);
+            for tombstone in account
+                .retired_refresh_tokens
+                .iter_mut()
+                .filter(|tombstone| successor_of.contains(&tombstone.digest))
+            {
+                tombstone.successor = Some(refresh_digest);
+            }
             account.refresh_tokens.push(RefreshTokenRecord {
-                digest: token_digest(&refresh_token),
+                digest: refresh_digest,
                 device_id: device_id.clone(),
                 family_id: family.family_id.clone(),
                 generation: family.generation,
@@ -2492,6 +2610,87 @@ mod tests {
             store.refresh(&first.refresh_token, 3),
             Err(ControlPlaneError::Unauthorized)
         ));
+        cleanup(&directory);
+    }
+
+    /// A refresh whose response was lost can be retried with the same key;
+    /// the token that lost response carried is dead, and the family lives on.
+    #[test]
+    fn a_keyed_retry_recovers_a_lost_refresh_response() {
+        let (mut store, directory) = test_store();
+        let first = store
+            .register("alice", "a sufficiently long password", None, 1)
+            .expect("registration");
+        let key: &str = &"a1".repeat(16);
+        let lost = store
+            .refresh_with_retry_key(&first.refresh_token, Some(key), 2)
+            .expect("first refresh, response never delivered");
+        let recovered = store
+            .refresh_with_retry_key(&first.refresh_token, Some(key), 3)
+            .expect("the retry is answered");
+        assert_ne!(recovered.refresh_token, lost.refresh_token);
+        // The recovered token is the live one, and it keeps rotating.
+        let next = store
+            .refresh(&recovered.refresh_token, 4)
+            .expect("the recovered token works");
+        // The token from the lost response was superseded, so presenting it
+        // now is a replay and condemns the family.
+        assert!(store.refresh(&lost.refresh_token, 5).is_err());
+        assert!(store.refresh(&next.refresh_token, 6).is_err());
+        cleanup(&directory);
+    }
+
+    /// Anything short of an exact retry is still a replay.
+    #[test]
+    fn a_refresh_retry_without_its_key_or_too_late_is_a_replay() {
+        let key: &str = &"a1".repeat(16);
+        for (label, retry_key, at) in [
+            ("no key", None, 3),
+            ("wrong key", Some("fedcba9876543210fedcba9876543210"), 3),
+            ("too late", Some(key), 2 + REFRESH_RETRY_GRACE_MS + 1),
+        ] {
+            let (mut store, directory) = test_store();
+            let first = store
+                .register("alice", "a sufficiently long password", None, 1)
+                .expect("registration");
+            let rotated = store
+                .refresh_with_retry_key(&first.refresh_token, Some(key), 2)
+                .expect("rotate");
+            assert!(
+                store
+                    .refresh_with_retry_key(&first.refresh_token, retry_key, at)
+                    .is_err(),
+                "{label}: refused"
+            );
+            assert!(
+                store.refresh(&rotated.refresh_token, at).is_err(),
+                "{label}: the family is condemned"
+            );
+            cleanup(&directory);
+        }
+    }
+
+    /// Once the successor has been used the response evidently arrived, so a
+    /// retry of the earlier request can only be a copy.
+    #[test]
+    fn a_refresh_retry_after_the_successor_was_used_is_a_replay() {
+        let (mut store, directory) = test_store();
+        let first = store
+            .register("alice", "a sufficiently long password", None, 1)
+            .expect("registration");
+        let key: &str = &"a1".repeat(16);
+        let second = store
+            .refresh_with_retry_key(&first.refresh_token, Some(key), 2)
+            .expect("rotate");
+        let third = store
+            .refresh(&second.refresh_token, 3)
+            .expect("rotate again");
+        assert!(
+            store
+                .refresh_with_retry_key(&first.refresh_token, Some(key), 4)
+                .is_err()
+        );
+        assert!(store.refresh(&third.refresh_token, 5).is_err());
         cleanup(&directory);
     }
 

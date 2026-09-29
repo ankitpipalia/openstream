@@ -29,6 +29,7 @@ openstream-settings = { path = "../../engine/lowlat/crates/settings" }
 openstream-host-agent = { path = "../../engine/lowlat/crates/host-agent" }
 openstream-local-ipc = { path = "../../engine/lowlat/crates/local-ipc" }
 libc = "0.2"
+getrandom = "0.2"
 hex = "0.4"
 reqwest = { version = "0.13.5", features = ["json"] }
 sha2 = "0.10"
