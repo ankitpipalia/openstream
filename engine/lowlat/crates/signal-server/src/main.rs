@@ -1496,6 +1496,10 @@ struct AccountCredentials {
 #[derive(Debug, Deserialize)]
 struct RefreshAccount {
     refresh_token: String,
+    /// Per-attempt key a client re-sends only when retrying an attempt whose
+    /// response it never received. Optional: older clients omit it.
+    #[serde(default)]
+    retry_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1964,7 +1968,11 @@ async fn refresh_account(
         return response;
     }
     let mut accounts = state.accounts.lock().await;
-    match accounts.refresh(&request.refresh_token, control_plane::now_ms()) {
+    match accounts.refresh_with_retry_key(
+        &request.refresh_token,
+        request.retry_key.as_deref(),
+        control_plane::now_ms(),
+    ) {
         Ok(tokens) => Json(AccountAuthResponse::from(tokens)).into_response(),
         Err(error) => control_error_response(error),
     }
@@ -2589,6 +2597,29 @@ fn seconds_until(deadline: Instant, now: Instant) -> u64 {
     deadline.saturating_duration_since(now).as_secs()
 }
 
+/// Refuse unless this device is one its account currently trusts.
+///
+/// Signing in from a new device issues an access token for a *pending*
+/// device, and that token authenticates. Anything that takes part in a
+/// session -- announcing, asking, or collecting a credential -- must also
+/// pass the trust boundary, or a password alone is enough to reach a host.
+#[allow(clippy::result_large_err, reason = "the error is an HTTP response")]
+async fn require_trusted_device(
+    state: &AppState,
+    account_id: &str,
+    device_id: &str,
+) -> Result<(), Response> {
+    state
+        .accounts
+        .lock()
+        .await
+        .can_create_session(&control_plane::AccountPrincipal {
+            account_id: account_id.to_string(),
+            device_id: Some(device_id.to_string()),
+        })
+        .map_err(control_error_response)
+}
+
 /// Announce that this device is online and able to host.
 async fn connect_presence(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let (account_id, device_id) = match connect_principal(&state, &headers).await {
@@ -2599,14 +2630,8 @@ async fn connect_presence(State(state): State<AppState>, headers: HeaderMap) -> 
     // accepted from a device the account has actually trusted. A pending or
     // revoked device announcing itself would appear in its owner's list as a
     // connectable machine.
-    {
-        let accounts = state.accounts.lock().await;
-        if let Err(error) = accounts.can_create_session(&control_plane::AccountPrincipal {
-            account_id: account_id.clone(),
-            device_id: Some(device_id.clone()),
-        }) {
-            return control_error_response(error);
-        }
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
     }
     state
         .connect
@@ -2636,6 +2661,12 @@ async fn connect_request(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    // The requester has to be trusted too. A pending device holds a valid
+    // access token, and without this it could put a prompt in front of the
+    // owner and, if approved, receive a live session.
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
+    }
     // The target has to be a device this account owns and trusts. Checked
     // against the store rather than inferred from the broker, because
     // presence is soft state and trust is not.
@@ -2721,6 +2752,24 @@ async fn connect_approve(
         account_id: &account_id,
         device_id: &device_id,
     };
+
+    // Both ends are re-checked here, not only when the request was made: a
+    // requester revoked while its prompt was on screen must not be handed a
+    // session by an approval the owner gave without knowing.
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
+    }
+    let requester = state
+        .connect
+        .lock()
+        .await
+        .requester_for_target(&request_id, party);
+    if let Some(requester) = requester
+        && let Err(response) = require_trusted_device(&state, &account_id, &requester).await
+    {
+        state.connect.lock().await.withdraw(&request_id);
+        return response;
+    }
 
     // Approve first. If this is refused -- the request expired, or this is
     // not the device being asked -- no session is created, so a rejected
@@ -2849,13 +2898,20 @@ async fn connect_approve(
     }
 }
 
-/// How long a session grant is good for.
+/// How long a session grant is good for: exactly as long as the session.
 ///
-/// Long enough to cover a reconnect or two -- a host that drops and comes back
-/// should not need a fresh approval -- and short enough that a captured grant
-/// is worth little. The broker also refuses a repeat of the same nonce, so the
-/// window bounds how long it has to remember one.
-const SESSION_GRANT_LIFETIME_MS: u64 = 10 * 60 * 1000;
+/// The broker re-verifies the grant on every `OpenCapture`, and the machine
+/// service presents the same one for the life of the session -- a logout
+/// that drops to the greeter reopens capture with it. A grant shorter than
+/// the session therefore ended pre-login capture for good partway through a
+/// session that was still valid. A captured grant stays bounded all the
+/// same: it names one target device and one session, and the broker's nonce
+/// lease refuses it on a second live connection.
+const SESSION_GRANT_LIFETIME_MS: u64 = DEFAULT_TTL_SECONDS * 1000;
+const _: () = assert!(
+    SESSION_GRANT_LIFETIME_MS >= DEFAULT_TTL_SECONDS * 1000,
+    "a session grant must outlive the session it approves"
+);
 
 /// Translate the negotiated permission classes into the broker's capability
 /// bits.
@@ -2915,6 +2971,10 @@ async fn connect_observe(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    // A device revoked after asking may still poll, but must not collect.
+    if let Err(response) = require_trusted_device(&state, &account_id, &device_id).await {
+        return response;
+    }
     let now = Instant::now();
     let mut broker = state.connect.lock().await;
     let observed = match broker.observe(&request_id, &account_id, &device_id, now) {
@@ -4920,7 +4980,7 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                 if let Ok(registration) = relay::decode_registration(datagram) {
                     let accepted = {
                         let mut sessions = state.sessions.lock().await;
-                        match sessions.get_mut(registration.session_id) {
+                        let accepted = match sessions.get_mut(registration.session_id) {
                             None => false,
                             Some(session) if session.expires_at <= Instant::now() => false,
                             Some(session) => {
@@ -4970,7 +5030,27 @@ async fn run_relay(socket: UdpSocket, state: AppState, shutdown: watch::Receiver
                                     }
                                 }
                             }
+                        };
+                        // Forwarding finds a sender by address alone, so one
+                        // address may hold a slot in one session only. A host
+                        // that crashed without unregistering and now serves a
+                        // new session from the same port would otherwise keep
+                        // its old slot -- refreshed by every packet it sends,
+                        // so never reaped -- and its traffic could go to the
+                        // old session's peer.
+                        if accepted {
+                            for (session_id, session) in sessions.iter_mut() {
+                                if session_id.as_str() == registration.session_id {
+                                    continue;
+                                }
+                                for slot in [&mut session.relay_host, &mut session.relay_client] {
+                                    if slot.as_ref().is_some_and(|owned| owned.addr == source) {
+                                        *slot = None;
+                                    }
+                                }
+                            }
                         }
+                        accepted
                     };
                     if accepted {
                         let _ = socket
@@ -6874,6 +6954,92 @@ mod tests {
             .expect("relay task joins");
     }
 
+    /// A host that re-registers its address for a new session gives up its
+    /// slot in the old one, so its traffic reaches only the new session's
+    /// peer. Before, forwarding took whichever session the map yielded first,
+    /// and every packet refreshed the stale slot so it was never reaped.
+    #[tokio::test]
+    async fn one_relay_address_holds_a_slot_in_one_session_only() {
+        let (host_one, _host_one_rx) = mpsc::channel(1);
+        let (host_two, _host_two_rx) = mpsc::channel(1);
+        let (client_one, _client_one_rx) = mpsc::channel(1);
+        let (client_two, _client_two_rx) = mpsc::channel(1);
+        let mut first = test_session();
+        first.host = Some(host_one);
+        first.host_generation = 1;
+        first.client = Some(client_one);
+        first.client_generation = 1;
+        let mut second = test_session();
+        second.host = Some(host_two);
+        second.host_generation = 1;
+        second.client = Some(client_two);
+        second.client_generation = 1;
+        let state = AppState {
+            sessions: Arc::new(Mutex::new(HashMap::from([
+                ("session-1".into(), first),
+                ("session-2".into(), second),
+            ]))),
+            ..connect_test_state()
+        };
+        let secret = state.relay_secret.clone();
+
+        let relay_socket = UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let relay_address = relay_socket.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let relay_task = tokio::spawn(super::run_relay(relay_socket, state.clone(), shutdown_rx));
+
+        let bind = || UdpSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        let host = bind().await.unwrap();
+        let old_client = bind().await.unwrap();
+        let new_client = bind().await.unwrap();
+        let register = async |socket: &UdpSocket, session: &str, role: relay::Role| {
+            register_relay(&secret, relay_address, socket, session, role).await;
+        };
+        register(&old_client, "session-1", relay::Role::Client).await;
+        register(&new_client, "session-2", relay::Role::Client).await;
+        // The same host address, first for the old session and then, without
+        // unregistering, for the new one.
+        register(&host, "session-1", relay::Role::Host).await;
+        register(&host, "session-2", relay::Role::Host).await;
+
+        {
+            let sessions = state.sessions.lock().await;
+            assert!(
+                sessions["session-1"].relay_host.is_none(),
+                "the old session's host slot is released"
+            );
+            assert_eq!(
+                sessions["session-2"]
+                    .relay_host
+                    .as_ref()
+                    .map(|slot| slot.addr),
+                Some(host.local_addr().unwrap())
+            );
+        }
+
+        host.send_to(b"media", relay_address).await.unwrap();
+        let mut bytes = [0_u8; 16];
+        let (length, _) = timeout(Duration::from_secs(1), new_client.recv_from(&mut bytes))
+            .await
+            .expect("the new session's client receives the packet")
+            .unwrap();
+        assert_eq!(&bytes[..length], b"media");
+        assert!(
+            timeout(Duration::from_millis(200), old_client.recv_from(&mut bytes))
+                .await
+                .is_err(),
+            "the old session's client receives nothing"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), relay_task)
+            .await
+            .expect("relay exits")
+            .expect("relay task joins");
+    }
+
     #[tokio::test]
     async fn replaced_connection_cannot_reissue_or_register_old_relay_ticket() {
         let secret = b"test-relay-secret-0123456789".to_vec();
@@ -7033,6 +7199,23 @@ mod tests {
             .await
             .expect("relay exits")
             .expect("relay task joins");
+    }
+
+    async fn register_relay(
+        secret: &[u8],
+        relay_address: SocketAddr,
+        socket: &UdpSocket,
+        session: &str,
+        role: relay::Role,
+    ) {
+        let (class, subject) = match role {
+            relay::Role::Host => ("host", "host"),
+            relay::Role::Client => ("client", "client"),
+        };
+        let ticket = relay_ticket::mint(secret, session, class, subject, 1);
+        let datagram = relay::encode_registration(session, role, &ticket).expect("encode");
+        socket.send_to(&datagram, relay_address).await.unwrap();
+        receive_relay_ack(socket, role).await;
     }
 
     async fn receive_relay_ack(socket: &UdpSocket, role: relay::Role) {
@@ -9449,6 +9632,90 @@ mod tests {
         assert!(!ownership.account_id.is_empty());
         assert_eq!(session.host_token, host_capability);
         assert_eq!(session.client_token, client_capability);
+    }
+
+    /// A device the owner has not trusted cannot ask a host for a session.
+    ///
+    /// Signing in from a new machine leaves it pending but still issues an
+    /// access token. Without the requester check that token was enough to put
+    /// a prompt in front of the owner, and an approval handed it a session.
+    #[tokio::test]
+    async fn a_pending_device_cannot_request_a_session() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (owner_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &owner_token, "device-host", 0x22).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // Same password, new machine: pending, but holding a token.
+        let intruder_token = sign_in_as_device(&app, "operator", "device-new", 0x33).await;
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&intruder_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "pending requester: {body}");
+
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]), "the owner is never prompted");
+    }
+
+    /// Revoking the requester while its prompt is open withdraws it: the
+    /// owner's later approval creates no session.
+    #[tokio::test]
+    async fn approving_a_revoked_requesters_prompt_creates_no_session() {
+        let state = connect_test_state();
+        let app = connect_router(state.clone());
+        let (client_token, _) = register_with_device(&app, "operator", "device-client", 0x11).await;
+        let host_token = sign_in_as_device(&app, "operator", "device-host", 0x22).await;
+        enroll_trusted_device(&app, &client_token, "device-host", 0x22).await;
+        let (status, _) = call(&app, "POST", "/v1/presence", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/v1/connect",
+            Some(&client_token),
+            Some(serde_json::json!({ "target_device_id": "device-host" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "connect request: {body}");
+        let request_id = body["request_id"].as_str().expect("request id").to_string();
+
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            "/v1/devices/device-client/trust",
+            Some(&host_token),
+            Some(serde_json::json!({ "trust": "revoked" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "revoke requester: {body}");
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            &format!("/v1/connect/{request_id}/approve"),
+            Some(&host_token),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "approve: {body}");
+        assert!(
+            state.sessions.lock().await.is_empty(),
+            "no session may exist for a revoked requester"
+        );
+        let (status, body) =
+            call(&app, "GET", "/v1/connect/pending", Some(&host_token), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]), "the prompt is withdrawn");
     }
 
     /// Neither end can take the other's capability, and a retry of one's own
